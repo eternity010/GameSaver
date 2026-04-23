@@ -32,6 +32,13 @@ snapshots/*
 events
 events/*
 
+# Redirector build artifacts
+src-tauri/redirector/*.obj
+src-tauri/redirector/bin/*.exp
+src-tauri/redirector/bin/*.lib
+src-tauri/redirector/bin/*.pdb
+src-tauri/redirector/bin/*.ilk
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
