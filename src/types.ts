@@ -135,3 +135,22 @@ export interface ImportMigrationZipResult {
   copiedBackupFiles: number;
   skippedBackupGames: number;
 }
+
+export interface LaunchPrecheckCheck {
+  key: string;
+  label: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface GameLaunchPrecheck {
+  gameId: string;
+  preferredExePath?: string;
+  exeHash?: string;
+  matchedRuleId?: string;
+  backupReady: boolean;
+  sandboxReady: boolean;
+  injectReady: boolean;
+  checks: LaunchPrecheckCheck[];
+  checkedAt: string;
+}

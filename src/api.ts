@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   BackupVersion,
+  GameLaunchPrecheck,
   ExportMigrationZipResult,
   CandidatePath,
   ExportRulesResult,
@@ -94,6 +95,10 @@ export async function launchGameFromLibrary(
   launchMode: LauncherMode = "backup",
 ): Promise<LauncherSession> {
   return invoke("launch_game_from_library", { gameId, launchMode });
+}
+
+export async function precheckGameLaunch(gameId: string): Promise<GameLaunchPrecheck> {
+  return invoke("precheck_game_launch", { gameId });
 }
 
 export async function getLauncherSession(launcherSessionId: string): Promise<LauncherSession> {

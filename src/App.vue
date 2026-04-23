@@ -8,6 +8,7 @@ import {
   finishLearning,
   getLauncherSession,
   getLearningSession,
+  precheckGameLaunch,
   getRedirectRuntimeInfo,
   getRuntimeStatus,
   importRules,
@@ -28,6 +29,7 @@ import type {
   BackupVersion,
   CandidatePath,
   GameLibraryItem,
+  GameLaunchPrecheck,
   GameSaveRule,
   LauncherMode,
   LauncherSession,
@@ -73,6 +75,8 @@ const cardLoading = ref<Record<string, boolean>>({});
 const expandedGames = ref<Record<string, boolean>>({});
 const backupVersionsByGame = ref<Record<string, BackupVersion[]>>({});
 const sessionDetailsByGame = ref<Record<string, LauncherSession | null>>({});
+const launchPrecheckByGame = ref<Record<string, GameLaunchPrecheck | null>>({});
+const hiddenPrecheckKeys = new Set(["sandbox_runtime", "inject_artifacts", "inject_arch"]);
 
 const hasHighConfidence = computed(() => candidates.value.some((item) => item.score >= 45));
 const filteredRules = computed(() => {
@@ -208,6 +212,16 @@ function sessionDetailsFor(gameIdText: string): LauncherSession | null {
   return sessionDetailsByGame.value[cardKey(gameIdText)] ?? null;
 }
 
+function launchPrecheckFor(gameIdText: string): GameLaunchPrecheck | null {
+  return launchPrecheckByGame.value[cardKey(gameIdText)] ?? null;
+}
+
+function visiblePrecheckChecks(gameIdText: string) {
+  const precheck = launchPrecheckFor(gameIdText);
+  if (!precheck) return [];
+  return precheck.checks.filter((check) => !hiddenPrecheckKeys.has(check.key));
+}
+
 async function chooseExePath() {
   try {
     const { open } = await import("@tauri-apps/plugin-dialog");
@@ -316,10 +330,44 @@ async function reloadLibraryWithLoading() {
   try {
     await refreshLibraryItems();
     await loadRedirectRuntimeInfo();
+    void refreshLaunchPrechecksForLibraryItems();
   } catch (err) {
     libraryState.value.error = `读取游戏库失败：${String(err)}`;
   } finally {
     libraryState.value.loading = false;
+  }
+}
+
+async function refreshLaunchPrechecksForLibraryItems() {
+  const items = [...libraryItems.value];
+  if (!items.length) {
+    launchPrecheckByGame.value = {};
+    return;
+  }
+  await Promise.all(items.map((item) => loadLaunchPrecheckForGame(item.gameId, false)));
+}
+
+async function loadLaunchPrecheckForGame(gameIdText: string, withCardLoading = true) {
+  const key = cardKey(gameIdText);
+  if (withCardLoading) {
+    setCardBusy(gameIdText, true);
+  }
+  try {
+    const precheck = await precheckGameLaunch(gameIdText);
+    launchPrecheckByGame.value = {
+      ...launchPrecheckByGame.value,
+      [key]: precheck,
+    };
+  } catch (err) {
+    libraryState.value.error = `读取启动前检查失败：${String(err)}`;
+    launchPrecheckByGame.value = {
+      ...launchPrecheckByGame.value,
+      [key]: null,
+    };
+  } finally {
+    if (withCardLoading) {
+      setCardBusy(gameIdText, false);
+    }
   }
 }
 
@@ -387,6 +435,7 @@ async function choosePreferredExeForGame(gameIdText: string) {
     libraryState.value.info = "";
     await setPreferredExePath(gameIdText, chosen);
     await refreshLibraryItems();
+    await loadLaunchPrecheckForGame(gameIdText, false);
     libraryState.value.info = `${gameIdText} 已更新启动 EXE`;
   } catch (err) {
     libraryState.value.error = `绑定 EXE 失败：${String(err)}`;
@@ -403,6 +452,7 @@ async function launchLibraryGame(gameIdText: string, mode: LauncherMode = "backu
     const session = await launchGameFromLibrary(gameIdText, mode);
     setGameExpanded(gameIdText, true);
     await refreshLibraryItems();
+    await loadLaunchPrecheckForGame(gameIdText, false);
     await Promise.all([
       loadBackupVersionsForGame(gameIdText, false),
       loadSessionDetailsForGame(gameIdText, false),
@@ -842,15 +892,6 @@ onMounted(() => {
         <section v-if="redirectRuntimeInfo" class="runtime-compact">
           <span class="runtime-chip">架构 {{ redirectRuntimeInfo.arch }}</span>
           <span class="runtime-chip">备份模式可用</span>
-          <span class="runtime-chip" :class="redirectRuntimeInfo.sandboxieExists ? 'ok' : 'warn'">
-            Sandboxie {{ redirectRuntimeInfo.sandboxieExists ? "可用" : "缺失" }}
-          </span>
-          <span class="runtime-chip" :class="redirectRuntimeInfo.injectorExists ? 'ok' : 'warn'">
-            Injector {{ redirectRuntimeInfo.injectorExists ? "可用" : "缺失" }}
-          </span>
-          <span class="runtime-chip" :class="redirectRuntimeInfo.dllExists ? 'ok' : 'warn'">
-            Hook DLL {{ redirectRuntimeInfo.dllExists ? "可用" : "缺失" }}
-          </span>
         </section>
       </header>
 
@@ -893,6 +934,35 @@ onMounted(() => {
             </div>
           </label>
 
+          <section class="precheck-box">
+            <div class="row precheck-head">
+              <strong>启动前预检查</strong>
+              <button
+                type="button"
+                :disabled="libraryState.loading || isCardBusy(item.gameId)"
+                @click="loadLaunchPrecheckForGame(item.gameId)"
+              >
+                刷新检查
+              </button>
+            </div>
+            <template v-if="launchPrecheckFor(item.gameId)">
+              <p class="precheck-mode-line">
+                自动备份：
+                <span :class="launchPrecheckFor(item.gameId)?.backupReady ? 'precheck-ok' : 'precheck-fail'">
+                  {{ launchPrecheckFor(item.gameId)?.backupReady ? "可启动" : "需处理" }}
+                </span>
+              </p>
+              <ul class="precheck-list">
+                <li v-for="check in visiblePrecheckChecks(item.gameId)" :key="`${item.gameId}-${check.key}`">
+                  <span class="precheck-badge" :class="check.ok ? 'ok' : 'fail'">{{ check.ok ? "OK" : "FAIL" }}</span>
+                  <span class="precheck-label">{{ check.label }}</span>
+                  <span class="precheck-detail">{{ check.detail }}</span>
+                </li>
+              </ul>
+            </template>
+            <p v-else class="empty-hint">尚未检查，点击“刷新检查”查看启动条件。</p>
+          </section>
+
           <div class="row">
             <button
               type="button"
@@ -903,26 +973,7 @@ onMounted(() => {
               启动游戏（自动备份）
             </button>
           </div>
-
-          <details class="advanced-box">
-            <summary>高级模式</summary>
-            <div class="row">
-              <button
-                type="button"
-                :disabled="libraryState.loading || isCardBusy(item.gameId)"
-                @click="launchLibraryGame(item.gameId, 'sandbox')"
-              >
-                沙盒启动
-              </button>
-              <button
-                type="button"
-                :disabled="libraryState.loading || isCardBusy(item.gameId)"
-                @click="launchLibraryGame(item.gameId, 'inject')"
-              >
-                注入启动
-              </button>
-            </div>
-          </details>
+          <p class="mode-hint">当前阶段仅开放自动备份启动。沙盒/注入模式已纳入开发计划。</p>
 
           <section v-if="isGameExpanded(item.gameId)" class="panel card-detail">
             <div class="row">
@@ -990,11 +1041,6 @@ onMounted(() => {
       <details v-if="redirectRuntimeInfo" class="runtime-diagnostics">
         <summary>运行时状态（高级）</summary>
         <p>备份目录（推荐模式）：<code>{{ redirectRuntimeInfo.backupRoot }}</code></p>
-        <p>托管目录（注入模式）：<code>{{ redirectRuntimeInfo.managedSaveRoot }}</code></p>
-        <p>沙盒根目录：<code>{{ redirectRuntimeInfo.sandboxRoot }}</code></p>
-        <p>Sandboxie 路径：<code>{{ redirectRuntimeInfo.sandboxiePath }}</code></p>
-        <p>Injector 路径：<code>{{ redirectRuntimeInfo.injectorPath }}</code></p>
-        <p>Hook DLL 路径：<code>{{ redirectRuntimeInfo.dllPath }}</code></p>
       </details>
     </section>
 

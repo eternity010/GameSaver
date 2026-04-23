@@ -274,6 +274,29 @@ struct RestoreBackupResult {
     restored_files: usize,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LaunchPrecheckCheck {
+    key: String,
+    label: String,
+    ok: bool,
+    detail: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GameLaunchPrecheck {
+    game_id: String,
+    preferred_exe_path: Option<String>,
+    exe_hash: Option<String>,
+    matched_rule_id: Option<String>,
+    backup_ready: bool,
+    sandbox_ready: bool,
+    inject_ready: bool,
+    checks: Vec<LaunchPrecheckCheck>,
+    checked_at: String,
+}
+
 struct RedirectArtifacts {
     injector_path: PathBuf,
     dll_path: PathBuf,
@@ -1780,6 +1803,252 @@ fn list_game_library_items(state: State<AppState>) -> Result<Vec<GameLibraryItem
 }
 
 #[tauri::command]
+fn precheck_game_launch(
+    app: AppHandle,
+    state: State<AppState>,
+    game_id: String,
+) -> Result<GameLaunchPrecheck, String> {
+    let trimmed_game_id = game_id.trim().to_string();
+    if trimmed_game_id.is_empty() {
+        return Err("gameId 不能为空".to_string());
+    }
+    let normalized_game_key = normalize_game_key(&trimmed_game_id);
+    if normalized_game_key.is_empty() {
+        return Err("gameId 不能为空".to_string());
+    }
+
+    let (rules, execution_config, selected_rule, preferred_exe_path) = {
+        let store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+        let selected_rule = select_rule_for_game(&store, &trimmed_game_id);
+        let preferred_exe_path = selected_rule.as_ref().and_then(|rule| {
+            let game_uid = normalize_game_uid(&rule.game_uid);
+            if game_uid.is_empty() {
+                None
+            } else {
+                store.execution_config.preferred_exe_by_uid.get(&game_uid).cloned()
+            }
+        });
+        (
+            store.rules.clone(),
+            store.execution_config.clone(),
+            selected_rule,
+            preferred_exe_path,
+        )
+    };
+
+    let mut checks = Vec::new();
+    let mut exe_hash: Option<String> = None;
+    let mut matched_rule: Option<GameSaveRule> = None;
+    let mut exe_is_valid = false;
+
+    let has_selected_rule = selected_rule.is_some();
+    checks.push(LaunchPrecheckCheck {
+        key: "rule_available".to_string(),
+        label: "可用规则".to_string(),
+        ok: has_selected_rule,
+        detail: if let Some(rule) = selected_rule.as_ref() {
+            format!("已选规则 {}（{}）", rule.game_id, rule.rule_id)
+        } else {
+            "未找到可用规则，请先学习并保存规则".to_string()
+        },
+    });
+
+    let trimmed_exe_path = preferred_exe_path
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    checks.push(LaunchPrecheckCheck {
+        key: "exe_bound".to_string(),
+        label: "已绑定 EXE".to_string(),
+        ok: trimmed_exe_path.is_some(),
+        detail: trimmed_exe_path
+            .as_ref()
+            .map(|value| format!("当前绑定：{value}"))
+            .unwrap_or_else(|| "未绑定 EXE，请先点击“选择/更换 EXE”".to_string()),
+    });
+
+    if let Some(exe_path_value) = trimmed_exe_path.as_ref() {
+        let exe_path = Path::new(exe_path_value);
+        let path_ok = exe_path.exists()
+            && exe_path.is_file()
+            && exe_path_value.to_ascii_lowercase().ends_with(".exe");
+        exe_is_valid = path_ok;
+        checks.push(LaunchPrecheckCheck {
+            key: "exe_exists".to_string(),
+            label: "EXE 文件可访问".to_string(),
+            ok: path_ok,
+            detail: if !exe_path.exists() {
+                "已绑定 EXE 不存在，请重新绑定".to_string()
+            } else if !exe_path.is_file() {
+                "已绑定路径不是文件，请重新绑定".to_string()
+            } else if !exe_path_value.to_ascii_lowercase().ends_with(".exe") {
+                "已绑定路径不是 .exe 文件，请重新绑定".to_string()
+            } else {
+                "EXE 文件存在且可访问".to_string()
+            },
+        });
+        if path_ok {
+            match file_sha256_hex(exe_path) {
+                Ok(hash) => {
+                    exe_hash = Some(hash.clone());
+                    let mut hash_matched_any = false;
+                    for rule in &rules {
+                        if !rule.enabled || !rule.exe_hash.eq_ignore_ascii_case(&hash) {
+                            continue;
+                        }
+                        hash_matched_any = true;
+                        if normalize_game_key(&rule.game_id) == normalized_game_key {
+                            matched_rule = Some(rule.clone());
+                            break;
+                        }
+                    }
+                    let match_ok = matched_rule.is_some();
+                    checks.push(LaunchPrecheckCheck {
+                        key: "rule_match".to_string(),
+                        label: "规则哈希命中".to_string(),
+                        ok: match_ok,
+                        detail: if let Some(rule) = matched_rule.as_ref() {
+                            format!("命中规则 {}（{}）", rule.game_id, rule.rule_id)
+                        } else if hash_matched_any {
+                            "当前 EXE 命中了其他游戏规则，请重新绑定".to_string()
+                        } else {
+                            "当前 EXE 未命中任何已启用规则".to_string()
+                        },
+                    });
+                }
+                Err(err) => {
+                    checks.push(LaunchPrecheckCheck {
+                        key: "rule_match".to_string(),
+                        label: "规则哈希命中".to_string(),
+                        ok: false,
+                        detail: format!("计算 EXE 哈希失败：{err}"),
+                    });
+                }
+            }
+        } else {
+            checks.push(LaunchPrecheckCheck {
+                key: "rule_match".to_string(),
+                label: "规则哈希命中".to_string(),
+                ok: false,
+                detail: "需要先绑定有效 EXE".to_string(),
+            });
+        }
+    } else {
+        checks.push(LaunchPrecheckCheck {
+            key: "exe_exists".to_string(),
+            label: "EXE 文件可访问".to_string(),
+            ok: false,
+            detail: "尚未绑定 EXE".to_string(),
+        });
+        checks.push(LaunchPrecheckCheck {
+            key: "rule_match".to_string(),
+            label: "规则哈希命中".to_string(),
+            ok: false,
+            detail: "尚未绑定 EXE".to_string(),
+        });
+    }
+
+    let backup_probe_root = if let Some(rule) = selected_rule.as_ref() {
+        let uid = normalize_game_uid(&rule.game_uid);
+        if uid.is_empty() {
+            Path::new(&execution_config.backup_root).to_path_buf()
+        } else {
+            backup_game_root(&execution_config.backup_root, &uid)
+        }
+    } else {
+        Path::new(&execution_config.backup_root).to_path_buf()
+    };
+    let backup_writable = ensure_directory_writable(&backup_probe_root);
+    let backup_writable_ok = backup_writable.is_ok();
+    let backup_writable_detail = match backup_writable {
+        Ok(_) => format!("可写：{}", backup_probe_root.to_string_lossy()),
+        Err(err) => format!("不可写：{err}"),
+    };
+    checks.push(LaunchPrecheckCheck {
+        key: "backup_writable".to_string(),
+        label: "备份目录可写".to_string(),
+        ok: backup_writable_ok,
+        detail: backup_writable_detail,
+    });
+
+    let sandbox_available = resolve_sandboxie_start_path(&execution_config);
+    let sandbox_available_ok = sandbox_available.is_ok();
+    let sandbox_available_detail = sandbox_available
+        .map(|path| format!("可用：{path}"))
+        .unwrap_or_else(|err| err);
+    checks.push(LaunchPrecheckCheck {
+        key: "sandbox_runtime".to_string(),
+        label: "Sandboxie 可用".to_string(),
+        ok: sandbox_available_ok,
+        detail: sandbox_available_detail,
+    });
+
+    let artifacts = resolve_redirector_artifacts(&app);
+    let inject_artifacts_ok = artifacts.injector_path.exists() && artifacts.dll_path.exists();
+    let inject_artifacts_detail = if inject_artifacts_ok {
+        format!(
+            "组件就绪：{} / {}",
+            artifacts.injector_path.to_string_lossy(),
+            artifacts.dll_path.to_string_lossy()
+        )
+    } else {
+        let mut missing = Vec::new();
+        if !artifacts.injector_path.exists() {
+            missing.push(format!("injector 缺失：{}", artifacts.injector_path.to_string_lossy()));
+        }
+        if !artifacts.dll_path.exists() {
+            missing.push(format!("hook DLL 缺失：{}", artifacts.dll_path.to_string_lossy()));
+        }
+        missing.join("；")
+    };
+    checks.push(LaunchPrecheckCheck {
+        key: "inject_artifacts".to_string(),
+        label: "注入组件可用".to_string(),
+        ok: inject_artifacts_ok,
+        detail: inject_artifacts_detail,
+    });
+
+    let inject_arch_ok = if let Some(exe_path_value) = trimmed_exe_path.as_ref() {
+        if exe_is_valid {
+            is_x64_pe(Path::new(exe_path_value))
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    checks.push(LaunchPrecheckCheck {
+        key: "inject_arch".to_string(),
+        label: "注入架构兼容".to_string(),
+        ok: inject_arch_ok,
+        detail: if !exe_is_valid {
+            "需要先绑定有效 EXE".to_string()
+        } else if inject_arch_ok {
+            "目标 EXE 为 x64".to_string()
+        } else {
+            "目标 EXE 非 x64，注入模式暂不支持".to_string()
+        },
+    });
+
+    let rule_match_ok = matched_rule.is_some();
+    let backup_ready = rule_match_ok && backup_writable_ok;
+    let sandbox_ready = rule_match_ok && sandbox_available_ok;
+    let inject_ready = rule_match_ok && inject_artifacts_ok && inject_arch_ok;
+
+    Ok(GameLaunchPrecheck {
+        game_id: trimmed_game_id,
+        preferred_exe_path: trimmed_exe_path,
+        exe_hash,
+        matched_rule_id: matched_rule.as_ref().map(|rule| rule.rule_id.clone()),
+        backup_ready,
+        sandbox_ready,
+        inject_ready,
+        checks,
+        checked_at: now_iso_string(),
+    })
+}
+
+#[tauri::command]
 fn set_preferred_exe_path(
     app: AppHandle,
     state: State<AppState>,
@@ -1861,6 +2130,14 @@ fn normalize_launch_mode(value: Option<&str>) -> String {
         "sandbox" => "sandbox".to_string(),
         _ => "inject".to_string(),
     }
+}
+
+fn ensure_directory_writable(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path).map_err(|err| format!("创建目录失败: {err}"))?;
+    let probe = path.join(format!(".gamesaver_write_probe_{}.tmp", Uuid::new_v4()));
+    fs::write(&probe, b"ok").map_err(|err| format!("写入测试文件失败: {err}"))?;
+    let _ = fs::remove_file(&probe);
+    Ok(())
 }
 
 fn sanitize_sandbox_box_name(game_id: &str) -> String {
@@ -3383,6 +3660,7 @@ pub fn run() {
             resolve_rule_for_exe,
             launch_with_rule,
             launch_game_from_library,
+            precheck_game_launch,
             get_launcher_session,
             list_launcher_sessions,
             list_game_library_items,
