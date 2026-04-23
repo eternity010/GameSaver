@@ -1,0 +1,3400 @@
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    io::Read,
+    path::{Component, Path, PathBuf},
+    process::Command,
+    sync::Mutex,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+use tauri::{AppHandle, Manager, State};
+use uuid::Uuid;
+use walkdir::WalkDir;
+
+const SCORE_TIME_MATCH: i64 = 35;
+const SCORE_EXTENSION_MATCH: i64 = 20;
+const SCORE_KEYWORD_MATCH: i64 = 20;
+const SCORE_CHANGE_COUNT_MATCH: i64 = 15;
+const SCORE_SIZE_REASONABLE: i64 = 10;
+const LOW_CONFIDENCE_THRESHOLD: i64 = 45;
+const SAVE_EXTENSIONS: [&str; 7] = ["sav", "save", "dat", "profile", "slot", "json", "bin"];
+const PATH_KEYWORDS: [&str; 4] = ["save", "savedata", "profile", "userdata"];
+const APP_IDENTIFIER: &str = "com.gamesaver.desktop";
+const NOISE_PATH_FRAGMENTS: [&str; 7] = [
+    "\\appdata\\local\\temp\\",
+    "\\appdata\\local\\tencent\\wetype\\",
+    "\\appdata\\local\\microsoft\\edge\\",
+    "\\appdata\\local\\google\\chrome\\",
+    "\\appdata\\roaming\\microsoft\\windows\\",
+    "\\$recycle.bin\\",
+    "\\ebwebview\\",
+];
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct FileMeta {
+    size: u64,
+    modified_unix: u64,
+    extension: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct Snapshot {
+    snapshot_ref: String,
+    created_at_unix: u64,
+    files: HashMap<String, FileMeta>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct CandidatePath {
+    path: String,
+    score: i64,
+    changed_files: usize,
+    added_files: usize,
+    modified_files: usize,
+    matched_signals: Vec<String>,
+    collapsed: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct LearningSession {
+    session_id: String,
+    game_id: String,
+    exe_path: String,
+    started_at: String,
+    ended_at: Option<String>,
+    status: String,
+    baseline_snapshot_ref: String,
+    final_snapshot_ref: Option<String>,
+    candidates: Vec<CandidatePath>,
+    pid: Option<u32>,
+    #[serde(default)]
+    tracked_pids: Vec<u32>,
+    #[serde(default)]
+    event_capture_mode: String,
+    #[serde(default)]
+    event_trace_name: Option<String>,
+    #[serde(default)]
+    event_trace_path: Option<String>,
+    #[serde(default)]
+    captured_event_count: usize,
+    #[serde(default)]
+    event_capture_error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct GameSaveRule {
+    rule_id: String,
+    game_id: String,
+    #[serde(default)]
+    game_uid: String,
+    exe_hash: String,
+    confirmed_paths: Vec<String>,
+    created_at: String,
+    confidence: i64,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    updated_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct PersistedStore {
+    sessions: Vec<LearningSession>,
+    rules: Vec<GameSaveRule>,
+    #[serde(default)]
+    launcher_sessions: Vec<LauncherSession>,
+    #[serde(default = "default_execution_config")]
+    execution_config: ExecutionConfig,
+}
+
+struct AppState {
+    store: Mutex<PersistedStore>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeStatus {
+    is_admin: bool,
+    can_use_etw: bool,
+    message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportRulesResult {
+    count: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportRulesResult {
+    imported: usize,
+    overwritten: usize,
+    skipped: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportMigrationZipResult {
+    rule_count: usize,
+    backup_games: usize,
+    exported_files: usize,
+    skipped_backup_games: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportMigrationZipResult {
+    imported_rules: usize,
+    overwritten_rules: usize,
+    skipped_rules: usize,
+    imported_backup_games: usize,
+    copied_backup_files: usize,
+    skipped_backup_games: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MigrationGameIndexItem {
+    game_uid: String,
+    game_id: String,
+    rule_ids: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct LauncherSession {
+    launcher_session_id: String,
+    exe_path: String,
+    exe_hash: String,
+    matched_rule_id: Option<String>,
+    matched_game_id: Option<String>,
+    #[serde(default)]
+    matched_game_uid: Option<String>,
+    #[serde(default)]
+    launch_mode: String,
+    status: String,
+    pid: Option<u32>,
+    injection_status: String,
+    #[serde(default)]
+    redirect_root: Option<String>,
+    #[serde(default)]
+    injector_exit_code: Option<i32>,
+    #[serde(default)]
+    hook_version: Option<String>,
+    #[serde(default)]
+    sandbox_box_name: Option<String>,
+    #[serde(default)]
+    sandbox_mirror_paths: Vec<String>,
+    started_at: String,
+    updated_at: String,
+    logs: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveRuleResult {
+    exe_hash: String,
+    matched_rule: Option<GameSaveRule>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ExecutionConfig {
+    managed_save_root: String,
+    backup_root: String,
+    block_on_inject_fail: bool,
+    sandbox_root: String,
+    sandboxie_start_exe: String,
+    #[serde(default)]
+    preferred_exe_by_uid: HashMap<String, String>,
+    #[serde(default)]
+    preferred_rule_uid_by_game: HashMap<String, String>,
+    #[serde(default, alias = "preferredExeByGame", skip_serializing)]
+    preferred_exe_by_game_legacy: HashMap<String, String>,
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        default_execution_config()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RedirectRuntimeInfo {
+    arch: String,
+    injector_path: String,
+    dll_path: String,
+    managed_save_root: String,
+    backup_root: String,
+    injector_exists: bool,
+    dll_exists: bool,
+    sandbox_root: String,
+    sandboxie_path: String,
+    sandboxie_exists: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GameLibraryItem {
+    game_id: String,
+    total_rules: usize,
+    enabled_rules: usize,
+    confirmed_path_count: usize,
+    last_rule_updated_at: String,
+    preferred_exe_path: Option<String>,
+    last_session_id: Option<String>,
+    last_session_status: Option<String>,
+    last_session_updated_at: Option<String>,
+    last_injection_status: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupVersion {
+    version_id: String,
+    created_at: String,
+    file_count: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreBackupResult {
+    game_id: String,
+    version_id: String,
+    restored_files: usize,
+}
+
+struct RedirectArtifacts {
+    injector_path: PathBuf,
+    dll_path: PathBuf,
+}
+
+struct InjectionRunResult {
+    injector_exit_code: i32,
+    hook_version: String,
+}
+
+struct SandboxLaunchResult {
+    pid: Option<u32>,
+    box_name: String,
+    mirror_paths: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportRuleInput {
+    rule_id: Option<String>,
+    game_id: String,
+    game_uid: Option<String>,
+    exe_hash: String,
+    confirmed_paths: Vec<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    confidence: Option<i64>,
+    enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct CimProcessRow {
+    process_id: u32,
+    parent_process_id: u32,
+}
+
+#[derive(Clone)]
+struct EventCaptureHandle {
+    trace_name: String,
+    etl_path: PathBuf,
+}
+
+#[derive(Default)]
+struct CandidateAccumulator {
+    path: String,
+    added_files: usize,
+    modified_files: usize,
+    changed_files: usize,
+    time_hits: usize,
+    extension_hits: usize,
+    keyword_hits: usize,
+    reasonable_size_hits: usize,
+    signals: HashSet<String>,
+}
+
+#[derive(Default)]
+struct GameLibraryAccumulator {
+    game_id: String,
+    game_uid: String,
+    total_rules: usize,
+    enabled_rules: usize,
+    confirmed_path_count: usize,
+    last_rule_updated_at: String,
+    last_rule_ts: u64,
+    last_session_id: Option<String>,
+    last_session_status: Option<String>,
+    last_session_updated_at: Option<String>,
+    last_session_ts: u64,
+    last_injection_status: Option<String>,
+    preferred_exe_path: Option<String>,
+}
+
+impl CandidateAccumulator {
+    fn into_candidate(self) -> CandidatePath {
+        let mut score = 0;
+        if self.time_hits > 0 {
+            score += SCORE_TIME_MATCH;
+        }
+        if self.extension_hits > 0 {
+            score += SCORE_EXTENSION_MATCH;
+        }
+        if self.keyword_hits > 0 {
+            score += SCORE_KEYWORD_MATCH;
+        }
+        if (1..=50).contains(&self.changed_files) {
+            score += SCORE_CHANGE_COUNT_MATCH;
+        }
+        if self.reasonable_size_hits > 0 {
+            score += SCORE_SIZE_REASONABLE;
+        }
+
+        let mut signals = self.signals.into_iter().collect::<Vec<_>>();
+        signals.sort();
+
+        CandidatePath {
+            path: self.path,
+            score,
+            changed_files: self.changed_files,
+            added_files: self.added_files,
+            modified_files: self.modified_files,
+            matched_signals: signals,
+            collapsed: score < LOW_CONFIDENCE_THRESHOLD,
+        }
+    }
+}
+
+#[tauri::command]
+fn start_learning(
+    app: AppHandle,
+    state: State<AppState>,
+    game_id: String,
+    exe_path: String,
+) -> Result<String, String> {
+    if game_id.trim().is_empty() {
+        return Err("gameId 不能为空".to_string());
+    }
+    if exe_path.trim().is_empty() {
+        return Err("exePath 不能为空".to_string());
+    }
+    if !Path::new(&exe_path).exists() {
+        return Err("exePath 不存在".to_string());
+    }
+
+    let session_id = Uuid::new_v4().to_string();
+    let snapshot_ref = format!("baseline_{session_id}.json");
+    let snapshot = collect_snapshot(&game_id, &exe_path)?;
+    write_snapshot(&app, &snapshot_ref, &snapshot)?;
+
+    let session = LearningSession {
+        session_id: session_id.clone(),
+        game_id,
+        exe_path,
+        started_at: now_iso_string(),
+        ended_at: None,
+        status: "running".to_string(),
+        baseline_snapshot_ref: snapshot_ref,
+        final_snapshot_ref: None,
+        candidates: vec![],
+        pid: None,
+        tracked_pids: vec![],
+        event_capture_mode: "snapshot".to_string(),
+        event_trace_name: None,
+        event_trace_path: None,
+        captured_event_count: 0,
+        event_capture_error: None,
+    };
+
+    let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+    store.sessions.push(session);
+    persist_store(&app, &store)?;
+    Ok(session_id)
+}
+
+#[tauri::command]
+fn launch_game(app: AppHandle, state: State<AppState>, session_id: String) -> Result<u32, String> {
+    let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+    let session = store
+        .sessions
+        .iter_mut()
+        .find(|item| item.session_id == session_id)
+        .ok_or_else(|| "sessionId 不存在".to_string())?;
+
+    let child = Command::new(&session.exe_path)
+        .spawn()
+        .map_err(|err| format!("无法启动游戏: {err}"))?;
+
+    let pid = child.id();
+    session.pid = Some(pid);
+    session.tracked_pids = collect_process_tree_pids(pid).unwrap_or_else(|_| vec![pid]);
+    match try_start_etw_capture(&app, &session.session_id) {
+        Ok(handle) => {
+            session.event_capture_mode = "etw".to_string();
+            session.event_trace_name = Some(handle.trace_name);
+            session.event_trace_path = Some(handle.etl_path.to_string_lossy().to_string());
+            session.event_capture_error = None;
+        }
+        Err(err) => {
+            session.event_capture_mode = "snapshot".to_string();
+            session.event_trace_name = None;
+            session.event_trace_path = None;
+            session.event_capture_error = Some(err);
+        }
+    }
+    persist_store(&app, &store)?;
+    Ok(pid)
+}
+
+#[tauri::command]
+fn finish_learning(
+    app: AppHandle,
+    state: State<AppState>,
+    session_id: String,
+) -> Result<Vec<CandidatePath>, String> {
+    let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+    let session = store
+        .sessions
+        .iter_mut()
+        .find(|item| item.session_id == session_id)
+        .ok_or_else(|| "sessionId 不存在".to_string())?;
+    if let Some(root_pid) = session.pid {
+        if let Ok(pids) = collect_process_tree_pids(root_pid) {
+            session.tracked_pids = pids;
+        }
+    }
+
+    if session.status != "running" {
+        return Ok(session.candidates.clone());
+    }
+
+    let end_unix = now_unix();
+    let final_snapshot_ref = format!("final_{session_id}.json");
+    let final_snapshot = collect_snapshot(&session.game_id, &session.exe_path)?;
+    write_snapshot(&app, &final_snapshot_ref, &final_snapshot)?;
+
+    let baseline_snapshot: Snapshot = read_snapshot(&app, &session.baseline_snapshot_ref)?;
+    let related_files = match collect_related_files_by_trace(
+        session.event_trace_name.as_deref(),
+        session.event_trace_path.as_deref(),
+        &session.tracked_pids,
+    ) {
+        Ok(files) => {
+            session.captured_event_count = files.len();
+            files
+        }
+        Err(err) => {
+            session.captured_event_count = 0;
+            if session.event_capture_mode == "etw" {
+                session.event_capture_error = Some(err);
+            }
+            HashSet::new()
+        }
+    };
+    let candidates = build_candidates(
+        &baseline_snapshot,
+        &final_snapshot,
+        &session.game_id,
+        iso_to_unix(&session.started_at).unwrap_or(end_unix),
+        end_unix + 120,
+        Some(&related_files),
+    );
+
+    session.status = "finished".to_string();
+    session.ended_at = Some(now_iso_string());
+    session.final_snapshot_ref = Some(final_snapshot_ref);
+    session.candidates = candidates.clone();
+
+    persist_store(&app, &store)?;
+    Ok(candidates)
+}
+
+#[tauri::command]
+fn confirm_rule(
+    app: AppHandle,
+    state: State<AppState>,
+    session_id: String,
+    selected_paths: Vec<String>,
+) -> Result<String, String> {
+    let normalized_paths = normalize_paths(selected_paths);
+    if normalized_paths.is_empty() {
+        return Err("selectedPaths 不能为空".to_string());
+    }
+    let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+    let session = store
+        .sessions
+        .iter()
+        .find(|item| item.session_id == session_id)
+        .ok_or_else(|| "sessionId 不存在".to_string())?;
+
+    let session_game_id = session.game_id.clone();
+    let session_exe_path = session.exe_path.clone();
+    let exe_hash = file_sha256_hex(Path::new(&session_exe_path))?;
+    let rule_key = build_rule_key(&session_game_id, &exe_hash);
+    let score_map: HashMap<String, i64> = session
+        .candidates
+        .iter()
+        .map(|item| (item.path.clone(), item.score))
+        .collect();
+
+    let mut confidence_sum = 0_i64;
+    let mut counted = 0_i64;
+    for path in &normalized_paths {
+        if let Some(score) = score_map.get(path) {
+            confidence_sum += *score;
+            counted += 1;
+        }
+    }
+    let confidence = if counted > 0 {
+        confidence_sum / counted
+    } else {
+        LOW_CONFIDENCE_THRESHOLD
+    };
+
+    if let Some(existing) = store
+        .rules
+        .iter_mut()
+        .find(|rule| build_rule_key(&rule.game_id, &rule.exe_hash) == rule_key)
+    {
+        if existing.game_uid.trim().is_empty() {
+            existing.game_uid = new_game_uid();
+        }
+        existing.confirmed_paths = normalized_paths;
+        existing.confidence = confidence;
+        existing.updated_at = now_iso_string();
+        let rule_id = existing.rule_id.clone();
+        persist_store(&app, &store)?;
+        return Ok(rule_id);
+    }
+
+    let rule_id = Uuid::new_v4().to_string();
+    let now = now_iso_string();
+    store.rules.push(GameSaveRule {
+        rule_id: rule_id.clone(),
+        game_id: session_game_id,
+        game_uid: new_game_uid(),
+        exe_hash,
+        confirmed_paths: normalized_paths,
+        created_at: now.clone(),
+        confidence,
+        enabled: true,
+        updated_at: now,
+    });
+
+    persist_store(&app, &store)?;
+    Ok(rule_id)
+}
+
+#[tauri::command]
+fn list_rules(state: State<AppState>) -> Result<Vec<GameSaveRule>, String> {
+    let mut rules = state
+        .store
+        .lock()
+        .map_err(|_| "无法锁定应用状态".to_string())?
+        .rules
+        .clone();
+    rules.sort_by(|a, b| {
+        let a_time = if a.updated_at.is_empty() { &a.created_at } else { &a.updated_at };
+        let b_time = if b.updated_at.is_empty() { &b.created_at } else { &b.updated_at };
+        b_time.cmp(a_time)
+    });
+    Ok(rules)
+}
+
+#[tauri::command]
+fn update_rule(
+    app: AppHandle,
+    state: State<AppState>,
+    rule_id: String,
+    confirmed_paths: Vec<String>,
+    enabled: bool,
+) -> Result<GameSaveRule, String> {
+    let normalized_paths = normalize_paths(confirmed_paths);
+    if normalized_paths.is_empty() {
+        return Err("confirmedPaths 至少需要一条有效路径".to_string());
+    }
+
+    let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+    let rule = store
+        .rules
+        .iter_mut()
+        .find(|item| item.rule_id == rule_id)
+        .ok_or_else(|| "ruleId 不存在".to_string())?;
+
+    rule.confirmed_paths = normalized_paths;
+    rule.enabled = enabled;
+    rule.updated_at = now_iso_string();
+    let updated = rule.clone();
+
+    persist_store(&app, &store)?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn delete_rule(app: AppHandle, state: State<AppState>, rule_id: String) -> Result<(), String> {
+    let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+    let before = store.rules.len();
+    store.rules.retain(|item| item.rule_id != rule_id);
+    if store.rules.len() == before {
+        return Err("ruleId 不存在".to_string());
+    }
+    persist_store(&app, &store)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn export_rules(state: State<AppState>, file_path: String) -> Result<ExportRulesResult, String> {
+    if file_path.trim().is_empty() {
+        return Err("filePath 不能为空".to_string());
+    }
+    let rules = state
+        .store
+        .lock()
+        .map_err(|_| "无法锁定应用状态".to_string())?
+        .rules
+        .clone();
+    let content =
+        serde_json::to_string_pretty(&rules).map_err(|err| format!("序列化导出文件失败: {err}"))?;
+    fs::write(&file_path, content).map_err(|err| format!("写入导出文件失败: {err}"))?;
+    Ok(ExportRulesResult { count: rules.len() })
+}
+
+#[tauri::command]
+fn import_rules(
+    app: AppHandle,
+    state: State<AppState>,
+    file_path: String,
+) -> Result<ImportRulesResult, String> {
+    if file_path.trim().is_empty() {
+        return Err("filePath 不能为空".to_string());
+    }
+    let raw = fs::read(&file_path).map_err(|err| format!("读取导入文件失败: {err}"))?;
+    let content = decode_text_bytes(&raw);
+    let value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|err| format!("解析导入文件失败: {err}"))?;
+    let array = value
+        .as_array()
+        .ok_or_else(|| "导入文件必须是规则数组(JSON Array)".to_string())?;
+
+    let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+    let summary = apply_import_rules_array(&mut store, array);
+
+    normalize_store(&mut store);
+    persist_store(&app, &store)?;
+    Ok(summary)
+}
+
+#[tauri::command]
+fn export_migration_zip(
+    state: State<AppState>,
+    file_path: String,
+) -> Result<ExportMigrationZipResult, String> {
+    let target_path = file_path.trim().to_string();
+    if target_path.is_empty() {
+        return Err("filePath 不能为空".to_string());
+    }
+    let (rules, backup_root) = {
+        let store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+        (store.rules.clone(), store.execution_config.backup_root.clone())
+    };
+
+    let temp_root = create_migration_temp_dir("export")?;
+    let result = (|| -> Result<ExportMigrationZipResult, String> {
+        let rules_dir = temp_root.join("rules");
+        let backups_dir = temp_root.join("backups");
+        let meta_dir = temp_root.join("meta");
+        fs::create_dir_all(&rules_dir).map_err(|err| format!("创建导出目录失败: {err}"))?;
+        fs::create_dir_all(&backups_dir).map_err(|err| format!("创建导出目录失败: {err}"))?;
+        fs::create_dir_all(&meta_dir).map_err(|err| format!("创建导出目录失败: {err}"))?;
+
+        let rules_path = rules_dir.join("gamesaver-rules.json");
+        write_pretty_json_file(&rules_path, &rules)?;
+
+        let game_index = build_migration_game_index(&rules);
+        let game_index_path = meta_dir.join("game-index.json");
+        write_pretty_json_file(&game_index_path, &game_index)?;
+
+        let mut processed_uids = HashSet::new();
+        let mut backup_games = 0_usize;
+        let mut skipped_backup_games = 0_usize;
+        for rule in &rules {
+            let game_uid = normalize_game_uid(&rule.game_uid);
+            if game_uid.is_empty() {
+                skipped_backup_games += 1;
+                continue;
+            }
+            if !processed_uids.insert(game_uid.clone()) {
+                continue;
+            }
+
+            let uid_root = backup_game_root(&backup_root, &game_uid);
+            let legacy_root = legacy_backup_game_root(&backup_root, &rule.game_id);
+            let source_root = if uid_root.exists() {
+                Some(uid_root)
+            } else if legacy_root.exists() {
+                Some(legacy_root)
+            } else {
+                None
+            };
+
+            if let Some(source_root) = source_root {
+                let copied = sync_directory(&source_root, &backups_dir.join(&game_uid))?;
+                if copied > 0 {
+                    backup_games += 1;
+                } else {
+                    skipped_backup_games += 1;
+                }
+            } else {
+                skipped_backup_games += 1;
+            }
+        }
+
+        let manifest = serde_json::json!({
+            "format": "gamesaver-migration-v1",
+            "createdAt": now_iso_string(),
+            "ruleCount": rules.len(),
+            "backupGames": backup_games
+        });
+        write_pretty_json_file(&temp_root.join("manifest.json"), &manifest)?;
+
+        let exported_files = zip_directory_contents(&temp_root, Path::new(&target_path))?;
+        Ok(ExportMigrationZipResult {
+            rule_count: rules.len(),
+            backup_games,
+            exported_files,
+            skipped_backup_games,
+        })
+    })();
+
+    let _ = fs::remove_dir_all(&temp_root);
+    result
+}
+
+#[tauri::command]
+fn import_migration_zip(
+    app: AppHandle,
+    state: State<AppState>,
+    file_path: String,
+) -> Result<ImportMigrationZipResult, String> {
+    let source_path = file_path.trim().to_string();
+    if source_path.is_empty() {
+        return Err("filePath 不能为空".to_string());
+    }
+
+    let temp_root = create_migration_temp_dir("import")?;
+    let result = (|| -> Result<ImportMigrationZipResult, String> {
+        unzip_archive_to_directory(Path::new(&source_path), &temp_root)?;
+
+        let rules_file_path = resolve_import_rules_path(&temp_root)
+            .ok_or_else(|| "迁移包缺少 rules/gamesaver-rules.json".to_string())?;
+        let raw_rules = fs::read(&rules_file_path).map_err(|err| format!("读取规则文件失败: {err}"))?;
+        let rules_text = decode_text_bytes(&raw_rules);
+        let rules_value: serde_json::Value =
+            serde_json::from_str(&rules_text).map_err(|err| format!("解析规则文件失败: {err}"))?;
+        let rules_array = rules_value
+            .as_array()
+            .ok_or_else(|| "迁移包规则文件格式错误：必须是数组".to_string())?;
+
+        let (summary, backup_root, staged_store) = {
+            let store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+            let mut staged = store.clone();
+            let summary = apply_import_rules_array(&mut staged, rules_array);
+            normalize_store(&mut staged);
+            let backup_root = staged.execution_config.backup_root.clone();
+            (summary, backup_root, staged)
+        };
+
+        let backups_root = temp_root.join("backups");
+        let mut imported_backup_games = 0_usize;
+        let mut copied_backup_files = 0_usize;
+        let mut skipped_backup_games = 0_usize;
+        if backups_root.exists() {
+            let entries = fs::read_dir(&backups_root).map_err(|err| format!("读取备份目录失败: {err}"))?;
+            for entry in entries {
+                let entry = match entry {
+                    Ok(value) => value,
+                    Err(_) => {
+                        skipped_backup_games += 1;
+                        continue;
+                    }
+                };
+                let file_type = entry.file_type().map_err(|err| format!("读取备份条目失败: {err}"))?;
+                if !file_type.is_dir() {
+                    skipped_backup_games += 1;
+                    continue;
+                }
+                let game_uid = normalize_game_uid(&entry.file_name().to_string_lossy());
+                if game_uid.is_empty() {
+                    skipped_backup_games += 1;
+                    continue;
+                }
+
+                let copied = sync_directory(&entry.path(), &backup_game_root(&backup_root, &game_uid))?;
+                copied_backup_files += copied;
+                imported_backup_games += 1;
+            }
+        }
+
+        {
+            let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+            *store = staged_store;
+            persist_store(&app, &store)?;
+        }
+
+        Ok(ImportMigrationZipResult {
+            imported_rules: summary.imported,
+            overwritten_rules: summary.overwritten,
+            skipped_rules: summary.skipped,
+            imported_backup_games,
+            copied_backup_files,
+            skipped_backup_games,
+        })
+    })();
+
+    let _ = fs::remove_dir_all(&temp_root);
+    result
+}
+
+fn apply_import_rules_array(store: &mut PersistedStore, array: &[serde_json::Value]) -> ImportRulesResult {
+    let mut imported = 0_usize;
+    let mut overwritten = 0_usize;
+    let mut skipped = 0_usize;
+    for item in array {
+        let parsed = match serde_json::from_value::<ImportRuleInput>(item.clone()) {
+            Ok(rule) => rule,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+
+        let game_id = parsed.game_id.trim().to_string();
+        let exe_hash = parsed.exe_hash.trim().to_string();
+        let confirmed_paths = normalize_paths(parsed.confirmed_paths);
+        if game_id.is_empty() || exe_hash.is_empty() || confirmed_paths.is_empty() {
+            skipped += 1;
+            continue;
+        }
+
+        let key = build_rule_key(&game_id, &exe_hash);
+        let parsed_game_uid = parsed.game_uid.as_deref().map(normalize_game_uid);
+        let created_at = parsed.created_at.unwrap_or_else(now_iso_string);
+        let updated_at = parsed
+            .updated_at
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| created_at.clone());
+        let confidence = parsed.confidence.unwrap_or(LOW_CONFIDENCE_THRESHOLD);
+        let enabled = parsed.enabled.unwrap_or(true);
+
+        if let Some(existing) = store
+            .rules
+            .iter_mut()
+            .find(|rule| build_rule_key(&rule.game_id, &rule.exe_hash) == key)
+        {
+            let next_uid = parsed_game_uid
+                .as_ref()
+                .filter(|uid| !uid.is_empty())
+                .cloned()
+                .unwrap_or_else(|| {
+                    let current = normalize_game_uid(&existing.game_uid);
+                    if current.is_empty() {
+                        new_game_uid()
+                    } else {
+                        current
+                    }
+                });
+            existing.game_id = game_id;
+            existing.game_uid = next_uid;
+            existing.exe_hash = exe_hash;
+            existing.confirmed_paths = confirmed_paths;
+            existing.confidence = confidence;
+            existing.enabled = enabled;
+            existing.created_at = created_at;
+            existing.updated_at = updated_at;
+            overwritten += 1;
+        } else {
+            store.rules.push(GameSaveRule {
+                rule_id: parsed.rule_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+                game_id,
+                game_uid: parsed_game_uid.filter(|uid| !uid.is_empty()).unwrap_or_else(new_game_uid),
+                exe_hash,
+                confirmed_paths,
+                created_at: created_at.clone(),
+                confidence,
+                enabled,
+                updated_at,
+            });
+            imported += 1;
+        }
+    }
+    ImportRulesResult {
+        imported,
+        overwritten,
+        skipped,
+    }
+}
+
+fn create_migration_temp_dir(prefix: &str) -> Result<PathBuf, String> {
+    let path = std::env::temp_dir()
+        .join("gamesaver-migration")
+        .join(format!("{}-{}", prefix, Uuid::new_v4()));
+    fs::create_dir_all(&path).map_err(|err| format!("创建临时目录失败: {err}"))?;
+    Ok(path)
+}
+
+fn write_pretty_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("创建目录失败: {err}"))?;
+    }
+    let content = serde_json::to_string_pretty(value).map_err(|err| format!("序列化 JSON 失败: {err}"))?;
+    fs::write(path, content).map_err(|err| format!("写入文件失败: {err}"))
+}
+
+fn build_migration_game_index(rules: &[GameSaveRule]) -> Vec<MigrationGameIndexItem> {
+    let mut by_uid: HashMap<String, (String, u64, Vec<String>)> = HashMap::new();
+    for rule in rules {
+        let game_uid = normalize_game_uid(&rule.game_uid);
+        if game_uid.is_empty() {
+            continue;
+        }
+        let ts = rule_updated_ts(rule);
+        let entry = by_uid
+            .entry(game_uid)
+            .or_insert_with(|| (rule.game_id.clone(), ts, Vec::new()));
+        if ts >= entry.1 {
+            entry.0 = rule.game_id.clone();
+            entry.1 = ts;
+        }
+        entry.2.push(rule.rule_id.clone());
+    }
+    let mut items = by_uid
+        .into_iter()
+        .map(|(game_uid, (game_id, _updated_ts, rule_ids))| MigrationGameIndexItem {
+            game_uid,
+            game_id,
+            rule_ids,
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|a, b| a.game_id.cmp(&b.game_id).then_with(|| a.game_uid.cmp(&b.game_uid)));
+    items
+}
+
+fn normalize_zip_entry_name(relative_path: &Path) -> Result<String, String> {
+    let mut parts = Vec::new();
+    for component in relative_path.components() {
+        match component {
+            Component::Normal(value) => {
+                let part = value.to_string_lossy().trim().to_string();
+                if part.is_empty() {
+                    return Err("ZIP 条目存在空路径片段".to_string());
+                }
+                parts.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err("ZIP 条目存在非法路径".to_string());
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err("ZIP 条目路径为空".to_string());
+    }
+    Ok(parts.join("/"))
+}
+
+fn zip_directory_contents(source_dir: &Path, output_zip_path: &Path) -> Result<usize, String> {
+    if !source_dir.exists() {
+        return Err("导出目录不存在".to_string());
+    }
+    if let Some(parent) = output_zip_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|err| format!("创建 ZIP 目录失败: {err}"))?;
+        }
+    }
+    let output_file = fs::File::create(output_zip_path).map_err(|err| format!("创建 ZIP 文件失败: {err}"))?;
+    let mut zip_writer = zip::ZipWriter::new(output_file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+
+    let mut file_count = 0_usize;
+    for entry in WalkDir::new(source_dir).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(source_dir)
+            .map_err(|err| format!("生成 ZIP 相对路径失败: {err}"))?;
+        let zip_entry_name = normalize_zip_entry_name(relative)?;
+        zip_writer
+            .start_file(zip_entry_name, options)
+            .map_err(|err| format!("写入 ZIP 条目失败: {err}"))?;
+        let mut source_file = fs::File::open(entry.path()).map_err(|err| format!("读取文件失败: {err}"))?;
+        std::io::copy(&mut source_file, &mut zip_writer).map_err(|err| format!("压缩文件失败: {err}"))?;
+        file_count += 1;
+    }
+
+    zip_writer.finish().map_err(|err| format!("完成 ZIP 写入失败: {err}"))?;
+    Ok(file_count)
+}
+
+fn unzip_archive_to_directory(zip_path: &Path, destination: &Path) -> Result<usize, String> {
+    if !zip_path.exists() {
+        return Err("迁移包不存在".to_string());
+    }
+    fs::create_dir_all(destination).map_err(|err| format!("创建解压目录失败: {err}"))?;
+    let zip_file = fs::File::open(zip_path).map_err(|err| format!("打开迁移包失败: {err}"))?;
+    let mut archive = zip::ZipArchive::new(zip_file).map_err(|err| format!("读取 ZIP 失败: {err}"))?;
+
+    let mut extracted_files = 0_usize;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|err| format!("读取 ZIP 条目失败: {err}"))?;
+        let entry_name = entry.name().to_string();
+        let enclosed = entry
+            .enclosed_name()
+            .ok_or_else(|| format!("ZIP 包含非法路径: {entry_name}"))?
+            .to_path_buf();
+        if enclosed
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+        {
+            return Err(format!("ZIP 包含非法路径: {entry_name}"));
+        }
+        let output_path = destination.join(&enclosed);
+        if entry.is_dir() {
+            fs::create_dir_all(&output_path).map_err(|err| format!("创建目录失败: {err}"))?;
+            continue;
+        }
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| format!("创建目录失败: {err}"))?;
+        }
+        let mut output_file = fs::File::create(&output_path).map_err(|err| format!("写入解压文件失败: {err}"))?;
+        std::io::copy(&mut entry, &mut output_file).map_err(|err| format!("解压文件失败: {err}"))?;
+        extracted_files += 1;
+    }
+    Ok(extracted_files)
+}
+
+fn resolve_import_rules_path(temp_root: &Path) -> Option<PathBuf> {
+    let candidates = [
+        temp_root.join("rules").join("gamesaver-rules.json"),
+        temp_root.join("gamesaver-rules.json"),
+    ];
+    candidates.into_iter().find(|path| path.exists())
+}
+
+#[tauri::command]
+fn get_runtime_status() -> Result<RuntimeStatus, String> {
+    let is_admin = is_running_as_admin();
+    let message = if is_admin {
+        "当前为管理员模式，可使用 ETW 高精度过滤。".to_string()
+    } else {
+        "当前非管理员模式：会自动降级到 snapshot 学习。可点击“一键管理员重启”开启 ETW。".to_string()
+    };
+    Ok(RuntimeStatus {
+        is_admin,
+        can_use_etw: is_admin,
+        message,
+    })
+}
+
+#[tauri::command]
+fn restart_as_admin() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|err| format!("读取当前程序路径失败: {err}"))?;
+    let exe_str = exe.to_string_lossy().to_string();
+    let mut command = Command::new("powershell");
+    command.args([
+        "-NoProfile",
+        "-Command",
+        &format!("Start-Process -FilePath '{}' -Verb RunAs", exe_str.replace('\'', "''")),
+    ]);
+    let started = apply_background_process_flags(&mut command)
+        .status()
+        .map_err(|err| format!("请求管理员重启失败: {err}"))?;
+
+    if !started.success() {
+        return Err("管理员重启请求未成功执行".to_string());
+    }
+
+    std::process::exit(0);
+}
+
+#[tauri::command]
+fn get_learning_session(
+    state: State<AppState>,
+    session_id: String,
+) -> Result<LearningSession, String> {
+    let store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+    let session = store
+        .sessions
+        .iter()
+        .find(|item| item.session_id == session_id)
+        .ok_or_else(|| "sessionId 不存在".to_string())?;
+    Ok(session.clone())
+}
+
+#[tauri::command]
+fn open_candidate_path(path: String) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("path 不能为空".to_string());
+    }
+    let target = Path::new(&path);
+    if !target.exists() {
+        return Err("候选目录不存在".to_string());
+    }
+    if !target.is_dir() {
+        return Err("候选路径不是目录".to_string());
+    }
+
+    Command::new("explorer")
+        .arg(&path)
+        .spawn()
+        .map_err(|err| format!("打开目录失败: {err}"))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+fn resolve_rule_for_exe(state: State<AppState>, exe_path: String) -> Result<ResolveRuleResult, String> {
+    let trimmed = exe_path.trim();
+    if trimmed.is_empty() {
+        return Err("exePath 不能为空".to_string());
+    }
+    let exe = Path::new(trimmed);
+    if !exe.exists() {
+        return Err("exePath 不存在".to_string());
+    }
+    if !exe.is_file() {
+        return Err("exePath 不是有效文件".to_string());
+    }
+
+    let exe_hash = file_sha256_hex(exe)?;
+    let store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+    let matched_rule = store
+        .rules
+        .iter()
+        .find(|rule| rule.enabled && rule.exe_hash.eq_ignore_ascii_case(&exe_hash))
+        .cloned();
+    Ok(ResolveRuleResult { exe_hash, matched_rule })
+}
+
+#[tauri::command]
+fn launch_with_rule(
+    app: AppHandle,
+    state: State<AppState>,
+    exe_path: String,
+    launch_mode: Option<String>,
+) -> Result<LauncherSession, String> {
+    launch_with_rule_internal(&app, &state, exe_path, launch_mode, None, false)
+}
+
+#[tauri::command]
+fn launch_game_from_library(
+    app: AppHandle,
+    state: State<AppState>,
+    game_id: String,
+    launch_mode: Option<String>,
+) -> Result<LauncherSession, String> {
+    let normalized_game_key = normalize_game_key(&game_id);
+    if normalized_game_key.is_empty() {
+        return Err("gameId 不能为空".to_string());
+    }
+    let preferred_exe_path = {
+        let store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+        let rule = select_rule_for_game(&store, &game_id)
+            .ok_or_else(|| format!("游戏 {} 暂无可用规则，请先学习并保存规则", game_id.trim()))?;
+        let game_uid = normalize_game_uid(&rule.game_uid);
+        if game_uid.is_empty() {
+            return Err(format!("游戏 {} 规则缺少 gameUid，请先刷新或重新导入规则", game_id.trim()));
+        }
+        store
+            .execution_config
+            .preferred_exe_by_uid
+            .get(&game_uid)
+            .cloned()
+            .ok_or_else(|| format!("游戏 {} 尚未绑定 EXE，请先点击“选择/更换 EXE”", game_id.trim()))?
+    };
+    let preferred_exe_path = preferred_exe_path.trim().to_string();
+    if preferred_exe_path.is_empty() {
+        return Err(format!("游戏 {} 的 EXE 绑定为空，请重新绑定", game_id.trim()));
+    }
+    let exe = Path::new(&preferred_exe_path);
+    if !exe.exists() {
+        return Err(format!("已绑定 EXE 不存在：{}，请重新绑定", preferred_exe_path));
+    }
+    if !exe.is_file() {
+        return Err(format!("已绑定路径不是有效 EXE 文件：{}，请重新绑定", preferred_exe_path));
+    }
+    if !preferred_exe_path.to_ascii_lowercase().ends_with(".exe") {
+        return Err(format!("已绑定路径不是 .exe 文件：{}，请重新绑定", preferred_exe_path));
+    }
+    launch_with_rule_internal(
+        &app,
+        &state,
+        preferred_exe_path,
+        launch_mode,
+        Some(normalized_game_key),
+        true,
+    )
+}
+
+fn launch_with_rule_internal(
+    app: &AppHandle,
+    state: &State<AppState>,
+    exe_path: String,
+    launch_mode: Option<String>,
+    expected_game_key: Option<String>,
+    require_rule_match: bool,
+) -> Result<LauncherSession, String> {
+    let launch_mode_value = normalize_launch_mode(launch_mode.as_deref());
+    let now = now_iso_string();
+    let mut session = LauncherSession {
+        launcher_session_id: Uuid::new_v4().to_string(),
+        exe_path: exe_path.trim().to_string(),
+        exe_hash: String::new(),
+        matched_rule_id: None,
+        matched_game_id: None,
+        matched_game_uid: None,
+        launch_mode: launch_mode_value.clone(),
+        status: "idle".to_string(),
+        pid: None,
+        injection_status: "not_required".to_string(),
+        redirect_root: None,
+        injector_exit_code: None,
+        hook_version: None,
+        sandbox_box_name: None,
+        sandbox_mirror_paths: vec![],
+        started_at: now.clone(),
+        updated_at: now,
+        logs: vec![],
+    };
+    let mut failed_error: Option<String> = None;
+
+    if session.exe_path.is_empty() {
+        failed_error = Some("exePath 不能为空".to_string());
+        session.status = "failed".to_string();
+        session.injection_status = "failed".to_string();
+        append_session_log(&mut session, "启动失败：exePath 为空");
+    } else {
+        let exe = Path::new(&session.exe_path);
+        if !exe.exists() {
+            failed_error = Some("exePath 不存在".to_string());
+            session.status = "failed".to_string();
+            session.injection_status = "failed".to_string();
+            append_session_log(&mut session, "启动失败：目标 exe 不存在");
+        } else if !exe.is_file() {
+            failed_error = Some("exePath 不是有效文件".to_string());
+            session.status = "failed".to_string();
+            session.injection_status = "failed".to_string();
+            append_session_log(&mut session, "启动失败：目标 exe 不是文件");
+        } else {
+            match file_sha256_hex(exe) {
+                Ok(hash) => {
+                    session.exe_hash = hash;
+                }
+                Err(err) => {
+                    failed_error = Some(format!("读取 exe 哈希失败: {err}"));
+                    session.status = "failed".to_string();
+                    session.injection_status = "failed".to_string();
+                    append_session_log(&mut session, "启动失败：读取 exe 哈希失败");
+                }
+            }
+        }
+    }
+
+    let mut execution_config = default_execution_config();
+    let mut matched_rule: Option<GameSaveRule> = None;
+    if failed_error.is_none() {
+        let mut hash_matched_any = false;
+        match state.store.lock() {
+            Ok(store) => {
+                execution_config = store.execution_config.clone();
+                for rule in &store.rules {
+                    if !rule.enabled || !rule.exe_hash.eq_ignore_ascii_case(&session.exe_hash) {
+                        continue;
+                    }
+                    hash_matched_any = true;
+                    let game_matches = if let Some(game_key) = expected_game_key.as_ref() {
+                        normalize_game_key(&rule.game_id) == *game_key
+                    } else {
+                        true
+                    };
+                    if game_matches {
+                        matched_rule = Some(rule.clone());
+                        break;
+                    }
+                }
+            }
+            Err(_) => {
+                failed_error = Some("无法锁定应用状态".to_string());
+                session.status = "failed".to_string();
+                session.injection_status = "failed".to_string();
+                append_session_log(&mut session, "启动失败：无法读取规则");
+            }
+        }
+        if failed_error.is_none() && require_rule_match && matched_rule.is_none() {
+            session.status = "failed".to_string();
+            session.injection_status = "failed".to_string();
+            let message = if let Some(game_key) = expected_game_key.as_ref() {
+                if hash_matched_any {
+                    format!(
+                        "已阻止启动：当前绑定 EXE 与游戏 {} 规则不匹配，请重新绑定正确 EXE",
+                        game_key
+                    )
+                } else {
+                    format!("已阻止启动：游戏 {} 未匹配到启用规则，请先完成学习或检查规则状态", game_key)
+                }
+            } else {
+                "已阻止启动：未匹配到启用规则".to_string()
+            };
+            append_session_log(&mut session, &message);
+            failed_error = Some(message);
+        }
+    }
+
+    if failed_error.is_none() {
+        if let Some(rule) = &matched_rule {
+            if launch_mode_value == "inject" && !is_x64_pe(Path::new(&session.exe_path)) {
+                failed_error = Some("仅支持 x64 目标进程，当前 exe 不是 x64".to_string());
+                session.status = "failed".to_string();
+                session.injection_status = "failed".to_string();
+                append_session_log(&mut session, "执行失败：目标进程架构非 x64");
+            }
+            session.matched_rule_id = Some(rule.rule_id.clone());
+            session.matched_game_id = Some(rule.game_id.clone());
+            session.matched_game_uid = Some(rule.game_uid.clone());
+            if launch_mode_value == "inject" {
+                session.injection_status = "pending".to_string();
+                session.redirect_root = Some(join_managed_root_for_game(
+                    &execution_config.managed_save_root,
+                    &rule.game_id,
+                ));
+            } else if launch_mode_value == "backup" {
+                session.injection_status = "not_required".to_string();
+                session.hook_version = Some("backup-auto-v1".to_string());
+                session.redirect_root = Some(
+                    backup_game_root(&execution_config.backup_root, &rule.game_uid)
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            } else {
+                session.injection_status = "pending".to_string();
+                session.redirect_root = Some(join_managed_root_for_game(
+                    &execution_config.managed_save_root,
+                    &rule.game_id,
+                ));
+            }
+            append_session_log(
+                &mut session,
+                &format!("已匹配规则：{} ({})，启动模式={launch_mode_value}", rule.game_id, rule.rule_id),
+            );
+        } else {
+            session.injection_status = "not_required".to_string();
+            append_session_log(&mut session, "未匹配到启用规则，将按普通模式启动");
+        }
+    }
+
+    if failed_error.is_none() && launch_mode_value == "backup" {
+        if let Some(rule) = &matched_rule {
+            match restore_latest_backup_for_rule(rule, &execution_config.backup_root) {
+                Ok(copied) => {
+                    append_session_log(
+                        &mut session,
+                        &format!("启动前自动恢复完成：文件 {}，备份根目录 {}", copied, execution_config.backup_root),
+                    );
+                }
+                Err(err) => {
+                    failed_error = Some(format!("自动恢复失败: {err}"));
+                    session.status = "failed".to_string();
+                    session.injection_status = "failed".to_string();
+                    append_session_log(&mut session, &format!("启动前自动恢复失败：{err}"));
+                }
+            }
+        }
+    }
+
+    let mut launched_child_for_backup: Option<std::process::Child> = None;
+    if failed_error.is_none() {
+        session.status = "launching".to_string();
+        if launch_mode_value == "sandbox" && matched_rule.is_some() {
+            let rule = matched_rule.as_ref().expect("checked is_some");
+            let exe_path_for_sandbox = session.exe_path.clone();
+            append_session_log(&mut session, "正在以沙盒模式启动目标进程");
+            match run_sandbox_launch_flow(&exe_path_for_sandbox, rule, &execution_config, &mut session) {
+                Ok(result) => {
+                    session.pid = result.pid;
+                    session.sandbox_box_name = Some(result.box_name);
+                    session.sandbox_mirror_paths = result.mirror_paths;
+                    session.hook_version = Some("sandbox-sync-v1".to_string());
+                }
+                Err(err) => {
+                    failed_error = Some(format!("沙盒启动失败: {err}"));
+                    session.status = "failed".to_string();
+                    session.injection_status = "failed".to_string();
+                    append_session_log(&mut session, &format!("沙盒启动失败：{err}"));
+                }
+            }
+        } else {
+            append_session_log(&mut session, "正在启动目标进程");
+            match Command::new(&session.exe_path).spawn() {
+                Ok(child) => {
+                    session.pid = Some(child.id());
+                    if launch_mode_value == "backup" && matched_rule.is_some() {
+                        launched_child_for_backup = Some(child);
+                    }
+                }
+                Err(err) => {
+                    failed_error = Some(format!("无法启动游戏: {err}"));
+                    session.status = "failed".to_string();
+                    session.injection_status = "failed".to_string();
+                    append_session_log(&mut session, &format!("启动失败：{err}"));
+                }
+            }
+        }
+    }
+
+    if failed_error.is_none() {
+        if launch_mode_value == "inject" && matched_rule.is_some() {
+            let rule = matched_rule.as_ref().expect("checked is_some");
+            let Some(pid) = session.pid else {
+                session.status = "failed".to_string();
+                session.injection_status = "failed".to_string();
+                append_session_log(&mut session, "注入失败：无法获取进程 PID");
+                session.updated_at = now_iso_string();
+                let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+                store.launcher_sessions.push(session.clone());
+                persist_store(app, &store)?;
+                return Err("启动成功但未获取进程 PID".to_string());
+            };
+            let started = Instant::now();
+            match run_real_injection_flow(app, pid, rule, &execution_config, &mut session) {
+                Ok(result) => {
+                    session.injection_status = "noop_injected".to_string();
+                    session.injector_exit_code = Some(result.injector_exit_code);
+                    session.hook_version = Some(result.hook_version);
+                    append_session_log(
+                        &mut session,
+                        &format!(
+                            "CreateFileW hook installed，耗时 {}ms",
+                            started.elapsed().as_millis()
+                        ),
+                    );
+                }
+                Err(err) => {
+                    session.status = "failed".to_string();
+                    session.injection_status = "failed".to_string();
+                    append_session_log(&mut session, &format!("注入失败：{err}"));
+                    session.injector_exit_code = Some(1);
+                    if execution_config.block_on_inject_fail {
+                        if let Some(pid) = session.pid {
+                            let _ = terminate_process(pid);
+                            append_session_log(&mut session, "已按策略终止目标进程（注入失败）");
+                        }
+                    }
+                    failed_error = Some(format!("已阻止启动（注入失败）：{err}"));
+                }
+            }
+        } else if launch_mode_value == "sandbox" && matched_rule.is_some() {
+            session.injection_status = "not_required".to_string();
+            session.injector_exit_code = Some(0);
+            append_session_log(&mut session, "沙盒模式已启动：退出游戏后请点击“回收沙盒存档”");
+        } else if launch_mode_value == "backup" && matched_rule.is_some() {
+            session.injection_status = "not_required".to_string();
+            session.injector_exit_code = Some(0);
+            if let Some(child) = launched_child_for_backup.take() {
+                if let Some(rule) = matched_rule.clone() {
+                    spawn_post_exit_backup_worker(
+                        app.clone(),
+                        session.launcher_session_id.clone(),
+                        child,
+                        rule,
+                        execution_config.backup_root.clone(),
+                    );
+                    append_session_log(&mut session, "已启用退出后自动增量备份");
+                }
+            } else {
+                append_session_log(&mut session, "未获取进程句柄，无法启用自动退出备份");
+            }
+        }
+        if failed_error.is_none() {
+            session.status = "running".to_string();
+            append_session_log(&mut session, "启动完成");
+        }
+    }
+
+    session.updated_at = now_iso_string();
+    {
+        let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+        store.launcher_sessions.push(session.clone());
+        persist_store(app, &store)?;
+    }
+
+    if let Some(err) = failed_error {
+        Err(err)
+    } else {
+        Ok(session)
+    }
+}
+
+#[tauri::command]
+fn get_redirect_runtime_info(app: AppHandle, state: State<AppState>) -> Result<RedirectRuntimeInfo, String> {
+    let execution_config = {
+        let store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+        store.execution_config.clone()
+    };
+    let artifacts = resolve_redirector_artifacts(&app);
+    Ok(RedirectRuntimeInfo {
+        arch: "x64".to_string(),
+        injector_path: artifacts.injector_path.to_string_lossy().to_string(),
+        dll_path: artifacts.dll_path.to_string_lossy().to_string(),
+        managed_save_root: execution_config.managed_save_root.clone(),
+        backup_root: execution_config.backup_root.clone(),
+        injector_exists: artifacts.injector_path.exists(),
+        dll_exists: artifacts.dll_path.exists(),
+        sandbox_root: execution_config.sandbox_root.clone(),
+        sandboxie_path: execution_config.sandboxie_start_exe.clone(),
+        sandboxie_exists: resolve_sandboxie_start_path(&execution_config).is_ok(),
+    })
+}
+
+#[tauri::command]
+fn sync_sandbox_session(
+    app: AppHandle,
+    state: State<AppState>,
+    launcher_session_id: String,
+) -> Result<LauncherSession, String> {
+    let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+    let execution_config = store.execution_config.clone();
+    let session = store
+        .launcher_sessions
+        .iter_mut()
+        .find(|item| item.launcher_session_id == launcher_session_id)
+        .ok_or_else(|| "launcherSessionId 不存在".to_string())?;
+    if session.launch_mode != "sandbox" {
+        return Err("当前会话不是沙盒模式".to_string());
+    }
+    let redirect_root = session
+        .redirect_root
+        .clone()
+        .ok_or_else(|| "当前会话缺少 redirectRoot".to_string())?;
+    let mut copied_total = 0_usize;
+    if session.sandbox_mirror_paths.is_empty() {
+        append_session_log(session, "未记录沙盒镜像路径，跳过回收");
+    } else {
+        for mirror in &session.sandbox_mirror_paths {
+            copied_total += sync_directory(Path::new(mirror), Path::new(&redirect_root))?;
+        }
+    }
+    append_session_log(
+        session,
+        &format!(
+            "沙盒存档回收完成，累计文件 {}，统一目录 {}",
+            copied_total, execution_config.managed_save_root
+        ),
+    );
+    session.status = "exited".to_string();
+    session.updated_at = now_iso_string();
+    let updated = session.clone();
+    persist_store(&app, &store)?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn list_backup_versions(state: State<AppState>, game_id: String) -> Result<Vec<BackupVersion>, String> {
+    let trimmed_game_id = game_id.trim();
+    if trimmed_game_id.is_empty() {
+        return Err("gameId 不能为空".to_string());
+    }
+    let store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+    let rule =
+        select_rule_for_game(&store, trimmed_game_id).ok_or_else(|| "未找到该游戏可用规则".to_string())?;
+    let base = ensure_backup_root_for_rule(&rule, &store.execution_config.backup_root)?;
+    let versions_dir = base.join("versions");
+    if !versions_dir.exists() {
+        return Ok(vec![]);
+    }
+    let mut versions = fs::read_dir(&versions_dir)
+        .map_err(|err| format!("读取版本目录失败: {err}"))?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|entry| {
+            let version_id = entry.file_name().to_string_lossy().to_string();
+            if version_id.trim().is_empty() {
+                return None;
+            }
+            let file_count = WalkDir::new(entry.path())
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|item| item.file_type().is_file())
+                .count();
+            Some(BackupVersion {
+                created_at: version_id.clone(),
+                version_id,
+                file_count,
+            })
+        })
+        .collect::<Vec<_>>();
+    versions.sort_by(|a, b| b.version_id.cmp(&a.version_id));
+    Ok(versions)
+}
+
+#[tauri::command]
+fn restore_backup_version(
+    app: AppHandle,
+    state: State<AppState>,
+    game_id: String,
+    version_id: String,
+) -> Result<RestoreBackupResult, String> {
+    let trimmed_game_id = game_id.trim().to_string();
+    let trimmed_version_id = version_id.trim().to_string();
+    if trimmed_game_id.is_empty() {
+        return Err("gameId 不能为空".to_string());
+    }
+    if trimmed_version_id.is_empty() {
+        return Err("versionId 不能为空".to_string());
+    }
+
+    let (backup_root, rule) = {
+        let store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+        let rule = select_rule_for_game(&store, &trimmed_game_id)
+            .ok_or_else(|| "未找到该游戏可用规则".to_string())?;
+        (store.execution_config.backup_root.clone(), rule)
+    };
+
+    let version_dir = ensure_backup_root_for_rule(&rule, &backup_root)?
+        .join("versions")
+        .join(&trimmed_version_id);
+    if !version_dir.exists() {
+        return Err("指定备份版本不存在".to_string());
+    }
+    if !version_dir.join("manifest.json").exists() {
+        return Err("该备份版本来自旧格式，暂不支持一键回滚，请使用最新自动备份后再回滚".to_string());
+    }
+
+    let mut restored_files = 0_usize;
+    for source_path in &rule.confirmed_paths {
+        let slot = backup_slot_name(source_path);
+        let slot_source = version_dir.join(&slot);
+        if !slot_source.exists() {
+            return Err(format!("备份版本不完整，缺少槽位 {slot}"));
+        }
+        let target = Path::new(source_path);
+        if target.exists() {
+            if target.is_dir() {
+                fs::remove_dir_all(target).map_err(|err| format!("清理目标目录失败: {err}"))?;
+            } else {
+                fs::remove_file(target).map_err(|err| format!("清理目标文件失败: {err}"))?;
+            }
+        }
+        restored_files += sync_directory(&slot_source, target)?;
+    }
+
+    {
+        let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+        let target_uid = normalize_game_uid(&rule.game_uid);
+        let latest_idx = store
+            .launcher_sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.matched_game_uid
+                    .as_ref()
+                    .is_some_and(|uid| normalize_game_uid(uid) == target_uid)
+                    || item
+                        .matched_game_id
+                        .as_ref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(&trimmed_game_id))
+            })
+            .max_by_key(|(_, item)| session_updated_ts(item))
+            .map(|(idx, _)| idx);
+        if let Some(idx) = latest_idx {
+            let session = &mut store.launcher_sessions[idx];
+            append_session_log(
+                session,
+                &format!(
+                    "已执行版本回滚：game={}, version={}, files={}",
+                    trimmed_game_id, trimmed_version_id, restored_files
+                ),
+            );
+            session.updated_at = now_iso_string();
+        }
+        persist_store(&app, &store)?;
+    }
+
+    Ok(RestoreBackupResult {
+        game_id: trimmed_game_id,
+        version_id: trimmed_version_id,
+        restored_files,
+    })
+}
+
+#[tauri::command]
+fn get_launcher_session(
+    state: State<AppState>,
+    launcher_session_id: String,
+) -> Result<LauncherSession, String> {
+    let store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+    let session = store
+        .launcher_sessions
+        .iter()
+        .find(|item| item.launcher_session_id == launcher_session_id)
+        .ok_or_else(|| "launcherSessionId 不存在".to_string())?;
+    Ok(session.clone())
+}
+
+#[tauri::command]
+fn list_launcher_sessions(state: State<AppState>) -> Result<Vec<LauncherSession>, String> {
+    let mut sessions = state
+        .store
+        .lock()
+        .map_err(|_| "无法锁定应用状态".to_string())?
+        .launcher_sessions
+        .clone();
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    Ok(sessions)
+}
+
+#[tauri::command]
+fn list_game_library_items(state: State<AppState>) -> Result<Vec<GameLibraryItem>, String> {
+    let store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+    Ok(build_game_library_items(&store))
+}
+
+#[tauri::command]
+fn set_preferred_exe_path(
+    app: AppHandle,
+    state: State<AppState>,
+    game_id: String,
+    exe_path: String,
+) -> Result<GameLibraryItem, String> {
+    let normalized_game_key = normalize_game_key(&game_id);
+    if normalized_game_key.is_empty() {
+        return Err("gameId 不能为空".to_string());
+    }
+    let trimmed_exe_path = exe_path.trim().to_string();
+    if trimmed_exe_path.is_empty() {
+        return Err("exePath 不能为空".to_string());
+    }
+    let exe = Path::new(&trimmed_exe_path);
+    if !exe.exists() {
+        return Err("exePath 不存在".to_string());
+    }
+    if !exe.is_file() {
+        return Err("exePath 不是有效文件".to_string());
+    }
+    if !trimmed_exe_path.to_ascii_lowercase().ends_with(".exe") {
+        return Err("exePath 必须是 .exe 文件".to_string());
+    }
+
+    let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+    let Some(rule) = select_rule_for_game(&store, &game_id) else {
+        return Err("该 gameId 暂无可用规则，请先学习并保存规则".to_string());
+    };
+    let game_uid = normalize_game_uid(&rule.game_uid);
+    if game_uid.is_empty() {
+        return Err("规则缺少 gameUid，请先刷新规则后重试".to_string());
+    }
+    store
+        .execution_config
+        .preferred_exe_by_uid
+        .insert(game_uid, trimmed_exe_path);
+    store
+        .execution_config
+        .preferred_rule_uid_by_game
+        .insert(normalized_game_key.clone(), normalize_game_uid(&rule.game_uid));
+    persist_store(&app, &store)?;
+
+    build_game_library_items(&store)
+        .into_iter()
+        .find(|item| normalize_game_key(&item.game_id) == normalized_game_key)
+        .ok_or_else(|| "更新 EXE 绑定后未找到对应游戏卡片".to_string())
+}
+
+fn normalize_paths(paths: Vec<String>) -> Vec<String> {
+    let mut dedup = HashSet::new();
+    let mut output = Vec::new();
+    for path in paths {
+        let trimmed = path.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if dedup.insert(trimmed.clone()) {
+            output.push(trimmed);
+        }
+    }
+    output
+}
+
+fn append_session_log(session: &mut LauncherSession, message: &str) {
+    session.logs.push(format!("[{}] {}", now_iso_string(), message));
+}
+
+fn join_managed_root_for_game(root: &str, game_id: &str) -> String {
+    Path::new(root)
+        .join(game_id.trim())
+        .to_string_lossy()
+        .to_string()
+}
+
+fn normalize_launch_mode(value: Option<&str>) -> String {
+    match value.unwrap_or("backup").trim().to_ascii_lowercase().as_str() {
+        "backup" => "backup".to_string(),
+        "sandbox" => "sandbox".to_string(),
+        _ => "inject".to_string(),
+    }
+}
+
+fn sanitize_sandbox_box_name(game_id: &str) -> String {
+    let mut out = String::new();
+    for ch in game_id.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let compact = out.trim_matches('_').to_string();
+    if compact.is_empty() {
+        "GameSaver_Default".to_string()
+    } else {
+        format!("GameSaver_{compact}")
+    }
+}
+
+fn resolve_sandboxie_start_path(config: &ExecutionConfig) -> Result<String, String> {
+    let configured = config.sandboxie_start_exe.trim();
+    if !configured.is_empty() && Path::new(configured).exists() {
+        return Ok(configured.to_string());
+    }
+    let fallbacks = [
+        "C:\\Program Files\\Sandboxie-Plus\\Start.exe",
+        "C:\\Program Files\\Sandboxie\\Start.exe",
+    ];
+    for item in fallbacks {
+        if Path::new(item).exists() {
+            return Ok(item.to_string());
+        }
+    }
+    Err("未找到 Sandboxie Start.exe，请先安装 Sandboxie Plus 或在配置中提供路径".to_string())
+}
+
+fn build_sandbox_mirror_path(
+    original_path: &str,
+    sandbox_root: &str,
+    user_name: &str,
+    box_name: &str,
+) -> Result<PathBuf, String> {
+    let normalized = original_path.trim().replace('/', "\\");
+    if normalized.len() < 3 {
+        return Err(format!("无效路径: {original_path}"));
+    }
+    let bytes = normalized.as_bytes();
+    if !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+        return Err(format!("仅支持盘符绝对路径: {original_path}"));
+    }
+    let drive = (bytes[0] as char).to_ascii_uppercase().to_string();
+    let remain = normalized[2..].trim_start_matches('\\').to_string();
+    Ok(Path::new(sandbox_root)
+        .join(user_name)
+        .join(box_name)
+        .join("drive")
+        .join(drive)
+        .join(remain))
+}
+
+fn sync_directory(source: &Path, target: &Path) -> Result<usize, String> {
+    if !source.exists() {
+        return Ok(0);
+    }
+    fs::create_dir_all(target).map_err(|err| format!("创建目录失败: {err}"))?;
+    let mut copied = 0_usize;
+    for entry in WalkDir::new(source).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = match entry.path().strip_prefix(source) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let dest = target.join(relative);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|err| format!("创建目录失败: {err}"))?;
+        }
+        fs::copy(entry.path(), &dest).map_err(|err| format!("复制文件失败: {err}"))?;
+        copied += 1;
+    }
+    Ok(copied)
+}
+
+fn backup_game_root(backup_root: &str, game_uid: &str) -> PathBuf {
+    Path::new(backup_root).join(game_uid.trim())
+}
+
+fn legacy_backup_game_root(backup_root: &str, game_id: &str) -> PathBuf {
+    Path::new(backup_root).join(game_id.trim())
+}
+
+fn backup_slot_name(source_path: &str) -> String {
+    let normalized = normalize_windows_path(source_path);
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+    format!("slot_{}", &hash[..12])
+}
+
+fn normalize_game_key(game_id: &str) -> String {
+    game_id.trim().to_ascii_lowercase()
+}
+
+fn normalize_game_uid(game_uid: &str) -> String {
+    game_uid.trim().to_ascii_lowercase()
+}
+
+fn new_game_uid() -> String {
+    Uuid::new_v4().to_string()
+}
+
+fn ensure_backup_root_for_rule(rule: &GameSaveRule, backup_root: &str) -> Result<PathBuf, String> {
+    let game_uid = normalize_game_uid(&rule.game_uid);
+    if game_uid.is_empty() {
+        return Err(format!("规则 {} 缺少 gameUid", rule.rule_id));
+    }
+    let uid_root = backup_game_root(backup_root, &game_uid);
+    let legacy_root = legacy_backup_game_root(backup_root, &rule.game_id);
+    if !uid_root.exists() && legacy_root.exists() {
+        let _ = sync_directory(&legacy_root, &uid_root);
+    }
+    Ok(uid_root)
+}
+
+fn unix_string_or_zero(value: &str) -> u64 {
+    value.trim().parse::<u64>().ok().unwrap_or(0)
+}
+
+fn rule_updated_ts(rule: &GameSaveRule) -> u64 {
+    let updated = rule.updated_at.trim();
+    if !updated.is_empty() {
+        return unix_string_or_zero(updated);
+    }
+    unix_string_or_zero(&rule.created_at)
+}
+
+fn session_updated_ts(session: &LauncherSession) -> u64 {
+    let updated = session.updated_at.trim();
+    if !updated.is_empty() {
+        return unix_string_or_zero(updated);
+    }
+    unix_string_or_zero(&session.started_at)
+}
+
+fn build_game_library_items(store: &PersistedStore) -> Vec<GameLibraryItem> {
+    let mut grouped: HashMap<String, GameLibraryAccumulator> = HashMap::new();
+    for rule in &store.rules {
+        let key = normalize_game_key(&rule.game_id);
+        if key.is_empty() {
+            continue;
+        }
+        let rule_ts = rule_updated_ts(rule);
+        let rule_updated_at = if rule.updated_at.trim().is_empty() {
+            rule.created_at.clone()
+        } else {
+            rule.updated_at.clone()
+        };
+        let entry = grouped.entry(key).or_default();
+        entry.total_rules += 1;
+        if rule.enabled {
+            entry.enabled_rules += 1;
+        }
+        entry.confirmed_path_count += rule.confirmed_paths.len();
+        if entry.game_id.trim().is_empty() || rule_ts >= entry.last_rule_ts {
+            entry.game_id = rule.game_id.clone();
+            entry.game_uid = normalize_game_uid(&rule.game_uid);
+            entry.last_rule_ts = rule_ts;
+            entry.last_rule_updated_at = rule_updated_at;
+        }
+    }
+
+    for (game_key, entry) in &mut grouped {
+        if let Some(primary_rule) = select_rule_for_game(store, game_key) {
+            entry.game_uid = normalize_game_uid(&primary_rule.game_uid);
+            entry.game_id = primary_rule.game_id;
+        }
+    }
+
+    for session in &store.launcher_sessions {
+        let Some(matched_game_id) = session.matched_game_id.as_ref() else {
+            continue;
+        };
+        let key = normalize_game_key(matched_game_id);
+        if key.is_empty() {
+            continue;
+        }
+        let Some(entry) = grouped.get_mut(&key) else {
+            continue;
+        };
+        let session_ts = session_updated_ts(session);
+        if session_ts >= entry.last_session_ts {
+            entry.last_session_ts = session_ts;
+            entry.last_session_id = Some(session.launcher_session_id.clone());
+            entry.last_session_status = Some(session.status.clone());
+            entry.last_session_updated_at = Some(session.updated_at.clone());
+            entry.last_injection_status = Some(session.injection_status.clone());
+        }
+    }
+
+    for entry in grouped.values_mut() {
+        if entry.game_uid.trim().is_empty() {
+            continue;
+        }
+        if let Some(path) = store.execution_config.preferred_exe_by_uid.get(&entry.game_uid) {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                entry.preferred_exe_path = Some(trimmed.to_string());
+            }
+        }
+    }
+
+    let mut cards: Vec<(u64, GameLibraryItem)> = grouped
+        .into_values()
+        .map(|entry| {
+            let activity_ts = entry.last_session_ts.max(entry.last_rule_ts);
+            (
+                activity_ts,
+                GameLibraryItem {
+                    game_id: entry.game_id,
+                    total_rules: entry.total_rules,
+                    enabled_rules: entry.enabled_rules,
+                    confirmed_path_count: entry.confirmed_path_count,
+                    last_rule_updated_at: entry.last_rule_updated_at,
+                    preferred_exe_path: entry.preferred_exe_path,
+                    last_session_id: entry.last_session_id,
+                    last_session_status: entry.last_session_status,
+                    last_session_updated_at: entry.last_session_updated_at,
+                    last_injection_status: entry.last_injection_status,
+                },
+            )
+        })
+        .collect();
+    cards.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.game_id.cmp(&b.1.game_id)));
+    cards.into_iter().map(|(_, item)| item).collect()
+}
+
+fn select_rule_for_game(store: &PersistedStore, game_id: &str) -> Option<GameSaveRule> {
+    let game_key = normalize_game_key(game_id);
+    if game_key.is_empty() {
+        return None;
+    }
+
+    let preferred_uid = store
+        .execution_config
+        .preferred_rule_uid_by_game
+        .get(&game_key)
+        .map(|uid| normalize_game_uid(uid))
+        .filter(|uid| !uid.is_empty());
+
+    if let Some(target_uid) = preferred_uid {
+        let preferred = store
+            .rules
+            .iter()
+            .filter(|rule| {
+                normalize_game_key(&rule.game_id) == game_key
+                    && normalize_game_uid(&rule.game_uid) == target_uid
+            })
+            .max_by_key(|rule| (rule.enabled as u8, rule_updated_ts(rule)))
+            .cloned();
+        if preferred.is_some() {
+            return preferred;
+        }
+    }
+
+    store
+        .rules
+        .iter()
+        .filter(|rule| normalize_game_key(&rule.game_id) == game_key)
+        .max_by_key(|rule| (rule.enabled as u8, rule_updated_ts(rule)))
+        .cloned()
+}
+
+fn file_signature(path: &Path) -> Option<(u64, u64)> {
+    let metadata = path.metadata().ok()?;
+    let size = metadata.len();
+    let modified = metadata.modified().ok().and_then(system_time_to_unix).unwrap_or(0);
+    Some((size, modified))
+}
+
+fn restore_latest_backup_for_rule(rule: &GameSaveRule, backup_root: &str) -> Result<usize, String> {
+    let base = ensure_backup_root_for_rule(rule, backup_root)?;
+    let latest = base.join("latest");
+    if !latest.exists() {
+        return Ok(0);
+    }
+    let mut copied = 0_usize;
+    for source in &rule.confirmed_paths {
+        let slot = backup_slot_name(source);
+        copied += sync_directory(&latest.join(slot), Path::new(source))?;
+    }
+    Ok(copied)
+}
+
+fn sync_source_to_backup_slot(source: &Path, latest_slot: &Path, version_slot: &Path) -> Result<usize, String> {
+    if !source.exists() {
+        if latest_slot.exists() {
+            fs::remove_dir_all(latest_slot).map_err(|err| format!("清理旧缓存失败: {err}"))?;
+        }
+        return Ok(0);
+    }
+    fs::create_dir_all(latest_slot).map_err(|err| format!("创建目录失败: {err}"))?;
+
+    let mut changed = 0_usize;
+    let mut source_files = HashSet::new();
+    for entry in WalkDir::new(source).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = match entry.path().strip_prefix(source) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let key = normalize_windows_path(&relative.to_string_lossy());
+        source_files.insert(key);
+        let latest_file = latest_slot.join(relative);
+        let source_sig = file_signature(entry.path());
+        let latest_sig = file_signature(&latest_file);
+        if source_sig != latest_sig {
+            if let Some(parent) = latest_file.parent() {
+                fs::create_dir_all(parent).map_err(|err| format!("创建目录失败: {err}"))?;
+            }
+            fs::copy(entry.path(), &latest_file).map_err(|err| format!("复制文件失败: {err}"))?;
+            let version_file = version_slot.join(relative);
+            if let Some(parent) = version_file.parent() {
+                fs::create_dir_all(parent).map_err(|err| format!("创建目录失败: {err}"))?;
+            }
+            fs::copy(entry.path(), &version_file).map_err(|err| format!("复制文件失败: {err}"))?;
+            changed += 1;
+        }
+    }
+
+    let mut stale_files = Vec::new();
+    for entry in WalkDir::new(latest_slot).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = match entry.path().strip_prefix(latest_slot) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let key = normalize_windows_path(&relative.to_string_lossy());
+        if !source_files.contains(&key) {
+            stale_files.push(entry.path().to_path_buf());
+        }
+    }
+    let stale_count = stale_files.len();
+    for stale in stale_files {
+        let _ = fs::remove_file(stale);
+    }
+    if stale_count > 0 {
+        changed += stale_count;
+    }
+
+    if changed > 0 {
+        if version_slot.exists() {
+            fs::remove_dir_all(version_slot).map_err(|err| format!("清理版本快照失败: {err}"))?;
+        }
+        let _ = sync_directory(source, version_slot)?;
+    }
+
+    Ok(changed)
+}
+
+fn cleanup_backup_versions(versions_dir: &Path, keep: usize) -> Result<(), String> {
+    if !versions_dir.exists() {
+        return Ok(());
+    }
+    let mut dirs = fs::read_dir(versions_dir)
+        .map_err(|err| format!("读取版本目录失败: {err}"))?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .collect::<Vec<_>>();
+    dirs.sort_by_key(|entry| entry.file_name());
+    if dirs.len() <= keep {
+        return Ok(());
+    }
+    let remove_count = dirs.len() - keep;
+    for entry in dirs.into_iter().take(remove_count) {
+        fs::remove_dir_all(entry.path()).map_err(|err| format!("清理旧版本失败: {err}"))?;
+    }
+    Ok(())
+}
+
+fn backup_after_exit_for_rule(rule: &GameSaveRule, backup_root: &str) -> Result<(usize, String), String> {
+    let base = ensure_backup_root_for_rule(rule, backup_root)?;
+    let latest = base.join("latest");
+    let versions = base.join("versions");
+    fs::create_dir_all(&latest).map_err(|err| format!("创建目录失败: {err}"))?;
+    fs::create_dir_all(&versions).map_err(|err| format!("创建目录失败: {err}"))?;
+    let snapshot_id = now_unix().to_string();
+    let version_root = versions.join(&snapshot_id);
+
+    let mut changed_total = 0_usize;
+    for source in &rule.confirmed_paths {
+        let slot = backup_slot_name(source);
+        let changed = sync_source_to_backup_slot(
+            Path::new(source),
+            &latest.join(&slot),
+            &version_root.join(&slot),
+        )?;
+        changed_total += changed;
+    }
+    if changed_total == 0 && version_root.exists() {
+        let _ = fs::remove_dir_all(&version_root);
+    } else if changed_total > 0 {
+        let manifest = serde_json::json!({
+            "format": "full-v1",
+            "createdAt": snapshot_id,
+            "gameUid": rule.game_uid
+        });
+        let manifest_path = version_root.join("manifest.json");
+        let manifest_text = serde_json::to_string_pretty(&manifest)
+            .map_err(|err| format!("序列化备份 manifest 失败: {err}"))?;
+        fs::write(&manifest_path, manifest_text).map_err(|err| format!("写入备份 manifest 失败: {err}"))?;
+    }
+    cleanup_backup_versions(&versions, 10)?;
+    Ok((changed_total, snapshot_id))
+}
+
+fn spawn_post_exit_backup_worker(
+    app: AppHandle,
+    session_id: String,
+    mut child: std::process::Child,
+    rule: GameSaveRule,
+    backup_root: String,
+) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        let backup_result = backup_after_exit_for_rule(&rule, &backup_root);
+        let state: State<AppState> = app.state();
+        let lock_result = state.store.lock();
+        if let Ok(mut store) = lock_result {
+            if let Some(session) = store
+                .launcher_sessions
+                .iter_mut()
+                .find(|item| item.launcher_session_id == session_id)
+            {
+                match backup_result {
+                    Ok((count, snapshot)) => {
+                        append_session_log(
+                            session,
+                            &format!("自动备份完成：文件 {}，版本 {}", count, snapshot),
+                        );
+                    }
+                    Err(err) => {
+                        append_session_log(session, &format!("自动备份失败：{err}"));
+                    }
+                }
+                session.status = "exited".to_string();
+                session.updated_at = now_iso_string();
+            }
+            let _ = persist_store(&app, &store);
+        };
+    });
+}
+
+fn run_sandbox_launch_flow(
+    exe_path: &str,
+    rule: &GameSaveRule,
+    execution_config: &ExecutionConfig,
+    session: &mut LauncherSession,
+) -> Result<SandboxLaunchResult, String> {
+    let start_exe = resolve_sandboxie_start_path(execution_config)?;
+    let user_name = std::env::var("USERNAME").unwrap_or_else(|_| "Default".to_string());
+    let box_name = sanitize_sandbox_box_name(&rule.game_id);
+    let redirect_root = join_managed_root_for_game(&execution_config.managed_save_root, &rule.game_id);
+    fs::create_dir_all(&redirect_root).map_err(|err| format!("创建统一存档目录失败: {err}"))?;
+
+    let mut mirror_paths = Vec::new();
+    let mut copied_in = 0_usize;
+    for original in &rule.confirmed_paths {
+        let mirror = build_sandbox_mirror_path(original, &execution_config.sandbox_root, &user_name, &box_name)?;
+        copied_in += sync_directory(Path::new(&redirect_root), &mirror)?;
+        mirror_paths.push(mirror.to_string_lossy().to_string());
+    }
+    append_session_log(
+        session,
+        &format!(
+            "沙盒预同步完成，文件 {}，沙盒 {}",
+            copied_in, box_name
+        ),
+    );
+
+    let box_arg = format!("/box:{box_name}");
+    let child = Command::new(&start_exe)
+        .args([&box_arg, exe_path])
+        .spawn()
+        .map_err(|err| format!("调用 Sandboxie 启动失败: {err}"))?;
+
+    Ok(SandboxLaunchResult {
+        pid: Some(child.id()),
+        box_name,
+        mirror_paths,
+    })
+}
+
+fn resolve_redirector_artifacts(app: &AppHandle) -> RedirectArtifacts {
+    let injector_name = "gamesaver-injector.exe";
+    let dll_name = "gamesaver-hook.dll";
+
+    let app_data_base = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("redirector")
+        .join("bin");
+    let manifest_base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("redirector").join("bin");
+    let exe_parent = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|v| v.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let app_bin_base = exe_parent
+        .join("redirector")
+        .join("bin");
+    let exe_resources_base = exe_parent.join("resources").join("redirector").join("bin");
+    let sibling_resources_base = exe_parent
+        .parent()
+        .map(|v| v.join("resources").join("redirector").join("bin"))
+        .unwrap_or_else(|| PathBuf::from(".").join("resources").join("redirector").join("bin"));
+
+    let candidates = [
+        app_data_base,
+        manifest_base,
+        app_bin_base,
+        exe_resources_base,
+        sibling_resources_base,
+    ];
+    for base in &candidates {
+        let injector = base.join(injector_name);
+        let dll = base.join(dll_name);
+        if injector.exists() && dll.exists() {
+            return RedirectArtifacts {
+                injector_path: injector,
+                dll_path: dll,
+            };
+        }
+    }
+
+    RedirectArtifacts {
+        injector_path: candidates[1].join(injector_name),
+        dll_path: candidates[1].join(dll_name),
+    }
+}
+
+fn run_real_injection_flow(
+    app: &AppHandle,
+    pid: u32,
+    rule: &GameSaveRule,
+    execution_config: &ExecutionConfig,
+    session: &mut LauncherSession,
+) -> Result<InjectionRunResult, String> {
+    let artifacts = resolve_redirector_artifacts(app);
+    if !artifacts.injector_path.exists() {
+        return Err(format!(
+            "injector 不存在: {}",
+            artifacts.injector_path.to_string_lossy()
+        ));
+    }
+    if !artifacts.dll_path.exists() {
+        return Err(format!("hook DLL 不存在: {}", artifacts.dll_path.to_string_lossy()));
+    }
+
+    let redirect_root = join_managed_root_for_game(&execution_config.managed_save_root, &rule.game_id);
+    fs::create_dir_all(&redirect_root).map_err(|err| format!("创建重定向目录失败: {err}"))?;
+    let config_path = write_redirect_config_file(pid, rule, &redirect_root)?;
+    append_session_log(session, &format!("重定向根目录：{redirect_root}"));
+
+    let output = {
+        let mut command = Command::new(&artifacts.injector_path);
+        command.args([
+            "--pid",
+            &pid.to_string(),
+            "--dll",
+            &artifacts.dll_path.to_string_lossy(),
+            "--config",
+            &config_path.to_string_lossy(),
+        ]);
+        apply_background_process_flags(&mut command)
+            .output()
+            .map_err(|err| format!("执行 injector 失败: {err}"))?
+    };
+
+    let code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stdout.is_empty() {
+        append_session_log(session, &format!("injector: {stdout}"));
+    }
+    if !stderr.is_empty() {
+        append_session_log(session, &format!("injector stderr: {stderr}"));
+    }
+    if !output.status.success() {
+        return Err(format!("injector 返回失败 code={code}"));
+    }
+
+    Ok(InjectionRunResult {
+        injector_exit_code: code,
+        hook_version: "createfilew-iat-v1".to_string(),
+    })
+}
+
+fn write_redirect_config_file(pid: u32, rule: &GameSaveRule, redirect_root: &str) -> Result<PathBuf, String> {
+    let base = std::env::temp_dir().join("gamesaver");
+    fs::create_dir_all(&base).map_err(|err| format!("创建临时目录失败: {err}"))?;
+    let path = base.join(format!("redirect_config_{pid}.json"));
+    let payload = serde_json::json!({
+        "pid": pid,
+        "gameId": rule.game_id,
+        "gameUid": rule.game_uid,
+        "confirmedPaths": rule.confirmed_paths,
+        "redirectRoot": redirect_root,
+        "logPath": base.join(format!("hook_{pid}.log")).to_string_lossy().to_string()
+    });
+    let content = serde_json::to_string_pretty(&payload).map_err(|err| format!("序列化注入配置失败: {err}"))?;
+    fs::write(&path, content).map_err(|err| format!("写入注入配置失败: {err}"))?;
+    Ok(path)
+}
+
+fn terminate_process(pid: u32) -> Result<(), String> {
+    let output = {
+        let mut command = Command::new("taskkill");
+        command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        apply_background_process_flags(&mut command)
+            .output()
+            .map_err(|err| format!("结束进程失败: {err}"))?
+    };
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("结束进程失败: {stderr}"))
+    }
+}
+
+fn is_x64_pe(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    if bytes.len() < 0x40 {
+        return false;
+    }
+    if bytes[0] != b'M' || bytes[1] != b'Z' {
+        return false;
+    }
+    let pe_offset = u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]]) as usize;
+    if bytes.len() < pe_offset + 6 {
+        return false;
+    }
+    if bytes[pe_offset] != b'P' || bytes[pe_offset + 1] != b'E' {
+        return false;
+    }
+    let machine = u16::from_le_bytes([bytes[pe_offset + 4], bytes[pe_offset + 5]]);
+    machine == 0x8664
+}
+
+fn build_rule_key(game_id: &str, exe_hash: &str) -> String {
+    format!(
+        "{}::{}",
+        game_id.trim().to_ascii_lowercase(),
+        exe_hash.trim().to_ascii_lowercase()
+    )
+}
+
+fn build_candidates(
+    baseline: &Snapshot,
+    final_snapshot: &Snapshot,
+    game_id: &str,
+    start_unix: u64,
+    end_unix_with_grace: u64,
+    related_files: Option<&HashSet<String>>,
+) -> Vec<CandidatePath> {
+    let mut grouped: HashMap<String, CandidateAccumulator> = HashMap::new();
+    let game_id_lower = game_id.to_ascii_lowercase();
+
+    for (path, final_meta) in &final_snapshot.files {
+        if let Some(related) = related_files {
+            if !related.is_empty() && !related.contains(&normalize_windows_path(path)) {
+                continue;
+            }
+        }
+        let changed = match baseline.files.get(path) {
+            None => true,
+            Some(base_meta) => {
+                base_meta.modified_unix != final_meta.modified_unix || base_meta.size != final_meta.size
+            }
+        };
+        if !changed {
+            continue;
+        }
+
+        let parent = Path::new(path)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+        let entry = grouped.entry(parent.clone()).or_insert_with(|| CandidateAccumulator {
+            path: parent.clone(),
+            ..CandidateAccumulator::default()
+        });
+
+        let is_added = !baseline.files.contains_key(path);
+        if is_added {
+            entry.added_files += 1;
+        } else {
+            entry.modified_files += 1;
+        }
+        entry.changed_files += 1;
+
+        if final_meta.modified_unix >= start_unix && final_meta.modified_unix <= end_unix_with_grace {
+            entry.time_hits += 1;
+            entry.signals.insert("time-window".to_string());
+        }
+
+        if SAVE_EXTENSIONS.contains(&final_meta.extension.as_str()) {
+            entry.extension_hits += 1;
+            entry.signals.insert(format!("extension:{}", final_meta.extension));
+        }
+
+        let lower_parent = parent.to_ascii_lowercase();
+        if matches_path_keyword(&lower_parent, &game_id_lower) {
+            entry.keyword_hits += 1;
+            entry.signals.insert("path-keyword".to_string());
+        }
+
+        if final_meta.size > 0 && final_meta.size < 200 * 1024 * 1024 {
+            entry.reasonable_size_hits += 1;
+            entry.signals.insert("size-reasonable".to_string());
+        }
+    }
+
+    let mut output = grouped
+        .into_values()
+        .map(CandidateAccumulator::into_candidate)
+        .collect::<Vec<_>>();
+    output.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| b.changed_files.cmp(&a.changed_files))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    output.truncate(10);
+    output
+}
+
+fn collect_snapshot(game_id: &str, exe_path: &str) -> Result<Snapshot, String> {
+    let roots = collect_scan_roots(exe_path)?;
+    let mut files = HashMap::new();
+    for root in roots {
+        if !root.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if should_ignore_candidate_path(entry.path()) {
+                continue;
+            }
+            let metadata = match entry.metadata() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let modified_unix = metadata
+                .modified()
+                .ok()
+                .and_then(system_time_to_unix)
+                .unwrap_or_default();
+            let size = metadata.len();
+            let extension = entry
+                .path()
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            files.insert(
+                entry.path().to_string_lossy().to_string(),
+                FileMeta {
+                    size,
+                    modified_unix,
+                    extension,
+                },
+            );
+        }
+    }
+
+    Ok(Snapshot {
+        snapshot_ref: format!("snapshot_{}_{}.json", game_id, now_unix()),
+        created_at_unix: now_unix(),
+        files,
+    })
+}
+
+fn collect_scan_roots(exe_path: &str) -> Result<Vec<PathBuf>, String> {
+    let profile = std::env::var("USERPROFILE").map_err(|_| "读取 USERPROFILE 失败".to_string())?;
+    let mut roots = vec![
+        Path::new(&profile).join("Documents"),
+        Path::new(&profile).join("AppData").join("Local"),
+        Path::new(&profile).join("AppData").join("LocalLow"),
+        Path::new(&profile).join("AppData").join("Roaming"),
+    ];
+    if let Some(exe_dir) = Path::new(exe_path).parent() {
+        roots.push(exe_dir.to_path_buf());
+    }
+    Ok(roots)
+}
+
+fn collect_process_tree_pids(root_pid: u32) -> Result<Vec<u32>, String> {
+    let script = "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress";
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-Command", script]);
+    let output = apply_background_process_flags(&mut command)
+        .output()
+        .map_err(|err| format!("读取进程列表失败: {err}"))?;
+    if !output.status.success() {
+        return Err("读取进程列表失败: powershell 命令返回异常".to_string());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return Ok(vec![root_pid]);
+    }
+
+    let rows = if stdout.starts_with('[') {
+        serde_json::from_str::<Vec<CimProcessRow>>(&stdout)
+            .map_err(|err| format!("解析进程列表失败: {err}"))?
+    } else {
+        let single = serde_json::from_str::<CimProcessRow>(&stdout)
+            .map_err(|err| format!("解析进程列表失败: {err}"))?;
+        vec![single]
+    };
+
+    let mut child_map: HashMap<u32, Vec<u32>> = HashMap::new();
+    for row in rows {
+        child_map
+            .entry(row.parent_process_id)
+            .or_default()
+            .push(row.process_id);
+    }
+
+    let mut tracked = Vec::new();
+    let mut visited = HashSet::new();
+    let mut stack = vec![root_pid];
+
+    while let Some(current) = stack.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        tracked.push(current);
+        if let Some(children) = child_map.get(&current) {
+            for child in children {
+                stack.push(*child);
+            }
+        }
+    }
+
+    tracked.sort_unstable();
+    Ok(tracked)
+}
+
+fn try_start_etw_capture(app: &AppHandle, session_id: &str) -> Result<EventCaptureHandle, String> {
+    if !is_running_as_admin() {
+        return Err("当前非管理员权限，ETW 已自动降级为 snapshot 模式。".to_string());
+    }
+
+    let trace_name = format!("GameSaverTrace_{}", session_id.replace('-', "").chars().take(10).collect::<String>());
+    let etl_path = event_logs_dir(app)?.join(format!("{trace_name}.etl"));
+    let etl_path_str = etl_path.to_string_lossy().to_string();
+
+    let _ = {
+        let mut command = Command::new("logman");
+        command.args(["stop", &trace_name, "-ets"]);
+        apply_background_process_flags(&mut command).output()
+    };
+
+    let created = {
+        let mut command = Command::new("logman");
+        command.args([
+            "create",
+            "trace",
+            &trace_name,
+            "-o",
+            &etl_path_str,
+            "-p",
+            "Microsoft-Windows-Kernel-File",
+            "0x10",
+            "5",
+            "-ets",
+        ]);
+        apply_background_process_flags(&mut command)
+            .output()
+            .map_err(|err| format!("启动 ETW 失败（无法执行 logman）: {err}"))?
+    };
+    if !created.status.success() {
+        let stderr = String::from_utf8_lossy(&created.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&created.stdout).trim().to_string();
+        let msg = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(format!("启动 ETW 失败（logman create trace）: {msg}"));
+    }
+
+    Ok(EventCaptureHandle { trace_name, etl_path })
+}
+
+fn is_running_as_admin() -> bool {
+    let mut command = Command::new("powershell");
+    command.args([
+        "-NoProfile",
+        "-Command",
+        "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)",
+    ]);
+    let output = apply_background_process_flags(&mut command).output();
+    let Ok(out) = output else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_ascii_lowercase();
+    text.contains("true")
+}
+
+fn collect_related_files_by_trace(
+    trace_name: Option<&str>,
+    trace_path: Option<&str>,
+    tracked_pids: &[u32],
+) -> Result<HashSet<String>, String> {
+    let mut files = HashSet::new();
+    let Some(name) = trace_name else {
+        return Ok(files);
+    };
+    let Some(etl_path) = trace_path else {
+        return Ok(files);
+    };
+
+    let _ = {
+        let mut command = Command::new("logman");
+        command.args(["stop", name, "-ets"]);
+        apply_background_process_flags(&mut command).output()
+    };
+
+    let csv_path = format!("{etl_path}.csv");
+    let converted = {
+        let mut command = Command::new("tracerpt");
+        command.args([etl_path, "-of", "CSV", "-o", &csv_path, "-y"]);
+        apply_background_process_flags(&mut command)
+            .output()
+            .map_err(|err| format!("解析 ETW 失败（无法执行 tracerpt）: {err}"))?
+    };
+    if !converted.status.success() {
+        let stderr = String::from_utf8_lossy(&converted.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&converted.stdout).trim().to_string();
+        let msg = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(format!("解析 ETW 失败（tracerpt）: {msg}"));
+    }
+
+    let raw = fs::read(&csv_path).map_err(|err| format!("读取 ETW CSV 失败: {err}"))?;
+    let content = decode_text_bytes(&raw);
+    let mut lines = content.lines();
+    let Some(header_line) = lines.next() else {
+        return Ok(files);
+    };
+    let headers = parse_csv_line(header_line);
+    let pid_idx = find_header_index(&headers, &["processid", "process id", "pid"]);
+    let path_idx = find_header_index(&headers, &["filename", "file name", "filepath", "file path", "pathname", "path"]);
+    let op_idx = find_header_index(&headers, &["opcode", "opcode name", "task", "task name", "eventname", "event name", "operation"]);
+
+    let pid_set = tracked_pids.iter().copied().collect::<HashSet<u32>>();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let row = parse_csv_line(trimmed);
+        let Some(pid_index) = pid_idx else {
+            continue;
+        };
+        let Some(pid_value) = row.get(pid_index) else {
+            continue;
+        };
+        let Some(pid) = parse_u32(pid_value) else {
+            continue;
+        };
+        if !pid_set.is_empty() && !pid_set.contains(&pid) {
+            continue;
+        }
+
+        let op_text = op_idx
+            .and_then(|idx| row.get(idx))
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        let is_write_like = op_text.is_empty()
+            || op_text.contains("write")
+            || op_text.contains("create")
+            || op_text.contains("setinfo")
+            || op_text.contains("rename");
+        if !is_write_like {
+            continue;
+        }
+
+        let extracted = path_idx
+            .and_then(|idx| row.get(idx).cloned())
+            .or_else(|| row.iter().find_map(|cell| extract_windows_path(cell)));
+        let Some(path) = extracted else {
+            continue;
+        };
+        let normalized = normalize_windows_path(&path);
+        if !normalized.is_empty() && !should_ignore_candidate_path(Path::new(&normalized)) {
+            files.insert(normalized);
+        }
+    }
+
+    Ok(files)
+}
+
+fn extract_windows_path(text: &str) -> Option<String> {
+    let chars = text.chars().collect::<Vec<_>>();
+    for i in 0..chars.len().saturating_sub(2) {
+        if chars[i].is_ascii_alphabetic() && chars[i + 1] == ':' && chars[i + 2] == '\\' {
+            let mut end = i + 3;
+            while end < chars.len() {
+                let c = chars[end];
+                if c == '"' || c == ',' {
+                    break;
+                }
+                end += 1;
+            }
+            let path = chars[i..end].iter().collect::<String>();
+            if path.len() > 4 {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn normalize_windows_path(path: &str) -> String {
+    path.replace('/', "\\").to_ascii_lowercase()
+}
+
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                if in_quotes && chars.peek().is_some_and(|next| *next == '"') {
+                    current.push('"');
+                    let _ = chars.next();
+                } else {
+                    in_quotes = !in_quotes;
+                }
+            }
+            ',' if !in_quotes => {
+                output.push(current.trim().trim_matches('"').to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    output.push(current.trim().trim_matches('"').to_string());
+    output
+}
+
+fn find_header_index(headers: &[String], keywords: &[&str]) -> Option<usize> {
+    headers.iter().position(|header| {
+        let normalized = header
+            .to_ascii_lowercase()
+            .replace(' ', "")
+            .replace('_', "");
+        keywords.iter().any(|keyword| {
+            let key = keyword
+                .to_ascii_lowercase()
+                .replace(' ', "")
+                .replace('_', "");
+            normalized == key || normalized.contains(&key)
+        })
+    })
+}
+
+fn parse_u32(text: &str) -> Option<u32> {
+    let digits = text
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<u32>().ok()
+    }
+}
+
+fn decode_text_bytes(raw: &[u8]) -> String {
+    if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8_lossy(&raw[3..]).to_string();
+    }
+    if raw.starts_with(&[0xFF, 0xFE]) {
+        let mut units = Vec::new();
+        let mut i = 2;
+        while i + 1 < raw.len() {
+            units.push(u16::from_le_bytes([raw[i], raw[i + 1]]));
+            i += 2;
+        }
+        return String::from_utf16_lossy(&units);
+    }
+    if raw.starts_with(&[0xFE, 0xFF]) {
+        let mut units = Vec::new();
+        let mut i = 2;
+        while i + 1 < raw.len() {
+            units.push(u16::from_be_bytes([raw[i], raw[i + 1]]));
+            i += 2;
+        }
+        return String::from_utf16_lossy(&units);
+    }
+
+    if let Ok(text) = String::from_utf8(raw.to_vec()) {
+        return text;
+    }
+
+    if raw.len() >= 2 {
+        let mut units = Vec::new();
+        let mut i = 0;
+        while i + 1 < raw.len() {
+            units.push(u16::from_le_bytes([raw[i], raw[i + 1]]));
+            i += 2;
+        }
+        let utf16 = String::from_utf16_lossy(&units);
+        if utf16.chars().any(|ch| ch == ',' || ch == '\n') {
+            return utf16;
+        }
+    }
+
+    String::from_utf8_lossy(raw).to_string()
+}
+
+fn should_ignore_candidate_path(path: &Path) -> bool {
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    if lower.contains(APP_IDENTIFIER) {
+        return true;
+    }
+    NOISE_PATH_FRAGMENTS
+        .iter()
+        .any(|fragment| lower.contains(fragment))
+}
+
+fn matches_path_keyword(lower_parent: &str, game_id_lower: &str) -> bool {
+    let normalized = lower_parent.replace('/', "\\");
+    let segments = normalized
+        .split(|ch: char| ch == '\\' || ch == '_' || ch == '-' || ch == '.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    let keyword_hit = segments.iter().any(|segment| {
+        PATH_KEYWORDS
+            .iter()
+            .any(|keyword| *segment == *keyword || segment.starts_with(keyword))
+    });
+
+    if keyword_hit {
+        return true;
+    }
+
+    if game_id_lower.is_empty() {
+        return false;
+    }
+
+    let compact_game_id = game_id_lower.replace(['-', '_', ' '], "");
+    segments
+        .iter()
+        .any(|segment| segment.contains(game_id_lower) || segment.contains(&compact_game_id))
+}
+
+fn store_file_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("解析 app_data 目录失败: {err}"))?;
+    fs::create_dir_all(&base).map_err(|err| format!("创建 app_data 目录失败: {err}"))?;
+    Ok(base.join("store.json"))
+}
+
+fn store_backup_file_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(store_file_path(app)?.with_extension("json.bak"))
+}
+
+fn snapshots_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("解析 snapshots 目录失败: {err}"))?
+        .join("snapshots");
+    fs::create_dir_all(&base).map_err(|err| format!("创建 snapshots 目录失败: {err}"))?;
+    Ok(base)
+}
+
+fn event_logs_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("解析 events 目录失败: {err}"))?
+        .join("events");
+    fs::create_dir_all(&base).map_err(|err| format!("创建 events 目录失败: {err}"))?;
+    Ok(base)
+}
+
+fn write_snapshot(app: &AppHandle, snapshot_ref: &str, snapshot: &Snapshot) -> Result<(), String> {
+    let path = snapshots_dir(app)?.join(snapshot_ref);
+    let content = serde_json::to_string(snapshot).map_err(|err| format!("序列化快照失败: {err}"))?;
+    fs::write(path, content).map_err(|err| format!("写入快照失败: {err}"))
+}
+
+fn read_snapshot(app: &AppHandle, snapshot_ref: &str) -> Result<Snapshot, String> {
+    let path = snapshots_dir(app)?.join(snapshot_ref);
+    let content = fs::read_to_string(path).map_err(|err| format!("读取快照失败: {err}"))?;
+    serde_json::from_str(&content).map_err(|err| format!("反序列化快照失败: {err}"))
+}
+
+fn load_store(app: &AppHandle) -> Result<PersistedStore, String> {
+    let path = store_file_path(app)?;
+    if !path.exists() {
+        return Ok(PersistedStore::default());
+    }
+    let raw = fs::read(&path).map_err(|err| format!("读取 store 失败: {err}"))?;
+    let content = decode_text_bytes(&raw);
+    let parsed = serde_json::from_str::<PersistedStore>(&content);
+    match parsed {
+        Ok(mut store) => {
+            normalize_store(&mut store);
+            Ok(store)
+        }
+        Err(primary_err) => {
+            let backup = store_backup_file_path(app)?;
+            if backup.exists() {
+                let backup_raw = fs::read(&backup).map_err(|err| format!("读取 store 备份失败: {err}"))?;
+                let backup_content = decode_text_bytes(&backup_raw);
+                if let Ok(mut store) = serde_json::from_str::<PersistedStore>(&backup_content) {
+                    normalize_store(&mut store);
+                    return Ok(store);
+                }
+            }
+            Err(format!("解析 store 失败: {primary_err}"))
+        }
+    }
+}
+
+fn persist_store(app: &AppHandle, store: &PersistedStore) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(store).map_err(|err| format!("序列化 store 失败: {err}"))?;
+    let path = store_file_path(app)?;
+    let backup = store_backup_file_path(app)?;
+    if path.exists() {
+        let _ = fs::copy(&path, &backup);
+    }
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, content).map_err(|err| format!("写入临时 store 失败: {err}"))?;
+    if path.exists() {
+        fs::remove_file(&path).map_err(|err| format!("替换 store 前删除旧文件失败: {err}"))?;
+    }
+    fs::rename(&temp_path, &path).map_err(|err| format!("替换 store 失败: {err}"))
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn normalize_store(store: &mut PersistedStore) {
+    let current = store.execution_config.managed_save_root.trim().to_string();
+    if current.is_empty() || current.eq_ignore_ascii_case(&legacy_managed_save_root()) {
+        store.execution_config.managed_save_root = default_managed_save_root();
+    }
+    if store.execution_config.sandbox_root.trim().is_empty() {
+        store.execution_config.sandbox_root = default_sandbox_root();
+    }
+    if store.execution_config.sandboxie_start_exe.trim().is_empty() {
+        store.execution_config.sandboxie_start_exe = default_sandboxie_start_exe();
+    }
+    if store.execution_config.backup_root.trim().is_empty() {
+        store.execution_config.backup_root = default_backup_root();
+    }
+    let mut migration_candidates: HashMap<String, (u64, String, String)> = HashMap::new();
+    let mut valid_uids_by_game: HashMap<String, HashSet<String>> = HashMap::new();
+    for rule in &mut store.rules {
+        let normalized_uid = normalize_game_uid(&rule.game_uid);
+        if normalized_uid.is_empty() {
+            rule.game_uid = new_game_uid();
+        } else {
+            rule.game_uid = normalized_uid;
+        }
+        rule.confirmed_paths = normalize_paths(rule.confirmed_paths.clone());
+        if rule.updated_at.trim().is_empty() {
+            rule.updated_at = rule.created_at.clone();
+        }
+        let game_key = normalize_game_key(&rule.game_id);
+        if !game_key.is_empty() {
+            let ts = rule_updated_ts(rule);
+            let uid = rule.game_uid.clone();
+            let game_id = rule.game_id.clone();
+            valid_uids_by_game
+                .entry(game_key.clone())
+                .or_default()
+                .insert(uid.clone());
+            let should_replace = migration_candidates
+                .get(&game_key)
+                .is_none_or(|(current_ts, _, _)| ts >= *current_ts);
+            if should_replace {
+                migration_candidates.insert(game_key, (ts, uid, game_id));
+            }
+        }
+    }
+    let mut game_key_uid_map: HashMap<String, String> = HashMap::new();
+    for (game_key, (_ts, uid, _game_id)) in &migration_candidates {
+        game_key_uid_map.insert(game_key.clone(), normalize_game_uid(uid));
+    }
+
+    let mut normalized_preferred_exe_by_uid: HashMap<String, String> = HashMap::new();
+    for (uid_key, exe_path) in store.execution_config.preferred_exe_by_uid.clone() {
+        let normalized_uid = normalize_game_uid(&uid_key);
+        let trimmed_exe = exe_path.trim();
+        if normalized_uid.is_empty() || trimmed_exe.is_empty() {
+            continue;
+        }
+        normalized_preferred_exe_by_uid.insert(normalized_uid, trimmed_exe.to_string());
+    }
+    for (game_key, exe_path) in store.execution_config.preferred_exe_by_game_legacy.clone() {
+        let normalized_game_key = normalize_game_key(&game_key);
+        let trimmed_exe = exe_path.trim();
+        if normalized_game_key.is_empty() || trimmed_exe.is_empty() {
+            continue;
+        }
+        if let Some(uid) = game_key_uid_map.get(&normalized_game_key) {
+            normalized_preferred_exe_by_uid
+                .entry(uid.clone())
+                .or_insert_with(|| trimmed_exe.to_string());
+        }
+    }
+    store.execution_config.preferred_exe_by_uid = normalized_preferred_exe_by_uid;
+    store.execution_config.preferred_exe_by_game_legacy = HashMap::new();
+
+    let mut normalized_preferred_rule_uid_by_game: HashMap<String, String> = HashMap::new();
+    for (game_key, uid) in store.execution_config.preferred_rule_uid_by_game.clone() {
+        let normalized_game_key = normalize_game_key(&game_key);
+        let normalized_uid = normalize_game_uid(&uid);
+        if normalized_game_key.is_empty() || normalized_uid.is_empty() {
+            continue;
+        }
+        if valid_uids_by_game
+            .get(&normalized_game_key)
+            .is_some_and(|uids| uids.contains(&normalized_uid))
+        {
+            normalized_preferred_rule_uid_by_game.insert(normalized_game_key, normalized_uid);
+        }
+    }
+    store.execution_config.preferred_rule_uid_by_game = normalized_preferred_rule_uid_by_game;
+
+    let game_keys = valid_uids_by_game.keys().cloned().collect::<Vec<_>>();
+    for game_key in game_keys {
+        let selected_uid = select_rule_for_game(store, &game_key).map(|rule| normalize_game_uid(&rule.game_uid));
+        if let Some(uid) = selected_uid {
+            if !uid.is_empty() {
+                store
+                    .execution_config
+                    .preferred_rule_uid_by_game
+                    .insert(game_key, uid);
+            }
+        }
+    }
+
+    let rule_uid_by_id: HashMap<String, String> = store
+        .rules
+        .iter()
+        .map(|rule| (rule.rule_id.clone(), rule.game_uid.clone()))
+        .collect();
+    for session in &mut store.launcher_sessions {
+        if session.launch_mode.trim().is_empty() {
+            session.launch_mode = "backup".to_string();
+        }
+        if session.updated_at.trim().is_empty() {
+            session.updated_at = session.started_at.clone();
+        }
+        if session.matched_game_uid.as_deref().unwrap_or("").trim().is_empty() {
+            if let Some(rule_id) = session.matched_rule_id.as_ref() {
+                if let Some(game_uid) = rule_uid_by_id.get(rule_id) {
+                    session.matched_game_uid = Some(game_uid.clone());
+                }
+            }
+        }
+    }
+    store.rules.retain(|rule| {
+        !rule.game_id.trim().is_empty()
+            && !rule.game_uid.trim().is_empty()
+            && !rule.exe_hash.trim().is_empty()
+            && !rule.confirmed_paths.is_empty()
+    });
+}
+
+fn default_execution_config() -> ExecutionConfig {
+    ExecutionConfig {
+        managed_save_root: default_managed_save_root(),
+        backup_root: default_backup_root(),
+        block_on_inject_fail: true,
+        sandbox_root: default_sandbox_root(),
+        sandboxie_start_exe: default_sandboxie_start_exe(),
+        preferred_exe_by_uid: HashMap::new(),
+        preferred_rule_uid_by_game: HashMap::new(),
+        preferred_exe_by_game_legacy: HashMap::new(),
+    }
+}
+
+fn default_managed_save_root() -> String {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|v| v.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    exe_dir
+        .join("GameSaverSaves")
+        .to_string_lossy()
+        .to_string()
+}
+
+fn legacy_managed_save_root() -> String {
+    let profile = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string());
+    Path::new(&profile)
+        .join("Saved Games")
+        .join("GameSaver")
+        .to_string_lossy()
+        .to_string()
+}
+
+fn default_backup_root() -> String {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|v| v.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    exe_dir
+        .join("GameSaverBackups")
+        .to_string_lossy()
+        .to_string()
+}
+
+fn default_sandbox_root() -> String {
+    "C:\\Sandbox".to_string()
+}
+
+fn default_sandboxie_start_exe() -> String {
+    "C:\\Program Files\\Sandboxie-Plus\\Start.exe".to_string()
+}
+
+fn now_unix() -> u64 {
+    system_time_to_unix(SystemTime::now()).unwrap_or_default()
+}
+
+fn system_time_to_unix(value: SystemTime) -> Option<u64> {
+    value.duration_since(UNIX_EPOCH).ok().map(|duration| duration.as_secs())
+}
+
+fn now_iso_string() -> String {
+    now_unix().to_string()
+}
+
+fn apply_background_process_flags(command: &mut Command) -> &mut Command {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+fn iso_to_unix(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok()
+}
+
+fn file_sha256_hex(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|err| format!("读取 exe 失败: {err}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|err| format!("读取 exe 内容失败: {err}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .manage(AppState {
+            store: Mutex::new(PersistedStore::default()),
+        })
+        .setup(|app| {
+            let loaded = match load_store(app.handle()) {
+                Ok(store) => store,
+                Err(err) => {
+                    eprintln!("[GameSaver] load_store failed, using default store: {err}");
+                    PersistedStore::default()
+                }
+            };
+            let state: State<AppState> = app.state();
+            if let Ok(mut guard) = state.store.lock() {
+                *guard = loaded;
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            start_learning,
+            launch_game,
+            finish_learning,
+            confirm_rule,
+            list_rules,
+            update_rule,
+            delete_rule,
+            export_rules,
+            import_rules,
+            export_migration_zip,
+            import_migration_zip,
+            open_candidate_path,
+            resolve_rule_for_exe,
+            launch_with_rule,
+            launch_game_from_library,
+            get_launcher_session,
+            list_launcher_sessions,
+            list_game_library_items,
+            set_preferred_exe_path,
+            get_redirect_runtime_info,
+            sync_sandbox_session,
+            list_backup_versions,
+            restore_backup_version,
+            get_learning_session,
+            get_runtime_status,
+            restart_as_admin
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
