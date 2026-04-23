@@ -104,6 +104,25 @@ export interface BackupVersion {
   fileCount: number;
 }
 
+export interface BackupStatsResult {
+  gameId: string;
+  gameUid: string;
+  totalBytes: number;
+  versionCount: number;
+  latestVersionId?: string;
+  keepVersions: number;
+}
+
+export interface PruneBackupResult {
+  gameId: string;
+  gameUid: string;
+  keepVersions: number;
+  deletedVersions: number;
+  freedBytes: number;
+  remainingVersions: number;
+  remainingBytes: number;
+}
+
 export interface RestoreBackupResult {
   gameId: string;
   versionId: string;
@@ -118,6 +137,14 @@ export interface ImportRulesResult {
   imported: number;
   overwritten: number;
   skipped: number;
+}
+
+export interface RuleConflictItem {
+  exeHash: string;
+  ruleIds: string[];
+  gameIds: string[];
+  primaryRuleId?: string;
+  conflictCount: number;
 }
 
 export interface ExportMigrationZipResult {

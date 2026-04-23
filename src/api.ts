@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  BackupStatsResult,
   BackupVersion,
   GameLaunchPrecheck,
   ExportMigrationZipResult,
@@ -12,7 +13,9 @@ import type {
   LauncherSession,
   LearningSession,
   LauncherMode,
+  RuleConflictItem,
   RedirectRuntimeInfo,
+  PruneBackupResult,
   RestoreBackupResult,
   ResolveRuleResult,
   RuntimeStatus,
@@ -38,12 +41,21 @@ export async function listRules(): Promise<GameSaveRule[]> {
   return invoke("list_rules");
 }
 
+export async function listRuleConflicts(): Promise<RuleConflictItem[]> {
+  return invoke("list_rule_conflicts");
+}
+
+export async function setPrimaryRule(ruleId: string): Promise<GameSaveRule> {
+  return invoke("set_primary_rule", { ruleId });
+}
+
 export async function updateRule(
   ruleId: string,
+  gameId: string,
   confirmedPaths: string[],
   enabled: boolean,
 ): Promise<GameSaveRule> {
-  return invoke("update_rule", { ruleId, confirmedPaths, enabled });
+  return invoke("update_rule", { ruleId, gameId, confirmedPaths, enabled });
 }
 
 export async function deleteRule(ruleId: string): Promise<void> {
@@ -127,6 +139,21 @@ export async function syncSandboxSession(launcherSessionId: string): Promise<Lau
 
 export async function listBackupVersions(gameId: string): Promise<BackupVersion[]> {
   return invoke("list_backup_versions", { gameId });
+}
+
+export async function getBackupStats(gameId: string): Promise<BackupStatsResult> {
+  return invoke("get_backup_stats", { gameId });
+}
+
+export async function setBackupKeepVersions(gameId: string, keepVersions: number): Promise<BackupStatsResult> {
+  return invoke("set_backup_keep_versions", { gameId, keepVersions });
+}
+
+export async function pruneBackupVersions(
+  gameId: string,
+  keepVersions?: number,
+): Promise<PruneBackupResult> {
+  return invoke("prune_backup_versions", { gameId, keepVersions });
 }
 
 export async function restoreBackupVersion(

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
   confirmRule,
   deleteRule,
@@ -7,6 +7,7 @@ import {
   exportRules,
   finishLearning,
   getLauncherSession,
+  getBackupStats,
   getLearningSession,
   precheckGameLaunch,
   getRedirectRuntimeInfo,
@@ -15,17 +16,22 @@ import {
   importMigrationZip,
   launchGame,
   launchGameFromLibrary,
+  listRuleConflicts,
   listBackupVersions,
   listGameLibraryItems,
+  pruneBackupVersions,
   listRules,
   openCandidatePath,
   restartAsAdmin,
   restoreBackupVersion,
+  setPrimaryRule,
+  setBackupKeepVersions,
   setPreferredExePath,
   startLearning,
   updateRule,
 } from "./api";
 import type {
+  BackupStatsResult,
   BackupVersion,
   CandidatePath,
   GameLibraryItem,
@@ -34,18 +40,38 @@ import type {
   LauncherMode,
   LauncherSession,
   RedirectRuntimeInfo,
+  RuleConflictItem,
 } from "./types";
 
 type UiStep = "setup" | "running" | "results";
 type TopTab = "learning" | "rules" | "library";
 type RuleDraft = {
+  gameIdText: string;
   confirmedPathsText: string;
   enabled: boolean;
 };
 type TabState = {
   loading: boolean;
-  info: string;
   error: string;
+};
+type CardAction =
+  | "bind_exe"
+  | "precheck"
+  | "launch"
+  | "backup_stats"
+  | "backup_policy_save"
+  | "backup_prune"
+  | "backup_versions"
+  | "backup_rollback"
+  | "session_logs";
+type ToastLevel = "success" | "error" | "info";
+type ConfirmDialogState = {
+  open: boolean;
+  title: string;
+  message: string;
+  confirmText: string;
+  cancelText: string;
+  danger: boolean;
 };
 
 const step = ref<UiStep>("setup");
@@ -57,11 +83,12 @@ const pid = ref<number | null>(null);
 const candidates = ref<CandidatePath[]>([]);
 const selected = ref<string[]>([]);
 const rules = ref<GameSaveRule[]>([]);
+const ruleConflicts = ref<RuleConflictItem[]>([]);
 const ruleSearch = ref("");
 const ruleDrafts = ref<Record<string, RuleDraft>>({});
-const learningState = ref<TabState>({ loading: false, info: "", error: "" });
-const rulesState = ref<TabState>({ loading: false, info: "", error: "" });
-const libraryState = ref<TabState>({ loading: false, info: "", error: "" });
+const learningState = ref<TabState>({ loading: false, error: "" });
+const rulesState = ref<TabState>({ loading: false, error: "" });
+const libraryState = ref<TabState>({ loading: false, error: "" });
 const migrationExportWaiting = ref(false);
 const eventCaptureMode = ref("unknown");
 const capturedEventCount = ref(0);
@@ -71,12 +98,32 @@ const runtimeMessage = ref("");
 const redirectRuntimeInfo = ref<RedirectRuntimeInfo | null>(null);
 const libraryItems = ref<GameLibraryItem[]>([]);
 const librarySearch = ref("");
-const cardLoading = ref<Record<string, boolean>>({});
+const cardLoading = ref<Record<string, Partial<Record<CardAction, boolean>>>>({});
+const libraryCardErrors = ref<Record<string, string>>({});
 const expandedGames = ref<Record<string, boolean>>({});
 const backupVersionsByGame = ref<Record<string, BackupVersion[]>>({});
+const backupStatsByGame = ref<Record<string, BackupStatsResult | null>>({});
+const backupKeepDraftByGame = ref<Record<string, string>>({});
 const sessionDetailsByGame = ref<Record<string, LauncherSession | null>>({});
 const launchPrecheckByGame = ref<Record<string, GameLaunchPrecheck | null>>({});
 const hiddenPrecheckKeys = new Set(["sandbox_runtime", "inject_artifacts", "inject_arch"]);
+const toast = ref<{ visible: boolean; message: string; level: ToastLevel }>({
+  visible: false,
+  message: "",
+  level: "info",
+});
+const confirmDialog = ref<ConfirmDialogState>({
+  open: false,
+  title: "",
+  message: "",
+  confirmText: "确认",
+  cancelText: "取消",
+  danger: false,
+});
+const blockingErrorMessage = ref("");
+
+let toastTimer: ReturnType<typeof setTimeout> | null = null;
+let confirmResolver: ((value: boolean) => void) | null = null;
 
 const hasHighConfidence = computed(() => candidates.value.some((item) => item.score >= 45));
 const filteredRules = computed(() => {
@@ -88,6 +135,15 @@ const filteredLibraryItems = computed(() => {
   const keyword = librarySearch.value.trim().toLowerCase();
   if (!keyword) return libraryItems.value;
   return libraryItems.value.filter((item) => item.gameId.toLowerCase().includes(keyword));
+});
+const ruleConflictByRuleId = computed<Record<string, RuleConflictItem>>(() => {
+  const map: Record<string, RuleConflictItem> = {};
+  for (const conflict of ruleConflicts.value) {
+    for (const ruleId of conflict.ruleIds) {
+      map[ruleId] = conflict;
+    }
+  }
+  return map;
 });
 
 function inferGameId(path: string): string {
@@ -104,16 +160,64 @@ function cardKey(gameIdText: string): string {
   return normalizeGameId(gameIdText);
 }
 
-function isCardBusy(gameIdText: string): boolean {
-  return cardLoading.value[cardKey(gameIdText)] === true;
+function isCardBusy(gameIdText: string, action?: CardAction): boolean {
+  const loadingMap = cardLoading.value[cardKey(gameIdText)];
+  if (!loadingMap) return false;
+  if (action) {
+    return loadingMap[action] === true;
+  }
+  return Object.values(loadingMap).some((value) => value === true);
 }
 
-function setCardBusy(gameIdText: string, busy: boolean) {
+function setCardBusy(gameIdText: string, action: CardAction, busy: boolean) {
   const key = cardKey(gameIdText);
+  const current = cardLoading.value[key] ?? {};
+  if (busy) {
+    cardLoading.value = {
+      ...cardLoading.value,
+      [key]: {
+        ...current,
+        [action]: true,
+      },
+    };
+    return;
+  }
+  const nextActions = { ...current };
+  delete nextActions[action];
+  if (!Object.keys(nextActions).length) {
+    const next = { ...cardLoading.value };
+    delete next[key];
+    cardLoading.value = next;
+    return;
+  }
   cardLoading.value = {
     ...cardLoading.value,
-    [key]: busy,
+    [key]: nextActions,
   };
+}
+
+function setLibraryCardError(gameIdText: string, message: string) {
+  const key = cardKey(gameIdText);
+  libraryCardErrors.value = {
+    ...libraryCardErrors.value,
+    [key]: message,
+  };
+}
+
+function clearLibraryCardError(gameIdText: string) {
+  const key = cardKey(gameIdText);
+  if (!(key in libraryCardErrors.value)) return;
+  const next = { ...libraryCardErrors.value };
+  delete next[key];
+  libraryCardErrors.value = next;
+}
+
+function clearAllLibraryCardErrors() {
+  libraryCardErrors.value = {};
+}
+
+function libraryCardErrorFor(gameIdText: string): string {
+  return libraryCardErrors.value[cardKey(gameIdText)] ?? "";
 }
 
 function isGameExpanded(gameIdText: string): boolean {
@@ -153,6 +257,9 @@ function normalizePaths(rawText: string): string[] {
 function hasRuleDraftChanges(rule: GameSaveRule): boolean {
   const draft = ruleDrafts.value[rule.ruleId];
   if (!draft) return false;
+  if (draft.gameIdText.trim() !== rule.gameId) {
+    return true;
+  }
   const draftPaths = normalizePaths(draft.confirmedPathsText);
   const savedPaths = rule.confirmedPaths;
   if (draft.enabled !== rule.enabled) {
@@ -162,6 +269,20 @@ function hasRuleDraftChanges(rule: GameSaveRule): boolean {
     return true;
   }
   return draftPaths.some((path, index) => path !== savedPaths[index]);
+}
+
+function ruleConflictFor(ruleId: string): RuleConflictItem | null {
+  return ruleConflictByRuleId.value[ruleId] ?? null;
+}
+
+function isPrimaryConflictRule(ruleId: string): boolean {
+  const conflict = ruleConflictFor(ruleId);
+  return !!conflict && conflict.primaryRuleId === ruleId;
+}
+
+function shortExeHash(exeHash: string): string {
+  if (exeHash.length <= 16) return exeHash;
+  return `${exeHash.slice(0, 8)}...${exeHash.slice(-8)}`;
 }
 
 function formatUnixTs(value: string): string {
@@ -181,6 +302,7 @@ function hydrateRuleDrafts() {
   for (const rule of rules.value) {
     const previous = ruleDrafts.value[rule.ruleId];
     next[rule.ruleId] = {
+      gameIdText: previous?.gameIdText ?? rule.gameId,
       confirmedPathsText: previous?.confirmedPathsText ?? rule.confirmedPaths.join("\n"),
       enabled: previous?.enabled ?? rule.enabled,
     };
@@ -208,6 +330,33 @@ function backupVersionsFor(gameIdText: string): BackupVersion[] {
   return backupVersionsByGame.value[cardKey(gameIdText)] ?? [];
 }
 
+function backupStatsFor(gameIdText: string): BackupStatsResult | null {
+  return backupStatsByGame.value[cardKey(gameIdText)] ?? null;
+}
+
+function backupKeepDraftFor(gameIdText: string): string {
+  const key = cardKey(gameIdText);
+  const draft = backupKeepDraftByGame.value[key];
+  if (typeof draft === "string") {
+    return draft;
+  }
+  const stats = backupStatsFor(gameIdText);
+  return String(stats?.keepVersions ?? 10);
+}
+
+function updateBackupKeepDraft(gameIdText: string, value: string) {
+  const key = cardKey(gameIdText);
+  backupKeepDraftByGame.value = {
+    ...backupKeepDraftByGame.value,
+    [key]: value,
+  };
+}
+
+function onBackupKeepInput(gameIdText: string, event: Event) {
+  const target = event.target as HTMLInputElement | null;
+  updateBackupKeepDraft(gameIdText, target?.value ?? "");
+}
+
 function sessionDetailsFor(gameIdText: string): LauncherSession | null {
   return sessionDetailsByGame.value[cardKey(gameIdText)] ?? null;
 }
@@ -220,6 +369,96 @@ function visiblePrecheckChecks(gameIdText: string) {
   const precheck = launchPrecheckFor(gameIdText);
   if (!precheck) return [];
   return precheck.checks.filter((check) => !hiddenPrecheckKeys.has(check.key));
+}
+
+function formatBytes(totalBytes: number): string {
+  if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = totalBytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const precision = value >= 100 || unitIndex === 0 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(precision)} ${units[unitIndex]}`;
+}
+
+function parseBackupKeepDraft(gameIdText: string): number | null {
+  const raw = backupKeepDraftFor(gameIdText).trim();
+  if (!raw) return null;
+  if (!/^\d+$/.test(raw)) {
+    return null;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return null;
+  }
+  return Math.min(Math.trunc(parsed), 200);
+}
+
+function showToast(message: string, level: ToastLevel = "info", timeoutMs = 2600) {
+  if (toastTimer) {
+    clearTimeout(toastTimer);
+    toastTimer = null;
+  }
+  toast.value = {
+    visible: true,
+    message,
+    level,
+  };
+  toastTimer = setTimeout(() => {
+    toast.value.visible = false;
+    toastTimer = null;
+  }, timeoutMs);
+}
+
+function closeToast() {
+  if (toastTimer) {
+    clearTimeout(toastTimer);
+    toastTimer = null;
+  }
+  toast.value.visible = false;
+}
+
+function showBlockingError(message: string) {
+  blockingErrorMessage.value = message;
+  showToast("操作失败，请查看错误详情", "error", 3200);
+}
+
+function closeBlockingError() {
+  blockingErrorMessage.value = "";
+}
+
+function askConfirm(options: {
+  title: string;
+  message: string;
+  confirmText?: string;
+  cancelText?: string;
+  danger?: boolean;
+}) {
+  return new Promise<boolean>((resolve) => {
+    confirmResolver = resolve;
+    confirmDialog.value = {
+      open: true,
+      title: options.title,
+      message: options.message,
+      confirmText: options.confirmText ?? "确认",
+      cancelText: options.cancelText ?? "取消",
+      danger: options.danger ?? false,
+    };
+  });
+}
+
+function resolveConfirm(result: boolean) {
+  const resolver = confirmResolver;
+  confirmResolver = null;
+  confirmDialog.value.open = false;
+  if (resolver) {
+    resolver(result);
+  }
 }
 
 async function chooseExePath() {
@@ -242,7 +481,6 @@ async function chooseExePath() {
 async function beginLearning() {
   learningState.value.loading = true;
   learningState.value.error = "";
-  learningState.value.info = "";
   try {
     const trimmedGameId = gameId.value.trim();
     const trimmedExePath = exePath.value.trim();
@@ -252,7 +490,6 @@ async function beginLearning() {
     sessionId.value = await startLearning(trimmedGameId, trimmedExePath);
     pid.value = await launchGame(sessionId.value);
     step.value = "running";
-    learningState.value.info = "学习会话已开始，请在游戏中执行一次存档后退出游戏。";
   } catch (err) {
     learningState.value.error = String(err);
   } finally {
@@ -263,7 +500,6 @@ async function beginLearning() {
 async function endLearning() {
   learningState.value.loading = true;
   learningState.value.error = "";
-  learningState.value.info = "";
   try {
     candidates.value = await finishLearning(sessionId.value);
     const session = await getLearningSession(sessionId.value);
@@ -284,7 +520,7 @@ async function endLearning() {
     selected.value = merged.slice(0, 2).map((item) => item.path);
     step.value = "results";
     if (!hasHighConfidence.value) {
-      learningState.value.info = "未检测到高可信候选，请确认是否在学习期间执行了存档动作。";
+      showToast("未检测到高可信候选，请确认学习阶段已执行存档动作", "info", 3600);
     }
   } catch (err) {
     learningState.value.error = String(err);
@@ -300,22 +536,24 @@ async function saveLearningRule() {
   }
   learningState.value.loading = true;
   learningState.value.error = "";
-  learningState.value.info = "";
   try {
     const ruleId = await confirmRule(sessionId.value, selected.value);
-    learningState.value.info = `规则已保存，ruleId=${ruleId}`;
+    void ruleId;
+    showToast("规则保存成功", "success");
     await refreshRules();
     await refreshLibraryItems();
   } catch (err) {
     learningState.value.error = String(err);
+    showToast("规则保存失败", "error");
   } finally {
     learningState.value.loading = false;
   }
 }
 
 async function refreshRules() {
-  const data = await listRules();
+  const [data, conflicts] = await Promise.all([listRules(), listRuleConflicts()]);
   rules.value = sortRulesByUpdatedTime(data);
+  ruleConflicts.value = conflicts;
   hydrateRuleDrafts();
 }
 
@@ -327,10 +565,12 @@ async function refreshLibraryItems() {
 async function reloadLibraryWithLoading() {
   libraryState.value.loading = true;
   libraryState.value.error = "";
+  clearAllLibraryCardErrors();
   try {
     await refreshLibraryItems();
     await loadRedirectRuntimeInfo();
     void refreshLaunchPrechecksForLibraryItems();
+    void refreshBackupStatsForLibraryItems();
   } catch (err) {
     libraryState.value.error = `读取游戏库失败：${String(err)}`;
   } finally {
@@ -347,11 +587,22 @@ async function refreshLaunchPrechecksForLibraryItems() {
   await Promise.all(items.map((item) => loadLaunchPrecheckForGame(item.gameId, false)));
 }
 
+async function refreshBackupStatsForLibraryItems() {
+  const items = [...libraryItems.value];
+  if (!items.length) {
+    backupStatsByGame.value = {};
+    backupKeepDraftByGame.value = {};
+    return;
+  }
+  await Promise.all(items.map((item) => loadBackupStatsForGame(item.gameId, false)));
+}
+
 async function loadLaunchPrecheckForGame(gameIdText: string, withCardLoading = true) {
   const key = cardKey(gameIdText);
   if (withCardLoading) {
-    setCardBusy(gameIdText, true);
+    setCardBusy(gameIdText, "precheck", true);
   }
+  clearLibraryCardError(gameIdText);
   try {
     const precheck = await precheckGameLaunch(gameIdText);
     launchPrecheckByGame.value = {
@@ -359,14 +610,14 @@ async function loadLaunchPrecheckForGame(gameIdText: string, withCardLoading = t
       [key]: precheck,
     };
   } catch (err) {
-    libraryState.value.error = `读取启动前检查失败：${String(err)}`;
+    setLibraryCardError(gameIdText, `读取启动前检查失败：${String(err)}`);
     launchPrecheckByGame.value = {
       ...launchPrecheckByGame.value,
       [key]: null,
     };
   } finally {
     if (withCardLoading) {
-      setCardBusy(gameIdText, false);
+      setCardBusy(gameIdText, "precheck", false);
     }
   }
 }
@@ -378,18 +629,48 @@ async function loadRedirectRuntimeInfo() {
 async function loadBackupVersionsForGame(gameIdText: string, withCardLoading = true) {
   const key = cardKey(gameIdText);
   if (withCardLoading) {
-    setCardBusy(gameIdText, true);
+    setCardBusy(gameIdText, "backup_versions", true);
   }
+  clearLibraryCardError(gameIdText);
   try {
     backupVersionsByGame.value = {
       ...backupVersionsByGame.value,
       [key]: await listBackupVersions(gameIdText),
     };
   } catch (err) {
-    libraryState.value.error = `读取备份版本失败：${String(err)}`;
+    setLibraryCardError(gameIdText, `读取备份版本失败：${String(err)}`);
   } finally {
     if (withCardLoading) {
-      setCardBusy(gameIdText, false);
+      setCardBusy(gameIdText, "backup_versions", false);
+    }
+  }
+}
+
+async function loadBackupStatsForGame(gameIdText: string, withCardLoading = true) {
+  const key = cardKey(gameIdText);
+  if (withCardLoading) {
+    setCardBusy(gameIdText, "backup_stats", true);
+  }
+  clearLibraryCardError(gameIdText);
+  try {
+    const stats = await getBackupStats(gameIdText);
+    backupStatsByGame.value = {
+      ...backupStatsByGame.value,
+      [key]: stats,
+    };
+    backupKeepDraftByGame.value = {
+      ...backupKeepDraftByGame.value,
+      [key]: String(stats.keepVersions),
+    };
+  } catch (err) {
+    backupStatsByGame.value = {
+      ...backupStatsByGame.value,
+      [key]: null,
+    };
+    setLibraryCardError(gameIdText, `读取备份统计失败：${String(err)}`);
+  } finally {
+    if (withCardLoading) {
+      setCardBusy(gameIdText, "backup_stats", false);
     }
   }
 }
@@ -405,8 +686,9 @@ async function loadSessionDetailsForGame(gameIdText: string, withCardLoading = t
     return;
   }
   if (withCardLoading) {
-    setCardBusy(gameIdText, true);
+    setCardBusy(gameIdText, "session_logs", true);
   }
+  clearLibraryCardError(gameIdText);
   try {
     const detail = await getLauncherSession(item.lastSessionId);
     sessionDetailsByGame.value = {
@@ -414,10 +696,10 @@ async function loadSessionDetailsForGame(gameIdText: string, withCardLoading = t
       [key]: detail,
     };
   } catch (err) {
-    libraryState.value.error = `读取会话详情失败：${String(err)}`;
+    setLibraryCardError(gameIdText, `读取会话详情失败：${String(err)}`);
   } finally {
     if (withCardLoading) {
-      setCardBusy(gameIdText, false);
+      setCardBusy(gameIdText, "session_logs", false);
     }
   }
 }
@@ -430,39 +712,42 @@ async function choosePreferredExeForGame(gameIdText: string) {
       filters: [{ name: "Executable", extensions: ["exe"] }],
     });
     if (!chosen || Array.isArray(chosen)) return;
-    setCardBusy(gameIdText, true);
+    setCardBusy(gameIdText, "bind_exe", true);
     libraryState.value.error = "";
-    libraryState.value.info = "";
+    clearLibraryCardError(gameIdText);
     await setPreferredExePath(gameIdText, chosen);
     await refreshLibraryItems();
     await loadLaunchPrecheckForGame(gameIdText, false);
-    libraryState.value.info = `${gameIdText} 已更新启动 EXE`;
+    showToast(`${gameIdText} 启动 EXE 已更新`, "success");
   } catch (err) {
-    libraryState.value.error = `绑定 EXE 失败：${String(err)}`;
+    setLibraryCardError(gameIdText, `绑定 EXE 失败：${String(err)}`);
+    showToast("绑定 EXE 失败", "error");
   } finally {
-    setCardBusy(gameIdText, false);
+    setCardBusy(gameIdText, "bind_exe", false);
   }
 }
 
 async function launchLibraryGame(gameIdText: string, mode: LauncherMode = "backup") {
-  setCardBusy(gameIdText, true);
+  setCardBusy(gameIdText, "launch", true);
   libraryState.value.error = "";
-  libraryState.value.info = "";
+  clearLibraryCardError(gameIdText);
   try {
-    const session = await launchGameFromLibrary(gameIdText, mode);
+    await launchGameFromLibrary(gameIdText, mode);
     setGameExpanded(gameIdText, true);
     await refreshLibraryItems();
     await loadLaunchPrecheckForGame(gameIdText, false);
     await Promise.all([
+      loadBackupStatsForGame(gameIdText, false),
       loadBackupVersionsForGame(gameIdText, false),
       loadSessionDetailsForGame(gameIdText, false),
     ]);
-    libraryState.value.info = `${gameIdText} 已启动，PID=${session.pid ?? "未知"}，模式=${session.launchMode ?? mode}`;
+    showToast(`${gameIdText} 启动成功`, "success");
   } catch (err) {
-    libraryState.value.error = String(err);
+    setLibraryCardError(gameIdText, String(err));
+    showBlockingError(String(err));
     await refreshLibraryItems();
   } finally {
-    setCardBusy(gameIdText, false);
+    setCardBusy(gameIdText, "launch", false);
   }
 }
 
@@ -470,30 +755,96 @@ function toggleLibraryDetails(gameIdText: string) {
   const next = !isGameExpanded(gameIdText);
   setGameExpanded(gameIdText, next);
   if (next) {
+    void loadBackupStatsForGame(gameIdText, false);
     void loadBackupVersionsForGame(gameIdText, false);
     void loadSessionDetailsForGame(gameIdText, false);
   }
 }
 
 async function rollbackToLibraryBackupVersion(gameIdText: string, versionId: string) {
-  if (!window.confirm(`确定回滚 ${gameIdText} 到版本 ${versionId} 吗？`)) {
+  const confirmed = await askConfirm({
+    title: "确认回滚",
+    message: `确定回滚 ${gameIdText} 到版本 ${versionId} 吗？此操作会覆盖当前存档。`,
+    confirmText: "确认回滚",
+    cancelText: "取消",
+    danger: true,
+  });
+  if (!confirmed) {
     return;
   }
-  setCardBusy(gameIdText, true);
+  setCardBusy(gameIdText, "backup_rollback", true);
   libraryState.value.error = "";
-  libraryState.value.info = "";
+  clearLibraryCardError(gameIdText);
   try {
     const result = await restoreBackupVersion(gameIdText, versionId);
     await refreshLibraryItems();
     await Promise.all([
+      loadBackupStatsForGame(gameIdText, false),
       loadBackupVersionsForGame(gameIdText, false),
       loadSessionDetailsForGame(gameIdText, false),
     ]);
-    libraryState.value.info = `回滚完成：${result.gameId} @ ${result.versionId}，恢复文件 ${result.restoredFiles}`;
+    void result;
+    showToast("回滚完成", "success");
   } catch (err) {
-    libraryState.value.error = `回滚失败：${String(err)}`;
+    setLibraryCardError(gameIdText, `回滚失败：${String(err)}`);
+    showBlockingError(`回滚失败：${String(err)}`);
   } finally {
-    setCardBusy(gameIdText, false);
+    setCardBusy(gameIdText, "backup_rollback", false);
+  }
+}
+
+async function saveBackupKeepPolicy(gameIdText: string) {
+  const keep = parseBackupKeepDraft(gameIdText);
+  if (!keep) {
+    setLibraryCardError(gameIdText, "保留版本数必须是大于等于 1 的整数。");
+    showToast("请输入有效的保留版本数", "error");
+    return;
+  }
+  setCardBusy(gameIdText, "backup_policy_save", true);
+  libraryState.value.error = "";
+  clearLibraryCardError(gameIdText);
+  try {
+    const stats = await setBackupKeepVersions(gameIdText, keep);
+    backupStatsByGame.value = {
+      ...backupStatsByGame.value,
+      [cardKey(gameIdText)]: stats,
+    };
+    backupKeepDraftByGame.value = {
+      ...backupKeepDraftByGame.value,
+      [cardKey(gameIdText)]: String(stats.keepVersions),
+    };
+    showToast("备份保留策略已保存", "success");
+  } catch (err) {
+    setLibraryCardError(gameIdText, `保存备份策略失败：${String(err)}`);
+    showToast("保存备份策略失败", "error");
+  } finally {
+    setCardBusy(gameIdText, "backup_policy_save", false);
+  }
+}
+
+async function pruneOldBackupsForGame(gameIdText: string) {
+  const keep = parseBackupKeepDraft(gameIdText);
+  if (!keep) {
+    setLibraryCardError(gameIdText, "保留版本数必须是大于等于 1 的整数。");
+    showToast("请输入有效的保留版本数", "error");
+    return;
+  }
+  setCardBusy(gameIdText, "backup_prune", true);
+  libraryState.value.error = "";
+  clearLibraryCardError(gameIdText);
+  try {
+    const result = await pruneBackupVersions(gameIdText, keep);
+    await Promise.all([
+      loadBackupStatsForGame(gameIdText, false),
+      loadBackupVersionsForGame(gameIdText, false),
+    ]);
+    void result;
+    showToast("旧备份已清理", "success");
+  } catch (err) {
+    setLibraryCardError(gameIdText, `清理备份失败：${String(err)}`);
+    showToast("清理备份失败", "error");
+  } finally {
+    setCardBusy(gameIdText, "backup_prune", false);
   }
 }
 
@@ -509,9 +860,35 @@ async function reloadRulesWithLoading() {
   }
 }
 
+async function markPrimaryRule(rule: GameSaveRule) {
+  const conflict = ruleConflictFor(rule.ruleId);
+  if (!conflict) {
+    rulesState.value.error = "当前规则不存在 exeHash 冲突，无需设置主规则。";
+    return;
+  }
+  rulesState.value.loading = true;
+  rulesState.value.error = "";
+  try {
+    await setPrimaryRule(rule.ruleId);
+    await refreshRules();
+    await refreshLibraryItems();
+    showToast("主规则设置成功", "success");
+  } catch (err) {
+    rulesState.value.error = `设置主规则失败：${String(err)}`;
+    showToast("设置主规则失败", "error");
+  } finally {
+    rulesState.value.loading = false;
+  }
+}
+
 async function saveManagedRule(rule: GameSaveRule) {
   const draft = ruleDrafts.value[rule.ruleId];
   if (!draft) return;
+  const normalizedGameId = draft.gameIdText.trim();
+  if (!normalizedGameId) {
+    rulesState.value.error = "游戏名不能为空。";
+    return;
+  }
   const normalizedPaths = normalizePaths(draft.confirmedPathsText);
   if (!normalizedPaths.length) {
     rulesState.value.error = "路径不能为空，至少保留一条路径。";
@@ -520,42 +897,40 @@ async function saveManagedRule(rule: GameSaveRule) {
 
   rulesState.value.loading = true;
   rulesState.value.error = "";
-  rulesState.value.info = "";
   try {
-    const updated = await updateRule(rule.ruleId, normalizedPaths, draft.enabled);
-    rules.value = sortRulesByUpdatedTime(
-      rules.value.map((item) => (item.ruleId === updated.ruleId ? updated : item)),
-    );
-    ruleDrafts.value[updated.ruleId] = {
-      confirmedPathsText: updated.confirmedPaths.join("\n"),
-      enabled: updated.enabled,
-    };
-    rulesState.value.info = `规则 ${rule.gameId} 已更新`;
+    const updated = await updateRule(rule.ruleId, normalizedGameId, normalizedPaths, draft.enabled);
+    await refreshRules();
+    showToast(`规则 ${updated.gameId} 已保存`, "success");
     await refreshLibraryItems();
   } catch (err) {
     rulesState.value.error = `保存规则失败：${String(err)}`;
+    showToast("保存规则失败", "error");
   } finally {
     rulesState.value.loading = false;
   }
 }
 
 async function removeManagedRule(rule: GameSaveRule) {
-  if (!window.confirm(`确定删除规则 ${rule.gameId} 吗？此操作不可恢复。`)) {
+  const confirmed = await askConfirm({
+    title: "确认删除规则",
+    message: `确定删除规则 ${rule.gameId} 吗？此操作不可恢复。`,
+    confirmText: "删除",
+    cancelText: "取消",
+    danger: true,
+  });
+  if (!confirmed) {
     return;
   }
   rulesState.value.loading = true;
   rulesState.value.error = "";
-  rulesState.value.info = "";
   try {
     await deleteRule(rule.ruleId);
-    rules.value = rules.value.filter((item) => item.ruleId !== rule.ruleId);
-    const nextDrafts = { ...ruleDrafts.value };
-    delete nextDrafts[rule.ruleId];
-    ruleDrafts.value = nextDrafts;
-    rulesState.value.info = `规则 ${rule.gameId} 已删除`;
+    await refreshRules();
+    showToast(`规则 ${rule.gameId} 已删除`, "success");
     await refreshLibraryItems();
   } catch (err) {
     rulesState.value.error = `删除规则失败：${String(err)}`;
+    showToast("删除规则失败", "error");
   } finally {
     rulesState.value.loading = false;
   }
@@ -571,11 +946,12 @@ async function exportRulesToFile() {
     if (!chosen) return;
     rulesState.value.loading = true;
     rulesState.value.error = "";
-    rulesState.value.info = "";
     const result = await exportRules(chosen);
-    rulesState.value.info = `导出成功，共 ${result.count} 条规则`;
+    void result;
+    showToast("规则导出成功", "success");
   } catch (err) {
     rulesState.value.error = `导出失败：${String(err)}`;
+    showToast("规则导出失败", "error");
   } finally {
     rulesState.value.loading = false;
   }
@@ -591,13 +967,14 @@ async function importRulesFromFile() {
     if (!chosen || Array.isArray(chosen)) return;
     rulesState.value.loading = true;
     rulesState.value.error = "";
-    rulesState.value.info = "";
     const result = await importRules(chosen);
     await refreshRules();
     await refreshLibraryItems();
-    rulesState.value.info = `导入完成：新增 ${result.imported}，覆盖 ${result.overwritten}，跳过 ${result.skipped}`;
+    void result;
+    showToast("规则导入完成", "success");
   } catch (err) {
     rulesState.value.error = `导入失败：${String(err)}`;
+    showToast("规则导入失败", "error");
   } finally {
     rulesState.value.loading = false;
   }
@@ -613,14 +990,13 @@ async function exportMigrationZipToFile() {
     if (!chosen) return;
     rulesState.value.loading = true;
     rulesState.value.error = "";
-    rulesState.value.info = "";
     migrationExportWaiting.value = true;
     const result = await exportMigrationZip(chosen);
-    rulesState.value.info =
-      `迁移包导出成功：规则 ${result.ruleCount}，备份游戏 ${result.backupGames}，文件 ${result.exportedFiles}，` +
-      `跳过 ${result.skippedBackupGames}`;
+    void result;
+    showToast("迁移包导出成功", "success");
   } catch (err) {
     rulesState.value.error = `导出迁移包失败：${String(err)}`;
+    showToast("迁移包导出失败", "error");
   } finally {
     migrationExportWaiting.value = false;
     rulesState.value.loading = false;
@@ -637,15 +1013,14 @@ async function importMigrationZipFromFile() {
     if (!chosen || Array.isArray(chosen)) return;
     rulesState.value.loading = true;
     rulesState.value.error = "";
-    rulesState.value.info = "";
     const result = await importMigrationZip(chosen);
     await refreshRules();
     await refreshLibraryItems();
-    rulesState.value.info =
-      `迁移包导入完成：规则 新增 ${result.importedRules} / 覆盖 ${result.overwrittenRules} / 跳过 ${result.skippedRules}；` +
-      `备份游戏 ${result.importedBackupGames}，复制文件 ${result.copiedBackupFiles}，跳过 ${result.skippedBackupGames}`;
+    void result;
+    showToast("迁移包导入完成", "success");
   } catch (err) {
     rulesState.value.error = `导入迁移包失败：${String(err)}`;
+    showToast("迁移包导入失败", "error");
   } finally {
     rulesState.value.loading = false;
   }
@@ -683,6 +1058,14 @@ onMounted(() => {
   void loadRuntimeStatus();
   void reloadRulesWithLoading();
   void reloadLibraryWithLoading();
+});
+
+onUnmounted(() => {
+  if (toastTimer) {
+    clearTimeout(toastTimer);
+    toastTimer = null;
+  }
+  confirmResolver = null;
 });
 </script>
 
@@ -729,6 +1112,7 @@ onMounted(() => {
       <header class="panel">
         <h1>GameSaver 学习模式 MVP</h1>
         <p>流程：选择游戏 -> 开始学习 -> 游戏存档并退出 -> 结束学习 -> 确认规则</p>
+        <p v-if="learningState.error" class="error inline-error">{{ learningState.error }}</p>
       </header>
 
       <section v-if="step === 'setup'" class="panel">
@@ -822,6 +1206,10 @@ onMounted(() => {
             <span class="progress-indeterminate"></span>
           </div>
         </div>
+        <p v-if="ruleConflicts.length" class="conflict-summary">
+          检测到 {{ ruleConflicts.length }} 组 exeHash 冲突，建议为每组指定主规则。
+        </p>
+        <p v-if="rulesState.error" class="error inline-error">{{ rulesState.error }}</p>
       </header>
 
       <ul v-if="filteredRules.length" class="rule-list rules-grid">
@@ -841,6 +1229,28 @@ onMounted(() => {
                   <span>置信度 {{ rule.confidence }}</span>
                   <span>更新 {{ formatUnixTs(rule.updatedAt) }}</span>
                 </div>
+                <section v-if="ruleConflictFor(rule.ruleId)" class="rule-conflict-box">
+                  <p>
+                    冲突：同 exeHash 命中 {{ ruleConflictFor(rule.ruleId)?.conflictCount }} 条规则
+                    （涉及 {{ ruleConflictFor(rule.ruleId)?.gameIds.join(" / ") }}）
+                  </p>
+                  <p class="conflict-warning">
+                    {{ isPrimaryConflictRule(rule.ruleId) ? "已指定主规则，启动不会被冲突拦截" : "未指定主规则会阻止启动，请先设置主规则" }}
+                  </p>
+                  <p>hash {{ shortExeHash(ruleConflictFor(rule.ruleId)?.exeHash || "") }}</p>
+                  <div class="row">
+                    <span class="conflict-primary" :class="isPrimaryConflictRule(rule.ruleId) ? 'on' : 'off'">
+                      {{ isPrimaryConflictRule(rule.ruleId) ? "当前主规则" : "非主规则" }}
+                    </span>
+                    <button
+                      type="button"
+                      :disabled="rulesState.loading || isPrimaryConflictRule(rule.ruleId)"
+                      @click="markPrimaryRule(rule)"
+                    >
+                      设为主规则
+                    </button>
+                  </div>
+                </section>
               </div>
               <label class="switch">
                 <input
@@ -851,6 +1261,15 @@ onMounted(() => {
                 <span class="switch-text">启用</span>
               </label>
             </div>
+            <label class="field compact-field">
+              <span>游戏名（gameId）</span>
+              <input
+                v-model="ruleDrafts[rule.ruleId].gameIdText"
+                type="text"
+                class="gameid-editor"
+                placeholder="例如：elden_ring"
+              />
+            </label>
             <label class="field compact-field">
               <span>存档路径（每行一条）</span>
               <textarea
@@ -893,16 +1312,25 @@ onMounted(() => {
           <span class="runtime-chip">架构 {{ redirectRuntimeInfo.arch }}</span>
           <span class="runtime-chip">备份模式可用</span>
         </section>
+        <p v-if="libraryState.error" class="error inline-error">{{ libraryState.error }}</p>
       </header>
 
       <div v-if="filteredLibraryItems.length" class="library-grid" :class="{ single: filteredLibraryItems.length === 1 }">
         <article v-for="item in filteredLibraryItems" :key="item.gameId" class="panel game-card">
+          <p v-if="libraryCardErrorFor(item.gameId)" class="error inline-error card-error">
+            {{ libraryCardErrorFor(item.gameId) }}
+          </p>
           <div class="card-head">
             <div class="card-title-block">
               <h3>{{ item.gameId }}</h3>
               <div class="card-meta">
                 <span>规则 {{ item.enabledRules }}/{{ item.totalRules }} 已启用</span>
                 <span>路径 {{ item.confirmedPathCount }}</span>
+                <span v-if="backupStatsFor(item.gameId)">
+                  备份 {{ backupStatsFor(item.gameId)?.versionCount ?? 0 }} 版 ·
+                  {{ formatBytes(backupStatsFor(item.gameId)?.totalBytes ?? 0) }}
+                </span>
+                <span v-else>备份统计读取中</span>
                 <span>规则更新 {{ formatUnixTs(item.lastRuleUpdatedAt) }}</span>
                 <span v-if="item.lastSessionStatus">
                   最近会话 {{ item.lastSessionStatus }} @ {{ formatUnixTs(item.lastSessionUpdatedAt || "") }}
@@ -913,7 +1341,7 @@ onMounted(() => {
             <button
               class="ghost"
               type="button"
-              :disabled="libraryState.loading || isCardBusy(item.gameId)"
+              :disabled="libraryState.loading"
               @click="toggleLibraryDetails(item.gameId)"
             >
               {{ isGameExpanded(item.gameId) ? "收起详情" : "展开详情" }}
@@ -926,7 +1354,7 @@ onMounted(() => {
               <input :value="item.preferredExePath || ''" readonly placeholder="尚未绑定 EXE，先点击右侧按钮" />
               <button
                 type="button"
-                :disabled="libraryState.loading || isCardBusy(item.gameId)"
+                :disabled="libraryState.loading || isCardBusy(item.gameId, 'bind_exe')"
                 @click="choosePreferredExeForGame(item.gameId)"
               >
                 选择/更换 EXE
@@ -937,28 +1365,35 @@ onMounted(() => {
           <section class="precheck-box">
             <div class="row precheck-head">
               <strong>启动前预检查</strong>
-              <button
-                type="button"
-                :disabled="libraryState.loading || isCardBusy(item.gameId)"
-                @click="loadLaunchPrecheckForGame(item.gameId)"
-              >
-                刷新检查
-              </button>
+              <div class="row precheck-head-actions">
+                <span
+                  v-if="launchPrecheckFor(item.gameId)"
+                  class="precheck-state-pill"
+                  :class="launchPrecheckFor(item.gameId)?.backupReady ? 'ok' : 'fail'"
+                >
+                  {{ launchPrecheckFor(item.gameId)?.backupReady ? "自动备份可启动" : "自动备份需处理" }}
+                </span>
+                <span v-else class="precheck-state-pill idle">未检查</span>
+                <button
+                  type="button"
+                  :disabled="libraryState.loading || isCardBusy(item.gameId, 'precheck')"
+                  @click="loadLaunchPrecheckForGame(item.gameId)"
+                >
+                  刷新
+                </button>
+              </div>
             </div>
             <template v-if="launchPrecheckFor(item.gameId)">
-              <p class="precheck-mode-line">
-                自动备份：
-                <span :class="launchPrecheckFor(item.gameId)?.backupReady ? 'precheck-ok' : 'precheck-fail'">
-                  {{ launchPrecheckFor(item.gameId)?.backupReady ? "可启动" : "需处理" }}
-                </span>
-              </p>
-              <ul class="precheck-list">
-                <li v-for="check in visiblePrecheckChecks(item.gameId)" :key="`${item.gameId}-${check.key}`">
-                  <span class="precheck-badge" :class="check.ok ? 'ok' : 'fail'">{{ check.ok ? "OK" : "FAIL" }}</span>
-                  <span class="precheck-label">{{ check.label }}</span>
-                  <span class="precheck-detail">{{ check.detail }}</span>
-                </li>
-              </ul>
+              <details v-if="visiblePrecheckChecks(item.gameId).length" class="precheck-details">
+                <summary>查看检查明细（{{ visiblePrecheckChecks(item.gameId).length }} 项）</summary>
+                <ul class="precheck-list">
+                  <li v-for="check in visiblePrecheckChecks(item.gameId)" :key="`${item.gameId}-${check.key}`">
+                    <span class="precheck-badge" :class="check.ok ? 'ok' : 'fail'">{{ check.ok ? "OK" : "FAIL" }}</span>
+                    <span class="precheck-label">{{ check.label }}</span>
+                    <span class="precheck-detail">{{ check.detail }}</span>
+                  </li>
+                </ul>
+              </details>
             </template>
             <p v-else class="empty-hint">尚未检查，点击“刷新检查”查看启动条件。</p>
           </section>
@@ -967,7 +1402,7 @@ onMounted(() => {
             <button
               type="button"
               class="primary"
-              :disabled="libraryState.loading || isCardBusy(item.gameId)"
+              :disabled="libraryState.loading || isCardBusy(item.gameId, 'launch')"
               @click="launchLibraryGame(item.gameId, 'backup')"
             >
               启动游戏（自动备份）
@@ -976,11 +1411,60 @@ onMounted(() => {
           <p class="mode-hint">当前阶段仅开放自动备份启动。沙盒/注入模式已纳入开发计划。</p>
 
           <section v-if="isGameExpanded(item.gameId)" class="panel card-detail">
+            <section class="backup-policy-box">
+              <div class="row backup-policy-head">
+                <h4>备份空间管理</h4>
+                <button
+                  type="button"
+                  :disabled="libraryState.loading || isCardBusy(item.gameId, 'backup_stats')"
+                  @click="loadBackupStatsForGame(item.gameId)"
+                >
+                  刷新统计
+                </button>
+              </div>
+              <div class="backup-policy-stats">
+                <span>当前占用：{{ formatBytes(backupStatsFor(item.gameId)?.totalBytes ?? 0) }}</span>
+                <span>版本数：{{ backupStatsFor(item.gameId)?.versionCount ?? 0 }}</span>
+                <span>当前保留策略：最近 {{ backupStatsFor(item.gameId)?.keepVersions ?? 10 }} 版</span>
+                <span v-if="backupStatsFor(item.gameId)?.latestVersionId">
+                  最新版本：{{ backupStatsFor(item.gameId)?.latestVersionId }}
+                </span>
+              </div>
+              <div class="row backup-policy-controls">
+                <label class="backup-keep-input">
+                  <span>保留最近 N 版</span>
+                  <input
+                    :value="backupKeepDraftFor(item.gameId)"
+                    type="number"
+                    min="1"
+                    max="200"
+                    step="1"
+                    @input="onBackupKeepInput(item.gameId, $event)"
+                  />
+                </label>
+                <button
+                  type="button"
+                  :disabled="libraryState.loading || isCardBusy(item.gameId, 'backup_policy_save')"
+                  @click="saveBackupKeepPolicy(item.gameId)"
+                >
+                  保存策略
+                </button>
+                <button
+                  type="button"
+                  class="danger"
+                  :disabled="libraryState.loading || isCardBusy(item.gameId, 'backup_prune')"
+                  @click="pruneOldBackupsForGame(item.gameId)"
+                >
+                  一键清理旧备份
+                </button>
+              </div>
+            </section>
+
             <div class="row">
               <h4>备份版本时间线</h4>
               <button
                 type="button"
-                :disabled="libraryState.loading || isCardBusy(item.gameId)"
+                :disabled="libraryState.loading || isCardBusy(item.gameId, 'backup_versions')"
                 @click="loadBackupVersionsForGame(item.gameId)"
               >
                 刷新版本
@@ -996,7 +1480,7 @@ onMounted(() => {
                   <button
                     type="button"
                     class="primary"
-                    :disabled="libraryState.loading || isCardBusy(item.gameId)"
+                    :disabled="libraryState.loading || isCardBusy(item.gameId, 'backup_rollback')"
                     @click="rollbackToLibraryBackupVersion(item.gameId, version.versionId)"
                   >
                     回滚到此版本
@@ -1010,7 +1494,7 @@ onMounted(() => {
               <h4>最近会话日志</h4>
               <button
                 type="button"
-                :disabled="libraryState.loading || isCardBusy(item.gameId)"
+                :disabled="libraryState.loading || isCardBusy(item.gameId, 'session_logs')"
                 @click="loadSessionDetailsForGame(item.gameId)"
               >
                 刷新日志
@@ -1044,11 +1528,38 @@ onMounted(() => {
       </details>
     </section>
 
-    <p v-if="activeTab === 'learning' && learningState.info" class="info">{{ learningState.info }}</p>
-    <p v-if="activeTab === 'learning' && learningState.error" class="error">{{ learningState.error }}</p>
-    <p v-if="activeTab === 'rules' && rulesState.info" class="info">{{ rulesState.info }}</p>
-    <p v-if="activeTab === 'rules' && rulesState.error" class="error">{{ rulesState.error }}</p>
-    <p v-if="activeTab === 'library' && libraryState.info" class="info">{{ libraryState.info }}</p>
-    <p v-if="activeTab === 'library' && libraryState.error" class="error">{{ libraryState.error }}</p>
+    <transition name="toast-fade">
+      <div v-if="toast.visible" class="toast" :class="toast.level" role="status" aria-live="polite">
+        <span>{{ toast.message }}</span>
+        <button type="button" class="toast-close" @click="closeToast">关闭</button>
+      </div>
+    </transition>
+
+    <div v-if="confirmDialog.open" class="modal-overlay" role="dialog" aria-modal="true">
+      <section class="modal">
+        <h3>{{ confirmDialog.title }}</h3>
+        <p>{{ confirmDialog.message }}</p>
+        <div class="row modal-actions">
+          <button type="button" @click="resolveConfirm(false)">{{ confirmDialog.cancelText }}</button>
+          <button
+            type="button"
+            :class="confirmDialog.danger ? 'danger' : 'primary'"
+            @click="resolveConfirm(true)"
+          >
+            {{ confirmDialog.confirmText }}
+          </button>
+        </div>
+      </section>
+    </div>
+
+    <div v-if="blockingErrorMessage" class="modal-overlay" role="dialog" aria-modal="true">
+      <section class="modal blocking-modal">
+        <h3>操作被阻止</h3>
+        <p>{{ blockingErrorMessage }}</p>
+        <div class="row modal-actions">
+          <button type="button" class="primary" @click="closeBlockingError">我知道了</button>
+        </div>
+      </section>
+    </div>
   </main>
 </template>
