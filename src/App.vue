@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
+import { useToast } from "./composables/useToast";
 import {
   confirmRule,
   deleteRule,
@@ -64,7 +65,6 @@ type CardAction =
   | "backup_versions"
   | "backup_rollback"
   | "session_logs";
-type ToastLevel = "success" | "error" | "info";
 type ConfirmDialogState = {
   open: boolean;
   title: string;
@@ -107,11 +107,7 @@ const backupKeepDraftByGame = ref<Record<string, string>>({});
 const sessionDetailsByGame = ref<Record<string, LauncherSession | null>>({});
 const launchPrecheckByGame = ref<Record<string, GameLaunchPrecheck | null>>({});
 const hiddenPrecheckKeys = new Set(["sandbox_runtime", "inject_artifacts", "inject_arch"]);
-const toast = ref<{ visible: boolean; message: string; level: ToastLevel }>({
-  visible: false,
-  message: "",
-  level: "info",
-});
+const { toast, showToast, closeToast } = useToast();
 const confirmDialog = ref<ConfirmDialogState>({
   open: false,
   title: "",
@@ -122,7 +118,6 @@ const confirmDialog = ref<ConfirmDialogState>({
 });
 const blockingErrorMessage = ref("");
 
-let toastTimer: ReturnType<typeof setTimeout> | null = null;
 let confirmResolver: ((value: boolean) => void) | null = null;
 
 const hasHighConfidence = computed(() => candidates.value.some((item) => item.score >= 45));
@@ -397,30 +392,6 @@ function parseBackupKeepDraft(gameIdText: string): number | null {
     return null;
   }
   return Math.min(Math.trunc(parsed), 200);
-}
-
-function showToast(message: string, level: ToastLevel = "info", timeoutMs = 2600) {
-  if (toastTimer) {
-    clearTimeout(toastTimer);
-    toastTimer = null;
-  }
-  toast.value = {
-    visible: true,
-    message,
-    level,
-  };
-  toastTimer = setTimeout(() => {
-    toast.value.visible = false;
-    toastTimer = null;
-  }, timeoutMs);
-}
-
-function closeToast() {
-  if (toastTimer) {
-    clearTimeout(toastTimer);
-    toastTimer = null;
-  }
-  toast.value.visible = false;
 }
 
 function showBlockingError(message: string) {
@@ -1061,10 +1032,6 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
-  if (toastTimer) {
-    clearTimeout(toastTimer);
-    toastTimer = null;
-  }
   confirmResolver = null;
 });
 </script>

@@ -22,6 +22,7 @@ const LOW_CONFIDENCE_THRESHOLD: i64 = 45;
 const SAVE_EXTENSIONS: [&str; 7] = ["sav", "save", "dat", "profile", "slot", "json", "bin"];
 const PATH_KEYWORDS: [&str; 4] = ["save", "savedata", "profile", "userdata"];
 const APP_IDENTIFIER: &str = "com.gamesaver.desktop";
+const USERPROFILE_TOKEN: &str = "%USERPROFILE%";
 const DEFAULT_BACKUP_KEEP_VERSIONS: usize = 10;
 const MAX_BACKUP_KEEP_VERSIONS: usize = 200;
 const NOISE_PATH_FRAGMENTS: [&str; 7] = [
@@ -627,11 +628,17 @@ fn confirm_rule(
     let session_exe_path = session.exe_path.clone();
     let exe_hash = file_sha256_hex(Path::new(&session_exe_path))?;
     let rule_key = build_rule_key(&session_game_id, &exe_hash);
-    let score_map: HashMap<String, i64> = session
-        .candidates
-        .iter()
-        .map(|item| (item.path.clone(), item.score))
-        .collect();
+    let mut score_map: HashMap<String, i64> = HashMap::new();
+    for item in &session.candidates {
+        let normalized = normalize_confirmed_path_for_storage(&item.path);
+        if normalized.is_empty() {
+            continue;
+        }
+        let entry = score_map.entry(normalized).or_insert(item.score);
+        if item.score > *entry {
+            *entry = item.score;
+        }
+    }
 
     let mut confidence_sum = 0_i64;
     let mut counted = 0_i64;
@@ -1965,7 +1972,11 @@ fn restore_backup_version_transactional(
     let mut plans = Vec::new();
     for source_path in &rule.confirmed_paths {
         let slot = backup_slot_name(source_path);
-        let slot_source = version_dir.join(&slot);
+        let mut slot_source = version_dir.join(&slot);
+        if !slot_source.exists() {
+            let legacy_slot = backup_slot_name_legacy(source_path);
+            slot_source = version_dir.join(legacy_slot);
+        }
         if !slot_source.exists() {
             cleanup_restore_temp_dirs(&staging_root, &rollback_root);
             return Err(format!("备份版本不完整，缺少槽位 {slot}"));
@@ -1977,7 +1988,8 @@ fn restore_backup_version_transactional(
             format!("准备恢复槽位 {slot} 失败: {err}")
         })?;
 
-        let target = Path::new(source_path);
+        let runtime_path = expand_confirmed_path_for_runtime(source_path);
+        let target = Path::new(&runtime_path);
         let rollback_slot = rollback_root.join(&slot);
         let target_exists = target.exists();
         if target_exists {
@@ -1988,7 +2000,7 @@ fn restore_backup_version_transactional(
         }
 
         plans.push(RestorePlanItem {
-            source_path: source_path.clone(),
+            source_path: runtime_path,
             slot_name: slot,
             stage_slot,
             rollback_slot,
@@ -2505,16 +2517,118 @@ fn set_preferred_exe_path(
         .ok_or_else(|| "更新 EXE 绑定后未找到对应游戏卡片".to_string())
 }
 
+fn resolve_user_profile_path() -> Option<String> {
+    let by_user_profile = std::env::var("USERPROFILE").ok().map(|value| value.trim().to_string());
+    if let Some(path) = by_user_profile.filter(|value| !value.is_empty()) {
+        return Some(path.replace('/', "\\"));
+    }
+    let home_drive = std::env::var("HOMEDRIVE").ok().map(|value| value.trim().to_string());
+    let home_path = std::env::var("HOMEPATH").ok().map(|value| value.trim().to_string());
+    match (home_drive, home_path) {
+        (Some(drive), Some(path)) if !drive.is_empty() && !path.is_empty() => {
+            Some(format!("{}{}", drive, path).replace('/', "\\"))
+        }
+        _ => None,
+    }
+}
+
+fn strip_prefix_case_insensitive(path: &str, prefix: &str) -> Option<String> {
+    let normalized_path = path.replace('/', "\\");
+    let normalized_prefix = prefix.replace('/', "\\").trim_end_matches('\\').to_string();
+    if normalized_prefix.is_empty() {
+        return None;
+    }
+    let path_lower = normalized_path.to_ascii_lowercase();
+    let prefix_lower = normalized_prefix.to_ascii_lowercase();
+    if path_lower == prefix_lower {
+        return Some(String::new());
+    }
+    let prefix_with_sep = format!("{prefix_lower}\\");
+    if path_lower.starts_with(&prefix_with_sep) {
+        return Some(normalized_path[normalized_prefix.len() + 1..].to_string());
+    }
+    None
+}
+
+fn strip_windows_users_prefix(path: &str) -> Option<String> {
+    let normalized = path.trim().replace('/', "\\");
+    let bytes = normalized.as_bytes();
+    if bytes.len() < 4 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return None;
+    }
+    let rest = &normalized[3..];
+    let rest_lower = rest.to_ascii_lowercase();
+    if !rest_lower.starts_with("users\\") {
+        return None;
+    }
+    let after_users = &rest[6..];
+    let mut splitter = after_users.splitn(2, '\\');
+    let user_segment = splitter.next().unwrap_or("");
+    if user_segment.is_empty() {
+        return None;
+    }
+    let suffix = splitter.next().unwrap_or("");
+    if suffix.is_empty() {
+        return None;
+    }
+    Some(suffix.to_string())
+}
+
+fn normalize_confirmed_path_for_storage(path: &str) -> String {
+    let trimmed = path.trim().replace('/', "\\");
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.eq_ignore_ascii_case(USERPROFILE_TOKEN) {
+        return USERPROFILE_TOKEN.to_string();
+    }
+    if let Some(suffix) = strip_prefix_case_insensitive(&trimmed, USERPROFILE_TOKEN) {
+        if suffix.is_empty() {
+            return USERPROFILE_TOKEN.to_string();
+        }
+        return format!(r"{}\{}", USERPROFILE_TOKEN, suffix);
+    }
+    if let Some(profile_root) = resolve_user_profile_path() {
+        if let Some(suffix) = strip_prefix_case_insensitive(&trimmed, &profile_root) {
+            if suffix.is_empty() {
+                return USERPROFILE_TOKEN.to_string();
+            }
+            return format!(r"{}\{}", USERPROFILE_TOKEN, suffix);
+        }
+    }
+    if let Some(suffix) = strip_windows_users_prefix(&trimmed) {
+        return format!(r"{}\{}", USERPROFILE_TOKEN, suffix);
+    }
+    trimmed
+}
+
+fn expand_confirmed_path_for_runtime(path: &str) -> String {
+    let trimmed = path.trim().replace('/', "\\");
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some(suffix) = strip_prefix_case_insensitive(&trimmed, USERPROFILE_TOKEN) {
+        if let Some(profile_root) = resolve_user_profile_path() {
+            if suffix.is_empty() {
+                return profile_root;
+            }
+            return format!(r"{}\{}", profile_root.trim_end_matches('\\'), suffix);
+        }
+    }
+    trimmed
+}
+
 fn normalize_paths(paths: Vec<String>) -> Vec<String> {
     let mut dedup = HashSet::new();
     let mut output = Vec::new();
     for path in paths {
-        let trimmed = path.trim().to_string();
-        if trimmed.is_empty() {
+        let normalized = normalize_confirmed_path_for_storage(&path);
+        if normalized.is_empty() {
             continue;
         }
-        if dedup.insert(trimmed.clone()) {
-            output.push(trimmed);
+        let dedup_key = normalize_windows_path(&normalized);
+        if dedup.insert(dedup_key) {
+            output.push(normalized);
         }
     }
     output
@@ -2568,7 +2682,8 @@ fn choose_restore_writable_probe_path(source: &Path) -> PathBuf {
 
 fn validate_restore_targets_writable(rule: &GameSaveRule) -> Result<(), String> {
     for source_path in &rule.confirmed_paths {
-        let source = Path::new(source_path);
+        let runtime_path = expand_confirmed_path_for_runtime(source_path);
+        let source = Path::new(&runtime_path);
         let probe_root = choose_restore_writable_probe_path(source);
         ensure_directory_writable(&probe_root).map_err(|err| {
             format!(
@@ -2677,11 +2792,14 @@ fn format_bytes_short(bytes: u64) -> String {
 fn validate_restore_disk_space(rule: &GameSaveRule, manifest: &BackupManifest) -> Result<(), String> {
     let mut slot_to_drive: HashMap<String, String> = HashMap::new();
     for source_path in &rule.confirmed_paths {
-        let source = Path::new(source_path);
-        let slot = backup_slot_name(source_path);
+        let runtime_path = expand_confirmed_path_for_runtime(source_path);
+        let source = Path::new(&runtime_path);
         let drive_id = drive_id_for_path(source)
             .ok_or_else(|| format!("无法识别目标路径所在磁盘: {}", source.to_string_lossy()))?;
-        slot_to_drive.insert(slot, drive_id);
+        let slot = backup_slot_name(source_path);
+        slot_to_drive.insert(slot, drive_id.clone());
+        let legacy_slot = backup_slot_name_legacy(source_path);
+        slot_to_drive.insert(legacy_slot, drive_id);
     }
 
     let mut required_by_drive: HashMap<String, u64> = HashMap::new();
@@ -2802,6 +2920,14 @@ fn legacy_backup_game_root(backup_root: &str, game_id: &str) -> PathBuf {
 }
 
 fn backup_slot_name(source_path: &str) -> String {
+    let normalized = normalize_windows_path(&normalize_confirmed_path_for_storage(source_path));
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+    format!("slot_{}", &hash[..12])
+}
+
+fn backup_slot_name_legacy(source_path: &str) -> String {
     let normalized = normalize_windows_path(source_path);
     let mut hasher = Sha256::new();
     hasher.update(normalized.as_bytes());
@@ -3159,8 +3285,15 @@ fn restore_latest_backup_for_rule(rule: &GameSaveRule, backup_root: &str) -> Res
     }
     let mut copied = 0_usize;
     for source in &rule.confirmed_paths {
+        let runtime_path = expand_confirmed_path_for_runtime(source);
+        let target_path = Path::new(&runtime_path);
         let slot = backup_slot_name(source);
-        copied += sync_directory(&latest.join(slot), Path::new(source))?;
+        let mut slot_source = latest.join(&slot);
+        if !slot_source.exists() {
+            let legacy_slot = backup_slot_name_legacy(source);
+            slot_source = latest.join(legacy_slot);
+        }
+        copied += sync_directory(&slot_source, target_path)?;
     }
     Ok(copied)
 }
@@ -3405,9 +3538,11 @@ fn backup_after_exit_for_rule(
 
     let mut changed_total = 0_usize;
     for source in &rule.confirmed_paths {
+        let runtime_path = expand_confirmed_path_for_runtime(source);
+        let runtime_source = Path::new(&runtime_path);
         let slot = backup_slot_name(source);
         let changed = sync_source_to_backup_slot(
-            Path::new(source),
+            runtime_source,
             &latest.join(&slot),
             &version_root.join(&slot),
         )?;
@@ -3489,7 +3624,9 @@ fn run_sandbox_launch_flow(
     let mut mirror_paths = Vec::new();
     let mut copied_in = 0_usize;
     for original in &rule.confirmed_paths {
-        let mirror = build_sandbox_mirror_path(original, &execution_config.sandbox_root, &user_name, &box_name)?;
+        let runtime_path = expand_confirmed_path_for_runtime(original);
+        let mirror =
+            build_sandbox_mirror_path(&runtime_path, &execution_config.sandbox_root, &user_name, &box_name)?;
         copied_in += sync_directory(Path::new(&redirect_root), &mirror)?;
         mirror_paths.push(mirror.to_string_lossy().to_string());
     }
