@@ -131,6 +131,8 @@ export interface RestoreBackupResult {
   versionId: string;
   restoredFiles: number;
   preRestoreVersionId?: string;
+  verifiedFiles: number;
+  hashSampleCount: number;
 }
 
 export interface ExportRulesResult {

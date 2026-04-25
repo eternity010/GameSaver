@@ -305,6 +305,13 @@ struct RestoreBackupResult {
     version_id: String,
     restored_files: usize,
     pre_restore_version_id: Option<String>,
+    verified_files: usize,
+    hash_sample_count: usize,
+}
+
+struct RestoreVerificationSummary {
+    verified_files: usize,
+    hash_sample_count: usize,
 }
 
 #[derive(Serialize)]
@@ -2218,6 +2225,27 @@ fn restore_backup_version(
         };
 
     let restored_files = restore_backup_version_transactional(&rule, &version_dir, &base)?;
+    let verification = match verify_restored_targets(&rule, &manifest) {
+        Ok(summary) => summary,
+        Err(verify_err) => {
+            if let Some(pre_restore_id) = pre_restore_version_id.as_ref() {
+                let rollback_version_dir = base.join("versions").join(pre_restore_id);
+                if rollback_version_dir.exists() {
+                    match restore_backup_version_transactional(&rule, &rollback_version_dir, &base) {
+                        Ok(_) => {
+                            return Err(format!("恢复后校验失败，已自动回退到回滚前状态：{verify_err}"));
+                        }
+                        Err(rollback_err) => {
+                            return Err(format!(
+                                "恢复后校验失败，且自动回退失败：{verify_err}；回退错误：{rollback_err}"
+                            ));
+                        }
+                    }
+                }
+            }
+            return Err(format!("恢复后校验失败：{verify_err}"));
+        }
+    };
 
     {
         let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
@@ -2242,8 +2270,12 @@ fn restore_backup_version(
             append_session_log(
                 session,
                 &format!(
-                    "已执行版本回滚（事务化）：game={}, version={}, files={}",
-                    trimmed_game_id, trimmed_version_id, restored_files
+                    "已执行版本回滚（事务化）：game={}, version={}, files={}, verify_files={}, verify_hash_sample={}",
+                    trimmed_game_id,
+                    trimmed_version_id,
+                    restored_files,
+                    verification.verified_files,
+                    verification.hash_sample_count
                 ),
             );
             session.updated_at = now_iso_string();
@@ -2256,6 +2288,8 @@ fn restore_backup_version(
         version_id: trimmed_version_id,
         restored_files,
         pre_restore_version_id,
+        verified_files: verification.verified_files,
+        hash_sample_count: verification.hash_sample_count,
     })
 }
 
@@ -2947,6 +2981,81 @@ fn validate_restore_disk_space(rule: &GameSaveRule, manifest: &BackupManifest) -
         }
     }
     Ok(())
+}
+
+fn verify_restored_targets(
+    rule: &GameSaveRule,
+    manifest: &BackupManifest,
+) -> Result<RestoreVerificationSummary, String> {
+    let mut slot_to_target: HashMap<String, PathBuf> = HashMap::new();
+    for source_path in &rule.confirmed_paths {
+        let runtime_path = expand_confirmed_path_for_runtime(source_path);
+        let target_root = PathBuf::from(runtime_path);
+        let slot = backup_slot_name(source_path);
+        slot_to_target.insert(slot, target_root.clone());
+        let legacy_slot = backup_slot_name_legacy(source_path);
+        slot_to_target.insert(legacy_slot, target_root);
+    }
+
+    let mut files_to_verify = Vec::new();
+    for item in &manifest.files {
+        let normalized_path = normalize_windows_path(&item.path);
+        let mut pieces = normalized_path.splitn(2, '\\');
+        let slot_name = pieces
+            .next()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("恢复后校验失败：manifest 路径非法 {}", item.path))?;
+        let relative = pieces
+            .next()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("恢复后校验失败：manifest 路径非法 {}", item.path))?;
+        let target_root = slot_to_target
+            .get(slot_name)
+            .ok_or_else(|| format!("恢复后校验失败：槽位映射不存在 {}", item.path))?;
+        let mut target_file = target_root.to_path_buf();
+        for segment in relative.split('\\').filter(|segment| !segment.is_empty()) {
+            target_file = target_file.join(segment);
+        }
+        if !target_file.exists() {
+            return Err(format!("恢复后校验失败：文件缺失 {}", target_file.to_string_lossy()));
+        }
+        let actual_size = target_file
+            .metadata()
+            .map_err(|err| format!("恢复后校验失败：读取文件元信息失败 {}: {err}", target_file.to_string_lossy()))?
+            .len();
+        if actual_size != item.size {
+            return Err(format!(
+                "恢复后校验失败：文件大小不一致 {} (expected={}, actual={})",
+                target_file.to_string_lossy(),
+                item.size,
+                actual_size
+            ));
+        }
+        files_to_verify.push((target_file, item.sha256.clone()));
+    }
+
+    let total = files_to_verify.len();
+    if total == 0 {
+        return Ok(RestoreVerificationSummary {
+            verified_files: 0,
+            hash_sample_count: 0,
+        });
+    }
+
+    let sample_count = total.min(5);
+    for sample_index in 0..sample_count {
+        let idx = sample_index * total / sample_count;
+        let (path, expected_sha) = &files_to_verify[idx];
+        let actual_sha = file_sha256_hex_with_context(path, "恢复后文件")?;
+        if !actual_sha.eq_ignore_ascii_case(expected_sha.trim()) {
+            return Err(format!("恢复后校验失败：哈希不一致 {}", path.to_string_lossy()));
+        }
+    }
+
+    Ok(RestoreVerificationSummary {
+        verified_files: total,
+        hash_sample_count: sample_count,
+    })
 }
 
 fn sanitize_sandbox_box_name(game_id: &str) -> String {

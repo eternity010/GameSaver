@@ -910,7 +910,10 @@ async function rollbackToLibraryBackupVersion(gameIdText: string, versionId: str
         },
       };
     }
-    showToast("回滚完成", "success");
+    showToast(
+      `回滚完成（已校验 ${result.verifiedFiles} 个文件，哈希抽样 ${result.hashSampleCount} 项）`,
+      "success",
+    );
   } catch (err) {
     setLibraryCardError(gameIdText, `回滚失败：${String(err)}`);
     showBlockingError(`回滚失败：${String(err)}`);
