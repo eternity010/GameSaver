@@ -5,6 +5,7 @@ export interface CandidatePath {
   addedFiles: number;
   modifiedFiles: number;
   matchedSignals: string[];
+  recommendation: "strong" | "recommended" | "possible" | "weak";
   collapsed: boolean;
 }
 

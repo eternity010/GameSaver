@@ -13,14 +13,36 @@ use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-const SCORE_TIME_MATCH: i64 = 35;
+const SCORE_TIME_MATCH: i64 = 30;
 const SCORE_EXTENSION_MATCH: i64 = 20;
-const SCORE_KEYWORD_MATCH: i64 = 20;
-const SCORE_CHANGE_COUNT_MATCH: i64 = 15;
-const SCORE_SIZE_REASONABLE: i64 = 10;
+const SCORE_WEAK_EXTENSION_MATCH: i64 = 8;
+const SCORE_KEYWORD_MATCH: i64 = 25;
+const SCORE_GAME_NAME_MATCH: i64 = 20;
+const SCORE_FILENAME_MATCH: i64 = 12;
+const SCORE_CHANGE_COUNT_MATCH: i64 = 10;
+const SCORE_ADDED_FILE_MATCH: i64 = 8;
+const SCORE_USER_SAVE_ROOT_MATCH: i64 = 10;
+const SCORE_GAME_DIR_MATCH: i64 = 6;
+const SCORE_SIZE_REASONABLE: i64 = 6;
+const SCORE_NOISE_PATH_PENALTY: i64 = 30;
+const SCORE_NOISE_FILENAME_PENALTY: i64 = 20;
+const SCORE_TOO_MANY_CHANGES_PENALTY: i64 = 20;
+const SCORE_WEAK_ONLY_PENALTY: i64 = 15;
 const LOW_CONFIDENCE_THRESHOLD: i64 = 45;
-const SAVE_EXTENSIONS: [&str; 7] = ["sav", "save", "dat", "profile", "slot", "json", "bin"];
+const STRONG_SAVE_EXTENSIONS: [&str; 4] = ["sav", "save", "profile", "slot"];
+const WEAK_SAVE_EXTENSIONS: [&str; 3] = ["dat", "json", "bin"];
 const PATH_KEYWORDS: [&str; 4] = ["save", "savedata", "profile", "userdata"];
+const FILENAME_SAVE_KEYWORDS: [&str; 5] = ["save", "slot", "profile", "global", "system"];
+const NOISE_FILENAME_KEYWORDS: [&str; 8] = ["config", "settings", "log", "cache", "crash", "tmp", "temp", "shader"];
+const WEAK_PATH_FRAGMENTS: [&str; 7] = [
+    "\\cache\\",
+    "\\logs\\",
+    "\\log\\",
+    "\\crash\\",
+    "\\config\\",
+    "\\settings\\",
+    "\\shader",
+];
 const APP_IDENTIFIER: &str = "com.gamesaver.desktop";
 const USERPROFILE_TOKEN: &str = "%USERPROFILE%";
 const DEFAULT_BACKUP_KEEP_VERSIONS: usize = 10;
@@ -60,6 +82,7 @@ struct CandidatePath {
     added_files: usize,
     modified_files: usize,
     matched_signals: Vec<String>,
+    recommendation: String,
     collapsed: bool,
 }
 
@@ -406,8 +429,15 @@ struct CandidateAccumulator {
     changed_files: usize,
     time_hits: usize,
     extension_hits: usize,
+    weak_extension_hits: usize,
     keyword_hits: usize,
+    game_name_hits: usize,
+    filename_hits: usize,
     reasonable_size_hits: usize,
+    user_save_root_hits: usize,
+    game_dir_hits: usize,
+    noise_hits: usize,
+    noise_filename_hits: usize,
     signals: HashSet<String>,
 }
 
@@ -437,18 +467,75 @@ impl CandidateAccumulator {
         if self.extension_hits > 0 {
             score += SCORE_EXTENSION_MATCH;
         }
+        if self.weak_extension_hits > 0 {
+            score += SCORE_WEAK_EXTENSION_MATCH;
+        }
         if self.keyword_hits > 0 {
             score += SCORE_KEYWORD_MATCH;
+        }
+        if self.game_name_hits > 0 {
+            score += SCORE_GAME_NAME_MATCH;
+        }
+        if self.filename_hits > 0 {
+            score += SCORE_FILENAME_MATCH;
         }
         if (1..=50).contains(&self.changed_files) {
             score += SCORE_CHANGE_COUNT_MATCH;
         }
+        if self.added_files > 0 {
+            score += SCORE_ADDED_FILE_MATCH;
+        }
+        if self.user_save_root_hits > 0 {
+            score += SCORE_USER_SAVE_ROOT_MATCH;
+        }
+        if self.game_dir_hits > 0 {
+            score += SCORE_GAME_DIR_MATCH;
+        }
         if self.reasonable_size_hits > 0 {
             score += SCORE_SIZE_REASONABLE;
         }
+        if self.noise_hits > 0 {
+            score -= SCORE_NOISE_PATH_PENALTY;
+        }
+        if self.noise_filename_hits > 0 {
+            score -= SCORE_NOISE_FILENAME_PENALTY;
+        }
+        if self.changed_files > 200 {
+            score -= SCORE_TOO_MANY_CHANGES_PENALTY;
+        }
+        if self.weak_extension_hits > 0 && self.extension_hits == 0 && self.keyword_hits == 0 {
+            score -= SCORE_WEAK_ONLY_PENALTY;
+        }
+        score = score.max(0);
 
         let mut signals = self.signals.into_iter().collect::<Vec<_>>();
         signals.sort();
+        let effective_signal_count = [
+            self.extension_hits > 0,
+            self.keyword_hits > 0,
+            self.game_name_hits > 0,
+            self.filename_hits > 0,
+            self.user_save_root_hits > 0,
+            self.game_dir_hits > 0,
+            self.added_files > 0,
+        ]
+        .into_iter()
+        .filter(|hit| *hit)
+        .count();
+        let noisy = self.noise_hits > 0 || self.noise_filename_hits > 0 || self.changed_files > 200;
+        let recommendation = if self.time_hits > 0
+            && self.keyword_hits > 0
+            && (self.extension_hits > 0 || self.game_name_hits > 0)
+            && !noisy
+        {
+            "strong"
+        } else if self.time_hits > 0 && effective_signal_count >= 2 && !noisy {
+            "recommended"
+        } else if (self.time_hits > 0 && effective_signal_count >= 1) || score >= LOW_CONFIDENCE_THRESHOLD {
+            "possible"
+        } else {
+            "weak"
+        };
 
         CandidatePath {
             path: self.path,
@@ -457,6 +544,7 @@ impl CandidateAccumulator {
             added_files: self.added_files,
             modified_files: self.modified_files,
             matched_signals: signals,
+            recommendation: recommendation.to_string(),
             collapsed: score < LOW_CONFIDENCE_THRESHOLD,
         }
     }
@@ -592,6 +680,7 @@ fn finish_learning(
         &baseline_snapshot,
         &final_snapshot,
         &session.game_id,
+        &session.exe_path,
         iso_to_unix(&session.started_at).unwrap_or(end_unix),
         end_unix + 120,
         Some(&related_files),
@@ -3839,12 +3928,20 @@ fn build_candidates(
     baseline: &Snapshot,
     final_snapshot: &Snapshot,
     game_id: &str,
+    exe_path: &str,
     start_unix: u64,
     end_unix_with_grace: u64,
     related_files: Option<&HashSet<String>>,
 ) -> Vec<CandidatePath> {
     let mut grouped: HashMap<String, CandidateAccumulator> = HashMap::new();
     let game_id_lower = game_id.to_ascii_lowercase();
+    let exe = Path::new(exe_path);
+    let exe_dir = exe.parent().map(|path| normalize_windows_path(&path.to_string_lossy()));
+    let exe_name = exe
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
 
     for (path, final_meta) in &final_snapshot.files {
         if let Some(related) = related_files {
@@ -3862,10 +3959,11 @@ fn build_candidates(
             continue;
         }
 
-        let parent = Path::new(path)
+        let raw_parent = Path::new(path)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| path.clone());
+        let parent = promote_candidate_parent(&raw_parent);
         let entry = grouped.entry(parent.clone()).or_insert_with(|| CandidateAccumulator {
             path: parent.clone(),
             ..CandidateAccumulator::default()
@@ -3884,15 +3982,55 @@ fn build_candidates(
             entry.signals.insert("time-window".to_string());
         }
 
-        if SAVE_EXTENSIONS.contains(&final_meta.extension.as_str()) {
+        if STRONG_SAVE_EXTENSIONS.contains(&final_meta.extension.as_str()) {
             entry.extension_hits += 1;
             entry.signals.insert(format!("extension:{}", final_meta.extension));
+        } else if WEAK_SAVE_EXTENSIONS.contains(&final_meta.extension.as_str()) {
+            entry.weak_extension_hits += 1;
+            entry.signals.insert(format!("weak-extension:{}", final_meta.extension));
         }
 
         let lower_parent = parent.to_ascii_lowercase();
-        if matches_path_keyword(&lower_parent, &game_id_lower) {
+        if matches_save_path_keyword(&lower_parent) {
             entry.keyword_hits += 1;
-            entry.signals.insert("path-keyword".to_string());
+            entry.signals.insert("save-path-keyword".to_string());
+        }
+
+        if matches_game_name_keyword(&lower_parent, &game_id_lower, &exe_name) {
+            entry.game_name_hits += 1;
+            entry.signals.insert("game-name-path".to_string());
+        }
+
+        if is_weak_candidate_path(&lower_parent) {
+            entry.noise_hits += 1;
+            entry.signals.insert("path-noise".to_string());
+        }
+
+        if is_user_save_root_path(&lower_parent) {
+            entry.user_save_root_hits += 1;
+            entry.signals.insert("user-save-root".to_string());
+        }
+
+        if exe_dir
+            .as_ref()
+            .is_some_and(|dir| normalize_windows_path(&parent).starts_with(dir))
+        {
+            entry.game_dir_hits += 1;
+            entry.signals.insert("game-dir".to_string());
+        }
+
+        let file_name = Path::new(path)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches_filename_keyword(&file_name, &FILENAME_SAVE_KEYWORDS) {
+            entry.filename_hits += 1;
+            entry.signals.insert("save-filename".to_string());
+        }
+        if matches_filename_keyword(&file_name, &NOISE_FILENAME_KEYWORDS) {
+            entry.noise_filename_hits += 1;
+            entry.signals.insert("filename-noise".to_string());
         }
 
         if final_meta.size > 0 && final_meta.size < 200 * 1024 * 1024 {
@@ -3908,6 +4046,7 @@ fn build_candidates(
     output.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
+            .then_with(|| recommendation_rank(&b.recommendation).cmp(&recommendation_rank(&a.recommendation)))
             .then_with(|| b.changed_files.cmp(&a.changed_files))
             .then_with(|| a.path.cmp(&b.path))
     });
@@ -4314,31 +4453,87 @@ fn should_ignore_candidate_path(path: &Path) -> bool {
         .any(|fragment| lower.contains(fragment))
 }
 
-fn matches_path_keyword(lower_parent: &str, game_id_lower: &str) -> bool {
-    let normalized = lower_parent.replace('/', "\\");
-    let segments = normalized
-        .split(|ch: char| ch == '\\' || ch == '_' || ch == '-' || ch == '.')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
+fn is_weak_candidate_path(lower_path: &str) -> bool {
+    WEAK_PATH_FRAGMENTS
+        .iter()
+        .any(|fragment| lower_path.contains(fragment))
+}
 
-    let keyword_hit = segments.iter().any(|segment| {
+fn is_user_save_root_path(lower_path: &str) -> bool {
+    lower_path.contains("\\appdata\\locallow\\")
+        || lower_path.contains("\\appdata\\local\\")
+        || lower_path.contains("\\appdata\\roaming\\")
+        || lower_path.contains("\\documents\\")
+        || lower_path.contains("\\saved games\\")
+}
+
+fn matches_save_path_keyword(lower_path: &str) -> bool {
+    split_path_words(lower_path).iter().any(|segment| {
         PATH_KEYWORDS
             .iter()
             .any(|keyword| *segment == *keyword || segment.starts_with(keyword))
-    });
+    })
+}
 
-    if keyword_hit {
-        return true;
-    }
+fn matches_game_name_keyword(lower_path: &str, game_id_lower: &str, exe_name_lower: &str) -> bool {
+    let segments = split_path_words(lower_path);
+    let game_id_hit = if game_id_lower.trim().is_empty() {
+        false
+    } else {
+        let compact_game_id = game_id_lower.replace(['-', '_', ' '], "");
+        segments
+            .iter()
+            .any(|segment| segment.contains(game_id_lower) || segment.contains(&compact_game_id))
+    };
+    let exe_name_hit = if exe_name_lower.trim().is_empty() {
+        false
+    } else {
+        let compact_exe = exe_name_lower.replace(['-', '_', ' '], "");
+        segments
+            .iter()
+            .any(|segment| segment.contains(exe_name_lower) || segment.contains(&compact_exe))
+    };
+    game_id_hit || exe_name_hit
+}
 
-    if game_id_lower.is_empty() {
-        return false;
-    }
-
-    let compact_game_id = game_id_lower.replace(['-', '_', ' '], "");
-    segments
+fn matches_filename_keyword(file_name_lower: &str, keywords: &[&str]) -> bool {
+    let compact = file_name_lower.replace(['-', '_', ' ', '.'], "");
+    keywords
         .iter()
-        .any(|segment| segment.contains(game_id_lower) || segment.contains(&compact_game_id))
+        .any(|keyword| file_name_lower.contains(keyword) || compact.contains(keyword))
+}
+
+fn promote_candidate_parent(parent: &str) -> String {
+    let normalized = parent.replace('/', "\\");
+    let parts = normalized.split('\\').collect::<Vec<_>>();
+    for (index, part) in parts.iter().enumerate().rev() {
+        let lower = part.to_ascii_lowercase();
+        if PATH_KEYWORDS
+            .iter()
+            .any(|keyword| lower == *keyword || lower.starts_with(keyword))
+        {
+            return parts[..=index].join("\\");
+        }
+    }
+    parent.to_string()
+}
+
+fn split_path_words(lower_path: &str) -> Vec<String> {
+    lower_path
+        .replace('/', "\\")
+        .split(|ch: char| ch == '\\' || ch == '_' || ch == '-' || ch == '.')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.to_string())
+        .collect::<Vec<_>>()
+}
+
+fn recommendation_rank(recommendation: &str) -> i32 {
+    match recommendation {
+        "strong" => 4,
+        "recommended" => 3,
+        "possible" => 2,
+        _ => 1,
+    }
 }
 
 fn store_file_path(app: &AppHandle) -> Result<PathBuf, String> {

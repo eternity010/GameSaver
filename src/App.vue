@@ -147,9 +147,63 @@ const ruleConflictByRuleId = computed<Record<string, RuleConflictItem>>(() => {
 });
 
 function inferGameId(path: string): string {
-  const parts = path.split("\\");
+  const parts = path.split(/[\\/]+/).filter(Boolean);
   const fileName = parts[parts.length - 1] ?? "";
-  return fileName.toLowerCase().endsWith(".exe") ? fileName.slice(0, -4) : fileName;
+  const exeName = fileName.toLowerCase().endsWith(".exe") ? fileName.slice(0, -4) : fileName;
+  const commonIndex = parts.findIndex((part) => part.toLowerCase() === "common");
+  if (commonIndex >= 0 && commonIndex + 1 < parts.length - 1) {
+    return cleanInferredGameId(parts[commonIndex + 1]);
+  }
+  if (!isGenericExeName(exeName)) {
+    return cleanInferredGameId(exeName);
+  }
+  for (let index = parts.length - 2; index >= 0; index -= 1) {
+    const candidate = parts[index] ?? "";
+    if (candidate && !isGenericPathSegment(candidate)) {
+      return cleanInferredGameId(candidate);
+    }
+  }
+  return cleanInferredGameId(exeName || fileName);
+}
+
+function cleanInferredGameId(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function isGenericExeName(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return [
+    "game",
+    "game.exe",
+    "main",
+    "launcher",
+    "start",
+    "play",
+    "nw",
+    "node-webkit",
+    "rpg_rt",
+    "rpgvxace",
+    "rpgmaker",
+    "unitycrashhandler64",
+    "unitycrashhandler32",
+  ].includes(normalized) || normalized.endsWith("-win64-shipping") || normalized.endsWith("-win32-shipping");
+}
+
+function isGenericPathSegment(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return [
+    "bin",
+    "binaries",
+    "win64",
+    "win32",
+    "x64",
+    "x86",
+    "windows",
+    "release",
+    "debug",
+    "build",
+    "dist",
+  ].includes(normalized);
 }
 
 function normalizeGameId(gameIdText: string): string {
@@ -391,6 +445,43 @@ function visiblePrecheckChecks(gameIdText: string) {
   return precheck.checks.filter((check) => !hiddenPrecheckKeys.has(check.key));
 }
 
+function candidateRecommendationLabel(item: CandidatePath): string {
+  switch (item.recommendation) {
+    case "strong":
+      return "强推荐";
+    case "recommended":
+      return "推荐";
+    case "possible":
+      return "可能相关";
+    default:
+      return "低可信";
+  }
+}
+
+function candidateRecommendationClass(item: CandidatePath): string {
+  return item.recommendation || "weak";
+}
+
+function candidateSignalLabel(signal: string): string {
+  if (signal === "time-window") return "刚刚发生变化";
+  if (signal === "path-keyword" || signal === "save-path-keyword") return "路径像存档目录";
+  if (signal === "game-name-path") return "路径包含游戏名";
+  if (signal === "save-filename") return "文件名像存档";
+  if (signal === "size-reasonable") return "文件大小合理";
+  if (signal === "user-save-root") return "位于常见用户存档目录";
+  if (signal === "game-dir") return "位于游戏目录";
+  if (signal === "path-noise") return "包含缓存/日志等弱相关路径";
+  if (signal === "filename-noise") return "文件名像配置/缓存/日志";
+  if (signal.startsWith("extension:")) return `命中存档扩展名 .${signal.slice("extension:".length)}`;
+  if (signal.startsWith("weak-extension:")) return `命中弱扩展名 .${signal.slice("weak-extension:".length)}`;
+  return signal;
+}
+
+function candidateSignalSummary(item: CandidatePath): string {
+  if (!item.matchedSignals.length) return "暂无明显理由";
+  return item.matchedSignals.map(candidateSignalLabel).join(" / ");
+}
+
 function formatBytes(totalBytes: number): string {
   if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
     return "0 B";
@@ -507,18 +598,10 @@ async function endLearning() {
     eventCaptureMode.value = session.eventCaptureMode ?? "unknown";
     capturedEventCount.value = session.capturedEventCount ?? 0;
     eventCaptureError.value = session.eventCaptureError ?? "";
-    const topTwo = candidates.value.filter((item) => !item.collapsed).slice(0, 2);
-    const prioritized = topTwo.filter((item) =>
-      item.matchedSignals.some((signal) => signal.startsWith("extension:")),
+    const autoSelectable = candidates.value.filter(
+      (item) => item.recommendation === "strong" || item.recommendation === "recommended",
     );
-    const fallback = topTwo.filter((item) => item.score >= 60);
-    const merged = [...prioritized];
-    for (const item of fallback) {
-      if (!merged.some((entry) => entry.path === item.path)) {
-        merged.push(item);
-      }
-    }
-    selected.value = merged.slice(0, 2).map((item) => item.path);
+    selected.value = autoSelectable.slice(0, 2).map((item) => item.path);
     step.value = "results";
     if (!hasHighConfidence.value) {
       showToast("未检测到高可信候选，请确认学习阶段已执行存档动作", "info", 3600);
@@ -1150,13 +1233,16 @@ onUnmounted(() => {
                 />
                 <strong>{{ item.path }}</strong>
               </label>
+              <span class="candidate-rank" :class="candidateRecommendationClass(item)">
+                {{ candidateRecommendationLabel(item) }}
+              </span>
               <button type="button" @click="openPath(item.path)">打开目录</button>
             </div>
             <p>
               得分：{{ item.score }} | changed={{ item.changedFiles }} added={{ item.addedFiles }}
               modified={{ item.modifiedFiles }}
             </p>
-            <p>信号：{{ item.matchedSignals.join(" / ") || "无" }}</p>
+            <p>推荐理由：{{ candidateSignalSummary(item) }}</p>
           </li>
         </ul>
         <div class="row">
