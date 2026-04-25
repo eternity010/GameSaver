@@ -149,15 +149,15 @@ button:disabled {
 
 .library-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(360px, 420px);
+  grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
   align-items: start;
   gap: 14px;
 }
 
 .library-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 12px;
+  grid-template-columns: 1fr;
+  gap: 6px;
   align-items: start;
 }
 
@@ -305,26 +305,27 @@ button:disabled {
 }
 
 .game-card {
-  display: grid;
-  gap: 10px;
-  border-color: #c8d7e3;
-  background: #ffffff;
+  display: block;
+  border-color: transparent;
+  background: transparent;
+  padding: 8px 10px;
   cursor: pointer;
   transition:
+    background 0.15s ease,
     border-color 0.15s ease,
-    box-shadow 0.15s ease,
-    transform 0.15s ease;
+    box-shadow 0.15s ease;
 }
 
 .game-card:hover {
-  border-color: #8fb3d2;
-  box-shadow: 0 10px 24px rgba(38, 84, 120, 0.1);
-  transform: translateY(-1px);
+  border-color: #d3e1ed;
+  background: #f7fbff;
+  box-shadow: none;
 }
 
 .game-card.selected {
   border-color: #2f83bd;
-  box-shadow: 0 0 0 2px rgba(47, 131, 189, 0.14), 0 12px 28px rgba(38, 84, 120, 0.12);
+  background: #eaf4fc;
+  box-shadow: inset 3px 0 0 #2f83bd;
 }
 
 .game-card:focus-visible {
@@ -475,58 +476,62 @@ button:disabled {
   color: #567289;
 }
 
-.exe-summary {
+.library-game-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.game-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex: 0 0 auto;
+  background: #b7c7d4;
+}
+
+.game-status-dot.ready {
+  background: #2e9d68;
+}
+
+.game-status-dot.missing {
+  background: #d68c38;
+}
+
+.library-game-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.library-game-main h3 {
   margin: 0;
-  color: #4c6478;
-  font-size: 12px;
-  line-height: 1.4;
+  font-size: 15px;
+  line-height: 1.25;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.card-actions {
+.library-game-main p {
+  margin: 3px 0 0;
+  color: #5a7286;
+  font-size: 12px;
   display: flex;
   gap: 8px;
-  flex-wrap: wrap;
-}
-
-.card-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 10px;
-}
-
-.card-head > button {
-  flex: 0 0 auto;
-  min-width: 86px;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.card-title-block {
-  display: grid;
-  gap: 4px;
-}
-
-.card-head h3 {
-  margin: 0;
-  font-size: 20px;
-}
-
-.card-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.card-meta > span {
+.session-mini {
+  flex: 0 0 auto;
   font-size: 12px;
   color: #35536c;
   background: #f2f7fc;
   border: 1px solid #d6e2ec;
   border-radius: 999px;
-  padding: 2px 8px;
+  padding: 1px 7px;
 }
 
 .ghost {

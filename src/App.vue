@@ -1317,40 +1317,19 @@ onUnmounted(() => {
             <p v-if="libraryCardErrorFor(item.gameId)" class="error inline-error card-error">
               {{ libraryCardErrorFor(item.gameId) }}
             </p>
-            <div class="card-head">
-              <div class="card-title-block">
+            <div class="library-game-row">
+              <span class="game-status-dot" :class="item.preferredExePath ? 'ready' : 'missing'"></span>
+              <div class="library-game-main">
                 <h3>{{ item.gameId }}</h3>
-                <div class="card-meta">
-                  <span>规则 {{ item.enabledRules }}/{{ item.totalRules }} 已启用</span>
-                  <span>路径 {{ item.confirmedPathCount }}</span>
+                <p>
+                  <span>规则 {{ item.enabledRules }}/{{ item.totalRules }}</span>
                   <span v-if="backupStatsFor(item.gameId)">
-                    备份 {{ backupStatsFor(item.gameId)?.versionCount ?? 0 }} 版 ·
-                    {{ formatBytes(backupStatsFor(item.gameId)?.totalBytes ?? 0) }}
+                    备份 {{ backupStatsFor(item.gameId)?.versionCount ?? 0 }} 版
                   </span>
-                  <span v-else>备份统计读取中</span>
-                  <span v-if="item.lastSessionStatus">
-                    最近会话 {{ item.lastSessionStatus }}
-                  </span>
-                </div>
+                  <span v-else>备份读取中</span>
+                </p>
               </div>
-            </div>
-            <p class="exe-summary">{{ item.preferredExePath || "尚未绑定启动 EXE" }}</p>
-            <div class="card-actions">
-              <button
-                type="button"
-                class="primary"
-                :disabled="libraryState.loading || isCardBusy(item.gameId, 'launch')"
-                @click.stop="launchLibraryGame(item.gameId, 'backup')"
-              >
-                启动游戏
-              </button>
-              <button
-                type="button"
-                :disabled="libraryState.loading || isCardBusy(item.gameId, 'bind_exe')"
-                @click.stop="choosePreferredExeForGame(item.gameId)"
-              >
-                更换 EXE
-              </button>
+              <span v-if="item.lastSessionStatus" class="session-mini">{{ item.lastSessionStatus }}</span>
             </div>
           </article>
         </div>

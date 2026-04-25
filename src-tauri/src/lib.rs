@@ -2750,24 +2750,41 @@ fn drive_id_for_path(path: &Path) -> Option<String> {
     None
 }
 
+#[cfg(windows)]
 fn query_drive_free_space_bytes(drive_id: &str) -> Result<u64, String> {
-    let script = format!(
-        "$d=Get-CimInstance Win32_LogicalDisk -Filter \"DeviceID='{}'\"; if ($null -ne $d) {{ $d.FreeSpace }}",
-        drive_id
-    );
-    let mut command = Command::new("powershell");
-    command.args(["-NoProfile", "-Command", &script]);
-    let output = apply_background_process_flags(&mut command)
-        .output()
-        .map_err(|err| format!("查询磁盘空间失败（无法执行 powershell）: {err}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let msg = if !stderr.is_empty() { stderr } else { stdout };
-        return Err(format!("查询磁盘空间失败: {msg}"));
+    use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let trimmed = drive_id.trim().trim_end_matches(['\\', '/']);
+    if trimmed.is_empty() {
+        return Err("查询磁盘空间失败：磁盘标识为空".to_string());
     }
-    parse_u64(&String::from_utf8_lossy(&output.stdout))
-        .ok_or_else(|| format!("无法解析磁盘 {drive_id} 可用空间"))
+    let root = if trimmed.ends_with(':') {
+        format!("{trimmed}\\")
+    } else {
+        format!("{trimmed}:\\")
+    };
+    let wide: Vec<u16> = OsStr::new(&root).encode_wide().chain(Some(0)).collect();
+    let mut free_bytes_available: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut total_free_bytes: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_bytes_available,
+            &mut total_bytes,
+            &mut total_free_bytes,
+        )
+    };
+    if ok == 0 {
+        return Err(format!("查询磁盘空间失败：无法读取 {root} 可用空间"));
+    }
+    Ok(free_bytes_available)
+}
+
+#[cfg(not(windows))]
+fn query_drive_free_space_bytes(drive_id: &str) -> Result<u64, String> {
+    Err(format!("查询磁盘空间失败：当前平台不支持磁盘 {drive_id} 空间检查"))
 }
 
 fn format_bytes_short(bytes: u64) -> String {
@@ -4241,18 +4258,6 @@ fn parse_u32(text: &str) -> Option<u32> {
         None
     } else {
         digits.parse::<u32>().ok()
-    }
-}
-
-fn parse_u64(text: &str) -> Option<u64> {
-    let digits = text
-        .chars()
-        .filter(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    if digits.is_empty() {
-        None
-    } else {
-        digits.parse::<u64>().ok()
     }
 }
 

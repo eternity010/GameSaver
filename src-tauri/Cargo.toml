@@ -1,6 +1,6 @@
 [package]
 name = "gamesaver"
-version = "0.1.4"
+version = "0.1.5"
 description = "GameSaver desktop app"
 authors = ["you"]
 edition = "2021"
@@ -22,3 +22,4 @@ uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
 hex = "0.4"
 zip = { version = "2", default-features = true, features = ["deflate"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
