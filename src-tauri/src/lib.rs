@@ -294,6 +294,8 @@ struct BackupVersion {
     version_id: String,
     created_at: String,
     file_count: usize,
+    label: String,
+    restorable: bool,
 }
 
 #[derive(Serialize)]
@@ -302,6 +304,7 @@ struct RestoreBackupResult {
     game_id: String,
     version_id: String,
     restored_files: usize,
+    pre_restore_version_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2150,12 +2153,14 @@ fn list_backup_versions(state: State<AppState>, game_id: String) -> Result<Vec<B
         .into_iter()
         .map(|(version_id, path)| BackupVersion {
             created_at: version_id.clone(),
-            version_id,
+            label: backup_version_label(&version_id),
+            restorable: !version_id.starts_with("_"),
             file_count: WalkDir::new(path)
                 .into_iter()
                 .filter_map(Result::ok)
                 .filter(|item| item.file_type().is_file())
                 .count(),
+            version_id,
         })
         .collect::<Vec<_>>();
     versions.sort_by(|a, b| b.version_id.cmp(&a.version_id));
@@ -2178,12 +2183,13 @@ fn restore_backup_version(
         return Err("versionId 不能为空".to_string());
     }
 
-    let (backup_root, rule, running_candidates) = {
+    let (backup_root, rule, keep_versions, running_candidates) = {
         let store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
         let rule = select_rule_for_game(&store, &trimmed_game_id)
             .ok_or_else(|| "未找到该游戏可用规则".to_string())?;
         let candidates = collect_restore_running_session_candidates(&store, &rule, &trimmed_game_id);
-        (store.execution_config.backup_root.clone(), rule, candidates)
+        let keep_versions = resolve_backup_keep_versions(&store.execution_config, &rule.game_uid);
+        (store.execution_config.backup_root.clone(), rule, keep_versions, candidates)
     };
 
     for (session_id, pid, _updated_ts) in running_candidates {
@@ -2203,6 +2209,13 @@ fn restore_backup_version(
     let manifest = verify_backup_manifest_integrity(&version_dir)?;
     validate_restore_targets_writable(&rule)?;
     validate_restore_disk_space(&rule, &manifest)?;
+
+    let pre_restore_version_id =
+        match backup_current_state_for_rule(&rule, &backup_root, keep_versions + 1, Some("pre_restore")) {
+            Ok((changed, version_id)) if changed > 0 => Some(version_id),
+            Ok(_) => None,
+            Err(err) => return Err(format!("恢复前备份当前存档失败，已阻止回滚：{err}")),
+        };
 
     let restored_files = restore_backup_version_transactional(&rule, &version_dir, &base)?;
 
@@ -2242,6 +2255,7 @@ fn restore_backup_version(
         game_id: trimmed_game_id,
         version_id: trimmed_version_id,
         restored_files,
+        pre_restore_version_id,
     })
 }
 
@@ -3436,6 +3450,14 @@ fn directory_total_bytes(path: &Path) -> u64 {
         .sum()
 }
 
+fn backup_version_label(version_id: &str) -> String {
+    if version_id.starts_with("pre_restore_") {
+        "回滚前备份".to_string()
+    } else {
+        "自动备份".to_string()
+    }
+}
+
 fn normalize_backup_manifest_relative_path(relative: &Path) -> String {
     normalize_windows_path(&relative.to_string_lossy())
 }
@@ -3629,17 +3651,21 @@ fn cleanup_backup_versions(versions_dir: &Path, keep: usize) -> Result<(), Strin
     Ok(())
 }
 
-fn backup_after_exit_for_rule(
+fn backup_current_state_for_rule(
     rule: &GameSaveRule,
     backup_root: &str,
     keep_versions: usize,
+    version_prefix: Option<&str>,
 ) -> Result<(usize, String), String> {
     let base = ensure_backup_root_for_rule(rule, backup_root)?;
     let latest = base.join("latest");
     let versions = base.join("versions");
     fs::create_dir_all(&latest).map_err(|err| format!("创建目录失败: {err}"))?;
     fs::create_dir_all(&versions).map_err(|err| format!("创建目录失败: {err}"))?;
-    let snapshot_id = now_unix().to_string();
+    let snapshot_id = match version_prefix {
+        Some(prefix) => format!("{}_{}", prefix.trim_matches('_'), now_unix()),
+        None => now_unix().to_string(),
+    };
     let version_root = versions.join(&snapshot_id);
 
     let mut changed_total = 0_usize;
@@ -3672,6 +3698,14 @@ fn backup_after_exit_for_rule(
     }
     cleanup_backup_versions(&versions, keep_versions)?;
     Ok((changed_total, snapshot_id))
+}
+
+fn backup_after_exit_for_rule(
+    rule: &GameSaveRule,
+    backup_root: &str,
+    keep_versions: usize,
+) -> Result<(usize, String), String> {
+    backup_current_state_for_rule(rule, backup_root, keep_versions, None)
 }
 
 fn spawn_post_exit_backup_worker(

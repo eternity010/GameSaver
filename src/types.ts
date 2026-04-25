@@ -103,6 +103,8 @@ export interface BackupVersion {
   versionId: string;
   createdAt: string;
   fileCount: number;
+  label: string;
+  restorable: boolean;
 }
 
 export interface BackupStatsResult {
@@ -128,6 +130,7 @@ export interface RestoreBackupResult {
   gameId: string;
   versionId: string;
   restoredFiles: number;
+  preRestoreVersionId?: string;
 }
 
 export interface ExportRulesResult {

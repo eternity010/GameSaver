@@ -73,6 +73,11 @@ type ConfirmDialogState = {
   cancelText: string;
   danger: boolean;
 };
+type RestoreUndoState = {
+  gameId: string;
+  versionId: string;
+  restoredVersionId: string;
+};
 
 const step = ref<UiStep>("setup");
 const activeTab = ref<TopTab>("library");
@@ -106,6 +111,7 @@ const backupStatsByGame = ref<Record<string, BackupStatsResult | null>>({});
 const backupKeepDraftByGame = ref<Record<string, string>>({});
 const sessionDetailsByGame = ref<Record<string, LauncherSession | null>>({});
 const launchPrecheckByGame = ref<Record<string, GameLaunchPrecheck | null>>({});
+const restoreUndoByGame = ref<Record<string, RestoreUndoState | null>>({});
 const hiddenPrecheckKeys = new Set(["sandbox_runtime", "inject_artifacts", "inject_arch"]);
 const { toast, showToast, closeToast } = useToast();
 const confirmDialog = ref<ConfirmDialogState>({
@@ -354,7 +360,7 @@ function shortExeHash(exeHash: string): string {
 }
 
 function formatUnixTs(value: string): string {
-  const timestamp = Number(value);
+  const timestamp = Number(value.startsWith("pre_restore_") ? value.slice("pre_restore_".length) : value);
   if (!Number.isFinite(timestamp) || timestamp <= 0) {
     return value || "未知";
   }
@@ -459,6 +465,10 @@ function onBackupKeepInput(gameIdText: string, event: Event) {
 
 function sessionDetailsFor(gameIdText: string): LauncherSession | null {
   return sessionDetailsByGame.value[cardKey(gameIdText)] ?? null;
+}
+
+function restoreUndoFor(gameIdText: string): RestoreUndoState | null {
+  return restoreUndoByGame.value[cardKey(gameIdText)] ?? null;
 }
 
 function launchPrecheckFor(gameIdText: string): GameLaunchPrecheck | null {
@@ -890,10 +900,54 @@ async function rollbackToLibraryBackupVersion(gameIdText: string, versionId: str
       loadSessionDetailsForGame(gameIdText, false),
     ]);
     void result;
+    if (result.preRestoreVersionId) {
+      restoreUndoByGame.value = {
+        ...restoreUndoByGame.value,
+        [cardKey(gameIdText)]: {
+          gameId: gameIdText,
+          versionId: result.preRestoreVersionId,
+          restoredVersionId: versionId,
+        },
+      };
+    }
     showToast("回滚完成", "success");
   } catch (err) {
     setLibraryCardError(gameIdText, `回滚失败：${String(err)}`);
     showBlockingError(`回滚失败：${String(err)}`);
+  } finally {
+    setCardBusy(gameIdText, "backup_rollback", false);
+  }
+}
+
+async function undoLibraryRestore(gameIdText: string) {
+  const undo = restoreUndoFor(gameIdText);
+  if (!undo) return;
+  const confirmed = await askConfirm({
+    title: "撤销本次恢复",
+    message: `确定恢复到回滚前备份 ${undo.versionId} 吗？此操作会再次覆盖当前存档。`,
+    confirmText: "撤销恢复",
+    cancelText: "取消",
+    danger: true,
+  });
+  if (!confirmed) return;
+  setCardBusy(gameIdText, "backup_rollback", true);
+  libraryState.value.error = "";
+  clearLibraryCardError(gameIdText);
+  try {
+    await restoreBackupVersion(gameIdText, undo.versionId);
+    restoreUndoByGame.value = {
+      ...restoreUndoByGame.value,
+      [cardKey(gameIdText)]: null,
+    };
+    await Promise.all([
+      loadBackupStatsForGame(gameIdText, false),
+      loadBackupVersionsForGame(gameIdText, false),
+      loadSessionDetailsForGame(gameIdText, false),
+    ]);
+    showToast("已撤销本次恢复", "success");
+  } catch (err) {
+    setLibraryCardError(gameIdText, `撤销恢复失败：${String(err)}`);
+    showBlockingError(`撤销恢复失败：${String(err)}`);
   } finally {
     setCardBusy(gameIdText, "backup_rollback", false);
   }
@@ -1617,17 +1671,32 @@ onUnmounted(() => {
                 刷新版本
               </button>
             </div>
-            <ul v-if="backupVersionsFor(selectedLibraryItem.gameId).length" class="rule-list">
-              <li v-for="version in backupVersionsFor(selectedLibraryItem.gameId)" :key="version.versionId">
-                <div class="row">
-                  <div>
+            <ul v-if="backupVersionsFor(selectedLibraryItem.gameId).length" class="backup-timeline">
+              <li
+                v-for="version in backupVersionsFor(selectedLibraryItem.gameId)"
+                :key="version.versionId"
+                :class="{ 'pre-restore': version.label === '回滚前备份' }"
+              >
+                <div class="backup-version-main">
+                  <div class="backup-version-title">
+                    <span class="backup-version-label">{{ version.label }}</span>
                     <strong>{{ formatUnixTs(version.createdAt) }}</strong>
-                    <p>versionId={{ version.versionId }} | files={{ version.fileCount }}</p>
                   </div>
+                  <p>{{ version.fileCount }} 个文件</p>
+                  <details class="backup-version-id">
+                    <summary>查看版本 ID</summary>
+                    <code>{{ version.versionId }}</code>
+                  </details>
+                </div>
+                <div class="backup-version-actions">
                   <button
                     type="button"
                     class="primary"
-                    :disabled="libraryState.loading || isCardBusy(selectedLibraryItem.gameId, 'backup_rollback')"
+                    :disabled="
+                      libraryState.loading ||
+                      isCardBusy(selectedLibraryItem.gameId, 'backup_rollback') ||
+                      !version.restorable
+                    "
                     @click="rollbackToLibraryBackupVersion(selectedLibraryItem.gameId, version.versionId)"
                   >
                     回滚到此版本
@@ -1636,6 +1705,23 @@ onUnmounted(() => {
               </li>
             </ul>
             <p v-else>暂无备份版本。</p>
+            <section v-if="restoreUndoFor(selectedLibraryItem.gameId)" class="restore-undo-box">
+              <div>
+                <strong>可撤销本次恢复</strong>
+                <p>
+                  已从 {{ restoreUndoFor(selectedLibraryItem.gameId)?.restoredVersionId }} 恢复。
+                  回滚前备份：{{ restoreUndoFor(selectedLibraryItem.gameId)?.versionId }}
+                </p>
+              </div>
+              <button
+                type="button"
+                class="danger"
+                :disabled="libraryState.loading || isCardBusy(selectedLibraryItem.gameId, 'backup_rollback')"
+                @click="undoLibraryRestore(selectedLibraryItem.gameId)"
+              >
+                撤销本次恢复
+              </button>
+            </section>
 
             <div class="row">
               <h4>最近会话日志</h4>
