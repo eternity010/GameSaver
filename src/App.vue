@@ -121,6 +121,32 @@ const blockingErrorMessage = ref("");
 let confirmResolver: ((value: boolean) => void) | null = null;
 
 const hasHighConfidence = computed(() => candidates.value.some((item) => item.score >= 45));
+const candidateGroups = computed(() => [
+  {
+    key: "strong",
+    title: "强推荐",
+    description: "最像真实存档目录，通常可以直接选择。",
+    items: candidates.value.filter((item) => item.recommendation === "strong"),
+  },
+  {
+    key: "recommended",
+    title: "推荐",
+    description: "命中了多个有效信号，建议打开目录确认。",
+    items: candidates.value.filter((item) => item.recommendation === "recommended"),
+  },
+  {
+    key: "possible",
+    title: "可能相关",
+    description: "有变化但证据不足，适合人工判断。",
+    items: candidates.value.filter((item) => item.recommendation === "possible"),
+  },
+  {
+    key: "weak",
+    title: "低可信",
+    description: "多为配置、缓存或弱信号，不会自动勾选。",
+    items: candidates.value.filter((item) => item.recommendation === "weak"),
+  },
+]);
 const filteredRules = computed(() => {
   const keyword = ruleSearch.value.trim().toLowerCase();
   if (!keyword) return rules.value;
@@ -626,6 +652,9 @@ async function saveLearningRule() {
     showToast("规则保存成功", "success");
     await refreshRules();
     await refreshLibraryItems();
+    activeTab.value = "library";
+    selectedLibraryGameId.value = gameId.value.trim();
+    void loadSelectedLibraryGameDetails();
   } catch (err) {
     learningState.value.error = String(err);
     showToast("规则保存失败", "error");
@@ -1172,27 +1201,25 @@ onUnmounted(() => {
     </nav>
 
     <template v-if="activeTab === 'learning'">
-      <section class="panel" :class="runtimeIsAdmin ? 'runtime-ok' : 'runtime-warn'">
-        <div class="row">
-          <strong>运行权限：{{ runtimeIsAdmin ? "管理员" : "普通用户" }}</strong>
-          <button v-if="!runtimeIsAdmin" type="button" class="primary" @click="relaunchAsAdmin">
-            一键管理员重启
-          </button>
-        </div>
-        <p>{{ runtimeMessage }}</p>
-      </section>
-
-      <header class="panel">
-        <h1>GameSaver 学习模式 MVP</h1>
-        <p>流程：选择游戏 -> 开始学习 -> 游戏存档并退出 -> 结束学习 -> 确认规则</p>
+      <header class="panel learning-hero">
+        <span class="eyebrow">学习存档</span>
+        <h1>把游戏加入 GameSaver</h1>
+        <p>选择游戏程序，启动后手动保存一次。GameSaver 会根据文件变化推荐存档目录。</p>
         <p v-if="learningState.error" class="error inline-error">{{ learningState.error }}</p>
+        <div class="learning-progress">
+          <span :class="{ active: step === 'setup', done: step !== 'setup' }">添加游戏</span>
+          <span :class="{ active: step === 'running', done: step === 'results' }">执行一次存档</span>
+          <span :class="{ active: step === 'results' }">选择存档目录</span>
+        </div>
       </header>
 
-      <section v-if="step === 'setup'" class="panel">
-        <h2>Step 1 / 2：选择游戏并开始学习</h2>
+      <section v-if="step === 'setup'" class="panel learning-card">
+        <span class="eyebrow">第一步</span>
+        <h2>添加游戏</h2>
+        <p class="learning-copy">选择游戏 EXE 后会自动推断游戏名称。名称只是显示和管理用，可以手动修改。</p>
         <label class="field">
-          <span>Game ID</span>
-          <input v-model="gameId" placeholder="例如：elden_ring" />
+          <span>游戏名称</span>
+          <input v-model="gameId" placeholder="例如：MonsterBlackMarket" />
         </label>
         <label class="field">
           <span>游戏 EXE 路径</span>
@@ -1202,52 +1229,86 @@ onUnmounted(() => {
           </div>
         </label>
         <button :disabled="learningState.loading" type="button" class="primary" @click="beginLearning">
-          {{ learningState.loading ? "处理中..." : "开始学习并启动游戏" }}
+          {{ learningState.loading ? "正在启动..." : "开始学习并启动游戏" }}
         </button>
       </section>
 
-      <section v-else-if="step === 'running'" class="panel">
-        <h2>Step 3 / 4 / 5：学习进行中</h2>
-        <p>会话 ID：{{ sessionId }}</p>
-        <p>游戏 PID：{{ pid ?? "未获取" }}</p>
-        <p>请在游戏中执行一次明确的存档动作，退出游戏后点击“结束学习”。</p>
-        <button :disabled="learningState.loading" type="button" class="primary" @click="endLearning">
-          {{ learningState.loading ? "分析中..." : "结束学习并分析候选路径" }}
-        </button>
-      </section>
-
-      <section v-else class="panel">
-        <h2>Step 6：候选结果与规则确认</h2>
-        <p>采集模式：{{ eventCaptureMode }} | 捕获事件数：{{ capturedEventCount }}</p>
-        <p v-if="eventCaptureError" class="error">ETW信息：{{ eventCaptureError }}</p>
-        <p v-if="!candidates.length">无候选路径。</p>
-        <ul v-else class="candidate-list">
-          <li v-for="item in candidates" :key="item.path" :class="{ collapsed: item.collapsed }">
-            <div class="candidate-header">
-              <label>
-                <input
-                  :checked="selected.includes(item.path)"
-                  type="checkbox"
-                  :disabled="item.collapsed"
-                  @change="toggleSelect(item.path)"
-                />
-                <strong>{{ item.path }}</strong>
-              </label>
-              <span class="candidate-rank" :class="candidateRecommendationClass(item)">
-                {{ candidateRecommendationLabel(item) }}
-              </span>
-              <button type="button" @click="openPath(item.path)">打开目录</button>
-            </div>
-            <p>
-              得分：{{ item.score }} | changed={{ item.changedFiles }} added={{ item.addedFiles }}
-              modified={{ item.modifiedFiles }}
-            </p>
-            <p>推荐理由：{{ candidateSignalSummary(item) }}</p>
-          </li>
+      <section v-else-if="step === 'running'" class="panel learning-card">
+        <span class="eyebrow">第二步</span>
+        <h2>进入游戏并手动保存一次</h2>
+        <p class="learning-copy">请在游戏里完成一次明确的存档动作。保存完成后，可以退出游戏，也可以保持游戏关闭后再点击分析。</p>
+        <ul class="learning-checklist">
+          <li>游戏已启动</li>
+          <li>进入游戏或读取一个已有存档</li>
+          <li>手动保存一次</li>
+          <li>回到 GameSaver 点击分析</li>
         </ul>
+        <button :disabled="learningState.loading" type="button" class="primary" @click="endLearning">
+          {{ learningState.loading ? "正在分析..." : "我已经保存，开始分析" }}
+        </button>
+        <details class="runtime-diagnostics learning-advanced">
+          <summary>采集详情（高级）</summary>
+          <p>运行权限：{{ runtimeIsAdmin ? "管理员" : "普通用户" }}</p>
+          <p>会话 ID：<code>{{ sessionId }}</code></p>
+          <p>游戏 PID：{{ pid ?? "未获取" }}</p>
+          <p>{{ runtimeMessage }}</p>
+          <button v-if="!runtimeIsAdmin" type="button" @click="relaunchAsAdmin">一键管理员重启</button>
+        </details>
+      </section>
+
+      <section v-else class="panel learning-card">
+        <span class="eyebrow">第三步</span>
+        <h2>选择存档目录</h2>
+        <p class="learning-copy">优先确认“强推荐”和“推荐”。如果不确定，可以打开目录查看里面是否有存档文件。</p>
+        <details class="runtime-diagnostics learning-advanced">
+          <summary>采集详情（高级）</summary>
+          <p>采集模式：{{ eventCaptureMode }} | 捕获事件数：{{ capturedEventCount }}</p>
+          <p v-if="eventCaptureError" class="error">ETW 信息：{{ eventCaptureError }}</p>
+        </details>
+        <p v-if="!candidates.length" class="empty-hint">没有检测到候选目录。请确认刚才在游戏内执行了保存动作。</p>
+        <div v-else class="candidate-groups">
+          <section
+            v-for="group in candidateGroups"
+            :key="group.key"
+            v-show="group.items.length"
+            class="candidate-group"
+          >
+            <div class="candidate-group-head">
+              <div>
+                <h3>{{ group.title }}</h3>
+                <p>{{ group.description }}</p>
+              </div>
+              <span>{{ group.items.length }} 项</span>
+            </div>
+            <ul class="candidate-list">
+              <li v-for="item in group.items" :key="item.path" :class="{ collapsed: item.collapsed }">
+                <div class="candidate-header">
+                  <label>
+                    <input
+                      :checked="selected.includes(item.path)"
+                      type="checkbox"
+                      :disabled="item.collapsed"
+                      @change="toggleSelect(item.path)"
+                    />
+                    <strong>{{ item.path }}</strong>
+                  </label>
+                  <span class="candidate-rank" :class="candidateRecommendationClass(item)">
+                    {{ candidateRecommendationLabel(item) }}
+                  </span>
+                  <button type="button" @click="openPath(item.path)">打开目录</button>
+                </div>
+                <p>
+                  得分：{{ item.score }} | changed={{ item.changedFiles }} added={{ item.addedFiles }}
+                  modified={{ item.modifiedFiles }}
+                </p>
+                <p>推荐理由：{{ candidateSignalSummary(item) }}</p>
+              </li>
+            </ul>
+          </section>
+        </div>
         <div class="row">
           <button :disabled="learningState.loading" type="button" class="primary" @click="saveLearningRule">
-            确认并保存规则
+            保存到游戏库
           </button>
           <button :disabled="learningState.loading" type="button" @click="step = 'setup'">重新学习</button>
         </div>

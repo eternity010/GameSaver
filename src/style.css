@@ -58,6 +58,80 @@ body {
   background: rgba(255, 249, 237, 0.96);
 }
 
+.learning-hero,
+.learning-card {
+  display: grid;
+  gap: 10px;
+}
+
+.learning-hero h1,
+.learning-card h2 {
+  margin-bottom: 0;
+}
+
+.learning-copy {
+  color: #4d687e;
+  line-height: 1.55;
+}
+
+.learning-progress {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.learning-progress span {
+  border: 1px solid #d3e0eb;
+  border-radius: 999px;
+  padding: 4px 10px;
+  color: #4c6478;
+  background: #f4f8fb;
+  font-size: 13px;
+}
+
+.learning-progress span.active {
+  color: #fff;
+  border-color: #2a6f97;
+  background: linear-gradient(135deg, #2a6f97, #3f88c5);
+}
+
+.learning-progress span.done {
+  color: #0a6d46;
+  border-color: #8bc7a7;
+  background: #edf9f2;
+}
+
+.learning-checklist {
+  display: grid;
+  gap: 8px;
+  margin: 4px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.learning-checklist li {
+  border: 1px solid #d8e5ef;
+  border-radius: 10px;
+  padding: 9px 11px;
+  background: #f8fbff;
+}
+
+.learning-checklist li::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 8px;
+  border-radius: 999px;
+  background: #2f83bd;
+  vertical-align: middle;
+}
+
+.learning-advanced {
+  margin-top: 4px;
+}
+
 h1 {
   margin: 0 0 6px;
   font-size: 24px;
@@ -744,6 +818,47 @@ button:disabled {
 
 .candidate-list li.collapsed {
   opacity: 0.6;
+}
+
+.candidate-groups {
+  display: grid;
+  gap: 12px;
+}
+
+.candidate-group {
+  border: 1px solid #d8e5ef;
+  border-radius: 12px;
+  padding: 12px;
+  background: #fbfdff;
+}
+
+.candidate-group-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.candidate-group-head h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.candidate-group-head p {
+  margin: 4px 0 0;
+  color: #567289;
+  font-size: 13px;
+}
+
+.candidate-group-head > span {
+  flex: 0 0 auto;
+  border: 1px solid #d6e2ec;
+  border-radius: 999px;
+  padding: 2px 8px;
+  color: #35536c;
+  background: #fff;
+  font-size: 12px;
 }
 
 .candidate-header {
