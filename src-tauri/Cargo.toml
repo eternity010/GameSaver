@@ -1,6 +1,6 @@
 [package]
 name = "gamesaver"
-version = "0.1.5"
+version = "0.1.8"
 description = "GameSaver desktop app"
 authors = ["you"]
 edition = "2021"

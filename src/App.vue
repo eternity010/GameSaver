@@ -78,6 +78,7 @@ type RestoreUndoState = {
   versionId: string;
   restoredVersionId: string;
 };
+type LearningBusyStage = "" | "starting" | "analyzing" | "saving";
 
 const step = ref<UiStep>("setup");
 const activeTab = ref<TopTab>("library");
@@ -95,6 +96,7 @@ const learningState = ref<TabState>({ loading: false, error: "" });
 const rulesState = ref<TabState>({ loading: false, error: "" });
 const libraryState = ref<TabState>({ loading: false, error: "" });
 const migrationExportWaiting = ref(false);
+const learningBusyStage = ref<LearningBusyStage>("");
 const eventCaptureMode = ref("unknown");
 const capturedEventCount = ref(0);
 const eventCaptureError = ref("");
@@ -518,6 +520,19 @@ function candidateSignalSummary(item: CandidatePath): string {
   return item.matchedSignals.map(candidateSignalLabel).join(" / ");
 }
 
+function learningBusyLabel(): string {
+  switch (learningBusyStage.value) {
+    case "starting":
+      return "正在启动游戏并创建学习会话...";
+    case "analyzing":
+      return "正在分析存档变化，这一步可能需要几十秒，请耐心等待。";
+    case "saving":
+      return "正在保存规则并同步到游戏库...";
+    default:
+      return "处理中...";
+  }
+}
+
 function formatBytes(totalBytes: number): string {
   if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
     return "0 B";
@@ -607,6 +622,7 @@ async function chooseExePath() {
 }
 
 async function beginLearning() {
+  learningBusyStage.value = "starting";
   learningState.value.loading = true;
   learningState.value.error = "";
   try {
@@ -622,10 +638,12 @@ async function beginLearning() {
     learningState.value.error = String(err);
   } finally {
     learningState.value.loading = false;
+    learningBusyStage.value = "";
   }
 }
 
 async function endLearning() {
+  learningBusyStage.value = "analyzing";
   learningState.value.loading = true;
   learningState.value.error = "";
   try {
@@ -646,6 +664,7 @@ async function endLearning() {
     learningState.value.error = String(err);
   } finally {
     learningState.value.loading = false;
+    learningBusyStage.value = "";
   }
 }
 
@@ -654,6 +673,7 @@ async function saveLearningRule() {
     learningState.value.error = "请至少选择一个候选路径。";
     return;
   }
+  learningBusyStage.value = "saving";
   learningState.value.loading = true;
   learningState.value.error = "";
   try {
@@ -670,6 +690,7 @@ async function saveLearningRule() {
     showToast("规则保存失败", "error");
   } finally {
     learningState.value.loading = false;
+    learningBusyStage.value = "";
   }
 }
 
@@ -1294,6 +1315,13 @@ onUnmounted(() => {
         <span class="eyebrow">第二步</span>
         <h2>进入游戏并手动保存一次</h2>
         <p class="learning-copy">请在游戏里完成一次明确的存档动作。保存完成后，可以退出游戏，也可以保持游戏关闭后再点击分析。</p>
+        <section v-if="learningState.loading && learningBusyStage === 'analyzing'" class="learning-loading-box">
+          <strong>{{ learningBusyLabel() }}</strong>
+          <div class="progress-track" role="progressbar" aria-label="正在分析存档变化">
+            <span class="progress-indeterminate"></span>
+          </div>
+          <p>期间请不要重复点击按钮，也不要关闭程序窗口。</p>
+        </section>
         <ul class="learning-checklist">
           <li>游戏已启动</li>
           <li>进入游戏或读取一个已有存档</li>
