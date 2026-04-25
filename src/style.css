@@ -147,10 +147,18 @@ button:disabled {
   padding: 10px;
 }
 
+.library-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 420px);
+  align-items: start;
+  gap: 14px;
+}
+
 .library-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 12px;
+  align-items: start;
 }
 
 .library-grid.single {
@@ -301,6 +309,27 @@ button:disabled {
   gap: 10px;
   border-color: #c8d7e3;
   background: #ffffff;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    transform 0.15s ease;
+}
+
+.game-card:hover {
+  border-color: #8fb3d2;
+  box-shadow: 0 10px 24px rgba(38, 84, 120, 0.1);
+  transform: translateY(-1px);
+}
+
+.game-card.selected {
+  border-color: #2f83bd;
+  box-shadow: 0 0 0 2px rgba(47, 131, 189, 0.14), 0 12px 28px rgba(38, 84, 120, 0.12);
+}
+
+.game-card:focus-visible {
+  outline: 3px solid rgba(47, 131, 189, 0.35);
+  outline-offset: 2px;
 }
 
 .precheck-box {
@@ -446,11 +475,33 @@ button:disabled {
   color: #567289;
 }
 
+.exe-summary {
+  margin: 0;
+  color: #4c6478;
+  font-size: 12px;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .card-head {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
   gap: 10px;
+}
+
+.card-head > button {
+  flex: 0 0 auto;
+  min-width: 86px;
+  white-space: nowrap;
 }
 
 .card-title-block {
@@ -521,6 +572,42 @@ button:disabled {
 .card-detail {
   background: #fbfdff;
   border-color: #d9e6f0;
+  max-height: min(68vh, 760px);
+  overflow: auto;
+}
+
+.library-detail-panel {
+  position: sticky;
+  top: 16px;
+  display: grid;
+  gap: 12px;
+  border-color: #c8d7e3;
+  background: #fbfdff;
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+}
+
+.detail-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.detail-head h3 {
+  margin: 2px 0 0;
+  font-size: 22px;
+}
+
+.eyebrow {
+  color: #5a748a;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+}
+
+.backup-detail-stack {
+  display: grid;
+  gap: 10px;
 }
 
 .backup-policy-box {
@@ -973,6 +1060,19 @@ button:disabled {
 @media (max-width: 700px) {
   .layout {
     padding: 12px;
+  }
+
+  .library-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .library-detail-panel {
+    position: static;
+    max-height: none;
+  }
+
+  .detail-head {
+    flex-direction: column;
   }
 
   .row {
