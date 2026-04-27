@@ -4,9 +4,8 @@ import { useToast } from "./composables/useToast";
 import {
   confirmRule,
   deleteRule,
-  exportMigrationZip,
   exportRules,
-  finishLearning,
+  getTask,
   getLauncherSession,
   getBackupStats,
   getLearningSession,
@@ -14,7 +13,6 @@ import {
   getRedirectRuntimeInfo,
   getRuntimeStatus,
   importRules,
-  importMigrationZip,
   launchGame,
   launchGameFromLibrary,
   listRuleConflicts,
@@ -24,10 +22,13 @@ import {
   listRules,
   openCandidatePath,
   restartAsAdmin,
-  restoreBackupVersion,
   setPrimaryRule,
   setBackupKeepVersions,
   setPreferredExePath,
+  startExportMigrationZipTask,
+  startFinishLearningTask,
+  startImportMigrationZipTask,
+  startRestoreBackupVersionTask,
   startLearning,
   updateRule,
 } from "./api";
@@ -35,12 +36,15 @@ import type {
   BackupStatsResult,
   BackupVersion,
   CandidatePath,
+  ExportMigrationZipResult,
   GameLibraryItem,
   GameLaunchPrecheck,
   GameSaveRule,
+  ImportMigrationZipResult,
   LauncherMode,
   LauncherSession,
   RedirectRuntimeInfo,
+  RestoreBackupResult,
   RuleConflictItem,
 } from "./types";
 
@@ -96,7 +100,14 @@ const learningState = ref<TabState>({ loading: false, error: "" });
 const rulesState = ref<TabState>({ loading: false, error: "" });
 const libraryState = ref<TabState>({ loading: false, error: "" });
 const migrationExportWaiting = ref(false);
+const migrationExportMessage = ref("");
+const migrationExportProgress = ref<number | null>(null);
+const migrationImportWaiting = ref(false);
+const migrationImportMessage = ref("");
+const migrationImportProgress = ref<number | null>(null);
 const learningBusyStage = ref<LearningBusyStage>("");
+const learningTaskMessage = ref("");
+const learningTaskProgress = ref<number | null>(null);
 const eventCaptureMode = ref("unknown");
 const capturedEventCount = ref(0);
 const eventCaptureError = ref("");
@@ -114,6 +125,8 @@ const backupKeepDraftByGame = ref<Record<string, string>>({});
 const sessionDetailsByGame = ref<Record<string, LauncherSession | null>>({});
 const launchPrecheckByGame = ref<Record<string, GameLaunchPrecheck | null>>({});
 const restoreUndoByGame = ref<Record<string, RestoreUndoState | null>>({});
+const restoreTaskMessageByGame = ref<Record<string, string>>({});
+const restoreTaskProgressByGame = ref<Record<string, number | null>>({});
 const hiddenPrecheckKeys = new Set(["sandbox_runtime", "inject_artifacts", "inject_arch"]);
 const { toast, showToast, closeToast } = useToast();
 const confirmDialog = ref<ConfirmDialogState>({
@@ -473,6 +486,31 @@ function restoreUndoFor(gameIdText: string): RestoreUndoState | null {
   return restoreUndoByGame.value[cardKey(gameIdText)] ?? null;
 }
 
+function restoreTaskMessageFor(gameIdText: string): string {
+  return restoreTaskMessageByGame.value[cardKey(gameIdText)] ?? "";
+}
+
+function restoreTaskProgressFor(gameIdText: string): number | null {
+  const value = restoreTaskProgressByGame.value[cardKey(gameIdText)];
+  return typeof value === "number" ? value : null;
+}
+
+function setRestoreTaskState(gameIdText: string, message: string, progress: number | null) {
+  const key = cardKey(gameIdText);
+  restoreTaskMessageByGame.value = {
+    ...restoreTaskMessageByGame.value,
+    [key]: message,
+  };
+  restoreTaskProgressByGame.value = {
+    ...restoreTaskProgressByGame.value,
+    [key]: progress,
+  };
+}
+
+function clearRestoreTaskState(gameIdText: string) {
+  setRestoreTaskState(gameIdText, "", null);
+}
+
 function launchPrecheckFor(gameIdText: string): GameLaunchPrecheck | null {
   return launchPrecheckByGame.value[cardKey(gameIdText)] ?? null;
 }
@@ -521,6 +559,9 @@ function candidateSignalSummary(item: CandidatePath): string {
 }
 
 function learningBusyLabel(): string {
+  if (learningBusyStage.value === "analyzing" && learningTaskMessage.value.trim()) {
+    return learningTaskMessage.value.trim();
+  }
   switch (learningBusyStage.value) {
     case "starting":
       return "正在启动游戏并创建学习会话...";
@@ -530,6 +571,31 @@ function learningBusyLabel(): string {
       return "正在保存规则并同步到游戏库...";
     default:
       return "处理中...";
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForTaskCompletion<T>(
+  taskId: string,
+  onProgress?: (message: string, progress: number | null) => void,
+) {
+  const startedAt = Date.now();
+  const timeoutMs = 3 * 60 * 1000;
+  while (true) {
+    const task = await getTask<T>(taskId);
+    const progressValue =
+      typeof task.progress === "number" && Number.isFinite(task.progress) ? Math.max(0, Math.min(100, task.progress)) : null;
+    onProgress?.(task.message ?? "", progressValue);
+    if (task.status === "success" || task.status === "failed") {
+      return task;
+    }
+    if (Date.now() - startedAt > timeoutMs) {
+      throw new Error("任务执行超时，请重试");
+    }
+    await sleep(350);
   }
 }
 
@@ -646,8 +712,22 @@ async function endLearning() {
   learningBusyStage.value = "analyzing";
   learningState.value.loading = true;
   learningState.value.error = "";
+  learningTaskMessage.value = "任务已创建，准备分析存档变化...";
+  learningTaskProgress.value = null;
   try {
-    candidates.value = await finishLearning(sessionId.value);
+    const taskId = await startFinishLearningTask(sessionId.value);
+    const finalTask = await waitForTaskCompletion<CandidatePath[]>(
+      taskId,
+      (message, progress) => {
+        learningTaskMessage.value = message || "正在分析存档变化...";
+        learningTaskProgress.value = progress;
+      },
+    );
+    if (finalTask.status === "failed") {
+      throw new Error(finalTask.error || "结束学习失败");
+    }
+    const taskResult = finalTask.result;
+    candidates.value = Array.isArray(taskResult) ? taskResult : [];
     const session = await getLearningSession(sessionId.value);
     eventCaptureMode.value = session.eventCaptureMode ?? "unknown";
     capturedEventCount.value = session.capturedEventCount ?? 0;
@@ -665,6 +745,8 @@ async function endLearning() {
   } finally {
     learningState.value.loading = false;
     learningBusyStage.value = "";
+    learningTaskMessage.value = "";
+    learningTaskProgress.value = null;
   }
 }
 
@@ -912,15 +994,28 @@ async function rollbackToLibraryBackupVersion(gameIdText: string, versionId: str
   setCardBusy(gameIdText, "backup_rollback", true);
   libraryState.value.error = "";
   clearLibraryCardError(gameIdText);
+  setRestoreTaskState(gameIdText, "任务已创建，准备回滚...", 0);
   try {
-    const result = await restoreBackupVersion(gameIdText, versionId);
+    const taskId = await startRestoreBackupVersionTask(gameIdText, versionId);
+    const finalTask = await waitForTaskCompletion<RestoreBackupResult>(
+      taskId,
+      (message, progress) => {
+        setRestoreTaskState(gameIdText, message || "正在回滚备份版本...", progress);
+      },
+    );
+    if (finalTask.status === "failed") {
+      throw new Error(finalTask.error || "回滚失败");
+    }
+    const result = finalTask.result;
+    if (!result) {
+      throw new Error("回滚失败：任务结果为空");
+    }
     await refreshLibraryItems();
     await Promise.all([
       loadBackupStatsForGame(gameIdText, false),
       loadBackupVersionsForGame(gameIdText, false),
       loadSessionDetailsForGame(gameIdText, false),
     ]);
-    void result;
     if (result.preRestoreVersionId) {
       restoreUndoByGame.value = {
         ...restoreUndoByGame.value,
@@ -939,6 +1034,7 @@ async function rollbackToLibraryBackupVersion(gameIdText: string, versionId: str
     setLibraryCardError(gameIdText, `回滚失败：${String(err)}`);
     showBlockingError(`回滚失败：${String(err)}`);
   } finally {
+    clearRestoreTaskState(gameIdText);
     setCardBusy(gameIdText, "backup_rollback", false);
   }
 }
@@ -957,8 +1053,18 @@ async function undoLibraryRestore(gameIdText: string) {
   setCardBusy(gameIdText, "backup_rollback", true);
   libraryState.value.error = "";
   clearLibraryCardError(gameIdText);
+  setRestoreTaskState(gameIdText, "任务已创建，准备撤销恢复...", 0);
   try {
-    await restoreBackupVersion(gameIdText, undo.versionId);
+    const taskId = await startRestoreBackupVersionTask(gameIdText, undo.versionId);
+    const finalTask = await waitForTaskCompletion<RestoreBackupResult>(
+      taskId,
+      (message, progress) => {
+        setRestoreTaskState(gameIdText, message || "正在撤销恢复...", progress);
+      },
+    );
+    if (finalTask.status === "failed") {
+      throw new Error(finalTask.error || "撤销恢复失败");
+    }
     restoreUndoByGame.value = {
       ...restoreUndoByGame.value,
       [cardKey(gameIdText)]: null,
@@ -973,6 +1079,7 @@ async function undoLibraryRestore(gameIdText: string) {
     setLibraryCardError(gameIdText, `撤销恢复失败：${String(err)}`);
     showBlockingError(`撤销恢复失败：${String(err)}`);
   } finally {
+    clearRestoreTaskState(gameIdText);
     setCardBusy(gameIdText, "backup_rollback", false);
   }
 }
@@ -1175,14 +1282,36 @@ async function exportMigrationZipToFile() {
     rulesState.value.loading = true;
     rulesState.value.error = "";
     migrationExportWaiting.value = true;
-    const result = await exportMigrationZip(chosen);
-    void result;
-    showToast("迁移包导出成功", "success");
+    migrationExportMessage.value = "任务已创建，准备导出迁移包...";
+    migrationExportProgress.value = 0;
+    const taskId = await startExportMigrationZipTask(chosen);
+    const finalTask = await waitForTaskCompletion<ExportMigrationZipResult>(
+      taskId,
+      (message, progress) => {
+        migrationExportMessage.value = message || "正在导出迁移包...";
+        migrationExportProgress.value = progress;
+      },
+    );
+    if (finalTask.status === "failed") {
+      throw new Error(finalTask.error || "导出迁移包失败");
+    }
+    const result = finalTask.result;
+    if (result) {
+      showToast(
+        `迁移包导出成功（规则 ${result.ruleCount} 条，备份游戏 ${result.backupGames} 个，文件 ${result.exportedFiles} 个）`,
+        "success",
+        4200,
+      );
+    } else {
+      showToast("迁移包导出成功", "success");
+    }
   } catch (err) {
     rulesState.value.error = `导出迁移包失败：${String(err)}`;
     showToast("迁移包导出失败", "error");
   } finally {
     migrationExportWaiting.value = false;
+    migrationExportMessage.value = "";
+    migrationExportProgress.value = null;
     rulesState.value.loading = false;
   }
 }
@@ -1197,15 +1326,39 @@ async function importMigrationZipFromFile() {
     if (!chosen || Array.isArray(chosen)) return;
     rulesState.value.loading = true;
     rulesState.value.error = "";
-    const result = await importMigrationZip(chosen);
+    migrationImportWaiting.value = true;
+    migrationImportMessage.value = "任务已创建，准备导入迁移包...";
+    migrationImportProgress.value = 0;
+    const taskId = await startImportMigrationZipTask(chosen);
+    const finalTask = await waitForTaskCompletion<ImportMigrationZipResult>(
+      taskId,
+      (message, progress) => {
+        migrationImportMessage.value = message || "正在导入迁移包...";
+        migrationImportProgress.value = progress;
+      },
+    );
+    if (finalTask.status === "failed") {
+      throw new Error(finalTask.error || "导入迁移包失败");
+    }
+    const result = finalTask.result;
     await refreshRules();
     await refreshLibraryItems();
-    void result;
-    showToast("迁移包导入完成", "success");
+    if (result) {
+      showToast(
+        `迁移包导入完成（新增规则 ${result.importedRules}，覆盖 ${result.overwrittenRules}，导入备份游戏 ${result.importedBackupGames}）`,
+        "success",
+        4200,
+      );
+    } else {
+      showToast("迁移包导入完成", "success");
+    }
   } catch (err) {
     rulesState.value.error = `导入迁移包失败：${String(err)}`;
     showToast("迁移包导入失败", "error");
   } finally {
+    migrationImportWaiting.value = false;
+    migrationImportMessage.value = "";
+    migrationImportProgress.value = null;
     rulesState.value.loading = false;
   }
 }
@@ -1318,8 +1471,14 @@ onUnmounted(() => {
         <section v-if="learningState.loading && learningBusyStage === 'analyzing'" class="learning-loading-box">
           <strong>{{ learningBusyLabel() }}</strong>
           <div class="progress-track" role="progressbar" aria-label="正在分析存档变化">
-            <span class="progress-indeterminate"></span>
+            <span v-if="learningTaskProgress === null" class="progress-indeterminate"></span>
+            <span
+              v-else
+              class="progress-determinate"
+              :style="{ width: `${learningTaskProgress}%` }"
+            ></span>
           </div>
+          <p v-if="learningTaskProgress !== null">当前进度：{{ learningTaskProgress }}%</p>
           <p>期间请不要重复点击按钮，也不要关闭程序窗口。</p>
         </section>
         <ul class="learning-checklist">
@@ -1423,10 +1582,28 @@ onUnmounted(() => {
           </div>
         </div>
         <div v-if="migrationExportWaiting" class="migration-progress">
-          <p>正在导出迁移包，文件较多时可能需要一点时间，请稍候...</p>
+          <p>{{ migrationExportMessage || "正在导出迁移包，文件较多时可能需要一点时间，请稍候..." }}</p>
           <div class="progress-track" role="progressbar" aria-label="迁移包导出进行中">
-            <span class="progress-indeterminate"></span>
+            <span v-if="migrationExportProgress === null" class="progress-indeterminate"></span>
+            <span
+              v-else
+              class="progress-determinate"
+              :style="{ width: `${migrationExportProgress}%` }"
+            ></span>
           </div>
+          <p v-if="migrationExportProgress !== null">当前进度：{{ migrationExportProgress }}%</p>
+        </div>
+        <div v-if="migrationImportWaiting" class="migration-progress">
+          <p>{{ migrationImportMessage || "正在导入迁移包，文件较多时可能需要一点时间，请稍候..." }}</p>
+          <div class="progress-track" role="progressbar" aria-label="迁移包导入进行中">
+            <span v-if="migrationImportProgress === null" class="progress-indeterminate"></span>
+            <span
+              v-else
+              class="progress-determinate"
+              :style="{ width: `${migrationImportProgress}%` }"
+            ></span>
+          </div>
+          <p v-if="migrationImportProgress !== null">当前进度：{{ migrationImportProgress }}%</p>
         </div>
         <p v-if="ruleConflicts.length" class="conflict-summary">
           检测到 {{ ruleConflicts.length }} 组 exeHash 冲突，建议为每组指定主规则。
@@ -1701,6 +1878,20 @@ onUnmounted(() => {
               >
                 刷新版本
               </button>
+            </div>
+            <div v-if="restoreTaskMessageFor(selectedLibraryItem.gameId)" class="migration-progress restore-progress">
+              <p>{{ restoreTaskMessageFor(selectedLibraryItem.gameId) }}</p>
+              <div class="progress-track" role="progressbar" aria-label="恢复进度">
+                <span v-if="restoreTaskProgressFor(selectedLibraryItem.gameId) === null" class="progress-indeterminate"></span>
+                <span
+                  v-else
+                  class="progress-determinate"
+                  :style="{ width: `${restoreTaskProgressFor(selectedLibraryItem.gameId)}%` }"
+                ></span>
+              </div>
+              <p v-if="restoreTaskProgressFor(selectedLibraryItem.gameId) !== null">
+                当前进度：{{ restoreTaskProgressFor(selectedLibraryItem.gameId) }}%
+              </p>
             </div>
             <ul v-if="backupVersionsFor(selectedLibraryItem.gameId).length" class="backup-timeline">
               <li

@@ -143,6 +143,25 @@ struct PersistedStore {
 
 struct AppState {
     store: Mutex<PersistedStore>,
+    tasks: Mutex<HashMap<String, BackgroundTask>>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BackgroundTask {
+    task_id: String,
+    task_type: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    started_at: String,
+    updated_at: String,
 }
 
 #[derive(Serialize)]
@@ -641,13 +660,15 @@ fn launch_game(app: AppHandle, state: State<AppState>, session_id: String) -> Re
     Ok(pid)
 }
 
-#[tauri::command]
-fn finish_learning(
-    app: AppHandle,
-    state: State<AppState>,
-    session_id: String,
+fn finish_learning_impl(
+    app: &AppHandle,
+    app_state: &AppState,
+    session_id: &str,
 ) -> Result<Vec<CandidatePath>, String> {
-    let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+    let mut store = app_state
+        .store
+        .lock()
+        .map_err(|_| "无法锁定应用状态".to_string())?;
     let session = store
         .sessions
         .iter_mut()
@@ -666,9 +687,9 @@ fn finish_learning(
     let end_unix = now_unix();
     let final_snapshot_ref = format!("final_{session_id}.json");
     let final_snapshot = collect_snapshot(&session.game_id, &session.exe_path)?;
-    write_snapshot(&app, &final_snapshot_ref, &final_snapshot)?;
+    write_snapshot(app, &final_snapshot_ref, &final_snapshot)?;
 
-    let baseline_snapshot: Snapshot = read_snapshot(&app, &session.baseline_snapshot_ref)?;
+    let baseline_snapshot: Snapshot = read_snapshot(app, &session.baseline_snapshot_ref)?;
     let related_files = match collect_related_files_by_trace(
         session.event_trace_name.as_deref(),
         session.event_trace_path.as_deref(),
@@ -701,8 +722,147 @@ fn finish_learning(
     session.final_snapshot_ref = Some(final_snapshot_ref);
     session.candidates = candidates.clone();
 
-    persist_store(&app, &store)?;
+    persist_store(app, &store)?;
     Ok(candidates)
+}
+
+fn update_background_task(
+    app: &AppHandle,
+    task_id: &str,
+    status: &str,
+    progress: Option<u8>,
+    message: Option<String>,
+    result: Option<serde_json::Value>,
+    error: Option<String>,
+) {
+    let app_state: State<AppState> = app.state();
+    let mut tasks = match app_state.tasks.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    if let Some(task) = tasks.get_mut(task_id) {
+        task.status = status.to_string();
+        task.progress = progress;
+        task.message = message;
+        if let Some(payload) = result {
+            task.result = Some(payload);
+        }
+        if status == "success" {
+            task.error = None;
+        } else if let Some(err) = error {
+            task.error = Some(err);
+        }
+        task.updated_at = now_iso_string();
+    }
+}
+
+#[tauri::command]
+fn start_finish_learning_task(
+    app: AppHandle,
+    state: State<AppState>,
+    session_id: String,
+) -> Result<String, String> {
+    let trimmed_session_id = session_id.trim().to_string();
+    if trimmed_session_id.is_empty() {
+        return Err("sessionId 不能为空".to_string());
+    }
+    {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "无法锁定应用状态".to_string())?;
+        if !store
+            .sessions
+            .iter()
+            .any(|item| item.session_id == trimmed_session_id)
+        {
+            return Err("sessionId 不存在".to_string());
+        }
+    }
+
+    let task_id = Uuid::new_v4().to_string();
+    let now = now_iso_string();
+    let task = BackgroundTask {
+        task_id: task_id.clone(),
+        task_type: "finish_learning".to_string(),
+        status: "pending".to_string(),
+        progress: Some(0),
+        message: Some("任务已创建，等待执行".to_string()),
+        result: None,
+        error: None,
+        started_at: now.clone(),
+        updated_at: now,
+    };
+    {
+        let mut tasks = state
+            .tasks
+            .lock()
+            .map_err(|_| "无法锁定任务状态".to_string())?;
+        tasks.insert(task_id.clone(), task);
+    }
+
+    let app_handle = app.clone();
+    let task_id_for_thread = task_id.clone();
+    let session_id_for_thread = trimmed_session_id.clone();
+    std::thread::spawn(move || {
+        update_background_task(
+            &app_handle,
+            &task_id_for_thread,
+            "running",
+            Some(15),
+            Some("正在分析存档变化...".to_string()),
+            None,
+            None,
+        );
+        let app_state: State<AppState> = app_handle.state();
+        match finish_learning_impl(&app_handle, app_state.inner(), &session_id_for_thread) {
+            Ok(candidates) => {
+                update_background_task(
+                    &app_handle,
+                    &task_id_for_thread,
+                    "success",
+                    Some(100),
+                    Some(format!("分析完成，共发现 {} 个候选目录", candidates.len())),
+                    serde_json::to_value(candidates).ok(),
+                    None,
+                );
+            }
+            Err(err) => {
+                update_background_task(
+                    &app_handle,
+                    &task_id_for_thread,
+                    "failed",
+                    Some(100),
+                    Some("分析失败".to_string()),
+                    None,
+                    Some(err),
+                );
+            }
+        }
+    });
+
+    Ok(task_id)
+}
+
+#[tauri::command]
+fn get_task(state: State<AppState>, task_id: String) -> Result<BackgroundTask, String> {
+    let tasks = state
+        .tasks
+        .lock()
+        .map_err(|_| "无法锁定任务状态".to_string())?;
+    tasks
+        .get(task_id.trim())
+        .cloned()
+        .ok_or_else(|| "taskId 不存在".to_string())
+}
+
+#[tauri::command]
+fn finish_learning(
+    app: AppHandle,
+    state: State<AppState>,
+    session_id: String,
+) -> Result<Vec<CandidatePath>, String> {
+    finish_learning_impl(&app, state.inner(), &session_id)
 }
 
 #[tauri::command]
@@ -945,19 +1105,30 @@ fn import_rules(
     Ok(summary)
 }
 
-#[tauri::command]
-fn export_migration_zip(
-    state: State<AppState>,
-    file_path: String,
-) -> Result<ExportMigrationZipResult, String> {
+fn export_migration_zip_impl<F>(
+    app_state: &AppState,
+    file_path: &str,
+    mut on_progress: F,
+) -> Result<ExportMigrationZipResult, String>
+where
+    F: FnMut(u8, String),
+{
     let target_path = file_path.trim().to_string();
     if target_path.is_empty() {
         return Err("filePath 不能为空".to_string());
     }
+    on_progress(5, "正在读取规则与备份配置...".to_string());
     let (rules, backup_root) = {
-        let store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+        let store = app_state
+            .store
+            .lock()
+            .map_err(|_| "无法锁定应用状态".to_string())?;
         (store.rules.clone(), store.execution_config.backup_root.clone())
     };
+    on_progress(
+        12,
+        format!("已加载 {} 条规则，正在准备迁移目录...", rules.len()),
+    );
 
     let temp_root = create_migration_temp_dir("export")?;
     let result = (|| -> Result<ExportMigrationZipResult, String> {
@@ -967,6 +1138,7 @@ fn export_migration_zip(
         fs::create_dir_all(&rules_dir).map_err(|err| format!("创建导出目录失败: {err}"))?;
         fs::create_dir_all(&backups_dir).map_err(|err| format!("创建导出目录失败: {err}"))?;
         fs::create_dir_all(&meta_dir).map_err(|err| format!("创建导出目录失败: {err}"))?;
+        on_progress(22, "正在写入规则与索引文件...".to_string());
 
         let rules_path = rules_dir.join("gamesaver-rules.json");
         write_pretty_json_file(&rules_path, &rules)?;
@@ -978,13 +1150,24 @@ fn export_migration_zip(
         let mut processed_uids = HashSet::new();
         let mut backup_games = 0_usize;
         let mut skipped_backup_games = 0_usize;
-        for rule in &rules {
+        let total_rules = rules.len().max(1);
+        for (index, rule) in rules.iter().enumerate() {
             let game_uid = normalize_game_uid(&rule.game_uid);
             if game_uid.is_empty() {
                 skipped_backup_games += 1;
+                let progress = 30 + (((index + 1) * 45) / total_rules) as u8;
+                on_progress(
+                    progress,
+                    format!("正在整理备份目录 ({}/{})...", index + 1, rules.len()),
+                );
                 continue;
             }
             if !processed_uids.insert(game_uid.clone()) {
+                let progress = 30 + (((index + 1) * 45) / total_rules) as u8;
+                on_progress(
+                    progress,
+                    format!("正在整理备份目录 ({}/{})...", index + 1, rules.len()),
+                );
                 continue;
             }
 
@@ -1008,6 +1191,14 @@ fn export_migration_zip(
             } else {
                 skipped_backup_games += 1;
             }
+            let progress = 30 + (((index + 1) * 45) / total_rules) as u8;
+            on_progress(
+                progress,
+                format!("正在整理备份目录 ({}/{})...", index + 1, rules.len()),
+            );
+        }
+        if rules.is_empty() {
+            on_progress(75, "未检测到规则，正在写入清单...".to_string());
         }
 
         let manifest = serde_json::json!({
@@ -1017,8 +1208,13 @@ fn export_migration_zip(
             "backupGames": backup_games
         });
         write_pretty_json_file(&temp_root.join("manifest.json"), &manifest)?;
+        on_progress(84, "正在压缩迁移包，请稍候...".to_string());
 
         let exported_files = zip_directory_contents(&temp_root, Path::new(&target_path))?;
+        on_progress(
+            97,
+            format!("压缩完成，共 {} 个文件，正在收尾...", exported_files),
+        );
         Ok(ExportMigrationZipResult {
             rule_count: rules.len(),
             backup_games,
@@ -1028,7 +1224,105 @@ fn export_migration_zip(
     })();
 
     let _ = fs::remove_dir_all(&temp_root);
+    if result.is_ok() {
+        on_progress(100, "迁移包导出完成".to_string());
+    }
     result
+}
+
+#[tauri::command]
+fn start_export_migration_zip_task(
+    app: AppHandle,
+    state: State<AppState>,
+    file_path: String,
+) -> Result<String, String> {
+    let trimmed_file_path = file_path.trim().to_string();
+    if trimmed_file_path.is_empty() {
+        return Err("filePath 不能为空".to_string());
+    }
+
+    let task_id = Uuid::new_v4().to_string();
+    let now = now_iso_string();
+    let task = BackgroundTask {
+        task_id: task_id.clone(),
+        task_type: "export_migration_zip".to_string(),
+        status: "pending".to_string(),
+        progress: Some(0),
+        message: Some("任务已创建，等待执行".to_string()),
+        result: None,
+        error: None,
+        started_at: now.clone(),
+        updated_at: now,
+    };
+    {
+        let mut tasks = state
+            .tasks
+            .lock()
+            .map_err(|_| "无法锁定任务状态".to_string())?;
+        tasks.insert(task_id.clone(), task);
+    }
+
+    let app_handle = app.clone();
+    let task_id_for_thread = task_id.clone();
+    std::thread::spawn(move || {
+        update_background_task(
+            &app_handle,
+            &task_id_for_thread,
+            "running",
+            Some(3),
+            Some("准备导出迁移包...".to_string()),
+            None,
+            None,
+        );
+        let app_state: State<AppState> = app_handle.state();
+        match export_migration_zip_impl(app_state.inner(), &trimmed_file_path, |progress, message| {
+            update_background_task(
+                &app_handle,
+                &task_id_for_thread,
+                "running",
+                Some(progress),
+                Some(message),
+                None,
+                None,
+            )
+        }) {
+            Ok(summary) => {
+                update_background_task(
+                    &app_handle,
+                    &task_id_for_thread,
+                    "success",
+                    Some(100),
+                    Some(format!(
+                        "导出完成：规则 {} 条，备份游戏 {} 个，文件 {} 个",
+                        summary.rule_count, summary.backup_games, summary.exported_files
+                    )),
+                    serde_json::to_value(summary).ok(),
+                    None,
+                );
+            }
+            Err(err) => {
+                update_background_task(
+                    &app_handle,
+                    &task_id_for_thread,
+                    "failed",
+                    Some(100),
+                    Some("导出迁移包失败".to_string()),
+                    None,
+                    Some(err),
+                );
+            }
+        }
+    });
+
+    Ok(task_id)
+}
+
+#[tauri::command]
+fn export_migration_zip(
+    state: State<AppState>,
+    file_path: String,
+) -> Result<ExportMigrationZipResult, String> {
+    export_migration_zip_impl(state.inner(), &file_path, |_progress, _message| {})
 }
 
 #[tauri::command]
@@ -1037,15 +1331,30 @@ fn import_migration_zip(
     state: State<AppState>,
     file_path: String,
 ) -> Result<ImportMigrationZipResult, String> {
+    import_migration_zip_impl(&app, state.inner(), &file_path, |_progress, _message| {})
+}
+
+fn import_migration_zip_impl<F>(
+    app: &AppHandle,
+    app_state: &AppState,
+    file_path: &str,
+    mut on_progress: F,
+) -> Result<ImportMigrationZipResult, String>
+where
+    F: FnMut(u8, String),
+{
     let source_path = file_path.trim().to_string();
     if source_path.is_empty() {
         return Err("filePath 不能为空".to_string());
     }
+    on_progress(5, "正在读取迁移包...".to_string());
 
     let temp_root = create_migration_temp_dir("import")?;
     let result = (|| -> Result<ImportMigrationZipResult, String> {
+        on_progress(15, "正在解压迁移包...".to_string());
         unzip_archive_to_directory(Path::new(&source_path), &temp_root)?;
 
+        on_progress(28, "正在读取规则文件...".to_string());
         let rules_file_path = resolve_import_rules_path(&temp_root)
             .ok_or_else(|| "迁移包缺少 rules/gamesaver-rules.json".to_string())?;
         let raw_rules = fs::read(&rules_file_path).map_err(|err| format!("读取规则文件失败: {err}"))?;
@@ -1056,8 +1365,12 @@ fn import_migration_zip(
             .as_array()
             .ok_or_else(|| "迁移包规则文件格式错误：必须是数组".to_string())?;
 
+        on_progress(40, "正在校验并合并规则...".to_string());
         let (summary, backup_root, staged_store) = {
-            let store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+            let store = app_state
+                .store
+                .lock()
+                .map_err(|_| "无法锁定应用状态".to_string())?;
             let mut staged = store.clone();
             let summary = apply_import_rules_array(&mut staged, rules_array);
             normalize_store(&mut staged);
@@ -1071,35 +1384,53 @@ fn import_migration_zip(
         let mut skipped_backup_games = 0_usize;
         if backups_root.exists() {
             let entries = fs::read_dir(&backups_root).map_err(|err| format!("读取备份目录失败: {err}"))?;
+            let mut entry_list = Vec::new();
             for entry in entries {
-                let entry = match entry {
-                    Ok(value) => value,
-                    Err(_) => {
-                        skipped_backup_games += 1;
-                        continue;
-                    }
-                };
+                match entry {
+                    Ok(value) => entry_list.push(value),
+                    Err(_) => skipped_backup_games += 1,
+                }
+            }
+            let total_entries = entry_list.len().max(1);
+            for (index, entry) in entry_list.into_iter().enumerate() {
+                let progress = 50 + (((index + 1) * 38) / total_entries) as u8;
                 let file_type = entry.file_type().map_err(|err| format!("读取备份条目失败: {err}"))?;
                 if !file_type.is_dir() {
                     skipped_backup_games += 1;
+                    on_progress(
+                        progress,
+                        format!("正在导入备份目录 ({}/{})...", index + 1, total_entries),
+                    );
                     continue;
                 }
                 let game_uid = normalize_game_uid(&entry.file_name().to_string_lossy());
                 if game_uid.is_empty() {
                     skipped_backup_games += 1;
+                    on_progress(
+                        progress,
+                        format!("正在导入备份目录 ({}/{})...", index + 1, total_entries),
+                    );
                     continue;
                 }
 
                 let copied = sync_directory(&entry.path(), &backup_game_root(&backup_root, &game_uid))?;
                 copied_backup_files += copied;
                 imported_backup_games += 1;
+                on_progress(
+                    progress,
+                    format!("正在导入备份目录 ({}/{})...", index + 1, total_entries),
+                );
             }
         }
 
+        on_progress(92, "正在写入本地存储...".to_string());
         {
-            let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+            let mut store = app_state
+                .store
+                .lock()
+                .map_err(|_| "无法锁定应用状态".to_string())?;
             *store = staged_store;
-            persist_store(&app, &store)?;
+            persist_store(app, &store)?;
         }
 
         Ok(ImportMigrationZipResult {
@@ -1113,7 +1444,97 @@ fn import_migration_zip(
     })();
 
     let _ = fs::remove_dir_all(&temp_root);
+    if result.is_ok() {
+        on_progress(100, "迁移包导入完成".to_string());
+    }
     result
+}
+
+#[tauri::command]
+fn start_import_migration_zip_task(
+    app: AppHandle,
+    state: State<AppState>,
+    file_path: String,
+) -> Result<String, String> {
+    let trimmed_file_path = file_path.trim().to_string();
+    if trimmed_file_path.is_empty() {
+        return Err("filePath 不能为空".to_string());
+    }
+
+    let task_id = Uuid::new_v4().to_string();
+    let now = now_iso_string();
+    let task = BackgroundTask {
+        task_id: task_id.clone(),
+        task_type: "import_migration_zip".to_string(),
+        status: "pending".to_string(),
+        progress: Some(0),
+        message: Some("任务已创建，等待执行".to_string()),
+        result: None,
+        error: None,
+        started_at: now.clone(),
+        updated_at: now,
+    };
+    {
+        let mut tasks = state
+            .tasks
+            .lock()
+            .map_err(|_| "无法锁定任务状态".to_string())?;
+        tasks.insert(task_id.clone(), task);
+    }
+
+    let app_handle = app.clone();
+    let task_id_for_thread = task_id.clone();
+    std::thread::spawn(move || {
+        update_background_task(
+            &app_handle,
+            &task_id_for_thread,
+            "running",
+            Some(3),
+            Some("准备导入迁移包...".to_string()),
+            None,
+            None,
+        );
+        let app_state: State<AppState> = app_handle.state();
+        match import_migration_zip_impl(&app_handle, app_state.inner(), &trimmed_file_path, |progress, message| {
+            update_background_task(
+                &app_handle,
+                &task_id_for_thread,
+                "running",
+                Some(progress),
+                Some(message),
+                None,
+                None,
+            )
+        }) {
+            Ok(summary) => {
+                update_background_task(
+                    &app_handle,
+                    &task_id_for_thread,
+                    "success",
+                    Some(100),
+                    Some(format!(
+                        "导入完成：新增规则 {}，覆盖规则 {}，导入备份游戏 {}",
+                        summary.imported_rules, summary.overwritten_rules, summary.imported_backup_games
+                    )),
+                    serde_json::to_value(summary).ok(),
+                    None,
+                );
+            }
+            Err(err) => {
+                update_background_task(
+                    &app_handle,
+                    &task_id_for_thread,
+                    "failed",
+                    Some(100),
+                    Some("导入迁移包失败".to_string()),
+                    None,
+                    Some(err),
+                );
+            }
+        }
+    });
+
+    Ok(task_id)
 }
 
 fn apply_import_rules_array(store: &mut PersistedStore, array: &[serde_json::Value]) -> ImportRulesResult {
@@ -2181,6 +2602,19 @@ fn restore_backup_version(
     game_id: String,
     version_id: String,
 ) -> Result<RestoreBackupResult, String> {
+    restore_backup_version_impl(&app, state.inner(), &game_id, &version_id, |_progress, _message| {})
+}
+
+fn restore_backup_version_impl<F>(
+    app: &AppHandle,
+    app_state: &AppState,
+    game_id: &str,
+    version_id: &str,
+    mut on_progress: F,
+) -> Result<RestoreBackupResult, String>
+where
+    F: FnMut(u8, String),
+{
     let trimmed_game_id = game_id.trim().to_string();
     let trimmed_version_id = version_id.trim().to_string();
     if trimmed_game_id.is_empty() {
@@ -2189,9 +2623,13 @@ fn restore_backup_version(
     if trimmed_version_id.is_empty() {
         return Err("versionId 不能为空".to_string());
     }
+    on_progress(6, "正在检查游戏状态...".to_string());
 
     let (backup_root, rule, keep_versions, running_candidates) = {
-        let store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+        let store = app_state
+            .store
+            .lock()
+            .map_err(|_| "无法锁定应用状态".to_string())?;
         let rule = select_rule_for_game(&store, &trimmed_game_id)
             .ok_or_else(|| "未找到该游戏可用规则".to_string())?;
         let candidates = collect_restore_running_session_candidates(&store, &rule, &trimmed_game_id);
@@ -2208,6 +2646,7 @@ fn restore_backup_version(
         }
     };
 
+    on_progress(18, "正在校验备份完整性与磁盘条件...".to_string());
     let base = ensure_backup_root_for_rule(&rule, &backup_root)?;
     let version_dir = base.join("versions").join(&trimmed_version_id);
     if !version_dir.exists() {
@@ -2217,6 +2656,7 @@ fn restore_backup_version(
     validate_restore_targets_writable(&rule)?;
     validate_restore_disk_space(&rule, &manifest)?;
 
+    on_progress(30, "正在创建回滚前备份...".to_string());
     let pre_restore_version_id =
         match backup_current_state_for_rule(&rule, &backup_root, keep_versions + 1, Some("pre_restore")) {
             Ok((changed, version_id)) if changed > 0 => Some(version_id),
@@ -2224,7 +2664,9 @@ fn restore_backup_version(
             Err(err) => return Err(format!("恢复前备份当前存档失败，已阻止回滚：{err}")),
         };
 
+    on_progress(55, "正在恢复目标版本...".to_string());
     let restored_files = restore_backup_version_transactional(&rule, &version_dir, &base)?;
+    on_progress(78, "正在校验恢复结果...".to_string());
     let verification = match verify_restored_targets(&rule, &manifest) {
         Ok(summary) => summary,
         Err(verify_err) => {
@@ -2247,8 +2689,12 @@ fn restore_backup_version(
         }
     };
 
+    on_progress(92, "正在写入会话日志...".to_string());
     {
-        let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+        let mut store = app_state
+            .store
+            .lock()
+            .map_err(|_| "无法锁定应用状态".to_string())?;
         let target_uid = normalize_game_uid(&rule.game_uid);
         let latest_idx = store
             .launcher_sessions
@@ -2280,9 +2726,16 @@ fn restore_backup_version(
             );
             session.updated_at = now_iso_string();
         }
-        persist_store(&app, &store)?;
+        persist_store(app, &store)?;
     }
 
+    on_progress(
+        100,
+        format!(
+            "恢复完成：{} 个文件，校验 {} 个，哈希抽样 {} 项",
+            restored_files, verification.verified_files, verification.hash_sample_count
+        ),
+    );
     Ok(RestoreBackupResult {
         game_id: trimmed_game_id,
         version_id: trimmed_version_id,
@@ -2291,6 +2744,104 @@ fn restore_backup_version(
         verified_files: verification.verified_files,
         hash_sample_count: verification.hash_sample_count,
     })
+}
+
+#[tauri::command]
+fn start_restore_backup_version_task(
+    app: AppHandle,
+    state: State<AppState>,
+    game_id: String,
+    version_id: String,
+) -> Result<String, String> {
+    let trimmed_game_id = game_id.trim().to_string();
+    let trimmed_version_id = version_id.trim().to_string();
+    if trimmed_game_id.is_empty() {
+        return Err("gameId 不能为空".to_string());
+    }
+    if trimmed_version_id.is_empty() {
+        return Err("versionId 不能为空".to_string());
+    }
+
+    let task_id = Uuid::new_v4().to_string();
+    let now = now_iso_string();
+    let task = BackgroundTask {
+        task_id: task_id.clone(),
+        task_type: "restore_backup_version".to_string(),
+        status: "pending".to_string(),
+        progress: Some(0),
+        message: Some("任务已创建，等待执行".to_string()),
+        result: None,
+        error: None,
+        started_at: now.clone(),
+        updated_at: now,
+    };
+    {
+        let mut tasks = state
+            .tasks
+            .lock()
+            .map_err(|_| "无法锁定任务状态".to_string())?;
+        tasks.insert(task_id.clone(), task);
+    }
+
+    let app_handle = app.clone();
+    let task_id_for_thread = task_id.clone();
+    std::thread::spawn(move || {
+        update_background_task(
+            &app_handle,
+            &task_id_for_thread,
+            "running",
+            Some(3),
+            Some("准备执行版本恢复...".to_string()),
+            None,
+            None,
+        );
+        let app_state: State<AppState> = app_handle.state();
+        match restore_backup_version_impl(
+            &app_handle,
+            app_state.inner(),
+            &trimmed_game_id,
+            &trimmed_version_id,
+            |progress, message| {
+                update_background_task(
+                    &app_handle,
+                    &task_id_for_thread,
+                    "running",
+                    Some(progress),
+                    Some(message),
+                    None,
+                    None,
+                )
+            },
+        ) {
+            Ok(summary) => {
+                update_background_task(
+                    &app_handle,
+                    &task_id_for_thread,
+                    "success",
+                    Some(100),
+                    Some(format!(
+                        "恢复完成：文件 {}，校验 {}，抽样 {}",
+                        summary.restored_files, summary.verified_files, summary.hash_sample_count
+                    )),
+                    serde_json::to_value(summary).ok(),
+                    None,
+                );
+            }
+            Err(err) => {
+                update_background_task(
+                    &app_handle,
+                    &task_id_for_thread,
+                    "failed",
+                    Some(100),
+                    Some("恢复失败".to_string()),
+                    None,
+                    Some(err),
+                );
+            }
+        }
+    });
+
+    Ok(task_id)
 }
 
 #[tauri::command]
@@ -5044,6 +5595,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             store: Mutex::new(PersistedStore::default()),
+            tasks: Mutex::new(HashMap::new()),
         })
         .setup(|app| {
             let loaded = match load_store(app.handle()) {
@@ -5062,6 +5614,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_learning,
             launch_game,
+            start_finish_learning_task,
+            get_task,
             finish_learning,
             confirm_rule,
             list_rules,
@@ -5071,7 +5625,9 @@ pub fn run() {
             delete_rule,
             export_rules,
             import_rules,
+            start_export_migration_zip_task,
             export_migration_zip,
+            start_import_migration_zip_task,
             import_migration_zip,
             open_candidate_path,
             resolve_rule_for_exe,
@@ -5088,6 +5644,7 @@ pub fn run() {
             set_backup_keep_versions,
             prune_backup_versions,
             list_backup_versions,
+            start_restore_backup_version_task,
             restore_backup_version,
             get_learning_session,
             get_runtime_status,

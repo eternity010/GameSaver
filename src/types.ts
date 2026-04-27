@@ -9,6 +9,20 @@ export interface CandidatePath {
   collapsed: boolean;
 }
 
+export type TaskStatus = "pending" | "running" | "success" | "failed";
+
+export interface TaskState<T = unknown> {
+  taskId: string;
+  taskType: string;
+  status: TaskStatus;
+  progress?: number;
+  message?: string;
+  result?: T;
+  error?: string;
+  startedAt: string;
+  updatedAt: string;
+}
+
 export interface LearningSession {
   sessionId: string;
   gameId: string;

@@ -19,6 +19,7 @@ import type {
   RestoreBackupResult,
   ResolveRuleResult,
   RuntimeStatus,
+  TaskState,
 } from "./types";
 
 export async function startLearning(gameId: string, exePath: string): Promise<string> {
@@ -31,6 +32,14 @@ export async function launchGame(sessionId: string): Promise<number> {
 
 export async function finishLearning(sessionId: string): Promise<CandidatePath[]> {
   return invoke("finish_learning", { sessionId });
+}
+
+export async function startFinishLearningTask(sessionId: string): Promise<string> {
+  return invoke("start_finish_learning_task", { sessionId });
+}
+
+export async function getTask<T = unknown>(taskId: string): Promise<TaskState<T>> {
+  return invoke("get_task", { taskId });
 }
 
 export async function confirmRule(sessionId: string, selectedPaths: string[]): Promise<string> {
@@ -74,8 +83,16 @@ export async function exportMigrationZip(filePath: string): Promise<ExportMigrat
   return invoke("export_migration_zip", { filePath });
 }
 
+export async function startExportMigrationZipTask(filePath: string): Promise<string> {
+  return invoke("start_export_migration_zip_task", { filePath });
+}
+
 export async function importMigrationZip(filePath: string): Promise<ImportMigrationZipResult> {
   return invoke("import_migration_zip", { filePath });
+}
+
+export async function startImportMigrationZipTask(filePath: string): Promise<string> {
+  return invoke("start_import_migration_zip_task", { filePath });
 }
 
 export async function openCandidatePath(path: string): Promise<void> {
@@ -161,4 +178,8 @@ export async function restoreBackupVersion(
   versionId: string,
 ): Promise<RestoreBackupResult> {
   return invoke("restore_backup_version", { gameId, versionId });
+}
+
+export async function startRestoreBackupVersionTask(gameId: string, versionId: string): Promise<string> {
+  return invoke("start_restore_backup_version_task", { gameId, versionId });
 }
