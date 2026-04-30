@@ -595,6 +595,18 @@ button:disabled {
   font-size: 13px;
 }
 
+.precheck-anchor-summary {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.precheck-anchor-label {
+  font-size: 12px;
+  color: #5d7185;
+  font-weight: 600;
+}
+
 .mode-hint {
   margin: 0;
   font-size: 12px;
@@ -902,6 +914,45 @@ button:disabled {
   margin: 0;
   font-size: 12px;
   line-height: 1.5;
+}
+
+.anchor-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.anchor-chip-row.compact {
+  gap: 6px;
+}
+
+.anchor-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid #c9d8e4;
+  background: #f4f8fb;
+  color: #36556e;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.anchor-chip.warning {
+  border-color: #ead4a2;
+  background: #fff8e8;
+  color: #72550f;
+}
+
+.anchor-chip.fallback {
+  border-color: #d8d6e7;
+  background: #f5f4fb;
+  color: #5b5974;
+}
+
+.anchor-note {
+  color: #556a7f;
 }
 
 .token-note {

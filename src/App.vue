@@ -436,6 +436,15 @@ async function selectLibraryGame(gameIdText: string) {
   await loadSelectedLibraryGameDetails();
 }
 
+async function loadSelectedLibraryGameSessionAndVersions() {
+  const gameIdText = selectedLibraryGameId.value;
+  if (!gameIdText) return;
+  await Promise.all([
+    loadBackupVersionsForGame(gameIdText, false),
+    loadSessionDetailsForGame(gameIdText, false),
+  ]);
+}
+
 async function loadSelectedLibraryGameDetails() {
   const gameIdText = selectedLibraryGameId.value;
   if (!gameIdText) return;
@@ -531,6 +540,106 @@ function selectedRuleForGame(gameIdText: string): GameSaveRule | null {
   return rules.value.find((rule) => cardKey(rule.gameId) === normalized) ?? null;
 }
 
+const PATH_ANCHOR_TOKENS = [
+  "%GAME_DIR%",
+  "%SAVED_GAMES%",
+  "%DOCUMENTS%",
+  "%LOCALLOW%",
+  "%LOCALAPPDATA%",
+  "%APPDATA%",
+  "%USERPROFILE%",
+] as const;
+
+function extractPathAnchorToken(path: string): string | null {
+  const normalized = path.trim().replace(/\//g, "\\").toUpperCase();
+  for (const token of PATH_ANCHOR_TOKENS) {
+    if (normalized === token || normalized.startsWith(`${token}\\`)) {
+      return token;
+    }
+  }
+  return null;
+}
+
+function pathAnchorLabel(token: string): string {
+  switch (token.toUpperCase()) {
+    case "%GAME_DIR%":
+      return "游戏目录";
+    case "%SAVED_GAMES%":
+      return "Saved Games";
+    case "%DOCUMENTS%":
+      return "文档";
+    case "%LOCALLOW%":
+      return "LocalLow";
+    case "%LOCALAPPDATA%":
+      return "Local";
+    case "%APPDATA%":
+      return "Roaming";
+    case "%USERPROFILE%":
+      return "用户目录（兼容）";
+    default:
+      return token;
+  }
+}
+
+function pathAnchorDescription(token: string): string {
+  switch (token.toUpperCase()) {
+    case "%GAME_DIR%":
+      return "跟随当前绑定的游戏 EXE 所在目录动态解析";
+    case "%SAVED_GAMES%":
+      return "Windows 的 Saved Games 存档目录";
+    case "%DOCUMENTS%":
+      return "当前用户的 Documents 目录";
+    case "%LOCALLOW%":
+      return "当前用户的 AppData\\LocalLow 目录";
+    case "%LOCALAPPDATA%":
+      return "当前用户的 AppData\\Local 目录";
+    case "%APPDATA%":
+      return "当前用户的 AppData\\Roaming 目录";
+    case "%USERPROFILE%":
+      return "当前用户根目录，属于兼容兜底锚点，范围较宽，优先级低于文档和 AppData 类锚点";
+    default:
+      return "使用路径锚点进行动态解析";
+  }
+}
+
+function ruleAnchorHint(tokens: string[]): string {
+  if (!tokens.length) {
+    return "";
+  }
+  if (tokens.includes("%USERPROFILE%")) {
+    return "当前规则含“用户目录（兼容）”锚点，建议优先使用更具体的文档 / AppData / 游戏目录锚点。";
+  }
+  if (tokens.includes("%GAME_DIR%")) {
+    return "当前规则含“游戏目录”锚点，路径会跟随已绑定 EXE 所在目录动态解析。";
+  }
+  return "当前规则已使用具体路径锚点，跨机器时会比纯用户目录规则更稳定。";
+}
+
+function collectAnchorTokens(paths: string[]): string[] {
+  const ordered = new Set<string>();
+  for (const path of paths) {
+    const token = extractPathAnchorToken(path);
+    if (token) {
+      ordered.add(token);
+    }
+  }
+  return Array.from(ordered);
+}
+
+function ruleAnchorTokens(rule: GameSaveRule | null | undefined): string[] {
+  if (!rule) return [];
+  return collectAnchorTokens(rule.confirmedPaths);
+}
+
+function ruleDraftAnchorTokens(ruleId: string): string[] {
+  const raw = ruleDrafts.value[ruleId]?.confirmedPathsText ?? "";
+  const paths = raw
+    .split(/\r?\n/)
+    .map((line: string) => line.trim())
+    .filter(Boolean);
+  return collectAnchorTokens(paths);
+}
+
 function ruleUsesGameDirToken(rule: GameSaveRule | null | undefined): boolean {
   if (!rule) return false;
   return rule.confirmedPaths.some((path) => path.toUpperCase().includes("%GAME_DIR%"));
@@ -552,6 +661,10 @@ function gameDirStatusLabel(gameIdText: string): string {
   if (issue) return "需绑定 EXE";
   if (gameUsesGameDirToken(gameIdText)) return "游戏目录规则";
   return "";
+}
+
+function selectedRuleAnchorTokens(gameIdText: string): string[] {
+  return ruleAnchorTokens(selectedRuleForGame(gameIdText));
 }
 
 function candidateRecommendationLabel(item: CandidatePath): string {
@@ -617,15 +730,24 @@ async function waitForTaskCompletion<T>(
 ) {
   const startedAt = Date.now();
   const timeoutMs = 3 * 60 * 1000;
+  let lastPollError = "";
   while (true) {
-    const task = await getTask<T>(taskId);
-    const progressValue =
-      typeof task.progress === "number" && Number.isFinite(task.progress) ? Math.max(0, Math.min(100, task.progress)) : null;
-    onProgress?.(task.message ?? "", progressValue);
-    if (task.status === "success" || task.status === "failed") {
-      return task;
+    try {
+      const task = await getTask<T>(taskId);
+      lastPollError = "";
+      const progressValue =
+        typeof task.progress === "number" && Number.isFinite(task.progress) ? Math.max(0, Math.min(100, task.progress)) : null;
+      onProgress?.(task.message ?? "", progressValue);
+      if (task.status === "success" || task.status === "failed") {
+        return task;
+      }
+    } catch (err) {
+      lastPollError = String(err);
     }
     if (Date.now() - startedAt > timeoutMs) {
+      if (lastPollError) {
+        throw new Error(`任务状态轮询失败：${lastPollError}`);
+      }
       throw new Error("任务执行超时，请重试");
     }
     await sleep(350);
@@ -670,8 +792,11 @@ function closeBlockingError() {
 }
 
 watch(librarySearch, () => {
+  const previousKey = cardKey(selectedLibraryGameId.value);
   ensureSelectedLibraryGame();
-  void loadSelectedLibraryGameDetails();
+  if (cardKey(selectedLibraryGameId.value) !== previousKey) {
+    void loadSelectedLibraryGameDetails();
+  }
 });
 
 function askConfirm(options: {
@@ -829,7 +954,7 @@ async function reloadLibraryWithLoading() {
   try {
     await refreshLibraryItems();
     await loadRedirectRuntimeInfo();
-    void loadSelectedLibraryGameDetails();
+    void loadSelectedLibraryGameSessionAndVersions();
     void refreshLaunchPrechecksForLibraryItems();
     void refreshBackupStatsForLibraryItems();
   } catch (err) {
@@ -967,13 +1092,13 @@ async function loadSessionDetailsForGame(gameIdText: string, withCardLoading = t
 
 async function choosePreferredExeForGame(gameIdText: string) {
   try {
-    selectedLibraryGameId.value = gameIdText;
     const { open } = await import("@tauri-apps/plugin-dialog");
     const chosen = await open({
       multiple: false,
       filters: [{ name: "Executable", extensions: ["exe"] }],
     });
     if (!chosen || Array.isArray(chosen)) return;
+    selectedLibraryGameId.value = gameIdText;
     setCardBusy(gameIdText, "bind_exe", true);
     libraryState.value.error = "";
     clearLibraryCardError(gameIdText);
@@ -1102,6 +1227,7 @@ async function undoLibraryRestore(gameIdText: string) {
       ...restoreUndoByGame.value,
       [cardKey(gameIdText)]: null,
     };
+    await refreshLibraryItems();
     await Promise.all([
       loadBackupStatsForGame(gameIdText, false),
       loadBackupVersionsForGame(gameIdText, false),
@@ -1704,6 +1830,20 @@ onUnmounted(() => {
             </label>
             <label class="field compact-field">
               <span>存档路径（每行一条）</span>
+              <div v-if="ruleDraftAnchorTokens(rule.ruleId).length" class="anchor-chip-row">
+                <span
+                  v-for="token in ruleDraftAnchorTokens(rule.ruleId)"
+                  :key="`${rule.ruleId}-${token}`"
+                  class="anchor-chip"
+                  :class="{ warning: token === '%GAME_DIR%', fallback: token === '%USERPROFILE%' }"
+                  :title="pathAnchorDescription(token)"
+                >
+                  {{ pathAnchorLabel(token) }}
+                </span>
+              </div>
+              <p v-if="ruleDraftAnchorTokens(rule.ruleId).length" class="field-note anchor-note">
+                {{ ruleAnchorHint(ruleDraftAnchorTokens(rule.ruleId)) }}
+              </p>
               <p v-if="ruleUsesGameDirToken(rule)" class="field-note token-note">
                 此规则包含 <code>%GAME_DIR%</code>，路径会跟随当前绑定的游戏 EXE 所在目录动态解析。
               </p>
@@ -1838,6 +1978,20 @@ onUnmounted(() => {
                 >
                   刷新
                 </button>
+              </div>
+            </div>
+            <div v-if="selectedRuleAnchorTokens(selectedLibraryItem.gameId).length" class="precheck-anchor-summary">
+              <span class="precheck-anchor-label">规则路径锚点</span>
+              <div class="anchor-chip-row compact">
+                <span
+                  v-for="token in selectedRuleAnchorTokens(selectedLibraryItem.gameId)"
+                  :key="`${selectedLibraryItem.gameId}-${token}`"
+                  class="anchor-chip"
+                  :class="{ warning: token === '%GAME_DIR%' }"
+                  :title="pathAnchorDescription(token)"
+                >
+                  {{ pathAnchorLabel(token) }}
+                </span>
               </div>
             </div>
             <div v-if="gameDirResolutionIssue(selectedLibraryItem.gameId)" class="warning-banner">

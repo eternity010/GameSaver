@@ -45,6 +45,11 @@ const WEAK_PATH_FRAGMENTS: [&str; 7] = [
 ];
 const APP_IDENTIFIER: &str = "com.gamesaver.desktop";
 const USERPROFILE_TOKEN: &str = "%USERPROFILE%";
+const DOCUMENTS_TOKEN: &str = "%DOCUMENTS%";
+const APPDATA_TOKEN: &str = "%APPDATA%";
+const LOCALAPPDATA_TOKEN: &str = "%LOCALAPPDATA%";
+const LOCALLOW_TOKEN: &str = "%LOCALLOW%";
+const SAVED_GAMES_TOKEN: &str = "%SAVED_GAMES%";
 const GAME_DIR_TOKEN: &str = "%GAME_DIR%";
 const DEFAULT_BACKUP_KEEP_VERSIONS: usize = 10;
 const MAX_BACKUP_KEEP_VERSIONS: usize = 200;
@@ -3102,18 +3107,7 @@ fn precheck_game_launch(
 
     let resolved_rule_for_paths = matched_rule.as_ref().or(selected_rule.as_ref());
     let path_resolution = if let Some(rule) = resolved_rule_for_paths {
-        let exe_context = trimmed_exe_path.as_deref();
-        let mut failed_message: Option<String> = None;
-        for confirmed_path in &rule.confirmed_paths {
-            if let Err(err) = expand_confirmed_path_for_runtime(confirmed_path, exe_context) {
-                failed_message = Some(err);
-                break;
-            }
-        }
-        match failed_message {
-            Some(message) => (false, message),
-            None => (true, "规则路径均可解析".to_string()),
-        }
+        describe_rule_path_resolution(&rule.confirmed_paths, trimmed_exe_path.as_deref())
     } else {
         (false, "当前没有可用于解析路径的规则".to_string())
     };
@@ -3299,6 +3293,237 @@ fn resolve_user_profile_path() -> Option<String> {
     }
 }
 
+fn normalize_system_root(path: PathBuf) -> Option<String> {
+    let normalized = path.to_string_lossy().trim().replace('/', "\\");
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn resolve_documents_path() -> Option<String> {
+    let profile_root = resolve_user_profile_path()?;
+    normalize_system_root(Path::new(&profile_root).join("Documents"))
+}
+
+fn resolve_saved_games_path() -> Option<String> {
+    let profile_root = resolve_user_profile_path()?;
+    normalize_system_root(Path::new(&profile_root).join("Saved Games"))
+}
+
+fn resolve_appdata_path() -> Option<String> {
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let trimmed = appdata.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.replace('/', "\\"));
+        }
+    }
+    let profile_root = resolve_user_profile_path()?;
+    normalize_system_root(Path::new(&profile_root).join("AppData").join("Roaming"))
+}
+
+fn resolve_local_appdata_path() -> Option<String> {
+    if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+        let trimmed = appdata.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.replace('/', "\\"));
+        }
+    }
+    let profile_root = resolve_user_profile_path()?;
+    normalize_system_root(Path::new(&profile_root).join("AppData").join("Local"))
+}
+
+fn resolve_local_low_path() -> Option<String> {
+    let profile_root = resolve_user_profile_path()?;
+    normalize_system_root(Path::new(&profile_root).join("AppData").join("LocalLow"))
+}
+
+fn resolve_anchor_root(token: &str, exe_path: Option<&str>) -> Option<String> {
+    if token.eq_ignore_ascii_case(GAME_DIR_TOKEN) {
+        return resolve_game_dir_root(exe_path);
+    }
+    if token.eq_ignore_ascii_case(SAVED_GAMES_TOKEN) {
+        return resolve_saved_games_path();
+    }
+    if token.eq_ignore_ascii_case(DOCUMENTS_TOKEN) {
+        return resolve_documents_path();
+    }
+    if token.eq_ignore_ascii_case(LOCALLOW_TOKEN) {
+        return resolve_local_low_path();
+    }
+    if token.eq_ignore_ascii_case(LOCALAPPDATA_TOKEN) {
+        return resolve_local_appdata_path();
+    }
+    if token.eq_ignore_ascii_case(APPDATA_TOKEN) {
+        return resolve_appdata_path();
+    }
+    if token.eq_ignore_ascii_case(USERPROFILE_TOKEN) {
+        return resolve_user_profile_path();
+    }
+    None
+}
+
+fn anchor_priority_tokens() -> [&'static str; 7] {
+    [
+        GAME_DIR_TOKEN,
+        SAVED_GAMES_TOKEN,
+        DOCUMENTS_TOKEN,
+        LOCALLOW_TOKEN,
+        LOCALAPPDATA_TOKEN,
+        APPDATA_TOKEN,
+        USERPROFILE_TOKEN,
+    ]
+}
+
+fn compose_token_path(token: &str, suffix: &str) -> String {
+    if suffix.is_empty() {
+        token.to_string()
+    } else {
+        format!(r"{}\{}", token, suffix.trim_start_matches('\\'))
+    }
+}
+
+fn normalize_token_reference(path: &str, token: &str) -> Option<String> {
+    if path.eq_ignore_ascii_case(token) {
+        return Some(token.to_string());
+    }
+    let suffix = strip_prefix_case_insensitive(path, token)?;
+    if suffix.is_empty() {
+        return Some(token.to_string());
+    }
+    if contains_parent_dir_segment(&suffix) {
+        return None;
+    }
+    Some(compose_token_path(token, &suffix))
+}
+
+fn infer_anchor_from_users_suffix(suffix: &str) -> Option<String> {
+    let normalized = suffix.trim().replace('/', "\\").trim_start_matches('\\').to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+    let candidates = [
+        (SAVED_GAMES_TOKEN, "Saved Games"),
+        (DOCUMENTS_TOKEN, "Documents"),
+        (LOCALLOW_TOKEN, r"AppData\LocalLow"),
+        (LOCALAPPDATA_TOKEN, r"AppData\Local"),
+        (APPDATA_TOKEN, r"AppData\Roaming"),
+    ];
+    for (token, prefix) in candidates {
+        if let Some(remainder) = strip_prefix_case_insensitive(&normalized, prefix) {
+            if contains_parent_dir_segment(&remainder) {
+                return None;
+            }
+            return Some(compose_token_path(token, &remainder));
+        }
+    }
+    None
+}
+
+fn detect_anchor_token(path: &str) -> Option<&'static str> {
+    let trimmed = path.trim().replace('/', "\\");
+    for token in anchor_priority_tokens() {
+        if trimmed.eq_ignore_ascii_case(token) {
+            return Some(token);
+        }
+        let prefix = format!(r"{}\{}", token, "");
+        if trimmed.to_ascii_uppercase().starts_with(&prefix.to_ascii_uppercase()) {
+            return Some(token);
+        }
+    }
+    None
+}
+
+fn anchor_display_label(token: &str) -> &'static str {
+    if token.eq_ignore_ascii_case(GAME_DIR_TOKEN) {
+        return "游戏目录";
+    }
+    if token.eq_ignore_ascii_case(SAVED_GAMES_TOKEN) {
+        return "Saved Games";
+    }
+    if token.eq_ignore_ascii_case(DOCUMENTS_TOKEN) {
+        return "文档目录";
+    }
+    if token.eq_ignore_ascii_case(LOCALLOW_TOKEN) {
+        return "LocalLow";
+    }
+    if token.eq_ignore_ascii_case(LOCALAPPDATA_TOKEN) {
+        return "Local";
+    }
+    if token.eq_ignore_ascii_case(APPDATA_TOKEN) {
+        return "Roaming";
+    }
+    if token.eq_ignore_ascii_case(USERPROFILE_TOKEN) {
+        return "用户目录";
+    }
+    "普通路径"
+}
+
+fn describe_rule_path_resolution(paths: &[String], exe_path: Option<&str>) -> (bool, String) {
+    if paths.is_empty() {
+        return (false, "当前规则没有可解析的存档路径".to_string());
+    }
+
+    let mut summaries: Vec<String> = Vec::new();
+    let mut has_failure = false;
+
+    for token in anchor_priority_tokens() {
+        let token_paths: Vec<&String> = paths
+            .iter()
+            .filter(|path| detect_anchor_token(path).is_some_and(|detected| detected.eq_ignore_ascii_case(token)))
+            .collect();
+        if token_paths.is_empty() {
+            continue;
+        }
+
+        let mut failure_message: Option<String> = None;
+        for path in &token_paths {
+            if let Err(err) = expand_confirmed_path_for_runtime(path, exe_path) {
+                failure_message = Some(err);
+                has_failure = true;
+                break;
+            }
+        }
+
+        let label = anchor_display_label(token);
+        if let Some(err) = failure_message {
+            if token.eq_ignore_ascii_case(GAME_DIR_TOKEN) {
+                summaries.push(format!("{label}待绑定 EXE"));
+            } else {
+                summaries.push(format!("{label}解析失败：{err}"));
+            }
+        } else {
+            summaries.push(format!("{label}可解析"));
+        }
+    }
+
+    let plain_paths: Vec<&String> = paths
+        .iter()
+        .filter(|path| detect_anchor_token(path).is_none())
+        .collect();
+    if !plain_paths.is_empty() {
+        let mut failure_message: Option<String> = None;
+        for path in &plain_paths {
+            if let Err(err) = expand_confirmed_path_for_runtime(path, exe_path) {
+                failure_message = Some(err);
+                has_failure = true;
+                break;
+            }
+        }
+        if let Some(err) = failure_message {
+            summaries.push(format!("普通路径解析失败：{err}"));
+        } else {
+            summaries.push("普通路径可解析".to_string());
+        }
+    }
+
+    if summaries.is_empty() {
+        return (false, "当前规则没有可用于解析路径的规则".to_string());
+    }
+    (!has_failure, summaries.join(" / "))
+}
+
 fn strip_prefix_case_insensitive(path: &str, prefix: &str) -> Option<String> {
     let normalized_path = path.replace('/', "\\");
     let normalized_prefix = prefix.replace('/', "\\").trim_end_matches('\\').to_string();
@@ -3366,46 +3591,29 @@ fn normalize_confirmed_path_for_storage(path: &str, exe_path: Option<&str>) -> S
     if trimmed.is_empty() {
         return String::new();
     }
-    if trimmed.eq_ignore_ascii_case(GAME_DIR_TOKEN) {
-        return GAME_DIR_TOKEN.to_string();
-    }
-    if let Some(suffix) = strip_prefix_case_insensitive(&trimmed, GAME_DIR_TOKEN) {
-        if suffix.is_empty() {
-            return GAME_DIR_TOKEN.to_string();
-        }
-        if !contains_parent_dir_segment(&suffix) {
-            return format!(r"{}\{}", GAME_DIR_TOKEN, suffix);
+    for token in anchor_priority_tokens() {
+        if let Some(normalized) = normalize_token_reference(&trimmed, token) {
+            return normalized;
         }
     }
-    if let Some(game_dir_root) = resolve_game_dir_root(exe_path) {
-        if let Some(suffix) = strip_prefix_case_insensitive(&trimmed, &game_dir_root) {
-            if suffix.is_empty() {
-                return GAME_DIR_TOKEN.to_string();
+    for token in anchor_priority_tokens() {
+        if let Some(root) = resolve_anchor_root(token, exe_path) {
+            if let Some(suffix) = strip_prefix_case_insensitive(&trimmed, &root) {
+                if contains_parent_dir_segment(&suffix) {
+                    continue;
+                }
+                return compose_token_path(token, &suffix);
             }
-            if !contains_parent_dir_segment(&suffix) {
-                return format!(r"{}\{}", GAME_DIR_TOKEN, suffix);
-            }
-        }
-    }
-    if trimmed.eq_ignore_ascii_case(USERPROFILE_TOKEN) {
-        return USERPROFILE_TOKEN.to_string();
-    }
-    if let Some(suffix) = strip_prefix_case_insensitive(&trimmed, USERPROFILE_TOKEN) {
-        if suffix.is_empty() {
-            return USERPROFILE_TOKEN.to_string();
-        }
-        return format!(r"{}\{}", USERPROFILE_TOKEN, suffix);
-    }
-    if let Some(profile_root) = resolve_user_profile_path() {
-        if let Some(suffix) = strip_prefix_case_insensitive(&trimmed, &profile_root) {
-            if suffix.is_empty() {
-                return USERPROFILE_TOKEN.to_string();
-            }
-            return format!(r"{}\{}", USERPROFILE_TOKEN, suffix);
         }
     }
     if let Some(suffix) = strip_windows_users_prefix(&trimmed) {
-        return format!(r"{}\{}", USERPROFILE_TOKEN, suffix);
+        if let Some(inferred) = infer_anchor_from_users_suffix(&suffix) {
+            return inferred;
+        }
+        if contains_parent_dir_segment(&suffix) {
+            return trimmed;
+        }
+        return compose_token_path(USERPROFILE_TOKEN, &suffix);
     }
     trimmed
 }
@@ -3415,27 +3623,22 @@ fn expand_confirmed_path_for_runtime(path: &str, exe_path: Option<&str>) -> Resu
     if trimmed.is_empty() {
         return Err("规则路径为空".to_string());
     }
-    if let Some(suffix) = strip_prefix_case_insensitive(&trimmed, GAME_DIR_TOKEN) {
-        if contains_parent_dir_segment(&suffix) {
-            return Err(format!("规则路径非法：{} 包含越界片段", path.trim()));
-        }
-        let Some(game_dir_root) = resolve_game_dir_root(exe_path) else {
-            return Err(format!("规则路径依赖 {}，但当前未绑定可用 EXE", GAME_DIR_TOKEN));
-        };
-        if suffix.is_empty() {
-            return Ok(game_dir_root);
-        }
-        return Ok(format!(r"{}\{}", game_dir_root.trim_end_matches('\\'), suffix));
-    }
-    if let Some(suffix) = strip_prefix_case_insensitive(&trimmed, USERPROFILE_TOKEN) {
-        if let Some(profile_root) = resolve_user_profile_path() {
-            if suffix.is_empty() {
-                return Ok(profile_root);
-            }
+    for token in anchor_priority_tokens() {
+        if let Some(suffix) = strip_prefix_case_insensitive(&trimmed, token) {
             if contains_parent_dir_segment(&suffix) {
                 return Err(format!("规则路径非法：{} 包含越界片段", path.trim()));
             }
-            return Ok(format!(r"{}\{}", profile_root.trim_end_matches('\\'), suffix));
+            let root = resolve_anchor_root(token, exe_path).ok_or_else(|| {
+                if token.eq_ignore_ascii_case(GAME_DIR_TOKEN) {
+                    format!("规则路径依赖 {}，但当前未绑定可用 EXE", GAME_DIR_TOKEN)
+                } else {
+                    format!("规则路径依赖 {}，但当前系统目录解析失败", token)
+                }
+            })?;
+            if suffix.is_empty() {
+                return Ok(root);
+            }
+            return Ok(format!(r"{}\{}", root.trim_end_matches('\\'), suffix));
         }
     }
     if contains_parent_dir_segment(&trimmed) {
@@ -4947,15 +5150,24 @@ fn collect_snapshot(game_id: &str, exe_path: &str) -> Result<Snapshot, String> {
 }
 
 fn collect_scan_roots(exe_path: &str) -> Result<Vec<PathBuf>, String> {
-    let profile = std::env::var("USERPROFILE").map_err(|_| "读取 USERPROFILE 失败".to_string())?;
-    let mut roots = vec![
-        Path::new(&profile).join("Documents"),
-        Path::new(&profile).join("AppData").join("Local"),
-        Path::new(&profile).join("AppData").join("LocalLow"),
-        Path::new(&profile).join("AppData").join("Roaming"),
-    ];
+    let mut roots = Vec::new();
+    for root in [
+        resolve_saved_games_path(),
+        resolve_documents_path(),
+        resolve_local_appdata_path(),
+        resolve_local_low_path(),
+        resolve_appdata_path(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        roots.push(PathBuf::from(root));
+    }
     if let Some(exe_dir) = Path::new(exe_path).parent() {
         roots.push(exe_dir.to_path_buf());
+    }
+    if roots.is_empty() {
+        return Err("读取常见存档目录失败".to_string());
     }
     Ok(roots)
 }
