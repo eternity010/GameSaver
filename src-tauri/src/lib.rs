@@ -3262,11 +3262,20 @@ fn set_preferred_exe_path(
     store
         .execution_config
         .preferred_exe_by_uid
-        .insert(game_uid, trimmed_exe_path);
+        .insert(game_uid.clone(), trimmed_exe_path.clone());
     store
         .execution_config
         .preferred_rule_uid_by_game
         .insert(normalized_game_key.clone(), normalize_game_uid(&rule.game_uid));
+    for existing_rule in &mut store.rules {
+        if normalize_game_uid(&existing_rule.game_uid) != game_uid {
+            continue;
+        }
+        existing_rule.confirmed_paths =
+            normalize_paths(existing_rule.confirmed_paths.clone(), Some(&trimmed_exe_path));
+        existing_rule.updated_at = now_iso_string();
+    }
+    normalize_store(&mut store);
     persist_store(&app, &store)?;
 
     build_game_library_items(&store)
@@ -5486,16 +5495,6 @@ fn normalize_store(store: &mut PersistedStore) {
         } else {
             rule.game_uid = normalized_uid;
         }
-        let normalized_exe = if rule.game_uid.trim().is_empty() {
-            None
-        } else {
-            store
-                .execution_config
-                .preferred_exe_by_uid
-                .get(&normalize_game_uid(&rule.game_uid))
-                .map(|value| value.as_str())
-        };
-        rule.confirmed_paths = normalize_paths(rule.confirmed_paths.clone(), normalized_exe);
         if rule.updated_at.trim().is_empty() {
             rule.updated_at = rule.created_at.clone();
         }
@@ -5544,6 +5543,19 @@ fn normalize_store(store: &mut PersistedStore) {
     }
     store.execution_config.preferred_exe_by_uid = normalized_preferred_exe_by_uid;
     store.execution_config.preferred_exe_by_game_legacy = HashMap::new();
+
+    for rule in &mut store.rules {
+        let normalized_exe = if rule.game_uid.trim().is_empty() {
+            None
+        } else {
+            store
+                .execution_config
+                .preferred_exe_by_uid
+                .get(&normalize_game_uid(&rule.game_uid))
+                .map(|value| value.as_str())
+        };
+        rule.confirmed_paths = normalize_paths(rule.confirmed_paths.clone(), normalized_exe);
+    }
 
     let mut normalized_preferred_rule_uid_by_game: HashMap<String, String> = HashMap::new();
     for (game_key, uid) in store.execution_config.preferred_rule_uid_by_game.clone() {
