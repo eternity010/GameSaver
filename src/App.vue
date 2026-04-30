@@ -521,6 +521,39 @@ function visiblePrecheckChecks(gameIdText: string) {
   return precheck.checks.filter((check) => !hiddenPrecheckKeys.has(check.key));
 }
 
+function precheckCheckFor(gameIdText: string, key: string) {
+  return launchPrecheckFor(gameIdText)?.checks.find((check) => check.key === key) ?? null;
+}
+
+function selectedRuleForGame(gameIdText: string): GameSaveRule | null {
+  const normalized = cardKey(gameIdText);
+  if (!normalized) return null;
+  return rules.value.find((rule) => cardKey(rule.gameId) === normalized) ?? null;
+}
+
+function ruleUsesGameDirToken(rule: GameSaveRule | null | undefined): boolean {
+  if (!rule) return false;
+  return rule.confirmedPaths.some((path) => path.toUpperCase().includes("%GAME_DIR%"));
+}
+
+function gameUsesGameDirToken(gameIdText: string): boolean {
+  return ruleUsesGameDirToken(selectedRuleForGame(gameIdText));
+}
+
+function gameDirResolutionIssue(gameIdText: string): string {
+  const check = precheckCheckFor(gameIdText, "rule_path_resolution");
+  if (!check || check.ok) return "";
+  if (!gameUsesGameDirToken(gameIdText)) return "";
+  return check.detail;
+}
+
+function gameDirStatusLabel(gameIdText: string): string {
+  const issue = gameDirResolutionIssue(gameIdText);
+  if (issue) return "需绑定 EXE";
+  if (gameUsesGameDirToken(gameIdText)) return "游戏目录规则";
+  return "";
+}
+
 function candidateRecommendationLabel(item: CandidatePath): string {
   switch (item.recommendation) {
     case "strong":
@@ -1671,6 +1704,9 @@ onUnmounted(() => {
             </label>
             <label class="field compact-field">
               <span>存档路径（每行一条）</span>
+              <p v-if="ruleUsesGameDirToken(rule)" class="field-note token-note">
+                此规则包含 <code>%GAME_DIR%</code>，路径会跟随当前绑定的游戏 EXE 所在目录动态解析。
+              </p>
               <textarea
                 v-model="ruleDrafts[rule.ruleId].confirmedPathsText"
                 rows="4"
@@ -1720,7 +1756,7 @@ onUnmounted(() => {
             v-for="item in filteredLibraryItems"
             :key="item.gameId"
             class="panel game-card"
-            :class="{ selected: isLibraryGameSelected(item.gameId) }"
+            :class="{ selected: isLibraryGameSelected(item.gameId), warning: !!gameDirResolutionIssue(item.gameId) }"
             @click="selectLibraryGame(item.gameId)"
           >
             <p v-if="libraryCardErrorFor(item.gameId)" class="error inline-error card-error">
@@ -1736,6 +1772,9 @@ onUnmounted(() => {
                     备份 {{ backupStatsFor(item.gameId)?.versionCount ?? 0 }} 版
                   </span>
                   <span v-else>备份读取中</span>
+                </p>
+                <p v-if="gameDirStatusLabel(item.gameId)" class="library-warning-text">
+                  {{ gameDirStatusLabel(item.gameId) }}
                 </p>
               </div>
               <span v-if="item.lastSessionStatus" class="session-mini">{{ item.lastSessionStatus }}</span>
@@ -1800,6 +1839,10 @@ onUnmounted(() => {
                   刷新
                 </button>
               </div>
+            </div>
+            <div v-if="gameDirResolutionIssue(selectedLibraryItem.gameId)" class="warning-banner">
+              <strong>需要绑定本地 EXE</strong>
+              <p>{{ gameDirResolutionIssue(selectedLibraryItem.gameId) }}</p>
             </div>
             <template v-if="launchPrecheckFor(selectedLibraryItem.gameId)">
               <details v-if="visiblePrecheckChecks(selectedLibraryItem.gameId).length" class="precheck-details">

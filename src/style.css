@@ -575,6 +575,26 @@ button:disabled {
   word-break: break-word;
 }
 
+.warning-banner {
+  display: grid;
+  gap: 4px;
+  border: 1px solid #e2bf72;
+  border-radius: 10px;
+  background: #fff8e7;
+  padding: 10px;
+  margin-bottom: 8px;
+}
+
+.warning-banner strong {
+  color: #7b5200;
+}
+
+.warning-banner p {
+  margin: 0;
+  color: #765a22;
+  font-size: 13px;
+}
+
 .mode-hint {
   margin: 0;
   font-size: 12px;
@@ -604,6 +624,11 @@ button:disabled {
   background: #d68c38;
 }
 
+.game-card.warning {
+  border-color: #e2bf72;
+  background: linear-gradient(180deg, #fffdf7 0%, #fff9ee 100%);
+}
+
 .library-game-main {
   min-width: 0;
   flex: 1;
@@ -627,6 +652,13 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.library-warning-text {
+  margin: 4px 0 0;
+  color: #8a5b08;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .session-mini {
@@ -864,6 +896,20 @@ button:disabled {
 
 .backup-keep-input input {
   width: 100%;
+}
+
+.field-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.token-note {
+  color: #6b5a22;
+  background: #fff9ec;
+  border: 1px solid #ead4a2;
+  border-radius: 8px;
+  padding: 8px 10px;
 }
 
 .runtime-compact {

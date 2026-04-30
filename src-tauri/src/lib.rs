@@ -45,6 +45,7 @@ const WEAK_PATH_FRAGMENTS: [&str; 7] = [
 ];
 const APP_IDENTIFIER: &str = "com.gamesaver.desktop";
 const USERPROFILE_TOKEN: &str = "%USERPROFILE%";
+const GAME_DIR_TOKEN: &str = "%GAME_DIR%";
 const DEFAULT_BACKUP_KEEP_VERSIONS: usize = 10;
 const MAX_BACKUP_KEEP_VERSIONS: usize = 200;
 const NOISE_PATH_FRAGMENTS: [&str; 7] = [
@@ -872,10 +873,6 @@ fn confirm_rule(
     session_id: String,
     selected_paths: Vec<String>,
 ) -> Result<String, String> {
-    let normalized_paths = normalize_paths(selected_paths);
-    if normalized_paths.is_empty() {
-        return Err("selectedPaths 不能为空".to_string());
-    }
     let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
     let session = store
         .sessions
@@ -885,11 +882,15 @@ fn confirm_rule(
 
     let session_game_id = session.game_id.clone();
     let session_exe_path = session.exe_path.clone();
+    let normalized_paths = normalize_paths(selected_paths, Some(&session_exe_path));
+    if normalized_paths.is_empty() {
+        return Err("selectedPaths 不能为空".to_string());
+    }
     let exe_hash = file_sha256_hex(Path::new(&session_exe_path))?;
     let rule_key = build_rule_key(&session_game_id, &exe_hash);
     let mut score_map: HashMap<String, i64> = HashMap::new();
     for item in &session.candidates {
-        let normalized = normalize_confirmed_path_for_storage(&item.path);
+        let normalized = normalize_confirmed_path_for_storage(&item.path, Some(&session_exe_path));
         if normalized.is_empty() {
             continue;
         }
@@ -1021,12 +1022,30 @@ fn update_rule(
     if normalized_game_id.is_empty() {
         return Err("gameId 不能为空".to_string());
     }
-    let normalized_paths = normalize_paths(confirmed_paths);
+
+    let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
+    let rule_context = store
+        .rules
+        .iter()
+        .find(|item| item.rule_id == rule_id)
+        .cloned()
+        .ok_or_else(|| "ruleId 不存在".to_string())?;
+    let exe_context = {
+        let normalized_uid = normalize_game_uid(&rule_context.game_uid);
+        if normalized_uid.is_empty() {
+            None
+        } else {
+            store
+                .execution_config
+                .preferred_exe_by_uid
+                .get(&normalized_uid)
+                .map(|value| value.as_str())
+        }
+    };
+    let normalized_paths = normalize_paths(confirmed_paths, exe_context);
     if normalized_paths.is_empty() {
         return Err("confirmedPaths 至少需要一条有效路径".to_string());
     }
-
-    let mut store = state.store.lock().map_err(|_| "无法锁定应用状态".to_string())?;
     {
         let rule = store
             .rules
@@ -1552,7 +1571,7 @@ fn apply_import_rules_array(store: &mut PersistedStore, array: &[serde_json::Val
 
         let game_id = parsed.game_id.trim().to_string();
         let exe_hash = parsed.exe_hash.trim().to_string();
-        let confirmed_paths = normalize_paths(parsed.confirmed_paths);
+        let confirmed_paths = normalize_paths(parsed.confirmed_paths, None);
         if game_id.is_empty() || exe_hash.is_empty() || confirmed_paths.is_empty() {
             skipped += 1;
             continue;
@@ -2088,7 +2107,7 @@ fn launch_with_rule_internal(
 
     if failed_error.is_none() && launch_mode_value == "backup" {
         if let Some(rule) = &matched_rule {
-            match restore_latest_backup_for_rule(rule, &execution_config.backup_root) {
+            match restore_latest_backup_for_rule(rule, &execution_config.backup_root, Some(&session.exe_path)) {
                 Ok(copied) => {
                     append_session_log(
                         &mut session,
@@ -2203,6 +2222,7 @@ fn launch_with_rule_internal(
                         rule,
                         execution_config.backup_root.clone(),
                         keep_versions,
+                        session.exe_path.clone(),
                     );
                     append_session_log(
                         &mut session,
@@ -2482,6 +2502,7 @@ fn restore_backup_version_transactional(
     rule: &GameSaveRule,
     version_dir: &Path,
     base: &Path,
+    exe_path: Option<&str>,
 ) -> Result<usize, String> {
     let tx_id = format!("{}_{}", now_unix(), Uuid::new_v4().simple());
     let staging_root = base.join("_restore_tmp").join(&tx_id);
@@ -2508,7 +2529,7 @@ fn restore_backup_version_transactional(
             format!("准备恢复槽位 {slot} 失败: {err}")
         })?;
 
-        let runtime_path = expand_confirmed_path_for_runtime(source_path);
+        let runtime_path = expand_confirmed_path_for_runtime(source_path, exe_path)?;
         let target = Path::new(&runtime_path);
         let rollback_slot = rollback_root.join(&slot);
         let target_exists = target.exists();
@@ -2653,27 +2674,51 @@ where
         return Err("指定备份版本不存在".to_string());
     }
     let manifest = verify_backup_manifest_integrity(&version_dir)?;
-    validate_restore_targets_writable(&rule)?;
-    validate_restore_disk_space(&rule, &manifest)?;
+    let restore_exe_path = {
+        let normalized_uid = normalize_game_uid(&rule.game_uid);
+        let store = app_state
+            .store
+            .lock()
+            .map_err(|_| "无法锁定应用状态".to_string())?;
+        if normalized_uid.is_empty() {
+            None
+        } else {
+            store.execution_config.preferred_exe_by_uid.get(&normalized_uid).cloned()
+        }
+    };
+    validate_restore_targets_writable(&rule, restore_exe_path.as_deref())?;
+    validate_restore_disk_space(&rule, &manifest, restore_exe_path.as_deref())?;
 
     on_progress(30, "正在创建回滚前备份...".to_string());
     let pre_restore_version_id =
-        match backup_current_state_for_rule(&rule, &backup_root, keep_versions + 1, Some("pre_restore")) {
+        match backup_current_state_for_rule(
+            &rule,
+            &backup_root,
+            keep_versions + 1,
+            Some("pre_restore"),
+            restore_exe_path.as_deref(),
+        ) {
             Ok((changed, version_id)) if changed > 0 => Some(version_id),
             Ok(_) => None,
             Err(err) => return Err(format!("恢复前备份当前存档失败，已阻止回滚：{err}")),
         };
 
     on_progress(55, "正在恢复目标版本...".to_string());
-    let restored_files = restore_backup_version_transactional(&rule, &version_dir, &base)?;
+    let restored_files =
+        restore_backup_version_transactional(&rule, &version_dir, &base, restore_exe_path.as_deref())?;
     on_progress(78, "正在校验恢复结果...".to_string());
-    let verification = match verify_restored_targets(&rule, &manifest) {
+    let verification = match verify_restored_targets(&rule, &manifest, restore_exe_path.as_deref()) {
         Ok(summary) => summary,
         Err(verify_err) => {
             if let Some(pre_restore_id) = pre_restore_version_id.as_ref() {
                 let rollback_version_dir = base.join("versions").join(pre_restore_id);
                 if rollback_version_dir.exists() {
-                    match restore_backup_version_transactional(&rule, &rollback_version_dir, &base) {
+                    match restore_backup_version_transactional(
+                        &rule,
+                        &rollback_version_dir,
+                        &base,
+                        restore_exe_path.as_deref(),
+                    ) {
                         Ok(_) => {
                             return Err(format!("恢复后校验失败，已自动回退到回滚前状态：{verify_err}"));
                         }
@@ -3055,7 +3100,31 @@ fn precheck_game_launch(
         });
     }
 
-    let backup_probe_root = if let Some(rule) = matched_rule.as_ref().or(selected_rule.as_ref()) {
+    let resolved_rule_for_paths = matched_rule.as_ref().or(selected_rule.as_ref());
+    let path_resolution = if let Some(rule) = resolved_rule_for_paths {
+        let exe_context = trimmed_exe_path.as_deref();
+        let mut failed_message: Option<String> = None;
+        for confirmed_path in &rule.confirmed_paths {
+            if let Err(err) = expand_confirmed_path_for_runtime(confirmed_path, exe_context) {
+                failed_message = Some(err);
+                break;
+            }
+        }
+        match failed_message {
+            Some(message) => (false, message),
+            None => (true, "规则路径均可解析".to_string()),
+        }
+    } else {
+        (false, "当前没有可用于解析路径的规则".to_string())
+    };
+    checks.push(LaunchPrecheckCheck {
+        key: "rule_path_resolution".to_string(),
+        label: "规则路径可解析".to_string(),
+        ok: path_resolution.0,
+        detail: path_resolution.1.clone(),
+    });
+
+    let backup_probe_root = if let Some(rule) = resolved_rule_for_paths {
         let uid = normalize_game_uid(&rule.game_uid);
         if uid.is_empty() {
             Path::new(&execution_config.backup_root).to_path_buf()
@@ -3138,9 +3207,10 @@ fn precheck_game_launch(
     });
 
     let rule_match_ok = matched_rule.is_some();
-    let backup_ready = rule_match_ok && primary_rule_resolved && backup_writable_ok;
-    let sandbox_ready = rule_match_ok && sandbox_available_ok;
-    let inject_ready = rule_match_ok && inject_artifacts_ok && inject_arch_ok;
+    let path_resolution_ok = path_resolution.0;
+    let backup_ready = rule_match_ok && primary_rule_resolved && path_resolution_ok && backup_writable_ok;
+    let sandbox_ready = rule_match_ok && path_resolution_ok && sandbox_available_ok;
+    let inject_ready = rule_match_ok && path_resolution_ok && inject_artifacts_ok && inject_arch_ok;
 
     Ok(GameLaunchPrecheck {
         game_id: trimmed_game_id,
@@ -3262,10 +3332,51 @@ fn strip_windows_users_prefix(path: &str) -> Option<String> {
     Some(suffix.to_string())
 }
 
-fn normalize_confirmed_path_for_storage(path: &str) -> String {
+fn resolve_game_dir_root(exe_path: Option<&str>) -> Option<String> {
+    let exe_path = exe_path?.trim();
+    if exe_path.is_empty() {
+        return None;
+    }
+    let exe_dir = Path::new(exe_path).parent()?;
+    let normalized = exe_dir.to_string_lossy().trim().replace('/', "\\");
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn contains_parent_dir_segment(path: &str) -> bool {
+    path.split('\\')
+        .filter(|segment| !segment.is_empty())
+        .any(|segment| segment == "..")
+}
+
+fn normalize_confirmed_path_for_storage(path: &str, exe_path: Option<&str>) -> String {
     let trimmed = path.trim().replace('/', "\\");
     if trimmed.is_empty() {
         return String::new();
+    }
+    if trimmed.eq_ignore_ascii_case(GAME_DIR_TOKEN) {
+        return GAME_DIR_TOKEN.to_string();
+    }
+    if let Some(suffix) = strip_prefix_case_insensitive(&trimmed, GAME_DIR_TOKEN) {
+        if suffix.is_empty() {
+            return GAME_DIR_TOKEN.to_string();
+        }
+        if !contains_parent_dir_segment(&suffix) {
+            return format!(r"{}\{}", GAME_DIR_TOKEN, suffix);
+        }
+    }
+    if let Some(game_dir_root) = resolve_game_dir_root(exe_path) {
+        if let Some(suffix) = strip_prefix_case_insensitive(&trimmed, &game_dir_root) {
+            if suffix.is_empty() {
+                return GAME_DIR_TOKEN.to_string();
+            }
+            if !contains_parent_dir_segment(&suffix) {
+                return format!(r"{}\{}", GAME_DIR_TOKEN, suffix);
+            }
+        }
     }
     if trimmed.eq_ignore_ascii_case(USERPROFILE_TOKEN) {
         return USERPROFILE_TOKEN.to_string();
@@ -3290,27 +3401,45 @@ fn normalize_confirmed_path_for_storage(path: &str) -> String {
     trimmed
 }
 
-fn expand_confirmed_path_for_runtime(path: &str) -> String {
+fn expand_confirmed_path_for_runtime(path: &str, exe_path: Option<&str>) -> Result<String, String> {
     let trimmed = path.trim().replace('/', "\\");
     if trimmed.is_empty() {
-        return String::new();
+        return Err("规则路径为空".to_string());
+    }
+    if let Some(suffix) = strip_prefix_case_insensitive(&trimmed, GAME_DIR_TOKEN) {
+        if contains_parent_dir_segment(&suffix) {
+            return Err(format!("规则路径非法：{} 包含越界片段", path.trim()));
+        }
+        let Some(game_dir_root) = resolve_game_dir_root(exe_path) else {
+            return Err(format!("规则路径依赖 {}，但当前未绑定可用 EXE", GAME_DIR_TOKEN));
+        };
+        if suffix.is_empty() {
+            return Ok(game_dir_root);
+        }
+        return Ok(format!(r"{}\{}", game_dir_root.trim_end_matches('\\'), suffix));
     }
     if let Some(suffix) = strip_prefix_case_insensitive(&trimmed, USERPROFILE_TOKEN) {
         if let Some(profile_root) = resolve_user_profile_path() {
             if suffix.is_empty() {
-                return profile_root;
+                return Ok(profile_root);
             }
-            return format!(r"{}\{}", profile_root.trim_end_matches('\\'), suffix);
+            if contains_parent_dir_segment(&suffix) {
+                return Err(format!("规则路径非法：{} 包含越界片段", path.trim()));
+            }
+            return Ok(format!(r"{}\{}", profile_root.trim_end_matches('\\'), suffix));
         }
     }
-    trimmed
+    if contains_parent_dir_segment(&trimmed) {
+        return Err(format!("规则路径非法：{} 包含越界片段", path.trim()));
+    }
+    Ok(trimmed)
 }
 
-fn normalize_paths(paths: Vec<String>) -> Vec<String> {
+fn normalize_paths(paths: Vec<String>, exe_path: Option<&str>) -> Vec<String> {
     let mut dedup = HashSet::new();
     let mut output = Vec::new();
     for path in paths {
-        let normalized = normalize_confirmed_path_for_storage(&path);
+        let normalized = normalize_confirmed_path_for_storage(&path, exe_path);
         if normalized.is_empty() {
             continue;
         }
@@ -3368,9 +3497,9 @@ fn choose_restore_writable_probe_path(source: &Path) -> PathBuf {
     source.to_path_buf()
 }
 
-fn validate_restore_targets_writable(rule: &GameSaveRule) -> Result<(), String> {
+fn validate_restore_targets_writable(rule: &GameSaveRule, exe_path: Option<&str>) -> Result<(), String> {
     for source_path in &rule.confirmed_paths {
-        let runtime_path = expand_confirmed_path_for_runtime(source_path);
+        let runtime_path = expand_confirmed_path_for_runtime(source_path, exe_path)?;
         let source = Path::new(&runtime_path);
         let probe_root = choose_restore_writable_probe_path(source);
         ensure_directory_writable(&probe_root).map_err(|err| {
@@ -3494,10 +3623,14 @@ fn format_bytes_short(bytes: u64) -> String {
     }
 }
 
-fn validate_restore_disk_space(rule: &GameSaveRule, manifest: &BackupManifest) -> Result<(), String> {
+fn validate_restore_disk_space(
+    rule: &GameSaveRule,
+    manifest: &BackupManifest,
+    exe_path: Option<&str>,
+) -> Result<(), String> {
     let mut slot_to_drive: HashMap<String, String> = HashMap::new();
     for source_path in &rule.confirmed_paths {
-        let runtime_path = expand_confirmed_path_for_runtime(source_path);
+        let runtime_path = expand_confirmed_path_for_runtime(source_path, exe_path)?;
         let source = Path::new(&runtime_path);
         let drive_id = drive_id_for_path(source)
             .ok_or_else(|| format!("无法识别目标路径所在磁盘: {}", source.to_string_lossy()))?;
@@ -3537,10 +3670,11 @@ fn validate_restore_disk_space(rule: &GameSaveRule, manifest: &BackupManifest) -
 fn verify_restored_targets(
     rule: &GameSaveRule,
     manifest: &BackupManifest,
+    exe_path: Option<&str>,
 ) -> Result<RestoreVerificationSummary, String> {
     let mut slot_to_target: HashMap<String, PathBuf> = HashMap::new();
     for source_path in &rule.confirmed_paths {
-        let runtime_path = expand_confirmed_path_for_runtime(source_path);
+        let runtime_path = expand_confirmed_path_for_runtime(source_path, exe_path)?;
         let target_root = PathBuf::from(runtime_path);
         let slot = backup_slot_name(source_path);
         slot_to_target.insert(slot, target_root.clone());
@@ -3700,7 +3834,7 @@ fn legacy_backup_game_root(backup_root: &str, game_id: &str) -> PathBuf {
 }
 
 fn backup_slot_name(source_path: &str) -> String {
-    let normalized = normalize_windows_path(&normalize_confirmed_path_for_storage(source_path));
+    let normalized = normalize_windows_path(&normalize_confirmed_path_for_storage(source_path, None));
     let mut hasher = Sha256::new();
     hasher.update(normalized.as_bytes());
     let hash = hex::encode(hasher.finalize());
@@ -4057,7 +4191,11 @@ fn file_signature(path: &Path) -> Option<(u64, u64)> {
     Some((size, modified))
 }
 
-fn restore_latest_backup_for_rule(rule: &GameSaveRule, backup_root: &str) -> Result<usize, String> {
+fn restore_latest_backup_for_rule(
+    rule: &GameSaveRule,
+    backup_root: &str,
+    exe_path: Option<&str>,
+) -> Result<usize, String> {
     let base = ensure_backup_root_for_rule(rule, backup_root)?;
     let latest = base.join("latest");
     if !latest.exists() {
@@ -4065,7 +4203,7 @@ fn restore_latest_backup_for_rule(rule: &GameSaveRule, backup_root: &str) -> Res
     }
     let mut copied = 0_usize;
     for source in &rule.confirmed_paths {
-        let runtime_path = expand_confirmed_path_for_runtime(source);
+        let runtime_path = expand_confirmed_path_for_runtime(source, exe_path)?;
         let target_path = Path::new(&runtime_path);
         let slot = backup_slot_name(source);
         let mut slot_source = latest.join(&slot);
@@ -4316,6 +4454,7 @@ fn backup_current_state_for_rule(
     backup_root: &str,
     keep_versions: usize,
     version_prefix: Option<&str>,
+    exe_path: Option<&str>,
 ) -> Result<(usize, String), String> {
     let base = ensure_backup_root_for_rule(rule, backup_root)?;
     let latest = base.join("latest");
@@ -4330,7 +4469,7 @@ fn backup_current_state_for_rule(
 
     let mut changed_total = 0_usize;
     for source in &rule.confirmed_paths {
-        let runtime_path = expand_confirmed_path_for_runtime(source);
+        let runtime_path = expand_confirmed_path_for_runtime(source, exe_path)?;
         let runtime_source = Path::new(&runtime_path);
         let slot = backup_slot_name(source);
         let changed = sync_source_to_backup_slot(
@@ -4364,8 +4503,9 @@ fn backup_after_exit_for_rule(
     rule: &GameSaveRule,
     backup_root: &str,
     keep_versions: usize,
+    exe_path: Option<&str>,
 ) -> Result<(usize, String), String> {
-    backup_current_state_for_rule(rule, backup_root, keep_versions, None)
+    backup_current_state_for_rule(rule, backup_root, keep_versions, None, exe_path)
 }
 
 fn spawn_post_exit_backup_worker(
@@ -4375,10 +4515,11 @@ fn spawn_post_exit_backup_worker(
     rule: GameSaveRule,
     backup_root: String,
     keep_versions: usize,
+    exe_path: String,
 ) {
     std::thread::spawn(move || {
         let _ = child.wait();
-        let backup_result = backup_after_exit_for_rule(&rule, &backup_root, keep_versions);
+        let backup_result = backup_after_exit_for_rule(&rule, &backup_root, keep_versions, Some(&exe_path));
         let state: State<AppState> = app.state();
         let lock_result = state.store.lock();
         if let Ok(mut store) = lock_result {
@@ -4424,7 +4565,7 @@ fn run_sandbox_launch_flow(
     let mut mirror_paths = Vec::new();
     let mut copied_in = 0_usize;
     for original in &rule.confirmed_paths {
-        let runtime_path = expand_confirmed_path_for_runtime(original);
+        let runtime_path = expand_confirmed_path_for_runtime(original, Some(exe_path))?;
         let mirror =
             build_sandbox_mirror_path(&runtime_path, &execution_config.sandbox_root, &user_name, &box_name)?;
         copied_in += sync_directory(Path::new(&redirect_root), &mirror)?;
@@ -5345,7 +5486,16 @@ fn normalize_store(store: &mut PersistedStore) {
         } else {
             rule.game_uid = normalized_uid;
         }
-        rule.confirmed_paths = normalize_paths(rule.confirmed_paths.clone());
+        let normalized_exe = if rule.game_uid.trim().is_empty() {
+            None
+        } else {
+            store
+                .execution_config
+                .preferred_exe_by_uid
+                .get(&normalize_game_uid(&rule.game_uid))
+                .map(|value| value.as_str())
+        };
+        rule.confirmed_paths = normalize_paths(rule.confirmed_paths.clone(), normalized_exe);
         if rule.updated_at.trim().is_empty() {
             rule.updated_at = rule.created_at.clone();
         }
