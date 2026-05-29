@@ -41,11 +41,13 @@ import type {
   GameLaunchPrecheck,
   GameSaveRule,
   ImportMigrationZipResult,
+  LaunchSyncDecision,
   LauncherMode,
   LauncherSession,
   RedirectRuntimeInfo,
   RestoreBackupResult,
   RuleConflictItem,
+  SaveLocationSummary,
 } from "./types";
 
 type UiStep = "setup" | "running" | "results";
@@ -534,6 +536,10 @@ function precheckCheckFor(gameIdText: string, key: string) {
   return launchPrecheckFor(gameIdText)?.checks.find((check) => check.key === key) ?? null;
 }
 
+function syncDecisionFor(gameIdText: string): LaunchSyncDecision | null {
+  return launchPrecheckFor(gameIdText)?.syncDecision ?? null;
+}
+
 function selectedRuleForGame(gameIdText: string): GameSaveRule | null {
   const normalized = cardKey(gameIdText);
   if (!normalized) return null;
@@ -665,6 +671,137 @@ function gameDirStatusLabel(gameIdText: string): string {
 
 function selectedRuleAnchorTokens(gameIdText: string): string[] {
   return ruleAnchorTokens(selectedRuleForGame(gameIdText));
+}
+
+function syncStatusLabel(status: string): string {
+  switch (status) {
+    case "no_backup":
+      return "暂无备份";
+    case "backup_only":
+      return "仅备份存在";
+    case "local_only":
+      return "仅本地存在";
+    case "in_sync":
+      return "看起来一致";
+    case "local_newer":
+      return "本地较新";
+    case "backup_newer":
+      return "备份较新";
+    default:
+      return "需人工判断";
+  }
+}
+
+function syncStatusShortHint(status: string): string {
+  switch (status) {
+    case "no_backup":
+      return "首次启动后会生成首个备份";
+    case "backup_only":
+      return "本地为空，可考虑先恢复备份";
+    case "local_only":
+      return "本地已有存档，退出后会首备份";
+    case "in_sync":
+      return "本地与最近备份看起来一致";
+    case "local_newer":
+      return "会保留本地并在退出后生成新备份";
+    case "backup_newer":
+      return "可选择恢复较新的历史备份";
+    default:
+      return "建议先进入详情确认";
+  }
+}
+
+function syncStatusClass(status: string): string {
+  switch (status) {
+    case "in_sync":
+    case "local_only":
+    case "no_backup":
+      return "ok";
+    case "backup_only":
+    case "local_newer":
+    case "backup_newer":
+      return "warn";
+    default:
+      return "fail";
+  }
+}
+
+function cardSyncStatusLabel(gameIdText: string): string {
+  const status = syncDecisionFor(gameIdText)?.status;
+  if (!status) return "";
+  return syncStatusLabel(status);
+}
+
+function cardSyncStatusHint(gameIdText: string): string {
+  const status = syncDecisionFor(gameIdText)?.status;
+  if (!status) return "";
+  return syncStatusShortHint(status);
+}
+
+function syncRecommendedActionLabel(action: string): string {
+  switch (action) {
+    case "launch_direct":
+      return "建议直接启动";
+    case "restore_then_launch":
+      return "建议恢复后启动";
+    default:
+      return "建议先人工确认";
+  }
+}
+
+function formatOptionalUnixTs(value?: string): string {
+  if (!value) return "无";
+  return formatUnixTs(value);
+}
+
+function syncSummaryMeta(summary?: SaveLocationSummary | null): string {
+  if (!summary) return "无摘要";
+  if (!summary.exists) return "未检测到文件";
+  return `${summary.fileCount} 个文件 / ${formatBytes(summary.totalBytes)}`;
+}
+
+function restoreProtectionSummary(result: RestoreBackupResult): string {
+  if (result.preRestoreVersionId) {
+    return `已先创建恢复前备份 ${result.preRestoreVersionId}`;
+  }
+  return "当前本地存档无新增变化，未额外创建恢复前备份";
+}
+
+async function resolveBackupLaunchMode(gameIdText: string): Promise<LauncherMode | null> {
+  const decision = syncDecisionFor(gameIdText);
+  if (!decision) {
+    return "backup_direct";
+  }
+  switch (decision.status) {
+    case "no_backup":
+    case "local_only":
+    case "local_newer":
+    case "in_sync":
+      return "backup_direct";
+    case "backup_only":
+    case "backup_newer": {
+      const restoreFirst = await askConfirm({
+        title: "检测到较新的历史备份",
+        message: `${decision.message}\n\n点击“恢复后启动”会先恢复最近备份；点击“直接启动”会保留当前本地状态直接进入游戏。`,
+        confirmText: "恢复后启动",
+        cancelText: "直接启动",
+        danger: false,
+      });
+      return restoreFirst ? "backup" : "backup_direct";
+    }
+    case "conflict_unknown": {
+      const continueDirect = await askConfirm({
+        title: "同步状态无法可靠判断",
+        message: `${decision.message}\n\n建议先查看备份时间线；如果你确认要继续，可以直接启动并保留当前本地状态。`,
+        confirmText: "直接启动",
+        cancelText: "取消",
+        danger: false,
+      });
+      return continueDirect ? "backup_direct" : null;
+    }
+    default:
+      return "backup_direct";
+  }
 }
 
 function candidateRecommendationLabel(item: CandidatePath): string {
@@ -1120,7 +1257,17 @@ async function launchLibraryGame(gameIdText: string, mode: LauncherMode = "backu
   libraryState.value.error = "";
   clearLibraryCardError(gameIdText);
   try {
-    await launchGameFromLibrary(gameIdText, mode);
+    let actualMode: LauncherMode | null = mode;
+    if (mode === "backup") {
+      if (!syncDecisionFor(gameIdText)) {
+        await loadLaunchPrecheckForGame(gameIdText, false);
+      }
+      actualMode = await resolveBackupLaunchMode(gameIdText);
+      if (!actualMode) {
+        return;
+      }
+    }
+    await launchGameFromLibrary(gameIdText, actualMode);
     await refreshLibraryItems();
     await loadLaunchPrecheckForGame(gameIdText, false);
     await Promise.all([
@@ -1128,7 +1275,12 @@ async function launchLibraryGame(gameIdText: string, mode: LauncherMode = "backu
       loadBackupVersionsForGame(gameIdText, false),
       loadSessionDetailsForGame(gameIdText, false),
     ]);
-    showToast(`${gameIdText} 启动成功`, "success");
+    if (mode === "backup") {
+      const launchLabel = actualMode === "backup" ? "恢复后启动" : "直接启动";
+      showToast(`${gameIdText} ${launchLabel}成功`, "success");
+    } else {
+      showToast(`${gameIdText} 启动成功`, "success");
+    }
   } catch (err) {
     setLibraryCardError(gameIdText, String(err));
     showBlockingError(String(err));
@@ -1140,9 +1292,9 @@ async function launchLibraryGame(gameIdText: string, mode: LauncherMode = "backu
 
 async function rollbackToLibraryBackupVersion(gameIdText: string, versionId: string) {
   const confirmed = await askConfirm({
-    title: "确认回滚",
-    message: `确定回滚 ${gameIdText} 到版本 ${versionId} 吗？此操作会覆盖当前存档。`,
-    confirmText: "确认回滚",
+    title: "确认恢复备份",
+    message: `确定将 ${gameIdText} 恢复到版本 ${versionId} 吗？\n\n执行恢复前，GameSaver 会先尝试为当前本地存档创建一份“恢复前备份”，然后再覆盖目标存档。`,
+    confirmText: "恢复并继续",
     cancelText: "取消",
     danger: true,
   });
@@ -1185,7 +1337,7 @@ async function rollbackToLibraryBackupVersion(gameIdText: string, versionId: str
       };
     }
     showToast(
-      `回滚完成（已校验 ${result.verifiedFiles} 个文件，哈希抽样 ${result.hashSampleCount} 项）`,
+      `恢复完成，${restoreProtectionSummary(result)}（已校验 ${result.verifiedFiles} 个文件，哈希抽样 ${result.hashSampleCount} 项）`,
       "success",
     );
   } catch (err) {
@@ -1202,7 +1354,7 @@ async function undoLibraryRestore(gameIdText: string) {
   if (!undo) return;
   const confirmed = await askConfirm({
     title: "撤销本次恢复",
-    message: `确定恢复到回滚前备份 ${undo.versionId} 吗？此操作会再次覆盖当前存档。`,
+    message: `确定恢复到刚才自动创建的恢复前备份 ${undo.versionId} 吗？此操作会再次覆盖当前存档。`,
     confirmText: "撤销恢复",
     cancelText: "取消",
     danger: true,
@@ -1913,6 +2065,15 @@ onUnmounted(() => {
                   </span>
                   <span v-else>备份读取中</span>
                 </p>
+                <div v-if="cardSyncStatusLabel(item.gameId)" class="library-sync-row">
+                  <span
+                    class="precheck-state-pill library-sync-pill"
+                    :class="syncStatusClass(syncDecisionFor(item.gameId)?.status || '')"
+                  >
+                    {{ cardSyncStatusLabel(item.gameId) }}
+                  </span>
+                  <p class="library-sync-text">{{ cardSyncStatusHint(item.gameId) }}</p>
+                </div>
                 <p v-if="gameDirStatusLabel(item.gameId)" class="library-warning-text">
                   {{ gameDirStatusLabel(item.gameId) }}
                 </p>
@@ -1994,6 +2155,42 @@ onUnmounted(() => {
                 </span>
               </div>
             </div>
+            <section v-if="syncDecisionFor(selectedLibraryItem.gameId)" class="sync-decision-box">
+              <div class="sync-decision-head">
+                <span class="precheck-anchor-label">启动前同步状态</span>
+                <span
+                  class="precheck-state-pill"
+                  :class="syncStatusClass(syncDecisionFor(selectedLibraryItem.gameId)?.status || '')"
+                >
+                  {{ syncStatusLabel(syncDecisionFor(selectedLibraryItem.gameId)?.status || "") }}
+                </span>
+              </div>
+              <p class="sync-decision-message">
+                {{ syncDecisionFor(selectedLibraryItem.gameId)?.message }}
+              </p>
+              <p class="sync-decision-action">
+                {{ syncRecommendedActionLabel(syncDecisionFor(selectedLibraryItem.gameId)?.recommendedAction || "") }}
+              </p>
+              <div class="sync-decision-grid">
+                <div class="sync-side-card">
+                  <strong>本地存档</strong>
+                  <p>{{ syncSummaryMeta(syncDecisionFor(selectedLibraryItem.gameId)?.localSummary) }}</p>
+                  <p>最近修改：{{ formatOptionalUnixTs(syncDecisionFor(selectedLibraryItem.gameId)?.localSummary?.latestModifiedAt) }}</p>
+                </div>
+                <div class="sync-side-card">
+                  <strong>最近备份</strong>
+                  <p>{{ syncSummaryMeta(syncDecisionFor(selectedLibraryItem.gameId)?.backupSummary) }}</p>
+                  <p>
+                    最近版本：
+                    {{
+                      syncDecisionFor(selectedLibraryItem.gameId)?.backupSummary?.latestVersionId
+                        ? formatUnixTs(syncDecisionFor(selectedLibraryItem.gameId)?.backupSummary?.latestVersionId || "")
+                        : "无"
+                    }}
+                  </p>
+                </div>
+              </div>
+            </section>
             <div v-if="gameDirResolutionIssue(selectedLibraryItem.gameId)" class="warning-banner">
               <strong>需要绑定本地 EXE</strong>
               <p>{{ gameDirResolutionIssue(selectedLibraryItem.gameId) }}</p>
@@ -2072,10 +2269,13 @@ onUnmounted(() => {
                 type="button"
                 :disabled="libraryState.loading || isCardBusy(selectedLibraryItem.gameId, 'backup_versions')"
                 @click="loadBackupVersionsForGame(selectedLibraryItem.gameId)"
-              >
-                刷新版本
-              </button>
+                >
+                  刷新版本
+                </button>
             </div>
+            <p class="field-note restore-safety-note">
+              恢复任一版本前，GameSaver 会先尝试为当前本地存档创建一份“恢复前备份”，方便你随时撤销。
+            </p>
             <div v-if="restoreTaskMessageFor(selectedLibraryItem.gameId)" class="migration-progress restore-progress">
               <p>{{ restoreTaskMessageFor(selectedLibraryItem.gameId) }}</p>
               <div class="progress-track" role="progressbar" aria-label="恢复进度">

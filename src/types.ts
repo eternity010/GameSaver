@@ -59,7 +59,7 @@ export interface RuntimeStatus {
 
 export type LauncherStatus = "idle" | "launching" | "running" | "failed" | "exited";
 export type InjectionStatus = "not_required" | "pending" | "noop_injected" | "failed";
-export type LauncherMode = "inject" | "sandbox" | "backup";
+export type LauncherMode = "inject" | "sandbox" | "backup" | "backup_direct";
 
 export interface LauncherSession {
   launcherSessionId: string;
@@ -190,6 +190,37 @@ export interface LaunchPrecheckCheck {
   detail: string;
 }
 
+export interface SaveLocationSummary {
+  exists: boolean;
+  fileCount: number;
+  totalBytes: number;
+  latestModifiedAt?: string;
+  resolvedPaths: string[];
+  latestVersionId?: string;
+}
+
+export type LaunchSyncStatus =
+  | "no_backup"
+  | "backup_only"
+  | "local_only"
+  | "in_sync"
+  | "local_newer"
+  | "backup_newer"
+  | "conflict_unknown";
+
+export type LaunchSyncRecommendedAction =
+  | "launch_direct"
+  | "restore_then_launch"
+  | "launch_after_manual_review";
+
+export interface LaunchSyncDecision {
+  status: LaunchSyncStatus;
+  message: string;
+  recommendedAction: LaunchSyncRecommendedAction;
+  localSummary?: SaveLocationSummary;
+  backupSummary?: SaveLocationSummary;
+}
+
 export interface GameLaunchPrecheck {
   gameId: string;
   preferredExePath?: string;
@@ -198,6 +229,7 @@ export interface GameLaunchPrecheck {
   backupReady: boolean;
   sandboxReady: boolean;
   injectReady: boolean;
+  syncDecision?: LaunchSyncDecision;
   checks: LaunchPrecheckCheck[];
   checkedAt: string;
 }

@@ -339,6 +339,11 @@ struct RestoreVerificationSummary {
     hash_sample_count: usize,
 }
 
+struct BackupRunResult {
+    changed_files: usize,
+    version_id: Option<String>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BackupStatsResult {
@@ -399,6 +404,27 @@ struct LaunchPrecheckCheck {
     detail: String,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SaveLocationSummary {
+    exists: bool,
+    file_count: usize,
+    total_bytes: u64,
+    latest_modified_at: Option<String>,
+    resolved_paths: Vec<String>,
+    latest_version_id: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct LaunchSyncDecision {
+    status: String,
+    message: String,
+    recommended_action: String,
+    local_summary: Option<SaveLocationSummary>,
+    backup_summary: Option<SaveLocationSummary>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GameLaunchPrecheck {
@@ -409,6 +435,7 @@ struct GameLaunchPrecheck {
     backup_ready: bool,
     sandbox_ready: bool,
     inject_ready: bool,
+    sync_decision: Option<LaunchSyncDecision>,
     checks: Vec<LaunchPrecheckCheck>,
     checked_at: String,
 }
@@ -1956,6 +1983,8 @@ fn launch_with_rule_internal(
     require_rule_match: bool,
 ) -> Result<LauncherSession, String> {
     let launch_mode_value = normalize_launch_mode(launch_mode.as_deref());
+    let is_backup_mode = launch_mode_value == "backup" || launch_mode_value == "backup_direct";
+    let restore_before_launch = launch_mode_value == "backup";
     let now = now_iso_string();
     let mut session = LauncherSession {
         launcher_session_id: Uuid::new_v4().to_string(),
@@ -2085,9 +2114,13 @@ fn launch_with_rule_internal(
                     &execution_config.managed_save_root,
                     &rule.game_id,
                 ));
-            } else if launch_mode_value == "backup" {
+            } else if is_backup_mode {
                 session.injection_status = "not_required".to_string();
-                session.hook_version = Some("backup-auto-v1".to_string());
+                session.hook_version = Some(if restore_before_launch {
+                    "backup-auto-v1".to_string()
+                } else {
+                    "backup-direct-v1".to_string()
+                });
                 session.redirect_root = Some(
                     backup_game_root(&execution_config.backup_root, &rule.game_uid)
                         .to_string_lossy()
@@ -2110,7 +2143,7 @@ fn launch_with_rule_internal(
         }
     }
 
-    if failed_error.is_none() && launch_mode_value == "backup" {
+    if failed_error.is_none() && restore_before_launch {
         if let Some(rule) = &matched_rule {
             match restore_latest_backup_for_rule(rule, &execution_config.backup_root, Some(&session.exe_path)) {
                 Ok(copied) => {
@@ -2127,6 +2160,8 @@ fn launch_with_rule_internal(
                 }
             }
         }
+    } else if failed_error.is_none() && launch_mode_value == "backup_direct" && matched_rule.is_some() {
+        append_session_log(&mut session, "已按同步状态跳过启动前自动恢复，将直接启动并在退出后自动备份");
     }
 
     let mut launched_child_for_backup: Option<std::process::Child> = None;
@@ -2155,7 +2190,7 @@ fn launch_with_rule_internal(
             match Command::new(&session.exe_path).spawn() {
                 Ok(child) => {
                     session.pid = Some(child.id());
-                    if launch_mode_value == "backup" && matched_rule.is_some() {
+                    if is_backup_mode && matched_rule.is_some() {
                         launched_child_for_backup = Some(child);
                     }
                 }
@@ -2214,7 +2249,7 @@ fn launch_with_rule_internal(
             session.injection_status = "not_required".to_string();
             session.injector_exit_code = Some(0);
             append_session_log(&mut session, "沙盒模式已启动：退出游戏后请点击“回收沙盒存档”");
-        } else if launch_mode_value == "backup" && matched_rule.is_some() {
+        } else if is_backup_mode && matched_rule.is_some() {
             session.injection_status = "not_required".to_string();
             session.injector_exit_code = Some(0);
             if let Some(child) = launched_child_for_backup.take() {
@@ -2703,7 +2738,7 @@ where
             Some("pre_restore"),
             restore_exe_path.as_deref(),
         ) {
-            Ok((changed, version_id)) if changed > 0 => Some(version_id),
+            Ok(result) if result.changed_files > 0 => result.version_id,
             Ok(_) => None,
             Err(err) => return Err(format!("恢复前备份当前存档失败，已阻止回滚：{err}")),
         };
@@ -3106,6 +3141,8 @@ fn precheck_game_launch(
     }
 
     let resolved_rule_for_paths = matched_rule.as_ref().or(selected_rule.as_ref());
+    let sync_decision = resolved_rule_for_paths
+        .map(|rule| build_launch_sync_decision(rule, &execution_config.backup_root, trimmed_exe_path.as_deref()));
     let path_resolution = if let Some(rule) = resolved_rule_for_paths {
         describe_rule_path_resolution(&rule.confirmed_paths, trimmed_exe_path.as_deref())
     } else {
@@ -3214,6 +3251,7 @@ fn precheck_game_launch(
         backup_ready,
         sandbox_ready,
         inject_ready,
+        sync_decision,
         checks,
         checked_at: now_iso_string(),
     })
@@ -3677,6 +3715,7 @@ fn join_managed_root_for_game(root: &str, game_id: &str) -> String {
 fn normalize_launch_mode(value: Option<&str>) -> String {
     match value.unwrap_or("backup").trim().to_ascii_lowercase().as_str() {
         "backup" => "backup".to_string(),
+        "backup_direct" => "backup_direct".to_string(),
         "sandbox" => "sandbox".to_string(),
         _ => "inject".to_string(),
     }
@@ -4403,6 +4442,204 @@ fn file_signature(path: &Path) -> Option<(u64, u64)> {
     Some((size, modified))
 }
 
+fn summarize_path_tree(path: &Path) -> (usize, u64, Option<u64>) {
+    if !path.exists() {
+        return (0, 0, None);
+    }
+    if path.is_file() {
+        if let Some((size, modified)) = file_signature(path) {
+            return (1, size, Some(modified));
+        }
+        return (0, 0, None);
+    }
+
+    let mut file_count = 0_usize;
+    let mut total_bytes = 0_u64;
+    let mut latest_modified = None;
+    for entry in WalkDir::new(path).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        file_count += 1;
+        if let Ok(metadata) = entry.metadata() {
+            total_bytes = total_bytes.saturating_add(metadata.len());
+            if let Ok(modified) = metadata.modified() {
+                if let Some(modified_unix) = system_time_to_unix(modified) {
+                    latest_modified =
+                        Some(latest_modified.map_or(modified_unix, |current: u64| current.max(modified_unix)));
+                }
+            }
+        }
+    }
+    (file_count, total_bytes, latest_modified)
+}
+
+fn summarize_runtime_paths(paths: &[String], exe_path: Option<&str>) -> Result<SaveLocationSummary, String> {
+    let mut resolved_paths = Vec::new();
+    let mut file_count = 0_usize;
+    let mut total_bytes = 0_u64;
+    let mut latest_modified = None;
+
+    for source in paths {
+        let runtime_path = expand_confirmed_path_for_runtime(source, exe_path)?;
+        resolved_paths.push(runtime_path.clone());
+        let (path_file_count, path_total_bytes, path_latest_modified) = summarize_path_tree(Path::new(&runtime_path));
+        file_count += path_file_count;
+        total_bytes = total_bytes.saturating_add(path_total_bytes);
+        if let Some(path_modified) = path_latest_modified {
+            latest_modified = Some(latest_modified.map_or(path_modified, |current: u64| current.max(path_modified)));
+        }
+    }
+
+    Ok(SaveLocationSummary {
+        exists: file_count > 0,
+        file_count,
+        total_bytes,
+        latest_modified_at: latest_modified.map(|value| value.to_string()),
+        resolved_paths,
+        latest_version_id: None,
+    })
+}
+
+fn summarize_latest_backup_for_rule(rule: &GameSaveRule, backup_root: &str) -> Result<SaveLocationSummary, String> {
+    let base = ensure_backup_root_for_rule(rule, backup_root)?;
+    let latest_dir = base.join("latest");
+    let latest_version_id = list_version_directories(&base.join("versions"))?
+        .into_iter()
+        .last()
+        .map(|(version_id, _)| version_id);
+    let (file_count, total_bytes, latest_modified) = summarize_path_tree(&latest_dir);
+    Ok(SaveLocationSummary {
+        exists: file_count > 0,
+        file_count,
+        total_bytes,
+        latest_modified_at: latest_version_id.clone().or_else(|| latest_modified.map(|value| value.to_string())),
+        resolved_paths: vec![latest_dir.to_string_lossy().to_string()],
+        latest_version_id,
+    })
+}
+
+fn build_launch_sync_decision(
+    rule: &GameSaveRule,
+    backup_root: &str,
+    exe_path: Option<&str>,
+) -> LaunchSyncDecision {
+    let local_summary = summarize_runtime_paths(&rule.confirmed_paths, exe_path);
+    let backup_summary = summarize_latest_backup_for_rule(rule, backup_root);
+
+    let local_ok = local_summary.as_ref().ok().cloned();
+    let backup_ok = backup_summary.as_ref().ok().cloned();
+
+    if let Err(err) = local_summary {
+        return LaunchSyncDecision {
+            status: "conflict_unknown".to_string(),
+            message: format!("无法可靠判断本地存档状态：{err}"),
+            recommended_action: "launch_after_manual_review".to_string(),
+            local_summary: None,
+            backup_summary: backup_ok,
+        };
+    }
+    if let Err(err) = backup_summary {
+        return LaunchSyncDecision {
+            status: "conflict_unknown".to_string(),
+            message: format!("无法可靠判断最近备份状态：{err}"),
+            recommended_action: "launch_after_manual_review".to_string(),
+            local_summary: local_ok,
+            backup_summary: None,
+        };
+    }
+
+    let local_summary = local_ok.unwrap_or(SaveLocationSummary {
+        exists: false,
+        file_count: 0,
+        total_bytes: 0,
+        latest_modified_at: None,
+        resolved_paths: Vec::new(),
+        latest_version_id: None,
+    });
+    let backup_summary = backup_ok.unwrap_or(SaveLocationSummary {
+        exists: false,
+        file_count: 0,
+        total_bytes: 0,
+        latest_modified_at: None,
+        resolved_paths: Vec::new(),
+        latest_version_id: None,
+    });
+
+    let local_ts = local_summary
+        .latest_modified_at
+        .as_deref()
+        .map(unix_string_or_zero)
+        .unwrap_or(0);
+    let backup_ts = backup_summary
+        .latest_modified_at
+        .as_deref()
+        .map(unix_string_or_zero)
+        .unwrap_or(0);
+    let same_shape = local_summary.file_count == backup_summary.file_count
+        && local_summary.total_bytes == backup_summary.total_bytes;
+
+    let (status, message, recommended_action) = if !backup_summary.exists {
+        if local_summary.exists {
+            (
+                "local_only",
+                "检测到本地存档，但当前还没有历史备份。建议直接启动，退出后生成首个备份。",
+                "launch_direct",
+            )
+        } else {
+            (
+                "no_backup",
+                "当前没有历史备份，也未检测到本地存档。可直接启动，退出后生成首个备份。",
+                "launch_direct",
+            )
+        }
+    } else if !local_summary.exists {
+        (
+            "backup_only",
+            "检测到历史备份，但本地存档目录为空或不存在。后续可以考虑先恢复备份再启动。",
+            "restore_then_launch",
+        )
+    } else if same_shape && local_ts == backup_ts {
+        (
+            "in_sync",
+            "本地存档与最近备份看起来一致，可直接启动。",
+            "launch_direct",
+        )
+    } else if local_ts > 0 && backup_ts > 0 && local_ts > backup_ts {
+        (
+            "local_newer",
+            "本地存档看起来比最近备份更新，建议保留本地并在退出后生成新备份。",
+            "launch_direct",
+        )
+    } else if local_ts > 0 && backup_ts > 0 && backup_ts > local_ts {
+        (
+            "backup_newer",
+            "最近备份看起来比本地存档更新，后续可以考虑先恢复备份再启动。",
+            "restore_then_launch",
+        )
+    } else if same_shape {
+        (
+            "in_sync",
+            "本地存档与最近备份在文件数和大小上看起来一致，可直接启动。",
+            "launch_direct",
+        )
+    } else {
+        (
+            "conflict_unknown",
+            "已检测到本地存档和历史备份，但暂时无法可靠判断哪一边更新，建议先人工查看后再决定。",
+            "launch_after_manual_review",
+        )
+    };
+
+    LaunchSyncDecision {
+        status: status.to_string(),
+        message: message.to_string(),
+        recommended_action: recommended_action.to_string(),
+        local_summary: Some(local_summary),
+        backup_summary: Some(backup_summary),
+    }
+}
+
 fn restore_latest_backup_for_rule(
     rule: &GameSaveRule,
     backup_root: &str,
@@ -4667,7 +4904,7 @@ fn backup_current_state_for_rule(
     keep_versions: usize,
     version_prefix: Option<&str>,
     exe_path: Option<&str>,
-) -> Result<(usize, String), String> {
+) -> Result<BackupRunResult, String> {
     let base = ensure_backup_root_for_rule(rule, backup_root)?;
     let latest = base.join("latest");
     let versions = base.join("versions");
@@ -4708,7 +4945,10 @@ fn backup_current_state_for_rule(
         }
     }
     cleanup_backup_versions(&versions, keep_versions)?;
-    Ok((changed_total, snapshot_id))
+    Ok(BackupRunResult {
+        changed_files: changed_total,
+        version_id: if changed_total > 0 { Some(snapshot_id) } else { None },
+    })
 }
 
 fn backup_after_exit_for_rule(
@@ -4716,7 +4956,7 @@ fn backup_after_exit_for_rule(
     backup_root: &str,
     keep_versions: usize,
     exe_path: Option<&str>,
-) -> Result<(usize, String), String> {
+) -> Result<BackupRunResult, String> {
     backup_current_state_for_rule(rule, backup_root, keep_versions, None, exe_path)
 }
 
@@ -4741,14 +4981,21 @@ fn spawn_post_exit_backup_worker(
                 .find(|item| item.launcher_session_id == session_id)
             {
                 match backup_result {
-                    Ok((count, snapshot)) => {
-                        append_session_log(
-                            session,
-                            &format!(
-                                "自动备份完成：文件 {}，版本 {}，保留最近 {} 版",
-                                count, snapshot, keep_versions
-                            ),
-                        );
+                    Ok(result) => {
+                        if let Some(snapshot) = result.version_id {
+                            append_session_log(
+                                session,
+                                &format!(
+                                    "自动备份完成：检测到 {} 项变化，已生成版本 {}，保留最近 {} 版",
+                                    result.changed_files, snapshot, keep_versions
+                                ),
+                            );
+                        } else {
+                            append_session_log(
+                                session,
+                                "未检测到存档变化，已跳过本次自动备份版本生成",
+                            );
+                        }
                     }
                     Err(err) => {
                         append_session_log(session, &format!("自动备份失败：{err}"));
