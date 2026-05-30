@@ -91,3 +91,29 @@ git push origin v0.1.0
 - 注入模式（CreateFileW 重定向）：
   - 当前状态：开发中，已从主界面入口隐藏，避免误导用户。
   - 计划目标：完善命中率与兼容性后再重新开放入口。
+# Version Release Checklist (Important)
+
+To avoid "new tag but old installer version" issues, keep these in sync before every release:
+
+- `package.json` -> `version`
+- `src-tauri/Cargo.toml` -> `package.version`
+- `src-tauri/tauri.conf.json` -> `version`
+
+Recommended release flow:
+
+1. Update the three versions above to the same value (for example `0.1.16`).
+2. Validate locally:
+   - `npm run build`
+   - `cargo check --manifest-path .\src-tauri\Cargo.toml`
+3. Push `main` first, then create/push tag:
+   - `git push origin main`
+   - `git tag vX.Y.Z`
+   - `git push origin vX.Y.Z`
+4. Verify tag target is the latest commit:
+   - `git show --no-patch --oneline vX.Y.Z`
+   - `git ls-remote --tags origin vX.Y.Z`
+
+If GitHub Release shows a new tag but assets still have an old version name (for example `GameSaver_0.1.14_...`), usually:
+
+- The tag points to an old commit.
+- `src-tauri/tauri.conf.json` version was not updated.
