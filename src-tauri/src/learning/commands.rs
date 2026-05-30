@@ -425,16 +425,10 @@ pub(crate) fn open_candidate_path(path: String) -> Result<(), String> {
     if !target.is_dir() {
         return Err("candidate path is not a directory".to_string());
     }
-    let started = {
-        let mut command = Command::new("explorer");
-        command.arg(target);
-        apply_background_process_flags(&mut command)
-            .status()
-            .map_err(|err| format!("open directory failed: {err}"))?
-    };
-    if started.success() {
-        Ok(())
-    } else {
-        Err("open directory failed: explorer returned non-zero".to_string())
-    }
+    let mut command = Command::new("explorer");
+    command.arg(target);
+    apply_background_process_flags(&mut command)
+        .spawn()
+        .map_err(|err| format!("open directory failed: {err}"))?;
+    Ok(())
 }
