@@ -178,11 +178,9 @@ pub(crate) fn legacy_managed_save_root() -> String {
 }
 
 pub(crate) fn default_backup_root() -> String {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|v| v.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    exe_dir.join("GameSaverBackups").to_string_lossy().to_string()
+    PathBuf::from(r"D:\GameSaverData\Backups")
+        .to_string_lossy()
+        .to_string()
 }
 
 pub(crate) fn normalize_game_key(game_id: &str) -> String {
