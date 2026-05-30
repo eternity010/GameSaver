@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useToast } from "./composables/useToast";
+import LibraryGameCard from "./components/library/LibraryGameCard.vue";
+import LibraryDetailPanel from "./components/library/LibraryDetailPanel.vue";
 import {
   confirmRule,
   deleteRule,
@@ -45,7 +47,6 @@ import type {
   LauncherSession,
   RestoreBackupResult,
   RuleConflictItem,
-  SaveLocationSummary,
 } from "./types";
 
 type UiStep = "setup" | "running" | "results";
@@ -482,11 +483,6 @@ function updateBackupKeepDraft(gameIdText: string, value: string) {
   };
 }
 
-function onBackupKeepInput(gameIdText: string, event: Event) {
-  const target = event.target as HTMLInputElement | null;
-  updateBackupKeepDraft(gameIdText, target?.value ?? "");
-}
-
 function sessionDetailsFor(gameIdText: string): LauncherSession | null {
   return sessionDetailsByGame.value[cardKey(gameIdText)] ?? null;
 }
@@ -711,35 +707,6 @@ function cardSyncStatusLabel(gameIdText: string): string {
   return syncStatusLabel(status);
 }
 
-function syncRecommendedActionLabel(action: string): string {
-  switch (action) {
-    case "launch_direct":
-      return "建议直接启动";
-    case "restore_then_launch":
-      return "建议恢复后启动";
-    default:
-      return "建议先人工确认";
-  }
-}
-
-function formatOptionalUnixTs(value?: string): string {
-  if (!value) return "无";
-  return formatUnixTs(value);
-}
-
-function syncSummaryMeta(summary?: SaveLocationSummary | null): string {
-  if (!summary) return "无摘要";
-  if (!summary.exists) return "未检测到文件";
-  return `${summary.fileCount} 个文件 / ${formatBytes(summary.totalBytes)}`;
-}
-
-function shortExePath(path?: string | null): string {
-  const value = (path || "").trim();
-  if (!value) return "";
-  if (value.length <= 72) return value;
-  return `${value.slice(0, 28)}...${value.slice(-36)}`;
-}
-
 function restoreProtectionSummary(result: RestoreBackupResult): string {
   if (result.preRestoreVersionId) {
     return `已先创建恢复前备份 ${result.preRestoreVersionId}`;
@@ -869,21 +836,6 @@ async function waitForTaskCompletion<T>(
     }
     await sleep(350);
   }
-}
-
-function formatBytes(totalBytes: number): string {
-  if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
-    return "0 B";
-  }
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let value = totalBytes;
-  let unitIndex = 0;
-  while (value >= 1024 && unitIndex < units.length - 1) {
-    value /= 1024;
-    unitIndex += 1;
-  }
-  const precision = value >= 100 || unitIndex === 0 ? 0 : value >= 10 ? 1 : 2;
-  return `${value.toFixed(precision)} ${units[unitIndex]}`;
 }
 
 function parseBackupKeepDraft(gameIdText: string): number | null {
@@ -2051,325 +2003,52 @@ onUnmounted(() => {
 
       <div v-if="filteredLibraryItems.length" class="library-layout">
         <div class="library-grid" :class="{ single: filteredLibraryItems.length === 1 }">
-          <article
+          <LibraryGameCard
             v-for="item in filteredLibraryItems"
             :key="item.gameId"
-            class="panel game-card"
-            :class="{ selected: isLibraryGameSelected(item.gameId), warning: !!gameDirResolutionIssue(item.gameId) }"
-            @click="selectLibraryGame(item.gameId)"
-          >
-            <p v-if="libraryCardErrorFor(item.gameId)" class="error inline-error card-error">
-              {{ libraryCardErrorFor(item.gameId) }}
-            </p>
-            <div class="library-game-row">
-              <span class="game-status-dot" :class="item.preferredExePath ? 'ready' : 'missing'"></span>
-              <div class="library-game-main">
-                <h3>{{ item.gameId }}</h3>
-                <p>
-                  <span>规则 {{ item.enabledRules }}/{{ item.totalRules }}</span>
-                  <span v-if="backupStatsFor(item.gameId)">
-                    备份 {{ backupStatsFor(item.gameId)?.versionCount ?? 0 }} 版
-                  </span>
-                  <span v-else>备份读取中</span>
-                </p>
-                <div v-if="cardSyncStatusLabel(item.gameId)" class="library-sync-row">
-                  <span
-                    class="precheck-state-pill library-sync-pill"
-                    :class="syncStatusClass(syncDecisionFor(item.gameId)?.status || '')"
-                  >
-                    {{ cardSyncStatusLabel(item.gameId) }}
-                  </span>
-                </div>
-                <p v-if="gameDirStatusLabel(item.gameId)" class="library-warning-text">
-                  {{ gameDirStatusLabel(item.gameId) }}
-                </p>
-              </div>
-              <span v-if="item.lastSessionStatus" class="session-mini">{{ item.lastSessionStatus }}</span>
-            </div>
-          </article>
+            :item="item"
+            :selected="isLibraryGameSelected(item.gameId)"
+            :warning="!!gameDirResolutionIssue(item.gameId)"
+            :card-error="libraryCardErrorFor(item.gameId)"
+            :sync-status-label="cardSyncStatusLabel(item.gameId)"
+            :sync-status-class="syncStatusClass(syncDecisionFor(item.gameId)?.status || '')"
+            :game-dir-status-label="gameDirStatusLabel(item.gameId)"
+            :backup-stats="backupStatsFor(item.gameId)"
+            @select="selectLibraryGame"
+          />
         </div>
 
-        <aside v-if="selectedLibraryItem" class="panel library-detail-panel">
-          <p v-if="libraryCardErrorFor(selectedLibraryItem.gameId)" class="error inline-error card-error">
-            {{ libraryCardErrorFor(selectedLibraryItem.gameId) }}
-          </p>
-          <div class="detail-head">
-            <div>
-              <span class="eyebrow">当前选中</span>
-              <h3>{{ selectedLibraryItem.gameId }}</h3>
-            </div>
-            <button
-              type="button"
-              class="primary"
-              :disabled="libraryState.loading || isCardBusy(selectedLibraryItem.gameId, 'launch')"
-              @click="launchLibraryGame(selectedLibraryItem.gameId, 'backup')"
-            >
-              启动游戏（自动备份）
-            </button>
-          </div>
-
-          <label class="field">
-            <span>启动 EXE</span>
-            <div class="row">
-              <input
-                :value="shortExePath(selectedLibraryItem.preferredExePath)"
-                :title="selectedLibraryItem.preferredExePath || ''"
-                readonly
-                placeholder="尚未绑定 EXE，先点击右侧按钮"
-              />
-              <button
-                type="button"
-                :disabled="libraryState.loading || isCardBusy(selectedLibraryItem.gameId, 'bind_exe')"
-                @click="choosePreferredExeForGame(selectedLibraryItem.gameId)"
-              >
-                选择/更换 EXE
-              </button>
-            </div>
-          </label>
-
-          <section class="precheck-box">
-            <div class="row precheck-head">
-              <strong>启动前预检查</strong>
-              <div class="row precheck-head-actions">
-                <span
-                  v-if="launchPrecheckFor(selectedLibraryItem.gameId)"
-                  class="precheck-state-pill"
-                  :class="launchPrecheckFor(selectedLibraryItem.gameId)?.backupReady ? 'ok' : 'fail'"
-                >
-                  {{ launchPrecheckFor(selectedLibraryItem.gameId)?.backupReady ? "自动备份可启动" : "自动备份需处理" }}
-                </span>
-                <span v-else class="precheck-state-pill idle">未检查</span>
-              </div>
-            </div>
-            <div v-if="selectedRuleAnchorTokens(selectedLibraryItem.gameId).length" class="precheck-anchor-summary">
-              <span class="precheck-anchor-label">规则路径锚点</span>
-              <div class="anchor-chip-row compact">
-                <span
-                  v-for="token in selectedRuleAnchorTokens(selectedLibraryItem.gameId)"
-                  :key="`${selectedLibraryItem.gameId}-${token}`"
-                  class="anchor-chip"
-                  :class="{ warning: token === '%GAME_DIR%' }"
-                  :title="pathAnchorDescription(token)"
-                >
-                  {{ pathAnchorLabel(token) }}
-                </span>
-              </div>
-            </div>
-            <section v-if="syncDecisionFor(selectedLibraryItem.gameId)" class="sync-decision-box">
-              <div class="sync-decision-head">
-                <span class="precheck-anchor-label">启动前同步状态</span>
-                <span
-                  class="precheck-state-pill"
-                  :class="syncStatusClass(syncDecisionFor(selectedLibraryItem.gameId)?.status || '')"
-                >
-                  {{ syncStatusLabel(syncDecisionFor(selectedLibraryItem.gameId)?.status || "") }}
-                </span>
-              </div>
-              <p class="sync-decision-message">
-                {{ syncDecisionFor(selectedLibraryItem.gameId)?.message }}
-              </p>
-              <p class="sync-decision-action">
-                {{ syncRecommendedActionLabel(syncDecisionFor(selectedLibraryItem.gameId)?.recommendedAction || "") }}
-              </p>
-              <p class="sync-inline-summary">
-                本地：{{ syncSummaryMeta(syncDecisionFor(selectedLibraryItem.gameId)?.localSummary) }} ·
-                备份：{{ syncSummaryMeta(syncDecisionFor(selectedLibraryItem.gameId)?.backupSummary) }}
-              </p>
-              <details class="sync-details">
-                <summary>展开同步详情</summary>
-                <div class="sync-decision-grid">
-                  <div class="sync-side-card">
-                    <strong>本地存档</strong>
-                    <p>{{ syncSummaryMeta(syncDecisionFor(selectedLibraryItem.gameId)?.localSummary) }}</p>
-                    <p>最近修改：{{ formatOptionalUnixTs(syncDecisionFor(selectedLibraryItem.gameId)?.localSummary?.latestModifiedAt) }}</p>
-                  </div>
-                  <div class="sync-side-card">
-                    <strong>最近备份</strong>
-                    <p>{{ syncSummaryMeta(syncDecisionFor(selectedLibraryItem.gameId)?.backupSummary) }}</p>
-                    <p>
-                      最近版本：
-                      {{
-                        syncDecisionFor(selectedLibraryItem.gameId)?.backupSummary?.latestVersionId
-                          ? formatUnixTs(syncDecisionFor(selectedLibraryItem.gameId)?.backupSummary?.latestVersionId || "")
-                          : "无"
-                      }}
-                    </p>
-                  </div>
-                </div>
-              </details>
-            </section>
-            <div v-if="gameDirResolutionIssue(selectedLibraryItem.gameId)" class="warning-banner">
-              <strong>需要绑定本地 EXE</strong>
-              <p>{{ gameDirResolutionIssue(selectedLibraryItem.gameId) }}</p>
-            </div>
-            <template v-if="launchPrecheckFor(selectedLibraryItem.gameId)">
-              <details v-if="visiblePrecheckChecks(selectedLibraryItem.gameId).length" class="precheck-details">
-                <summary>查看检查明细（{{ visiblePrecheckChecks(selectedLibraryItem.gameId).length }} 项）</summary>
-                <ul class="precheck-list">
-                  <li
-                    v-for="check in visiblePrecheckChecks(selectedLibraryItem.gameId)"
-                    :key="`${selectedLibraryItem.gameId}-${check.key}`"
-                  >
-                    <span class="precheck-badge" :class="check.ok ? 'ok' : 'fail'">{{ check.ok ? "OK" : "FAIL" }}</span>
-                    <span class="precheck-label">{{ check.label }}</span>
-                    <span class="precheck-detail">{{ check.detail }}</span>
-                  </li>
-                </ul>
-              </details>
-            </template>
-            <p v-else class="empty-hint">尚未检查，点击“刷新”查看启动条件。</p>
-          </section>
-
-          <section class="backup-detail-stack">
-            <details class="library-collapsible" open>
-              <summary>备份空间管理</summary>
-            <section class="backup-policy-box">
-              <div class="row backup-policy-head">
-                <h4>备份空间管理</h4>
-              </div>
-              <div class="backup-policy-stats">
-                <span>当前占用：{{ formatBytes(backupStatsFor(selectedLibraryItem.gameId)?.totalBytes ?? 0) }}</span>
-                <span>版本数：{{ backupStatsFor(selectedLibraryItem.gameId)?.versionCount ?? 0 }}</span>
-                <span>当前保留策略：最近 {{ backupStatsFor(selectedLibraryItem.gameId)?.keepVersions ?? 10 }} 版</span>
-                <span v-if="backupStatsFor(selectedLibraryItem.gameId)?.latestVersionId">
-                  最新版本：{{ backupStatsFor(selectedLibraryItem.gameId)?.latestVersionId }}
-                </span>
-              </div>
-              <details class="policy-controls-details">
-                <summary>展开策略与清理操作</summary>
-                <div class="row backup-policy-controls">
-                  <label class="backup-keep-input">
-                    <span>保留最近 N 版</span>
-                    <input
-                      :value="backupKeepDraftFor(selectedLibraryItem.gameId)"
-                      type="number"
-                      min="1"
-                      max="10"
-                      step="1"
-                      @input="onBackupKeepInput(selectedLibraryItem.gameId, $event)"
-                    />
-                  </label>
-                  <button
-                    type="button"
-                    :disabled="libraryState.loading || isCardBusy(selectedLibraryItem.gameId, 'backup_policy_save')"
-                    @click="saveBackupKeepPolicy(selectedLibraryItem.gameId)"
-                  >
-                    保存策略
-                  </button>
-                  <button
-                    type="button"
-                    class="danger"
-                    :disabled="libraryState.loading || isCardBusy(selectedLibraryItem.gameId, 'backup_prune')"
-                    @click="pruneOldBackupsForGame(selectedLibraryItem.gameId)"
-                  >
-                    一键清理旧备份
-                  </button>
-                </div>
-              </details>
-            </section>
-            </details>
-
-            <details class="library-collapsible">
-              <summary>备份版本时间线与恢复</summary>
-            <div class="row">
-              <h4>备份版本时间线</h4>
-            </div>
-            <p class="field-note restore-safety-note">
-              恢复任一版本前，GameSaver 会先尝试为当前本地存档创建一份“恢复前备份”，方便你随时撤销。
-            </p>
-            <div v-if="restoreTaskMessageFor(selectedLibraryItem.gameId)" class="migration-progress restore-progress">
-              <p>{{ restoreTaskMessageFor(selectedLibraryItem.gameId) }}</p>
-              <div class="progress-track" role="progressbar" aria-label="恢复进度">
-                <span v-if="restoreTaskProgressFor(selectedLibraryItem.gameId) === null" class="progress-indeterminate"></span>
-                <span
-                  v-else
-                  class="progress-determinate"
-                  :style="{ width: `${restoreTaskProgressFor(selectedLibraryItem.gameId)}%` }"
-                ></span>
-              </div>
-              <p v-if="restoreTaskProgressFor(selectedLibraryItem.gameId) !== null">
-                当前进度：{{ restoreTaskProgressFor(selectedLibraryItem.gameId) }}%
-              </p>
-            </div>
-            <ul v-if="backupVersionsFor(selectedLibraryItem.gameId).length" class="backup-timeline">
-              <li
-                v-for="version in backupVersionsFor(selectedLibraryItem.gameId)"
-                :key="version.versionId"
-                :class="{ 'pre-restore': version.label === '回滚前备份' }"
-              >
-                <div class="backup-version-main">
-                  <div class="backup-version-title">
-                    <span class="backup-version-label">{{ version.label }}</span>
-                    <strong>{{ formatUnixTs(version.createdAt) }}</strong>
-                  </div>
-                  <p>{{ version.fileCount }} 个文件</p>
-                  <details class="backup-version-id">
-                    <summary>查看版本 ID</summary>
-                    <code>{{ version.versionId }}</code>
-                  </details>
-                </div>
-                <div class="backup-version-actions">
-                  <button
-                    type="button"
-                    class="primary"
-                    :disabled="
-                      libraryState.loading ||
-                      isCardBusy(selectedLibraryItem.gameId, 'backup_rollback') ||
-                      !version.restorable
-                    "
-                    @click="rollbackToLibraryBackupVersion(selectedLibraryItem.gameId, version.versionId)"
-                  >
-                    回滚到此版本
-                  </button>
-                </div>
-              </li>
-            </ul>
-            <p v-else>暂无备份版本。</p>
-            <section v-if="restoreUndoFor(selectedLibraryItem.gameId)" class="restore-undo-box">
-              <div>
-                <strong>可撤销本次恢复</strong>
-                <p>
-                  已从 {{ restoreUndoFor(selectedLibraryItem.gameId)?.restoredVersionId }} 恢复。
-                  回滚前备份：{{ restoreUndoFor(selectedLibraryItem.gameId)?.versionId }}
-                </p>
-              </div>
-              <button
-                type="button"
-                class="danger"
-                :disabled="libraryState.loading || isCardBusy(selectedLibraryItem.gameId, 'backup_rollback')"
-                @click="undoLibraryRestore(selectedLibraryItem.gameId)"
-              >
-                撤销本次恢复
-              </button>
-            </section>
-            </details>
-
-            <details class="library-collapsible">
-              <summary>最近会话日志</summary>
-            <div class="row">
-              <h4>最近会话日志</h4>
-            </div>
-            <template v-if="sessionDetailsFor(selectedLibraryItem.gameId)">
-              <p>sessionId={{ sessionDetailsFor(selectedLibraryItem.gameId)?.launcherSessionId }}</p>
-              <p>
-                status={{ sessionDetailsFor(selectedLibraryItem.gameId)?.status }} |
-                mode={{ sessionDetailsFor(selectedLibraryItem.gameId)?.launchMode ?? "backup" }} |
-                pid={{ sessionDetailsFor(selectedLibraryItem.gameId)?.pid ?? "无" }}
-              </p>
-              <ul class="rule-list">
-                <li
-                  v-for="(log, idx) in (sessionDetailsFor(selectedLibraryItem.gameId)?.logs || []).slice(-10)"
-                  :key="`${selectedLibraryItem.gameId}-${idx}`"
-                >
-                  {{ log }}
-                </li>
-              </ul>
-            </template>
-            <p v-else>暂无会话日志。</p>
-            </details>
-          </section>
-          <p class="mode-hint">当前阶段仅支持自动备份启动与直接备份启动。</p>
-        </aside>
+        <LibraryDetailPanel
+          v-if="selectedLibraryItem"
+          :selected-item="selectedLibraryItem"
+          :card-error="libraryCardErrorFor(selectedLibraryItem.gameId)"
+          :loading="libraryState.loading"
+          :launch-busy="isCardBusy(selectedLibraryItem.gameId, 'launch')"
+          :bind-exe-busy="isCardBusy(selectedLibraryItem.gameId, 'bind_exe')"
+          :backup-policy-save-busy="isCardBusy(selectedLibraryItem.gameId, 'backup_policy_save')"
+          :backup-prune-busy="isCardBusy(selectedLibraryItem.gameId, 'backup_prune')"
+          :backup-rollback-busy="isCardBusy(selectedLibraryItem.gameId, 'backup_rollback')"
+          :preferred-exe-path="selectedLibraryItem.preferredExePath || ''"
+          :precheck="launchPrecheckFor(selectedLibraryItem.gameId)"
+          :sync-decision="syncDecisionFor(selectedLibraryItem.gameId)"
+          :anchor-tokens="selectedRuleAnchorTokens(selectedLibraryItem.gameId)"
+          :game-dir-issue="gameDirResolutionIssue(selectedLibraryItem.gameId)"
+          :visible-precheck-checks="visiblePrecheckChecks(selectedLibraryItem.gameId)"
+          :backup-stats="backupStatsFor(selectedLibraryItem.gameId)"
+          :backup-keep-draft="backupKeepDraftFor(selectedLibraryItem.gameId)"
+          :backup-versions="backupVersionsFor(selectedLibraryItem.gameId)"
+          :restore-undo="restoreUndoFor(selectedLibraryItem.gameId)"
+          :restore-task-message="restoreTaskMessageFor(selectedLibraryItem.gameId)"
+          :restore-task-progress="restoreTaskProgressFor(selectedLibraryItem.gameId)"
+          :session-details="sessionDetailsFor(selectedLibraryItem.gameId)"
+          @launch="launchLibraryGame($event, 'backup')"
+          @choose-exe="choosePreferredExeForGame"
+          @update-backup-keep="updateBackupKeepDraft"
+          @save-backup-keep="saveBackupKeepPolicy"
+          @prune-backups="pruneOldBackupsForGame"
+          @rollback-version="rollbackToLibraryBackupVersion"
+          @undo-restore="undoLibraryRestore"
+        />
       </div>
       <p v-else>暂无游戏卡片，请先在“学习存档”中生成规则。</p>
     </section>
