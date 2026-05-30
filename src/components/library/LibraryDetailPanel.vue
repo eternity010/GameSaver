@@ -167,6 +167,11 @@ function syncSummaryMeta(summary?: LaunchSyncDecision["localSummary"] | null): s
   return `${summary.fileCount} 个文件 / ${formatBytes(summary.totalBytes)}`;
 }
 
+function backupSummaryText(): string {
+  if (!props.backupStats) return "备份读取中";
+  return `${props.backupStats.versionCount ?? 0} 版 / ${formatBytes(props.backupStats.totalBytes ?? 0)}`;
+}
+
 function shortExePath(path?: string | null): string {
   const value = (path || "").trim();
   if (!value) return "";
@@ -200,7 +205,22 @@ function onBackupKeepInput(event: Event) {
       </button>
     </div>
 
-    <label class="field">
+    <section class="detail-summary-strip">
+      <div class="detail-summary-item">
+        <span>启动状态</span>
+        <strong>{{ precheck?.backupReady ? "可启动" : "需检查" }}</strong>
+      </div>
+      <div class="detail-summary-item">
+        <span>同步状态</span>
+        <strong>{{ syncDecision ? syncStatusLabel(syncDecision.status) : "未检查" }}</strong>
+      </div>
+      <div class="detail-summary-item">
+        <span>备份</span>
+        <strong>{{ backupSummaryText() }}</strong>
+      </div>
+    </section>
+
+    <label class="field compact-detail-field">
       <span>启动 EXE</span>
       <div class="row">
         <input
@@ -219,9 +239,9 @@ function onBackupKeepInput(event: Event) {
       </div>
     </label>
 
-    <section class="precheck-box">
+    <section class="precheck-box compact-precheck-box">
       <div class="row precheck-head">
-        <strong>启动前预检查</strong>
+        <strong>启动检查</strong>
         <div class="row precheck-head-actions">
           <span
             v-if="precheck"
@@ -233,39 +253,25 @@ function onBackupKeepInput(event: Event) {
           <span v-else class="precheck-state-pill idle">未检查</span>
         </div>
       </div>
-      <div v-if="anchorTokens.length" class="precheck-anchor-summary">
-        <span class="precheck-anchor-label">规则路径锚点</span>
-        <div class="anchor-chip-row compact">
-          <span
-            v-for="token in anchorTokens"
-            :key="`${selectedItem.gameId}-${token}`"
-            class="anchor-chip"
-            :class="{ warning: token === '%GAME_DIR%' }"
-            :title="pathAnchorDescription(token)"
-          >
-            {{ pathAnchorLabel(token) }}
-          </span>
-        </div>
-      </div>
-      <section v-if="syncDecision" class="sync-decision-box">
+      <section v-if="syncDecision" class="sync-decision-box compact-sync-box">
         <div class="sync-decision-head">
-          <span class="precheck-anchor-label">启动前同步状态</span>
+          <span class="precheck-anchor-label">同步状态</span>
           <span class="precheck-state-pill" :class="syncStatusClass(syncDecision.status)">
             {{ syncStatusLabel(syncDecision.status) }}
           </span>
         </div>
-        <p class="sync-decision-message">
-          {{ syncDecision.message }}
-        </p>
         <p class="sync-decision-action">
           {{ syncRecommendedActionLabel(syncDecision.recommendedAction || "") }}
         </p>
-        <p class="sync-inline-summary">
-          本地：{{ syncSummaryMeta(syncDecision.localSummary) }} ·
-          备份：{{ syncSummaryMeta(syncDecision.backupSummary) }}
-        </p>
         <details class="sync-details">
-          <summary>展开同步详情</summary>
+          <summary>查看同步依据</summary>
+          <p class="sync-decision-message">
+            {{ syncDecision.message }}
+          </p>
+          <p class="sync-inline-summary">
+            本地：{{ syncSummaryMeta(syncDecision.localSummary) }} ·
+            备份：{{ syncSummaryMeta(syncDecision.backupSummary) }}
+          </p>
           <div class="sync-decision-grid">
             <div class="sync-side-card">
               <strong>本地存档</strong>
@@ -287,6 +293,20 @@ function onBackupKeepInput(event: Event) {
           </div>
         </details>
       </section>
+      <details v-if="anchorTokens.length" class="precheck-anchor-summary">
+        <summary>规则路径锚点</summary>
+        <div class="anchor-chip-row compact detail-anchor-row">
+          <span
+            v-for="token in anchorTokens"
+            :key="`${selectedItem.gameId}-${token}`"
+            class="anchor-chip"
+            :class="{ warning: token === '%GAME_DIR%' }"
+            :title="pathAnchorDescription(token)"
+          >
+            {{ pathAnchorLabel(token) }}
+          </span>
+        </div>
+      </details>
       <div v-if="gameDirIssue" class="warning-banner">
         <strong>需要绑定本地 EXE</strong>
         <p>{{ gameDirIssue }}</p>
@@ -310,7 +330,7 @@ function onBackupKeepInput(event: Event) {
     </section>
 
     <section class="backup-detail-stack">
-      <details class="library-collapsible" open>
+      <details class="library-collapsible">
         <summary>备份空间管理</summary>
         <section class="backup-policy-box">
           <div class="row backup-policy-head">
@@ -453,6 +473,5 @@ function onBackupKeepInput(event: Event) {
         <p v-else>暂无会话日志。</p>
       </details>
     </section>
-    <p class="mode-hint">当前阶段仅支持自动备份启动与直接备份启动。</p>
   </aside>
 </template>

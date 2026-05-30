@@ -260,10 +260,15 @@ function learningBusyLabel(): string {
                 <button type="button" @click="emit('open-path', item.path)">打开目录</button>
               </div>
               <p>
-                得分：{{ item.score }} | changed={{ item.changedFiles }} added={{ item.addedFiles }}
-                modified={{ item.modifiedFiles }}
+                {{ candidateSignalSummary(item) }}
               </p>
-              <p>推荐理由：{{ candidateSignalSummary(item) }}</p>
+              <details class="candidate-evidence">
+                <summary>查看依据</summary>
+                <p>
+                  得分 {{ item.score }} · changed {{ item.changedFiles }} · added {{ item.addedFiles }} ·
+                  modified {{ item.modifiedFiles }}
+                </p>
+              </details>
             </li>
           </ul>
         </section>

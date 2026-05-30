@@ -41,11 +41,10 @@ function currentPath(): string {
       <div class="settings-title-row">
         <div>
           <span class="eyebrow">设置</span>
-          <h2>数据路径管理</h2>
+          <h2>备份目录</h2>
         </div>
         <button :disabled="settingsState.loading" type="button" @click="emit('reload')">刷新</button>
       </div>
-      <p class="settings-copy">这里显示的是当前实际生效路径，不一定等于代码默认值。</p>
       <p v-if="settingsState.error" class="error inline-error">{{ settingsState.error }}</p>
       <div v-if="migrationKind" class="migration-progress">
         <p>{{ migrationMessage || "正在迁移数据目录..." }}</p>
@@ -65,22 +64,18 @@ function currentPath(): string {
       <section class="settings-card">
         <div class="settings-card-head">
           <div>
-            <h3>备份目录</h3>
-            <p>自动备份、恢复和迁移包导出导入都会使用这个路径。</p>
+            <h3>{{ settings.backupRoot }}</h3>
+            <p>自动备份、恢复和迁移包会使用这个目录。</p>
           </div>
           <span class="settings-kind-chip">backupRoot</span>
         </div>
-        <label class="field">
-          <span>当前生效路径</span>
-          <input :value="settings.backupRoot" readonly />
-        </label>
-        <label class="field">
-          <span>默认路径</span>
-          <input :value="settings.defaultBackupRoot" readonly />
-        </label>
-        <p v-if="settings.backupRoot !== settings.defaultBackupRoot" class="field-note settings-note">
-          当前值已偏离默认路径，说明这是你本机已保存的用户配置。
-        </p>
+        <details class="settings-details">
+          <summary>查看默认路径</summary>
+          <p>{{ settings.defaultBackupRoot }}</p>
+          <p v-if="settings.backupRoot !== settings.defaultBackupRoot" class="field-note settings-note">
+            当前使用的是你保存过的自定义路径。
+          </p>
+        </details>
         <label class="field">
           <span>新路径</span>
           <div class="row">
