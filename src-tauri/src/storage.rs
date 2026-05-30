@@ -3,16 +3,16 @@ use serde_json;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Runtime};
 use uuid::Uuid;
 
 const MAX_BACKUP_KEEP_VERSIONS: usize = 10;
 
 pub(crate) trait StoreRepository {
-    fn load(&self, app: &AppHandle) -> Result<PersistedStore, String>;
-    fn persist(&self, app: &AppHandle, store: &PersistedStore) -> Result<(), String>;
+    fn load<R: Runtime>(&self, app: &AppHandle<R>) -> Result<PersistedStore, String>;
+    fn persist<R: Runtime>(&self, app: &AppHandle<R>, store: &PersistedStore) -> Result<(), String>;
     fn normalize(&self, store: &mut PersistedStore);
 }
 
@@ -23,7 +23,7 @@ impl JsonStoreRepository {
         Self
     }
 
-    fn store_file_path(&self, app: &AppHandle) -> Result<PathBuf, String> {
+    fn store_file_path<R: Runtime>(&self, app: &AppHandle<R>) -> Result<PathBuf, String> {
         let base = app
             .path()
             .app_data_dir()
@@ -32,13 +32,13 @@ impl JsonStoreRepository {
         Ok(base.join("store.json"))
     }
 
-    fn store_backup_file_path(&self, app: &AppHandle) -> Result<PathBuf, String> {
+    fn store_backup_file_path<R: Runtime>(&self, app: &AppHandle<R>) -> Result<PathBuf, String> {
         Ok(self.store_file_path(app)?.with_extension("json.bak"))
     }
 }
 
 impl StoreRepository for JsonStoreRepository {
-    fn load(&self, app: &AppHandle) -> Result<PersistedStore, String> {
+    fn load<R: Runtime>(&self, app: &AppHandle<R>) -> Result<PersistedStore, String> {
         let path = self.store_file_path(app)?;
         if !path.exists() {
             return Ok(PersistedStore::default());
@@ -68,7 +68,7 @@ impl StoreRepository for JsonStoreRepository {
         }
     }
 
-    fn persist(&self, app: &AppHandle, store: &PersistedStore) -> Result<(), String> {
+    fn persist<R: Runtime>(&self, app: &AppHandle<R>, store: &PersistedStore) -> Result<(), String> {
         let content =
             serde_json::to_string_pretty(store).map_err(|err| format!("serialize store failed: {err}"))?;
         let path = self.store_file_path(app)?;
@@ -87,10 +87,6 @@ impl StoreRepository for JsonStoreRepository {
     }
 
     fn normalize(&self, store: &mut PersistedStore) {
-        let current = store.execution_config.managed_save_root.trim().to_string();
-        if current.is_empty() || current.eq_ignore_ascii_case(&legacy_managed_save_root()) {
-            store.execution_config.managed_save_root = default_managed_save_root();
-        }
         if store.execution_config.backup_root.trim().is_empty() {
             store.execution_config.backup_root = default_backup_root();
         }
@@ -158,23 +154,6 @@ impl StoreRepository for JsonStoreRepository {
                 && !rule.confirmed_paths.is_empty()
         });
     }
-}
-
-pub(crate) fn default_managed_save_root() -> String {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|v| v.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    exe_dir.join("GameSaverSaves").to_string_lossy().to_string()
-}
-
-pub(crate) fn legacy_managed_save_root() -> String {
-    let profile = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string());
-    Path::new(&profile)
-        .join("Saved Games")
-        .join("GameSaver")
-        .to_string_lossy()
-        .to_string()
 }
 
 pub(crate) fn default_backup_root() -> String {

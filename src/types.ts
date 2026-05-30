@@ -58,6 +58,26 @@ export interface RuntimeStatus {
   message: string;
 }
 
+export interface SettingsPaths {
+  backupRoot: string;
+  defaultBackupRoot: string;
+}
+
+export type DataPathKind = "backupRoot";
+
+export interface UpdateSettingsPathsInput {
+  backupRoot?: string;
+}
+
+export interface DataPathMigrationResult {
+  kind: DataPathKind;
+  sourcePath: string;
+  targetPath: string;
+  copiedFiles: number;
+  createdDirectories: number;
+  keptOriginal: boolean;
+}
+
 export type LauncherStatus = "idle" | "launching" | "running" | "failed" | "exited";
 export type LauncherMode = "backup" | "backup_direct";
 

@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   BackupStatsResult,
   BackupVersion,
+  DataPathKind,
   GameLaunchPrecheck,
   ExportMigrationZipResult,
   CandidatePath,
@@ -18,7 +19,9 @@ import type {
   RestoreBackupResult,
   ResolveRuleResult,
   RuntimeStatus,
+  SettingsPaths,
   TaskState,
+  UpdateSettingsPathsInput,
 } from "./types";
 
 export async function startLearning(gameId: string, exePath: string, extraScanRoots: string[] = []): Promise<string> {
@@ -108,6 +111,18 @@ export async function getRuntimeStatus(): Promise<RuntimeStatus> {
 
 export async function restartAsAdmin(): Promise<void> {
   return invoke("restart_as_admin");
+}
+
+export async function getSettingsPaths(): Promise<SettingsPaths> {
+  return invoke("get_settings_paths");
+}
+
+export async function updateSettingsPaths(input: UpdateSettingsPathsInput): Promise<SettingsPaths> {
+  return invoke("update_settings_paths", { input });
+}
+
+export async function startMigrateDataPathTask(kind: DataPathKind, targetPath: string): Promise<string> {
+  return invoke("start_migrate_data_path_task", { kind, targetPath });
 }
 
 export async function resolveRuleForExe(exePath: string): Promise<ResolveRuleResult> {

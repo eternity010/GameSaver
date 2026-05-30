@@ -1,0 +1,117 @@
+<script setup lang="ts">
+import type { DataPathKind, SettingsPaths } from "../types";
+
+type TabState = {
+  loading: boolean;
+  error: string;
+};
+
+const props = defineProps<{
+  settings: SettingsPaths | null;
+  settingsState: TabState;
+  backupRootDraft: string;
+  migrationKind: DataPathKind | "";
+  migrationMessage: string;
+  migrationProgress: number | null;
+}>();
+
+const emit = defineEmits<{
+  (e: "update:backupRootDraft", value: string): void;
+  (e: "reload"): void;
+  (e: "choose-directory", kind: DataPathKind): void;
+  (e: "open-directory", path: string): void;
+  (e: "save-path", kind: DataPathKind): void;
+  (e: "migrate-path", kind: DataPathKind): void;
+}>();
+
+function isChanged(): boolean {
+  if (!props.settings) return false;
+  return props.backupRootDraft.trim() !== props.settings.backupRoot.trim();
+}
+
+function currentPath(): string {
+  if (!props.settings) return "";
+  return props.settings.backupRoot;
+}
+</script>
+
+<template>
+  <section class="panel settings-shell">
+    <header class="settings-header">
+      <div class="settings-title-row">
+        <div>
+          <span class="eyebrow">设置</span>
+          <h2>数据路径管理</h2>
+        </div>
+        <button :disabled="settingsState.loading" type="button" @click="emit('reload')">刷新</button>
+      </div>
+      <p class="settings-copy">这里显示的是当前实际生效路径，不一定等于代码默认值。</p>
+      <p v-if="settingsState.error" class="error inline-error">{{ settingsState.error }}</p>
+      <div v-if="migrationKind" class="migration-progress">
+        <p>{{ migrationMessage || "正在迁移数据目录..." }}</p>
+        <div class="progress-track" role="progressbar" aria-label="数据目录迁移进行中">
+          <span v-if="migrationProgress === null" class="progress-indeterminate"></span>
+          <span
+            v-else
+            class="progress-determinate"
+            :style="{ width: `${migrationProgress}%` }"
+          ></span>
+        </div>
+        <p v-if="migrationProgress !== null">当前进度：{{ migrationProgress }}%</p>
+      </div>
+    </header>
+
+    <div v-if="settings" class="settings-grid">
+      <section class="settings-card">
+        <div class="settings-card-head">
+          <div>
+            <h3>备份目录</h3>
+            <p>自动备份、恢复和迁移包导出导入都会使用这个路径。</p>
+          </div>
+          <span class="settings-kind-chip">backupRoot</span>
+        </div>
+        <label class="field">
+          <span>当前生效路径</span>
+          <input :value="settings.backupRoot" readonly />
+        </label>
+        <label class="field">
+          <span>默认路径</span>
+          <input :value="settings.defaultBackupRoot" readonly />
+        </label>
+        <p v-if="settings.backupRoot !== settings.defaultBackupRoot" class="field-note settings-note">
+          当前值已偏离默认路径，说明这是你本机已保存的用户配置。
+        </p>
+        <label class="field">
+          <span>新路径</span>
+          <div class="row">
+            <input
+              :value="backupRootDraft"
+              placeholder="选择新的备份目录"
+              @input="emit('update:backupRootDraft', ($event.target as HTMLInputElement).value)"
+            />
+            <button :disabled="settingsState.loading" type="button" @click="emit('choose-directory', 'backupRoot')">
+              浏览
+            </button>
+          </div>
+        </label>
+        <div class="row settings-actions-row">
+          <button :disabled="!currentPath()" type="button" @click="emit('open-directory', currentPath())">
+            打开当前目录
+          </button>
+          <button :disabled="settingsState.loading || !isChanged()" type="button" @click="emit('save-path', 'backupRoot')">
+            仅保存路径
+          </button>
+          <button
+            :disabled="settingsState.loading || !isChanged() || migrationKind !== ''"
+            type="button"
+            class="primary"
+            @click="emit('migrate-path', 'backupRoot')"
+          >
+            迁移到新路径
+          </button>
+        </div>
+      </section>
+
+    </div>
+  </section>
+</template>

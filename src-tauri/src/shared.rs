@@ -14,6 +14,8 @@ mod precheck;
 mod rules;
 #[path = "shared/runtime_info.rs"]
 mod runtime_info;
+#[path = "shared/settings.rs"]
+mod settings;
 #[path = "shared/store.rs"]
 mod store;
 
@@ -34,4 +36,7 @@ pub(crate) use rules::{
 };
 pub(crate) use rules::ResolveRuleResult;
 pub(crate) use runtime_info::RuntimeStatus;
+pub(crate) use settings::{
+    DataPathKind, DataPathMigrationResult, SettingsPaths, UpdateSettingsPathsInput,
+};
 pub(crate) use store::PersistedStore;

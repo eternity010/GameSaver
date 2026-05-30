@@ -151,6 +151,76 @@ body {
   font-size: 13px;
 }
 
+.settings-shell,
+.settings-header {
+  display: grid;
+  gap: 12px;
+}
+
+.settings-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 12px;
+}
+
+.settings-copy {
+  color: #4d687e;
+  line-height: 1.55;
+}
+
+.settings-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.settings-card {
+  border: 1px solid #d7e1e8;
+  border-radius: 12px;
+  padding: 14px;
+  background: #fbfdff;
+  display: grid;
+  gap: 12px;
+}
+
+.settings-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 12px;
+}
+
+.settings-card-head h3 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.settings-card-head p {
+  margin: 4px 0 0;
+  color: #577188;
+  line-height: 1.5;
+}
+
+.settings-kind-chip {
+  border: 1px solid #c3d6e6;
+  border-radius: 999px;
+  padding: 4px 10px;
+  background: #eef6fd;
+  color: #2a6f97;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.settings-note {
+  margin-top: -4px;
+  color: #5a6f82;
+}
+
+.settings-actions-row {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 h1 {
   margin: 0 0 6px;
   font-size: 24px;

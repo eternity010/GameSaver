@@ -12,6 +12,7 @@ mod precheck;
 mod rules;
 mod runtime;
 mod runtime_commands;
+mod settings;
 mod shared;
 mod storage;
 mod tasks;
@@ -79,6 +80,9 @@ pub fn run() {
             migration::start_import_migration_zip_task,
             precheck::precheck_game_launch,
             library::set_preferred_exe_path,
+            settings::get_settings_paths,
+            settings::update_settings_paths,
+            settings::start_migrate_data_path_task,
             runtime_commands::get_runtime_status,
             runtime_commands::restart_as_admin
         ])

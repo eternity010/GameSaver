@@ -4,7 +4,6 @@ use std::collections::HashMap;
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExecutionConfig {
-    pub(crate) managed_save_root: String,
     pub(crate) backup_root: String,
     #[serde(default)]
     pub(crate) preferred_exe_by_uid: HashMap<String, String>,
@@ -23,7 +22,6 @@ pub(crate) struct ExecutionConfig {
 impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
-            managed_save_root: String::new(),
             backup_root: String::new(),
             preferred_exe_by_uid: HashMap::new(),
             preferred_rule_uid_by_game: HashMap::new(),
