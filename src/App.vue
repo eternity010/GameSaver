@@ -690,25 +690,6 @@ function syncStatusLabel(status: string): string {
   }
 }
 
-function syncStatusShortHint(status: string): string {
-  switch (status) {
-    case "no_backup":
-      return "首次启动后会生成首个备份";
-    case "backup_only":
-      return "本地为空，可考虑先恢复备份";
-    case "local_only":
-      return "本地已有存档，退出后会首备份";
-    case "in_sync":
-      return "本地与最近备份看起来一致";
-    case "local_newer":
-      return "会保留本地并在退出后生成新备份";
-    case "backup_newer":
-      return "可选择恢复较新的历史备份";
-    default:
-      return "建议先进入详情确认";
-  }
-}
-
 function syncStatusClass(status: string): string {
   switch (status) {
     case "in_sync":
@@ -728,12 +709,6 @@ function cardSyncStatusLabel(gameIdText: string): string {
   const status = syncDecisionFor(gameIdText)?.status;
   if (!status) return "";
   return syncStatusLabel(status);
-}
-
-function cardSyncStatusHint(gameIdText: string): string {
-  const status = syncDecisionFor(gameIdText)?.status;
-  if (!status) return "";
-  return syncStatusShortHint(status);
 }
 
 function syncRecommendedActionLabel(action: string): string {
@@ -756,6 +731,13 @@ function syncSummaryMeta(summary?: SaveLocationSummary | null): string {
   if (!summary) return "无摘要";
   if (!summary.exists) return "未检测到文件";
   return `${summary.fileCount} 个文件 / ${formatBytes(summary.totalBytes)}`;
+}
+
+function shortExePath(path?: string | null): string {
+  const value = (path || "").trim();
+  if (!value) return "";
+  if (value.length <= 72) return value;
+  return `${value.slice(0, 28)}...${value.slice(-36)}`;
 }
 
 function restoreProtectionSummary(result: RestoreBackupResult): string {
@@ -2097,7 +2079,6 @@ onUnmounted(() => {
                   >
                     {{ cardSyncStatusLabel(item.gameId) }}
                   </span>
-                  <p class="library-sync-text">{{ cardSyncStatusHint(item.gameId) }}</p>
                 </div>
                 <p v-if="gameDirStatusLabel(item.gameId)" class="library-warning-text">
                   {{ gameDirStatusLabel(item.gameId) }}
@@ -2131,7 +2112,8 @@ onUnmounted(() => {
             <span>启动 EXE</span>
             <div class="row">
               <input
-                :value="selectedLibraryItem.preferredExePath || ''"
+                :value="shortExePath(selectedLibraryItem.preferredExePath)"
+                :title="selectedLibraryItem.preferredExePath || ''"
                 readonly
                 placeholder="尚未绑定 EXE，先点击右侧按钮"
               />
@@ -2157,13 +2139,6 @@ onUnmounted(() => {
                   {{ launchPrecheckFor(selectedLibraryItem.gameId)?.backupReady ? "自动备份可启动" : "自动备份需处理" }}
                 </span>
                 <span v-else class="precheck-state-pill idle">未检查</span>
-                <button v-if="false"
-                  type="button"
-                  :disabled="libraryState.loading || isCardBusy(selectedLibraryItem?.gameId || '', 'precheck')"
-                  @click="loadLaunchPrecheckForGame(selectedLibraryItem?.gameId || '')"
-                >
-                  刷新
-                </button>
               </div>
             </div>
             <div v-if="selectedRuleAnchorTokens(selectedLibraryItem.gameId).length" class="precheck-anchor-summary">
@@ -2196,25 +2171,32 @@ onUnmounted(() => {
               <p class="sync-decision-action">
                 {{ syncRecommendedActionLabel(syncDecisionFor(selectedLibraryItem.gameId)?.recommendedAction || "") }}
               </p>
-              <div class="sync-decision-grid">
-                <div class="sync-side-card">
-                  <strong>本地存档</strong>
-                  <p>{{ syncSummaryMeta(syncDecisionFor(selectedLibraryItem.gameId)?.localSummary) }}</p>
-                  <p>最近修改：{{ formatOptionalUnixTs(syncDecisionFor(selectedLibraryItem.gameId)?.localSummary?.latestModifiedAt) }}</p>
+              <p class="sync-inline-summary">
+                本地：{{ syncSummaryMeta(syncDecisionFor(selectedLibraryItem.gameId)?.localSummary) }} ·
+                备份：{{ syncSummaryMeta(syncDecisionFor(selectedLibraryItem.gameId)?.backupSummary) }}
+              </p>
+              <details class="sync-details">
+                <summary>展开同步详情</summary>
+                <div class="sync-decision-grid">
+                  <div class="sync-side-card">
+                    <strong>本地存档</strong>
+                    <p>{{ syncSummaryMeta(syncDecisionFor(selectedLibraryItem.gameId)?.localSummary) }}</p>
+                    <p>最近修改：{{ formatOptionalUnixTs(syncDecisionFor(selectedLibraryItem.gameId)?.localSummary?.latestModifiedAt) }}</p>
+                  </div>
+                  <div class="sync-side-card">
+                    <strong>最近备份</strong>
+                    <p>{{ syncSummaryMeta(syncDecisionFor(selectedLibraryItem.gameId)?.backupSummary) }}</p>
+                    <p>
+                      最近版本：
+                      {{
+                        syncDecisionFor(selectedLibraryItem.gameId)?.backupSummary?.latestVersionId
+                          ? formatUnixTs(syncDecisionFor(selectedLibraryItem.gameId)?.backupSummary?.latestVersionId || "")
+                          : "无"
+                      }}
+                    </p>
+                  </div>
                 </div>
-                <div class="sync-side-card">
-                  <strong>最近备份</strong>
-                  <p>{{ syncSummaryMeta(syncDecisionFor(selectedLibraryItem.gameId)?.backupSummary) }}</p>
-                  <p>
-                    最近版本：
-                    {{
-                      syncDecisionFor(selectedLibraryItem.gameId)?.backupSummary?.latestVersionId
-                        ? formatUnixTs(syncDecisionFor(selectedLibraryItem.gameId)?.backupSummary?.latestVersionId || "")
-                        : "无"
-                    }}
-                  </p>
-                </div>
-              </div>
+              </details>
             </section>
             <div v-if="gameDirResolutionIssue(selectedLibraryItem.gameId)" class="warning-banner">
               <strong>需要绑定本地 EXE</strong>
@@ -2239,16 +2221,11 @@ onUnmounted(() => {
           </section>
 
           <section class="backup-detail-stack">
+            <details class="library-collapsible" open>
+              <summary>备份空间管理</summary>
             <section class="backup-policy-box">
               <div class="row backup-policy-head">
                 <h4>备份空间管理</h4>
-                <button v-if="false"
-                  type="button"
-                  :disabled="libraryState.loading || isCardBusy(selectedLibraryItem?.gameId || '', 'backup_stats')"
-                  @click="loadBackupStatsForGame(selectedLibraryItem?.gameId || '')"
-                >
-                  刷新统计
-                </button>
               </div>
               <div class="backup-policy-stats">
                 <span>当前占用：{{ formatBytes(backupStatsFor(selectedLibraryItem.gameId)?.totalBytes ?? 0) }}</span>
@@ -2258,45 +2235,44 @@ onUnmounted(() => {
                   最新版本：{{ backupStatsFor(selectedLibraryItem.gameId)?.latestVersionId }}
                 </span>
               </div>
-              <div class="row backup-policy-controls">
-                <label class="backup-keep-input">
-                  <span>保留最近 N 版</span>
-                  <input
-                    :value="backupKeepDraftFor(selectedLibraryItem.gameId)"
-                    type="number"
-                    min="1"
-                    max="10"
-                    step="1"
-                    @input="onBackupKeepInput(selectedLibraryItem.gameId, $event)"
-                  />
-                </label>
-                <button
-                  type="button"
-                  :disabled="libraryState.loading || isCardBusy(selectedLibraryItem.gameId, 'backup_policy_save')"
-                  @click="saveBackupKeepPolicy(selectedLibraryItem.gameId)"
-                >
-                  保存策略
-                </button>
-                <button
-                  type="button"
-                  class="danger"
-                  :disabled="libraryState.loading || isCardBusy(selectedLibraryItem.gameId, 'backup_prune')"
-                  @click="pruneOldBackupsForGame(selectedLibraryItem.gameId)"
-                >
-                  一键清理旧备份
-                </button>
-              </div>
+              <details class="policy-controls-details">
+                <summary>展开策略与清理操作</summary>
+                <div class="row backup-policy-controls">
+                  <label class="backup-keep-input">
+                    <span>保留最近 N 版</span>
+                    <input
+                      :value="backupKeepDraftFor(selectedLibraryItem.gameId)"
+                      type="number"
+                      min="1"
+                      max="10"
+                      step="1"
+                      @input="onBackupKeepInput(selectedLibraryItem.gameId, $event)"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    :disabled="libraryState.loading || isCardBusy(selectedLibraryItem.gameId, 'backup_policy_save')"
+                    @click="saveBackupKeepPolicy(selectedLibraryItem.gameId)"
+                  >
+                    保存策略
+                  </button>
+                  <button
+                    type="button"
+                    class="danger"
+                    :disabled="libraryState.loading || isCardBusy(selectedLibraryItem.gameId, 'backup_prune')"
+                    @click="pruneOldBackupsForGame(selectedLibraryItem.gameId)"
+                  >
+                    一键清理旧备份
+                  </button>
+                </div>
+              </details>
             </section>
+            </details>
 
+            <details class="library-collapsible">
+              <summary>备份版本时间线与恢复</summary>
             <div class="row">
               <h4>备份版本时间线</h4>
-              <button v-if="false"
-                type="button"
-                :disabled="libraryState.loading || isCardBusy(selectedLibraryItem?.gameId || '', 'backup_versions')"
-                @click="loadBackupVersionsForGame(selectedLibraryItem?.gameId || '')"
-                >
-                  刷新版本
-                </button>
             </div>
             <p class="field-note restore-safety-note">
               恢复任一版本前，GameSaver 会先尝试为当前本地存档创建一份“恢复前备份”，方便你随时撤销。
@@ -2366,16 +2342,12 @@ onUnmounted(() => {
                 撤销本次恢复
               </button>
             </section>
+            </details>
 
+            <details class="library-collapsible">
+              <summary>最近会话日志</summary>
             <div class="row">
               <h4>最近会话日志</h4>
-              <button v-if="false"
-                type="button"
-                :disabled="libraryState.loading || isCardBusy(selectedLibraryItem?.gameId || '', 'session_logs')"
-                @click="loadSessionDetailsForGame(selectedLibraryItem?.gameId || '')"
-              >
-                刷新日志
-              </button>
             </div>
             <template v-if="sessionDetailsFor(selectedLibraryItem.gameId)">
               <p>sessionId={{ sessionDetailsFor(selectedLibraryItem.gameId)?.launcherSessionId }}</p>
@@ -2394,6 +2366,7 @@ onUnmounted(() => {
               </ul>
             </template>
             <p v-else>暂无会话日志。</p>
+            </details>
           </section>
           <p class="mode-hint">当前阶段仅支持自动备份启动与直接备份启动。</p>
         </aside>

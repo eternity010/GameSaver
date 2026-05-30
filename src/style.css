@@ -642,6 +642,40 @@ button:disabled {
   font-weight: 600;
 }
 
+.sync-inline-summary {
+  margin: 0;
+  font-size: 12px;
+  color: #4e677b;
+}
+
+.sync-details {
+  border-top: 1px solid #dce8f2;
+  padding-top: 6px;
+}
+
+.sync-details summary {
+  list-style: none;
+  cursor: pointer;
+  color: #3a5a72;
+  font-size: 12px;
+  user-select: none;
+}
+
+.sync-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.sync-details summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 0.15s ease;
+}
+
+.sync-details[open] summary::before {
+  transform: rotate(90deg);
+}
+
 .sync-decision-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -728,22 +762,15 @@ button:disabled {
 }
 
 .library-sync-row {
-  display: grid;
-  gap: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
   margin-top: 6px;
 }
 
 .library-sync-pill {
   justify-self: start;
   padding-inline: 7px;
-}
-
-.library-sync-text {
-  margin: 0;
-  color: #61788c;
-  font-size: 12px;
-  line-height: 1.35;
-  white-space: normal;
 }
 
 .library-warning-text {
@@ -844,6 +871,41 @@ button:disabled {
   gap: 10px;
 }
 
+.library-collapsible {
+  border: 1px solid #d9e6f0;
+  border-radius: 10px;
+  background: #f7fbff;
+  padding: 0;
+}
+
+.library-collapsible > summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 10px 12px;
+  font-weight: 600;
+  color: #2f4d64;
+}
+
+.library-collapsible > summary::-webkit-details-marker {
+  display: none;
+}
+
+.library-collapsible > summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  color: #5a7892;
+  transition: transform 0.15s ease;
+}
+
+.library-collapsible[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.library-collapsible > :not(summary) {
+  padding: 0 10px 10px;
+}
+
 .backup-policy-box {
   border: 1px solid #d9e6f0;
   border-radius: 10px;
@@ -852,6 +914,34 @@ button:disabled {
   display: grid;
   gap: 8px;
   margin-bottom: 10px;
+}
+
+.policy-controls-details {
+  border-top: 1px solid #dce8f2;
+  padding-top: 6px;
+}
+
+.policy-controls-details summary {
+  list-style: none;
+  cursor: pointer;
+  color: #3a5a72;
+  font-size: 12px;
+  user-select: none;
+}
+
+.policy-controls-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.policy-controls-details summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 0.15s ease;
+}
+
+.policy-controls-details[open] summary::before {
+  transform: rotate(90deg);
 }
 
 .restore-undo-box {
