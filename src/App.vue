@@ -10,7 +10,6 @@ import {
   getBackupStats,
   getLearningSession,
   precheckGameLaunch,
-  getRedirectRuntimeInfo,
   getRuntimeStatus,
   importRules,
   launchGame,
@@ -44,7 +43,6 @@ import type {
   LaunchSyncDecision,
   LauncherMode,
   LauncherSession,
-  RedirectRuntimeInfo,
   RestoreBackupResult,
   RuleConflictItem,
   SaveLocationSummary,
@@ -90,6 +88,7 @@ const step = ref<UiStep>("setup");
 const activeTab = ref<TopTab>("library");
 const gameId = ref("");
 const exePath = ref("");
+const extraScanRootsText = ref("");
 const sessionId = ref("");
 const pid = ref<number | null>(null);
 const candidates = ref<CandidatePath[]>([]);
@@ -115,7 +114,6 @@ const capturedEventCount = ref(0);
 const eventCaptureError = ref("");
 const runtimeIsAdmin = ref(false);
 const runtimeMessage = ref("");
-const redirectRuntimeInfo = ref<RedirectRuntimeInfo | null>(null);
 const libraryItems = ref<GameLibraryItem[]>([]);
 const librarySearch = ref("");
 const cardLoading = ref<Record<string, Partial<Record<CardAction, boolean>>>>({});
@@ -129,7 +127,7 @@ const launchPrecheckByGame = ref<Record<string, GameLaunchPrecheck | null>>({});
 const restoreUndoByGame = ref<Record<string, RestoreUndoState | null>>({});
 const restoreTaskMessageByGame = ref<Record<string, string>>({});
 const restoreTaskProgressByGame = ref<Record<string, number | null>>({});
-const hiddenPrecheckKeys = new Set(["sandbox_runtime", "inject_artifacts", "inject_arch"]);
+const hiddenPrecheckKeys = new Set<string>();
 const { toast, showToast, closeToast } = useToast();
 const confirmDialog = ref<ConfirmDialogState>({
   open: false,
@@ -982,6 +980,27 @@ async function chooseExePath() {
   }
 }
 
+async function chooseExtraScanRoot() {
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const chosen = await open({
+      multiple: false,
+      directory: true,
+    });
+    if (!chosen || Array.isArray(chosen)) return;
+    const current = extraScanRootsText.value
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (!current.includes(chosen)) {
+      current.push(chosen);
+      extraScanRootsText.value = current.join("\n");
+    }
+  } catch (err) {
+    learningState.value.error = `无法打开目录选择器：${String(err)}`;
+  }
+}
+
 async function beginLearning() {
   learningBusyStage.value = "starting";
   learningState.value.loading = true;
@@ -989,10 +1008,14 @@ async function beginLearning() {
   try {
     const trimmedGameId = gameId.value.trim();
     const trimmedExePath = exePath.value.trim();
+    const extraScanRoots = extraScanRootsText.value
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
     if (!trimmedGameId || !trimmedExePath) {
       throw new Error("请先填写 gameId 并选择 exePath");
     }
-    sessionId.value = await startLearning(trimmedGameId, trimmedExePath);
+    sessionId.value = await startLearning(trimmedGameId, trimmedExePath, extraScanRoots);
     pid.value = await launchGame(sessionId.value);
     step.value = "running";
   } catch (err) {
@@ -1090,7 +1113,6 @@ async function reloadLibraryWithLoading() {
   clearAllLibraryCardErrors();
   try {
     await refreshLibraryItems();
-    await loadRedirectRuntimeInfo();
     void loadSelectedLibraryGameSessionAndVersions();
     void refreshLaunchPrechecksForLibraryItems();
     void refreshBackupStatsForLibraryItems();
@@ -1143,10 +1165,6 @@ async function loadLaunchPrecheckForGame(gameIdText: string, withCardLoading = t
       setCardBusy(gameIdText, "precheck", false);
     }
   }
-}
-
-async function loadRedirectRuntimeInfo() {
-  redirectRuntimeInfo.value = await getRedirectRuntimeInfo();
 }
 
 async function loadBackupVersionsForGame(gameIdText: string, withCardLoading = true) {
@@ -1770,6 +1788,17 @@ onUnmounted(() => {
             <button type="button" @click="chooseExePath">浏览</button>
           </div>
         </label>
+        <label class="field">
+          <span>额外扫描目录（可选）</span>
+          <textarea
+            v-model="extraScanRootsText"
+            rows="4"
+            placeholder="每行一个目录，例如：&#10;D:\\SteamLibrary\\steamapps\\compatdata&#10;E:\\Games\\SaveData"
+          ></textarea>
+          <div class="row">
+            <button type="button" @click="chooseExtraScanRoot">添加目录</button>
+          </div>
+        </label>
         <button :disabled="learningState.loading" type="button" class="primary" @click="beginLearning">
           {{ learningState.loading ? "正在启动..." : "开始学习并启动游戏" }}
         </button>
@@ -2035,10 +2064,6 @@ onUnmounted(() => {
           <span>搜索游戏</span>
           <input v-model="librarySearch" placeholder="按 gameId 搜索" />
         </label>
-        <section v-if="redirectRuntimeInfo" class="runtime-compact">
-          <span class="runtime-chip">架构 {{ redirectRuntimeInfo.arch }}</span>
-          <span class="runtime-chip">备份模式可用</span>
-        </section>
         <p v-if="libraryState.error" class="error inline-error">{{ libraryState.error }}</p>
       </header>
 
@@ -2132,10 +2157,10 @@ onUnmounted(() => {
                   {{ launchPrecheckFor(selectedLibraryItem.gameId)?.backupReady ? "自动备份可启动" : "自动备份需处理" }}
                 </span>
                 <span v-else class="precheck-state-pill idle">未检查</span>
-                <button
+                <button v-if="false"
                   type="button"
-                  :disabled="libraryState.loading || isCardBusy(selectedLibraryItem.gameId, 'precheck')"
-                  @click="loadLaunchPrecheckForGame(selectedLibraryItem.gameId)"
+                  :disabled="libraryState.loading || isCardBusy(selectedLibraryItem?.gameId || '', 'precheck')"
+                  @click="loadLaunchPrecheckForGame(selectedLibraryItem?.gameId || '')"
                 >
                   刷新
                 </button>
@@ -2217,10 +2242,10 @@ onUnmounted(() => {
             <section class="backup-policy-box">
               <div class="row backup-policy-head">
                 <h4>备份空间管理</h4>
-                <button
+                <button v-if="false"
                   type="button"
-                  :disabled="libraryState.loading || isCardBusy(selectedLibraryItem.gameId, 'backup_stats')"
-                  @click="loadBackupStatsForGame(selectedLibraryItem.gameId)"
+                  :disabled="libraryState.loading || isCardBusy(selectedLibraryItem?.gameId || '', 'backup_stats')"
+                  @click="loadBackupStatsForGame(selectedLibraryItem?.gameId || '')"
                 >
                   刷新统计
                 </button>
@@ -2240,7 +2265,7 @@ onUnmounted(() => {
                     :value="backupKeepDraftFor(selectedLibraryItem.gameId)"
                     type="number"
                     min="1"
-                    max="200"
+                    max="10"
                     step="1"
                     @input="onBackupKeepInput(selectedLibraryItem.gameId, $event)"
                   />
@@ -2265,10 +2290,10 @@ onUnmounted(() => {
 
             <div class="row">
               <h4>备份版本时间线</h4>
-              <button
+              <button v-if="false"
                 type="button"
-                :disabled="libraryState.loading || isCardBusy(selectedLibraryItem.gameId, 'backup_versions')"
-                @click="loadBackupVersionsForGame(selectedLibraryItem.gameId)"
+                :disabled="libraryState.loading || isCardBusy(selectedLibraryItem?.gameId || '', 'backup_versions')"
+                @click="loadBackupVersionsForGame(selectedLibraryItem?.gameId || '')"
                 >
                   刷新版本
                 </button>
@@ -2344,10 +2369,10 @@ onUnmounted(() => {
 
             <div class="row">
               <h4>最近会话日志</h4>
-              <button
+              <button v-if="false"
                 type="button"
-                :disabled="libraryState.loading || isCardBusy(selectedLibraryItem.gameId, 'session_logs')"
-                @click="loadSessionDetailsForGame(selectedLibraryItem.gameId)"
+                :disabled="libraryState.loading || isCardBusy(selectedLibraryItem?.gameId || '', 'session_logs')"
+                @click="loadSessionDetailsForGame(selectedLibraryItem?.gameId || '')"
               >
                 刷新日志
               </button>
@@ -2370,15 +2395,10 @@ onUnmounted(() => {
             </template>
             <p v-else>暂无会话日志。</p>
           </section>
-          <p class="mode-hint">当前阶段仅开放自动备份启动。沙盒/注入模式已纳入开发计划。</p>
+          <p class="mode-hint">当前阶段仅支持自动备份启动与直接备份启动。</p>
         </aside>
       </div>
       <p v-else>暂无游戏卡片，请先在“学习存档”中生成规则。</p>
-
-      <details v-if="redirectRuntimeInfo" class="runtime-diagnostics">
-        <summary>运行时状态（高级）</summary>
-        <p>备份目录（推荐模式）：<code>{{ redirectRuntimeInfo.backupRoot }}</code></p>
-      </details>
     </section>
 
     <transition name="toast-fade">

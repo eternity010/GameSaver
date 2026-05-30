@@ -37,6 +37,7 @@ export interface LearningSession {
   capturedEventCount?: number;
   trackedPids?: number[];
   eventCaptureError?: string;
+  extraScanRoots?: string[];
 }
 
 export interface GameSaveRule {
@@ -58,8 +59,7 @@ export interface RuntimeStatus {
 }
 
 export type LauncherStatus = "idle" | "launching" | "running" | "failed" | "exited";
-export type InjectionStatus = "not_required" | "pending" | "noop_injected" | "failed";
-export type LauncherMode = "inject" | "sandbox" | "backup" | "backup_direct";
+export type LauncherMode = "backup" | "backup_direct";
 
 export interface LauncherSession {
   launcherSessionId: string;
@@ -71,12 +71,8 @@ export interface LauncherSession {
   launchMode?: LauncherMode;
   status: LauncherStatus;
   pid?: number;
-  injectionStatus: InjectionStatus;
   redirectRoot?: string;
-  injectorExitCode?: number;
   hookVersion?: string;
-  sandboxBoxName?: string;
-  sandboxMirrorPaths?: string[];
   startedAt: string;
   updatedAt: string;
   logs: string[];
@@ -85,19 +81,6 @@ export interface LauncherSession {
 export interface ResolveRuleResult {
   exeHash: string;
   matchedRule?: GameSaveRule;
-}
-
-export interface RedirectRuntimeInfo {
-  arch: string;
-  injectorPath: string;
-  dllPath: string;
-  managedSaveRoot: string;
-  backupRoot: string;
-  injectorExists: boolean;
-  dllExists: boolean;
-  sandboxRoot: string;
-  sandboxiePath: string;
-  sandboxieExists: boolean;
 }
 
 export interface GameLibraryItem {
@@ -110,7 +93,6 @@ export interface GameLibraryItem {
   lastSessionId?: string;
   lastSessionStatus?: string;
   lastSessionUpdatedAt?: string;
-  lastInjectionStatus?: string;
 }
 
 export interface BackupVersion {
@@ -227,8 +209,6 @@ export interface GameLaunchPrecheck {
   exeHash?: string;
   matchedRuleId?: string;
   backupReady: boolean;
-  sandboxReady: boolean;
-  injectReady: boolean;
   syncDecision?: LaunchSyncDecision;
   checks: LaunchPrecheckCheck[];
   checkedAt: string;

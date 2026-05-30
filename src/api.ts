@@ -14,7 +14,6 @@ import type {
   LearningSession,
   LauncherMode,
   RuleConflictItem,
-  RedirectRuntimeInfo,
   PruneBackupResult,
   RestoreBackupResult,
   ResolveRuleResult,
@@ -22,8 +21,8 @@ import type {
   TaskState,
 } from "./types";
 
-export async function startLearning(gameId: string, exePath: string): Promise<string> {
-  return invoke("start_learning", { gameId, exePath });
+export async function startLearning(gameId: string, exePath: string, extraScanRoots: string[] = []): Promise<string> {
+  return invoke("start_learning", { gameId, exePath, extraScanRoots });
 }
 
 export async function launchGame(sessionId: string): Promise<number> {
@@ -144,14 +143,6 @@ export async function listGameLibraryItems(): Promise<GameLibraryItem[]> {
 
 export async function setPreferredExePath(gameId: string, exePath: string): Promise<GameLibraryItem> {
   return invoke("set_preferred_exe_path", { gameId, exePath });
-}
-
-export async function getRedirectRuntimeInfo(): Promise<RedirectRuntimeInfo> {
-  return invoke("get_redirect_runtime_info");
-}
-
-export async function syncSandboxSession(launcherSessionId: string): Promise<LauncherSession> {
-  return invoke("sync_sandbox_session", { launcherSessionId });
 }
 
 export async function listBackupVersions(gameId: string): Promise<BackupVersion[]> {
