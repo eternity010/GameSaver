@@ -1,51 +1,35 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
+import { useLibraryPage } from "./composables/useLibraryPage";
 import { useToast } from "./composables/useToast";
-import LibraryGameCard from "./components/library/LibraryGameCard.vue";
-import LibraryDetailPanel from "./components/library/LibraryDetailPanel.vue";
+import LearningPage from "./components/learning/LearningPage.vue";
+import LibraryPage from "./components/library/LibraryPage.vue";
+import RulesPage from "./components/rules/RulesPage.vue";
 import {
   confirmRule,
   deleteRule,
   exportRules,
   getTask,
-  getLauncherSession,
-  getBackupStats,
   getLearningSession,
-  precheckGameLaunch,
   getRuntimeStatus,
   importRules,
   launchGame,
-  launchGameFromLibrary,
   listRuleConflicts,
-  listBackupVersions,
-  listGameLibraryItems,
-  pruneBackupVersions,
   listRules,
   openCandidatePath,
   restartAsAdmin,
   setPrimaryRule,
-  setBackupKeepVersions,
-  setPreferredExePath,
   startExportMigrationZipTask,
   startFinishLearningTask,
   startImportMigrationZipTask,
-  startRestoreBackupVersionTask,
   startLearning,
   updateRule,
 } from "./api";
 import type {
-  BackupStatsResult,
-  BackupVersion,
   CandidatePath,
   ExportMigrationZipResult,
-  GameLibraryItem,
-  GameLaunchPrecheck,
   GameSaveRule,
   ImportMigrationZipResult,
-  LaunchSyncDecision,
-  LauncherMode,
-  LauncherSession,
-  RestoreBackupResult,
   RuleConflictItem,
 } from "./types";
 
@@ -60,16 +44,6 @@ type TabState = {
   loading: boolean;
   error: string;
 };
-type CardAction =
-  | "bind_exe"
-  | "precheck"
-  | "launch"
-  | "backup_stats"
-  | "backup_policy_save"
-  | "backup_prune"
-  | "backup_versions"
-  | "backup_rollback"
-  | "session_logs";
 type ConfirmDialogState = {
   open: boolean;
   title: string;
@@ -77,11 +51,6 @@ type ConfirmDialogState = {
   confirmText: string;
   cancelText: string;
   danger: boolean;
-};
-type RestoreUndoState = {
-  gameId: string;
-  versionId: string;
-  restoredVersionId: string;
 };
 type LearningBusyStage = "" | "starting" | "analyzing" | "saving";
 
@@ -100,7 +69,6 @@ const ruleSearch = ref("");
 const ruleDrafts = ref<Record<string, RuleDraft>>({});
 const learningState = ref<TabState>({ loading: false, error: "" });
 const rulesState = ref<TabState>({ loading: false, error: "" });
-const libraryState = ref<TabState>({ loading: false, error: "" });
 const migrationExportWaiting = ref(false);
 const migrationExportMessage = ref("");
 const migrationExportProgress = ref<number | null>(null);
@@ -115,20 +83,6 @@ const capturedEventCount = ref(0);
 const eventCaptureError = ref("");
 const runtimeIsAdmin = ref(false);
 const runtimeMessage = ref("");
-const libraryItems = ref<GameLibraryItem[]>([]);
-const librarySearch = ref("");
-const cardLoading = ref<Record<string, Partial<Record<CardAction, boolean>>>>({});
-const libraryCardErrors = ref<Record<string, string>>({});
-const selectedLibraryGameId = ref("");
-const backupVersionsByGame = ref<Record<string, BackupVersion[]>>({});
-const backupStatsByGame = ref<Record<string, BackupStatsResult | null>>({});
-const backupKeepDraftByGame = ref<Record<string, string>>({});
-const sessionDetailsByGame = ref<Record<string, LauncherSession | null>>({});
-const launchPrecheckByGame = ref<Record<string, GameLaunchPrecheck | null>>({});
-const restoreUndoByGame = ref<Record<string, RestoreUndoState | null>>({});
-const restoreTaskMessageByGame = ref<Record<string, string>>({});
-const restoreTaskProgressByGame = ref<Record<string, number | null>>({});
-const hiddenPrecheckKeys = new Set<string>();
 const { toast, showToast, closeToast } = useToast();
 const confirmDialog = ref<ConfirmDialogState>({
   open: false,
@@ -143,47 +97,6 @@ const blockingErrorMessage = ref("");
 let confirmResolver: ((value: boolean) => void) | null = null;
 
 const hasHighConfidence = computed(() => candidates.value.some((item) => item.score >= 45));
-const candidateGroups = computed(() => [
-  {
-    key: "strong",
-    title: "强推荐",
-    description: "最像真实存档目录，通常可以直接选择。",
-    items: candidates.value.filter((item) => item.recommendation === "strong"),
-  },
-  {
-    key: "recommended",
-    title: "推荐",
-    description: "命中了多个有效信号，建议打开目录确认。",
-    items: candidates.value.filter((item) => item.recommendation === "recommended"),
-  },
-  {
-    key: "possible",
-    title: "可能相关",
-    description: "有变化但证据不足，适合人工判断。",
-    items: candidates.value.filter((item) => item.recommendation === "possible"),
-  },
-  {
-    key: "weak",
-    title: "低可信",
-    description: "多为配置、缓存或弱信号，不会自动勾选。",
-    items: candidates.value.filter((item) => item.recommendation === "weak"),
-  },
-]);
-const filteredRules = computed(() => {
-  const keyword = ruleSearch.value.trim().toLowerCase();
-  if (!keyword) return rules.value;
-  return rules.value.filter((rule) => rule.gameId.toLowerCase().includes(keyword));
-});
-const filteredLibraryItems = computed(() => {
-  const keyword = librarySearch.value.trim().toLowerCase();
-  if (!keyword) return libraryItems.value;
-  return libraryItems.value.filter((item) => item.gameId.toLowerCase().includes(keyword));
-});
-const selectedLibraryItem = computed(() => {
-  const selectedKey = cardKey(selectedLibraryGameId.value);
-  if (!selectedKey) return null;
-  return filteredLibraryItems.value.find((item) => cardKey(item.gameId) === selectedKey) ?? null;
-});
 const ruleConflictByRuleId = computed<Record<string, RuleConflictItem>>(() => {
   const map: Record<string, RuleConflictItem> = {};
   for (const conflict of ruleConflicts.value) {
@@ -254,74 +167,6 @@ function isGenericPathSegment(value: string): boolean {
   ].includes(normalized);
 }
 
-function normalizeGameId(gameIdText: string): string {
-  return gameIdText.trim().toLowerCase();
-}
-
-function cardKey(gameIdText: string): string {
-  return normalizeGameId(gameIdText);
-}
-
-function isCardBusy(gameIdText: string, action?: CardAction): boolean {
-  const loadingMap = cardLoading.value[cardKey(gameIdText)];
-  if (!loadingMap) return false;
-  if (action) {
-    return loadingMap[action] === true;
-  }
-  return Object.values(loadingMap).some((value) => value === true);
-}
-
-function setCardBusy(gameIdText: string, action: CardAction, busy: boolean) {
-  const key = cardKey(gameIdText);
-  const current = cardLoading.value[key] ?? {};
-  if (busy) {
-    cardLoading.value = {
-      ...cardLoading.value,
-      [key]: {
-        ...current,
-        [action]: true,
-      },
-    };
-    return;
-  }
-  const nextActions = { ...current };
-  delete nextActions[action];
-  if (!Object.keys(nextActions).length) {
-    const next = { ...cardLoading.value };
-    delete next[key];
-    cardLoading.value = next;
-    return;
-  }
-  cardLoading.value = {
-    ...cardLoading.value,
-    [key]: nextActions,
-  };
-}
-
-function setLibraryCardError(gameIdText: string, message: string) {
-  const key = cardKey(gameIdText);
-  libraryCardErrors.value = {
-    ...libraryCardErrors.value,
-    [key]: message,
-  };
-}
-
-function clearLibraryCardError(gameIdText: string) {
-  const key = cardKey(gameIdText);
-  if (!(key in libraryCardErrors.value)) return;
-  const next = { ...libraryCardErrors.value };
-  delete next[key];
-  libraryCardErrors.value = next;
-}
-
-function clearAllLibraryCardErrors() {
-  libraryCardErrors.value = {};
-}
-
-function libraryCardErrorFor(gameIdText: string): string {
-  return libraryCardErrors.value[cardKey(gameIdText)] ?? "";
-}
-
 function toggleSelect(path: string) {
   if (selected.value.includes(path)) {
     selected.value = selected.value.filter((item) => item !== path);
@@ -344,47 +189,20 @@ function normalizePaths(rawText: string): string[] {
   return output;
 }
 
-function hasRuleDraftChanges(rule: GameSaveRule): boolean {
-  const draft = ruleDrafts.value[rule.ruleId];
-  if (!draft) return false;
-  if (draft.gameIdText.trim() !== rule.gameId) {
-    return true;
-  }
-  const draftPaths = normalizePaths(draft.confirmedPathsText);
-  const savedPaths = rule.confirmedPaths;
-  if (draft.enabled !== rule.enabled) {
-    return true;
-  }
-  if (draftPaths.length !== savedPaths.length) {
-    return true;
-  }
-  return draftPaths.some((path, index) => path !== savedPaths[index]);
+function updateRuleDraft(ruleId: string, patch: Partial<RuleDraft>) {
+  const current = ruleDrafts.value[ruleId];
+  if (!current) return;
+  ruleDrafts.value = {
+    ...ruleDrafts.value,
+    [ruleId]: {
+      ...current,
+      ...patch,
+    },
+  };
 }
 
 function ruleConflictFor(ruleId: string): RuleConflictItem | null {
   return ruleConflictByRuleId.value[ruleId] ?? null;
-}
-
-function isPrimaryConflictRule(ruleId: string): boolean {
-  const conflict = ruleConflictFor(ruleId);
-  return !!conflict && conflict.primaryRuleId === ruleId;
-}
-
-function shortExeHash(exeHash: string): string {
-  if (exeHash.length <= 16) return exeHash;
-  return `${exeHash.slice(0, 8)}...${exeHash.slice(-8)}`;
-}
-
-function formatUnixTs(value: string): string {
-  const timestamp = Number(value.startsWith("pre_restore_") ? value.slice("pre_restore_".length) : value);
-  if (!Number.isFinite(timestamp) || timestamp <= 0) {
-    return value || "未知";
-  }
-  const date = new Date(timestamp * 1000);
-  if (Number.isNaN(date.getTime())) {
-    return value || "未知";
-  }
-  return date.toLocaleString();
 }
 
 function hydrateRuleDrafts() {
@@ -406,402 +224,6 @@ function sortRulesByUpdatedTime(items: GameSaveRule[]): GameSaveRule[] {
     const bTime = Number(b.updatedAt || b.createdAt || "0");
     return bTime - aTime;
   });
-}
-
-function sortLibraryItems(items: GameLibraryItem[]): GameLibraryItem[] {
-  return [...items].sort((a, b) => {
-    const aTime = Math.max(Number(a.lastSessionUpdatedAt || "0"), Number(a.lastRuleUpdatedAt || "0"));
-    const bTime = Math.max(Number(b.lastSessionUpdatedAt || "0"), Number(b.lastRuleUpdatedAt || "0"));
-    return bTime - aTime;
-  });
-}
-
-function ensureSelectedLibraryGame() {
-  if (!filteredLibraryItems.value.length) {
-    selectedLibraryGameId.value = "";
-    return;
-  }
-  const selectedKey = cardKey(selectedLibraryGameId.value);
-  const stillVisible = filteredLibraryItems.value.some((item) => cardKey(item.gameId) === selectedKey);
-  if (!stillVisible) {
-    selectedLibraryGameId.value = filteredLibraryItems.value[0].gameId;
-  }
-}
-
-function isLibraryGameSelected(gameIdText: string): boolean {
-  return cardKey(selectedLibraryGameId.value) === cardKey(gameIdText);
-}
-
-async function selectLibraryGame(gameIdText: string) {
-  selectedLibraryGameId.value = gameIdText;
-  await loadSelectedLibraryGameDetails();
-}
-
-async function loadSelectedLibraryGameSessionAndVersions() {
-  const gameIdText = selectedLibraryGameId.value;
-  if (!gameIdText) return;
-  await Promise.all([
-    loadBackupVersionsForGame(gameIdText, false),
-    loadSessionDetailsForGame(gameIdText, false),
-  ]);
-}
-
-async function loadSelectedLibraryGameDetails() {
-  const gameIdText = selectedLibraryGameId.value;
-  if (!gameIdText) return;
-  await Promise.all([
-    loadLaunchPrecheckForGame(gameIdText, false),
-    loadBackupStatsForGame(gameIdText, false),
-    loadBackupVersionsForGame(gameIdText, false),
-    loadSessionDetailsForGame(gameIdText, false),
-  ]);
-}
-
-function backupVersionsFor(gameIdText: string): BackupVersion[] {
-  return backupVersionsByGame.value[cardKey(gameIdText)] ?? [];
-}
-
-function backupStatsFor(gameIdText: string): BackupStatsResult | null {
-  return backupStatsByGame.value[cardKey(gameIdText)] ?? null;
-}
-
-function backupKeepDraftFor(gameIdText: string): string {
-  const key = cardKey(gameIdText);
-  const draft = backupKeepDraftByGame.value[key];
-  if (typeof draft === "string") {
-    return draft;
-  }
-  const stats = backupStatsFor(gameIdText);
-  return String(stats?.keepVersions ?? 10);
-}
-
-function updateBackupKeepDraft(gameIdText: string, value: string) {
-  const key = cardKey(gameIdText);
-  backupKeepDraftByGame.value = {
-    ...backupKeepDraftByGame.value,
-    [key]: value,
-  };
-}
-
-function sessionDetailsFor(gameIdText: string): LauncherSession | null {
-  return sessionDetailsByGame.value[cardKey(gameIdText)] ?? null;
-}
-
-function restoreUndoFor(gameIdText: string): RestoreUndoState | null {
-  return restoreUndoByGame.value[cardKey(gameIdText)] ?? null;
-}
-
-function restoreTaskMessageFor(gameIdText: string): string {
-  return restoreTaskMessageByGame.value[cardKey(gameIdText)] ?? "";
-}
-
-function restoreTaskProgressFor(gameIdText: string): number | null {
-  const value = restoreTaskProgressByGame.value[cardKey(gameIdText)];
-  return typeof value === "number" ? value : null;
-}
-
-function setRestoreTaskState(gameIdText: string, message: string, progress: number | null) {
-  const key = cardKey(gameIdText);
-  restoreTaskMessageByGame.value = {
-    ...restoreTaskMessageByGame.value,
-    [key]: message,
-  };
-  restoreTaskProgressByGame.value = {
-    ...restoreTaskProgressByGame.value,
-    [key]: progress,
-  };
-}
-
-function clearRestoreTaskState(gameIdText: string) {
-  setRestoreTaskState(gameIdText, "", null);
-}
-
-function launchPrecheckFor(gameIdText: string): GameLaunchPrecheck | null {
-  return launchPrecheckByGame.value[cardKey(gameIdText)] ?? null;
-}
-
-function visiblePrecheckChecks(gameIdText: string) {
-  const precheck = launchPrecheckFor(gameIdText);
-  if (!precheck) return [];
-  return precheck.checks.filter((check) => !hiddenPrecheckKeys.has(check.key));
-}
-
-function precheckCheckFor(gameIdText: string, key: string) {
-  return launchPrecheckFor(gameIdText)?.checks.find((check) => check.key === key) ?? null;
-}
-
-function syncDecisionFor(gameIdText: string): LaunchSyncDecision | null {
-  return launchPrecheckFor(gameIdText)?.syncDecision ?? null;
-}
-
-function selectedRuleForGame(gameIdText: string): GameSaveRule | null {
-  const normalized = cardKey(gameIdText);
-  if (!normalized) return null;
-  return rules.value.find((rule) => cardKey(rule.gameId) === normalized) ?? null;
-}
-
-const PATH_ANCHOR_TOKENS = [
-  "%GAME_DIR%",
-  "%SAVED_GAMES%",
-  "%DOCUMENTS%",
-  "%LOCALLOW%",
-  "%LOCALAPPDATA%",
-  "%APPDATA%",
-  "%USERPROFILE%",
-] as const;
-
-function extractPathAnchorToken(path: string): string | null {
-  const normalized = path.trim().replace(/\//g, "\\").toUpperCase();
-  for (const token of PATH_ANCHOR_TOKENS) {
-    if (normalized === token || normalized.startsWith(`${token}\\`)) {
-      return token;
-    }
-  }
-  return null;
-}
-
-function pathAnchorLabel(token: string): string {
-  switch (token.toUpperCase()) {
-    case "%GAME_DIR%":
-      return "游戏目录";
-    case "%SAVED_GAMES%":
-      return "Saved Games";
-    case "%DOCUMENTS%":
-      return "文档";
-    case "%LOCALLOW%":
-      return "LocalLow";
-    case "%LOCALAPPDATA%":
-      return "Local";
-    case "%APPDATA%":
-      return "Roaming";
-    case "%USERPROFILE%":
-      return "用户目录（兼容）";
-    default:
-      return token;
-  }
-}
-
-function pathAnchorDescription(token: string): string {
-  switch (token.toUpperCase()) {
-    case "%GAME_DIR%":
-      return "跟随当前绑定的游戏 EXE 所在目录动态解析";
-    case "%SAVED_GAMES%":
-      return "Windows 的 Saved Games 存档目录";
-    case "%DOCUMENTS%":
-      return "当前用户的 Documents 目录";
-    case "%LOCALLOW%":
-      return "当前用户的 AppData\\LocalLow 目录";
-    case "%LOCALAPPDATA%":
-      return "当前用户的 AppData\\Local 目录";
-    case "%APPDATA%":
-      return "当前用户的 AppData\\Roaming 目录";
-    case "%USERPROFILE%":
-      return "当前用户根目录，属于兼容兜底锚点，范围较宽，优先级低于文档和 AppData 类锚点";
-    default:
-      return "使用路径锚点进行动态解析";
-  }
-}
-
-function ruleAnchorHint(tokens: string[]): string {
-  if (!tokens.length) {
-    return "";
-  }
-  if (tokens.includes("%USERPROFILE%")) {
-    return "当前规则含“用户目录（兼容）”锚点，建议优先使用更具体的文档 / AppData / 游戏目录锚点。";
-  }
-  if (tokens.includes("%GAME_DIR%")) {
-    return "当前规则含“游戏目录”锚点，路径会跟随已绑定 EXE 所在目录动态解析。";
-  }
-  return "当前规则已使用具体路径锚点，跨机器时会比纯用户目录规则更稳定。";
-}
-
-function collectAnchorTokens(paths: string[]): string[] {
-  const ordered = new Set<string>();
-  for (const path of paths) {
-    const token = extractPathAnchorToken(path);
-    if (token) {
-      ordered.add(token);
-    }
-  }
-  return Array.from(ordered);
-}
-
-function ruleAnchorTokens(rule: GameSaveRule | null | undefined): string[] {
-  if (!rule) return [];
-  return collectAnchorTokens(rule.confirmedPaths);
-}
-
-function ruleDraftAnchorTokens(ruleId: string): string[] {
-  const raw = ruleDrafts.value[ruleId]?.confirmedPathsText ?? "";
-  const paths = raw
-    .split(/\r?\n/)
-    .map((line: string) => line.trim())
-    .filter(Boolean);
-  return collectAnchorTokens(paths);
-}
-
-function ruleUsesGameDirToken(rule: GameSaveRule | null | undefined): boolean {
-  if (!rule) return false;
-  return rule.confirmedPaths.some((path) => path.toUpperCase().includes("%GAME_DIR%"));
-}
-
-function gameUsesGameDirToken(gameIdText: string): boolean {
-  return ruleUsesGameDirToken(selectedRuleForGame(gameIdText));
-}
-
-function gameDirResolutionIssue(gameIdText: string): string {
-  const check = precheckCheckFor(gameIdText, "rule_path_resolution");
-  if (!check || check.ok) return "";
-  if (!gameUsesGameDirToken(gameIdText)) return "";
-  return check.detail;
-}
-
-function gameDirStatusLabel(gameIdText: string): string {
-  const issue = gameDirResolutionIssue(gameIdText);
-  if (issue) return "需绑定 EXE";
-  if (gameUsesGameDirToken(gameIdText)) return "游戏目录规则";
-  return "";
-}
-
-function selectedRuleAnchorTokens(gameIdText: string): string[] {
-  return ruleAnchorTokens(selectedRuleForGame(gameIdText));
-}
-
-function syncStatusLabel(status: string): string {
-  switch (status) {
-    case "no_backup":
-      return "暂无备份";
-    case "backup_only":
-      return "仅备份存在";
-    case "local_only":
-      return "仅本地存在";
-    case "in_sync":
-      return "看起来一致";
-    case "local_newer":
-      return "本地较新";
-    case "backup_newer":
-      return "备份较新";
-    default:
-      return "需人工判断";
-  }
-}
-
-function syncStatusClass(status: string): string {
-  switch (status) {
-    case "in_sync":
-    case "local_only":
-    case "no_backup":
-      return "ok";
-    case "backup_only":
-    case "local_newer":
-    case "backup_newer":
-      return "warn";
-    default:
-      return "fail";
-  }
-}
-
-function cardSyncStatusLabel(gameIdText: string): string {
-  const status = syncDecisionFor(gameIdText)?.status;
-  if (!status) return "";
-  return syncStatusLabel(status);
-}
-
-function restoreProtectionSummary(result: RestoreBackupResult): string {
-  if (result.preRestoreVersionId) {
-    return `已先创建恢复前备份 ${result.preRestoreVersionId}`;
-  }
-  return "当前本地存档无新增变化，未额外创建恢复前备份";
-}
-
-async function resolveBackupLaunchMode(gameIdText: string): Promise<LauncherMode | null> {
-  const decision = syncDecisionFor(gameIdText);
-  if (!decision) {
-    return "backup_direct";
-  }
-  switch (decision.status) {
-    case "no_backup":
-    case "local_only":
-    case "local_newer":
-    case "in_sync":
-      return "backup_direct";
-    case "backup_only":
-    case "backup_newer": {
-      const restoreFirst = await askConfirm({
-        title: "检测到较新的历史备份",
-        message: `${decision.message}\n\n点击“恢复后启动”会先恢复最近备份；点击“直接启动”会保留当前本地状态直接进入游戏。`,
-        confirmText: "恢复后启动",
-        cancelText: "直接启动",
-        danger: false,
-      });
-      return restoreFirst ? "backup" : "backup_direct";
-    }
-    case "conflict_unknown": {
-      const continueDirect = await askConfirm({
-        title: "同步状态无法可靠判断",
-        message: `${decision.message}\n\n建议先查看备份时间线；如果你确认要继续，可以直接启动并保留当前本地状态。`,
-        confirmText: "直接启动",
-        cancelText: "取消",
-        danger: false,
-      });
-      return continueDirect ? "backup_direct" : null;
-    }
-    default:
-      return "backup_direct";
-  }
-}
-
-function candidateRecommendationLabel(item: CandidatePath): string {
-  switch (item.recommendation) {
-    case "strong":
-      return "强推荐";
-    case "recommended":
-      return "推荐";
-    case "possible":
-      return "可能相关";
-    default:
-      return "低可信";
-  }
-}
-
-function candidateRecommendationClass(item: CandidatePath): string {
-  return item.recommendation || "weak";
-}
-
-function candidateSignalLabel(signal: string): string {
-  if (signal === "time-window") return "刚刚发生变化";
-  if (signal === "path-keyword" || signal === "save-path-keyword") return "路径像存档目录";
-  if (signal === "game-name-path") return "路径包含游戏名";
-  if (signal === "save-filename") return "文件名像存档";
-  if (signal === "size-reasonable") return "文件大小合理";
-  if (signal === "user-save-root") return "位于常见用户存档目录";
-  if (signal === "game-dir") return "位于游戏目录";
-  if (signal === "path-noise") return "包含缓存/日志等弱相关路径";
-  if (signal === "filename-noise") return "文件名像配置/缓存/日志";
-  if (signal.startsWith("extension:")) return `命中存档扩展名 .${signal.slice("extension:".length)}`;
-  if (signal.startsWith("weak-extension:")) return `命中弱扩展名 .${signal.slice("weak-extension:".length)}`;
-  return signal;
-}
-
-function candidateSignalSummary(item: CandidatePath): string {
-  if (!item.matchedSignals.length) return "暂无明显理由";
-  return item.matchedSignals.map(candidateSignalLabel).join(" / ");
-}
-
-function learningBusyLabel(): string {
-  if (learningBusyStage.value === "analyzing" && learningTaskMessage.value.trim()) {
-    return learningTaskMessage.value.trim();
-  }
-  switch (learningBusyStage.value) {
-    case "starting":
-      return "正在启动游戏并创建学习会话...";
-    case "analyzing":
-      return "正在分析存档变化，这一步可能需要几十秒，请耐心等待。";
-    case "saving":
-      return "正在保存规则并同步到游戏库...";
-    default:
-      return "处理中...";
-  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -838,19 +260,6 @@ async function waitForTaskCompletion<T>(
   }
 }
 
-function parseBackupKeepDraft(gameIdText: string): number | null {
-  const raw = backupKeepDraftFor(gameIdText).trim();
-  if (!raw) return null;
-  if (!/^\d+$/.test(raw)) {
-    return null;
-  }
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 1) {
-    return null;
-  }
-  return Math.min(Math.trunc(parsed), 200);
-}
-
 function showBlockingError(message: string) {
   blockingErrorMessage.value = message;
   showToast("操作失败，请查看错误详情", "error", 3200);
@@ -859,14 +268,6 @@ function showBlockingError(message: string) {
 function closeBlockingError() {
   blockingErrorMessage.value = "";
 }
-
-watch(librarySearch, () => {
-  const previousKey = cardKey(selectedLibraryGameId.value);
-  ensureSelectedLibraryGame();
-  if (cardKey(selectedLibraryGameId.value) !== previousKey) {
-    void loadSelectedLibraryGameDetails();
-  }
-});
 
 function askConfirm(options: {
   title: string;
@@ -896,6 +297,47 @@ function resolveConfirm(result: boolean) {
     resolver(result);
   }
 }
+
+const {
+  libraryState,
+  librarySearch,
+  filteredLibraryItems,
+  selectedLibraryItem,
+  libraryCardErrorFor,
+  isLibraryGameSelected,
+  gameDirResolutionIssue,
+  cardSyncStatusLabel,
+  syncStatusClass,
+  syncDecisionFor,
+  gameDirStatusLabel,
+  backupStatsFor,
+  isCardBusy,
+  launchPrecheckFor,
+  selectedRuleAnchorTokens,
+  visiblePrecheckChecks,
+  backupKeepDraftFor,
+  backupVersionsFor,
+  restoreUndoFor,
+  restoreTaskMessageFor,
+  restoreTaskProgressFor,
+  sessionDetailsFor,
+  refreshLibraryItems,
+  reloadLibraryWithLoading,
+  selectLibraryGame,
+  choosePreferredExeForGame,
+  launchLibraryGame,
+  updateBackupKeepDraft,
+  saveBackupKeepPolicy,
+  pruneOldBackupsForGame,
+  rollbackToLibraryBackupVersion,
+  undoLibraryRestore,
+} = useLibraryPage({
+  rules,
+  waitForTaskCompletion,
+  askConfirm,
+  showToast,
+  showBlockingError,
+});
 
 async function chooseExePath() {
   try {
@@ -1017,8 +459,7 @@ async function saveLearningRule() {
     await refreshRules();
     await refreshLibraryItems();
     activeTab.value = "library";
-    selectedLibraryGameId.value = gameId.value.trim();
-    void loadSelectedLibraryGameDetails();
+    await selectLibraryGame(gameId.value.trim());
   } catch (err) {
     learningState.value.error = String(err);
     showToast("规则保存失败", "error");
@@ -1034,374 +475,6 @@ async function refreshRules() {
   ruleConflicts.value = conflicts;
   hydrateRuleDrafts();
 }
-
-async function refreshLibraryItems() {
-  const data = await listGameLibraryItems();
-  libraryItems.value = sortLibraryItems(data);
-  ensureSelectedLibraryGame();
-}
-
-async function reloadLibraryWithLoading() {
-  libraryState.value.loading = true;
-  libraryState.value.error = "";
-  clearAllLibraryCardErrors();
-  try {
-    await refreshLibraryItems();
-    void loadSelectedLibraryGameSessionAndVersions();
-    void refreshLaunchPrechecksForLibraryItems();
-    void refreshBackupStatsForLibraryItems();
-  } catch (err) {
-    libraryState.value.error = `读取游戏库失败：${String(err)}`;
-  } finally {
-    libraryState.value.loading = false;
-  }
-}
-
-async function refreshLaunchPrechecksForLibraryItems() {
-  const items = [...libraryItems.value];
-  if (!items.length) {
-    launchPrecheckByGame.value = {};
-    return;
-  }
-  await Promise.all(items.map((item) => loadLaunchPrecheckForGame(item.gameId, false)));
-}
-
-async function refreshBackupStatsForLibraryItems() {
-  const items = [...libraryItems.value];
-  if (!items.length) {
-    backupStatsByGame.value = {};
-    backupKeepDraftByGame.value = {};
-    return;
-  }
-  await Promise.all(items.map((item) => loadBackupStatsForGame(item.gameId, false)));
-}
-
-async function loadLaunchPrecheckForGame(gameIdText: string, withCardLoading = true) {
-  const key = cardKey(gameIdText);
-  if (withCardLoading) {
-    setCardBusy(gameIdText, "precheck", true);
-  }
-  clearLibraryCardError(gameIdText);
-  try {
-    const precheck = await precheckGameLaunch(gameIdText);
-    launchPrecheckByGame.value = {
-      ...launchPrecheckByGame.value,
-      [key]: precheck,
-    };
-  } catch (err) {
-    setLibraryCardError(gameIdText, `读取启动前检查失败：${String(err)}`);
-    launchPrecheckByGame.value = {
-      ...launchPrecheckByGame.value,
-      [key]: null,
-    };
-  } finally {
-    if (withCardLoading) {
-      setCardBusy(gameIdText, "precheck", false);
-    }
-  }
-}
-
-async function loadBackupVersionsForGame(gameIdText: string, withCardLoading = true) {
-  const key = cardKey(gameIdText);
-  if (withCardLoading) {
-    setCardBusy(gameIdText, "backup_versions", true);
-  }
-  clearLibraryCardError(gameIdText);
-  try {
-    backupVersionsByGame.value = {
-      ...backupVersionsByGame.value,
-      [key]: await listBackupVersions(gameIdText),
-    };
-  } catch (err) {
-    setLibraryCardError(gameIdText, `读取备份版本失败：${String(err)}`);
-  } finally {
-    if (withCardLoading) {
-      setCardBusy(gameIdText, "backup_versions", false);
-    }
-  }
-}
-
-async function loadBackupStatsForGame(gameIdText: string, withCardLoading = true) {
-  const key = cardKey(gameIdText);
-  if (withCardLoading) {
-    setCardBusy(gameIdText, "backup_stats", true);
-  }
-  clearLibraryCardError(gameIdText);
-  try {
-    const stats = await getBackupStats(gameIdText);
-    backupStatsByGame.value = {
-      ...backupStatsByGame.value,
-      [key]: stats,
-    };
-    backupKeepDraftByGame.value = {
-      ...backupKeepDraftByGame.value,
-      [key]: String(stats.keepVersions),
-    };
-  } catch (err) {
-    backupStatsByGame.value = {
-      ...backupStatsByGame.value,
-      [key]: null,
-    };
-    setLibraryCardError(gameIdText, `读取备份统计失败：${String(err)}`);
-  } finally {
-    if (withCardLoading) {
-      setCardBusy(gameIdText, "backup_stats", false);
-    }
-  }
-}
-
-async function loadSessionDetailsForGame(gameIdText: string, withCardLoading = true) {
-  const key = cardKey(gameIdText);
-  const item = libraryItems.value.find((entry) => cardKey(entry.gameId) === key);
-  if (!item?.lastSessionId) {
-    sessionDetailsByGame.value = {
-      ...sessionDetailsByGame.value,
-      [key]: null,
-    };
-    return;
-  }
-  if (withCardLoading) {
-    setCardBusy(gameIdText, "session_logs", true);
-  }
-  clearLibraryCardError(gameIdText);
-  try {
-    const detail = await getLauncherSession(item.lastSessionId);
-    sessionDetailsByGame.value = {
-      ...sessionDetailsByGame.value,
-      [key]: detail,
-    };
-  } catch (err) {
-    setLibraryCardError(gameIdText, `读取会话详情失败：${String(err)}`);
-  } finally {
-    if (withCardLoading) {
-      setCardBusy(gameIdText, "session_logs", false);
-    }
-  }
-}
-
-async function choosePreferredExeForGame(gameIdText: string) {
-  try {
-    const { open } = await import("@tauri-apps/plugin-dialog");
-    const chosen = await open({
-      multiple: false,
-      filters: [{ name: "Executable", extensions: ["exe"] }],
-    });
-    if (!chosen || Array.isArray(chosen)) return;
-    selectedLibraryGameId.value = gameIdText;
-    setCardBusy(gameIdText, "bind_exe", true);
-    libraryState.value.error = "";
-    clearLibraryCardError(gameIdText);
-    await setPreferredExePath(gameIdText, chosen);
-    await refreshLibraryItems();
-    await loadLaunchPrecheckForGame(gameIdText, false);
-    showToast(`${gameIdText} 启动 EXE 已更新`, "success");
-  } catch (err) {
-    setLibraryCardError(gameIdText, `绑定 EXE 失败：${String(err)}`);
-    showToast("绑定 EXE 失败", "error");
-  } finally {
-    setCardBusy(gameIdText, "bind_exe", false);
-  }
-}
-
-async function launchLibraryGame(gameIdText: string, mode: LauncherMode = "backup") {
-  selectedLibraryGameId.value = gameIdText;
-  setCardBusy(gameIdText, "launch", true);
-  libraryState.value.error = "";
-  clearLibraryCardError(gameIdText);
-  try {
-    let actualMode: LauncherMode | null = mode;
-    if (mode === "backup") {
-      if (!syncDecisionFor(gameIdText)) {
-        await loadLaunchPrecheckForGame(gameIdText, false);
-      }
-      actualMode = await resolveBackupLaunchMode(gameIdText);
-      if (!actualMode) {
-        return;
-      }
-    }
-    await launchGameFromLibrary(gameIdText, actualMode);
-    await refreshLibraryItems();
-    await loadLaunchPrecheckForGame(gameIdText, false);
-    await Promise.all([
-      loadBackupStatsForGame(gameIdText, false),
-      loadBackupVersionsForGame(gameIdText, false),
-      loadSessionDetailsForGame(gameIdText, false),
-    ]);
-    if (mode === "backup") {
-      const launchLabel = actualMode === "backup" ? "恢复后启动" : "直接启动";
-      showToast(`${gameIdText} ${launchLabel}成功`, "success");
-    } else {
-      showToast(`${gameIdText} 启动成功`, "success");
-    }
-  } catch (err) {
-    setLibraryCardError(gameIdText, String(err));
-    showBlockingError(String(err));
-    await refreshLibraryItems();
-  } finally {
-    setCardBusy(gameIdText, "launch", false);
-  }
-}
-
-async function rollbackToLibraryBackupVersion(gameIdText: string, versionId: string) {
-  const confirmed = await askConfirm({
-    title: "确认恢复备份",
-    message: `确定将 ${gameIdText} 恢复到版本 ${versionId} 吗？\n\n执行恢复前，GameSaver 会先尝试为当前本地存档创建一份“恢复前备份”，然后再覆盖目标存档。`,
-    confirmText: "恢复并继续",
-    cancelText: "取消",
-    danger: true,
-  });
-  if (!confirmed) {
-    return;
-  }
-  setCardBusy(gameIdText, "backup_rollback", true);
-  libraryState.value.error = "";
-  clearLibraryCardError(gameIdText);
-  setRestoreTaskState(gameIdText, "任务已创建，准备回滚...", 0);
-  try {
-    const taskId = await startRestoreBackupVersionTask(gameIdText, versionId);
-    const finalTask = await waitForTaskCompletion<RestoreBackupResult>(
-      taskId,
-      (message, progress) => {
-        setRestoreTaskState(gameIdText, message || "正在回滚备份版本...", progress);
-      },
-    );
-    if (finalTask.status === "failed") {
-      throw new Error(finalTask.error || "回滚失败");
-    }
-    const result = finalTask.result;
-    if (!result) {
-      throw new Error("回滚失败：任务结果为空");
-    }
-    await refreshLibraryItems();
-    await Promise.all([
-      loadBackupStatsForGame(gameIdText, false),
-      loadBackupVersionsForGame(gameIdText, false),
-      loadSessionDetailsForGame(gameIdText, false),
-    ]);
-    if (result.preRestoreVersionId) {
-      restoreUndoByGame.value = {
-        ...restoreUndoByGame.value,
-        [cardKey(gameIdText)]: {
-          gameId: gameIdText,
-          versionId: result.preRestoreVersionId,
-          restoredVersionId: versionId,
-        },
-      };
-    }
-    showToast(
-      `恢复完成，${restoreProtectionSummary(result)}（已校验 ${result.verifiedFiles} 个文件，哈希抽样 ${result.hashSampleCount} 项）`,
-      "success",
-    );
-  } catch (err) {
-    setLibraryCardError(gameIdText, `回滚失败：${String(err)}`);
-    showBlockingError(`回滚失败：${String(err)}`);
-  } finally {
-    clearRestoreTaskState(gameIdText);
-    setCardBusy(gameIdText, "backup_rollback", false);
-  }
-}
-
-async function undoLibraryRestore(gameIdText: string) {
-  const undo = restoreUndoFor(gameIdText);
-  if (!undo) return;
-  const confirmed = await askConfirm({
-    title: "撤销本次恢复",
-    message: `确定恢复到刚才自动创建的恢复前备份 ${undo.versionId} 吗？此操作会再次覆盖当前存档。`,
-    confirmText: "撤销恢复",
-    cancelText: "取消",
-    danger: true,
-  });
-  if (!confirmed) return;
-  setCardBusy(gameIdText, "backup_rollback", true);
-  libraryState.value.error = "";
-  clearLibraryCardError(gameIdText);
-  setRestoreTaskState(gameIdText, "任务已创建，准备撤销恢复...", 0);
-  try {
-    const taskId = await startRestoreBackupVersionTask(gameIdText, undo.versionId);
-    const finalTask = await waitForTaskCompletion<RestoreBackupResult>(
-      taskId,
-      (message, progress) => {
-        setRestoreTaskState(gameIdText, message || "正在撤销恢复...", progress);
-      },
-    );
-    if (finalTask.status === "failed") {
-      throw new Error(finalTask.error || "撤销恢复失败");
-    }
-    restoreUndoByGame.value = {
-      ...restoreUndoByGame.value,
-      [cardKey(gameIdText)]: null,
-    };
-    await refreshLibraryItems();
-    await Promise.all([
-      loadBackupStatsForGame(gameIdText, false),
-      loadBackupVersionsForGame(gameIdText, false),
-      loadSessionDetailsForGame(gameIdText, false),
-    ]);
-    showToast("已撤销本次恢复", "success");
-  } catch (err) {
-    setLibraryCardError(gameIdText, `撤销恢复失败：${String(err)}`);
-    showBlockingError(`撤销恢复失败：${String(err)}`);
-  } finally {
-    clearRestoreTaskState(gameIdText);
-    setCardBusy(gameIdText, "backup_rollback", false);
-  }
-}
-
-async function saveBackupKeepPolicy(gameIdText: string) {
-  const keep = parseBackupKeepDraft(gameIdText);
-  if (!keep) {
-    setLibraryCardError(gameIdText, "保留版本数必须是大于等于 1 的整数。");
-    showToast("请输入有效的保留版本数", "error");
-    return;
-  }
-  setCardBusy(gameIdText, "backup_policy_save", true);
-  libraryState.value.error = "";
-  clearLibraryCardError(gameIdText);
-  try {
-    const stats = await setBackupKeepVersions(gameIdText, keep);
-    backupStatsByGame.value = {
-      ...backupStatsByGame.value,
-      [cardKey(gameIdText)]: stats,
-    };
-    backupKeepDraftByGame.value = {
-      ...backupKeepDraftByGame.value,
-      [cardKey(gameIdText)]: String(stats.keepVersions),
-    };
-    showToast("备份保留策略已保存", "success");
-  } catch (err) {
-    setLibraryCardError(gameIdText, `保存备份策略失败：${String(err)}`);
-    showToast("保存备份策略失败", "error");
-  } finally {
-    setCardBusy(gameIdText, "backup_policy_save", false);
-  }
-}
-
-async function pruneOldBackupsForGame(gameIdText: string) {
-  const keep = parseBackupKeepDraft(gameIdText);
-  if (!keep) {
-    setLibraryCardError(gameIdText, "保留版本数必须是大于等于 1 的整数。");
-    showToast("请输入有效的保留版本数", "error");
-    return;
-  }
-  setCardBusy(gameIdText, "backup_prune", true);
-  libraryState.value.error = "";
-  clearLibraryCardError(gameIdText);
-  try {
-    const result = await pruneBackupVersions(gameIdText, keep);
-    await Promise.all([
-      loadBackupStatsForGame(gameIdText, false),
-      loadBackupVersionsForGame(gameIdText, false),
-    ]);
-    void result;
-    showToast("旧备份已清理", "success");
-  } catch (err) {
-    setLibraryCardError(gameIdText, `清理备份失败：${String(err)}`);
-    showToast("清理备份失败", "error");
-  } finally {
-    setCardBusy(gameIdText, "backup_prune", false);
-  }
-}
-
 async function reloadRulesWithLoading() {
   rulesState.value.loading = true;
   rulesState.value.error = "";
@@ -1694,364 +767,99 @@ onUnmounted(() => {
       </button>
     </nav>
 
-    <template v-if="activeTab === 'learning'">
-      <header class="panel learning-hero">
-        <span class="eyebrow">学习存档</span>
-        <h1>把游戏加入 GameSaver</h1>
-        <p>选择游戏程序，启动后手动保存一次。GameSaver 会根据文件变化推荐存档目录。</p>
-        <p v-if="learningState.error" class="error inline-error">{{ learningState.error }}</p>
-        <div class="learning-progress">
-          <span :class="{ active: step === 'setup', done: step !== 'setup' }">添加游戏</span>
-          <span :class="{ active: step === 'running', done: step === 'results' }">执行一次存档</span>
-          <span :class="{ active: step === 'results' }">选择存档目录</span>
-        </div>
-      </header>
+    <LearningPage
+      v-if="activeTab === 'learning'"
+      :step="step"
+      :game-id="gameId"
+      :exe-path="exePath"
+      :extra-scan-roots-text="extraScanRootsText"
+      :session-id="sessionId"
+      :pid="pid"
+      :candidates="candidates"
+      :selected-paths="selected"
+      :learning-state="learningState"
+      :learning-busy-stage="learningBusyStage"
+      :learning-task-message="learningTaskMessage"
+      :learning-task-progress="learningTaskProgress"
+      :event-capture-mode="eventCaptureMode"
+      :captured-event-count="capturedEventCount"
+      :event-capture-error="eventCaptureError"
+      :runtime-is-admin="runtimeIsAdmin"
+      :runtime-message="runtimeMessage"
+      @update:game-id="gameId = $event"
+      @update:exe-path="exePath = $event"
+      @update:extra-scan-roots-text="extraScanRootsText = $event"
+      @update:step="step = $event"
+      @choose-exe="chooseExePath"
+      @choose-extra-scan-root="chooseExtraScanRoot"
+      @begin-learning="beginLearning"
+      @end-learning="endLearning"
+      @toggle-select="toggleSelect"
+      @open-path="openPath"
+      @save-learning-rule="saveLearningRule"
+      @relaunch-as-admin="relaunchAsAdmin"
+    />
 
-      <section v-if="step === 'setup'" class="panel learning-card">
-        <span class="eyebrow">第一步</span>
-        <h2>添加游戏</h2>
-        <p class="learning-copy">选择游戏 EXE 后会自动推断游戏名称。名称只是显示和管理用，可以手动修改。</p>
-        <label class="field">
-          <span>游戏名称</span>
-          <input v-model="gameId" placeholder="例如：MonsterBlackMarket" />
-        </label>
-        <label class="field">
-          <span>游戏 EXE 路径</span>
-          <div class="row">
-            <input v-model="exePath" placeholder="D:\\Games\\xxx\\game.exe" />
-            <button type="button" @click="chooseExePath">浏览</button>
-          </div>
-        </label>
-        <label class="field">
-          <span>额外扫描目录（可选）</span>
-          <textarea
-            v-model="extraScanRootsText"
-            rows="4"
-            placeholder="每行一个目录，例如：&#10;D:\\SteamLibrary\\steamapps\\compatdata&#10;E:\\Games\\SaveData"
-          ></textarea>
-          <div class="row">
-            <button type="button" @click="chooseExtraScanRoot">添加目录</button>
-          </div>
-        </label>
-        <button :disabled="learningState.loading" type="button" class="primary" @click="beginLearning">
-          {{ learningState.loading ? "正在启动..." : "开始学习并启动游戏" }}
-        </button>
-      </section>
+    <RulesPage
+      v-else-if="activeTab === 'rules'"
+      :rules="rules"
+      :rule-conflicts="ruleConflicts"
+      :rule-search="ruleSearch"
+      :rule-drafts="ruleDrafts"
+      :rules-state="rulesState"
+      :migration-export-waiting="migrationExportWaiting"
+      :migration-export-message="migrationExportMessage"
+      :migration-export-progress="migrationExportProgress"
+      :migration-import-waiting="migrationImportWaiting"
+      :migration-import-message="migrationImportMessage"
+      :migration-import-progress="migrationImportProgress"
+      @update:rule-search="ruleSearch = $event"
+      @update:rule-draft="updateRuleDraft($event.ruleId, $event.patch)"
+      @reload="reloadRulesWithLoading"
+      @export-rules="exportRulesToFile"
+      @import-rules="importRulesFromFile"
+      @export-migration="exportMigrationZipToFile"
+      @import-migration="importMigrationZipFromFile"
+      @mark-primary="markPrimaryRule"
+      @save-rule="saveManagedRule"
+      @remove-rule="removeManagedRule"
+    />
 
-      <section v-else-if="step === 'running'" class="panel learning-card">
-        <span class="eyebrow">第二步</span>
-        <h2>进入游戏并手动保存一次</h2>
-        <p class="learning-copy">请在游戏里完成一次明确的存档动作。保存完成后，可以退出游戏，也可以保持游戏关闭后再点击分析。</p>
-        <section v-if="learningState.loading && learningBusyStage === 'analyzing'" class="learning-loading-box">
-          <strong>{{ learningBusyLabel() }}</strong>
-          <div class="progress-track" role="progressbar" aria-label="正在分析存档变化">
-            <span v-if="learningTaskProgress === null" class="progress-indeterminate"></span>
-            <span
-              v-else
-              class="progress-determinate"
-              :style="{ width: `${learningTaskProgress}%` }"
-            ></span>
-          </div>
-          <p v-if="learningTaskProgress !== null">当前进度：{{ learningTaskProgress }}%</p>
-          <p>期间请不要重复点击按钮，也不要关闭程序窗口。</p>
-        </section>
-        <ul class="learning-checklist">
-          <li>游戏已启动</li>
-          <li>进入游戏或读取一个已有存档</li>
-          <li>手动保存一次</li>
-          <li>回到 GameSaver 点击分析</li>
-        </ul>
-        <button :disabled="learningState.loading" type="button" class="primary" @click="endLearning">
-          {{ learningState.loading ? "正在分析..." : "我已经保存，开始分析" }}
-        </button>
-        <details class="runtime-diagnostics learning-advanced">
-          <summary>采集详情（高级）</summary>
-          <p>运行权限：{{ runtimeIsAdmin ? "管理员" : "普通用户" }}</p>
-          <p>会话 ID：<code>{{ sessionId }}</code></p>
-          <p>游戏 PID：{{ pid ?? "未获取" }}</p>
-          <p>{{ runtimeMessage }}</p>
-          <button v-if="!runtimeIsAdmin" type="button" @click="relaunchAsAdmin">一键管理员重启</button>
-        </details>
-      </section>
-
-      <section v-else class="panel learning-card">
-        <span class="eyebrow">第三步</span>
-        <h2>选择存档目录</h2>
-        <p class="learning-copy">优先确认“强推荐”和“推荐”。如果不确定，可以打开目录查看里面是否有存档文件。</p>
-        <details class="runtime-diagnostics learning-advanced">
-          <summary>采集详情（高级）</summary>
-          <p>采集模式：{{ eventCaptureMode }} | 捕获事件数：{{ capturedEventCount }}</p>
-          <p v-if="eventCaptureError" class="error">ETW 信息：{{ eventCaptureError }}</p>
-        </details>
-        <p v-if="!candidates.length" class="empty-hint">没有检测到候选目录。请确认刚才在游戏内执行了保存动作。</p>
-        <div v-else class="candidate-groups">
-          <section
-            v-for="group in candidateGroups"
-            :key="group.key"
-            v-show="group.items.length"
-            class="candidate-group"
-          >
-            <div class="candidate-group-head">
-              <div>
-                <h3>{{ group.title }}</h3>
-                <p>{{ group.description }}</p>
-              </div>
-              <span>{{ group.items.length }} 项</span>
-            </div>
-            <ul class="candidate-list">
-              <li v-for="item in group.items" :key="item.path" :class="{ collapsed: item.collapsed }">
-                <div class="candidate-header">
-                  <label>
-                    <input
-                      :checked="selected.includes(item.path)"
-                      type="checkbox"
-                      :disabled="item.collapsed"
-                      @change="toggleSelect(item.path)"
-                    />
-                    <strong>{{ item.path }}</strong>
-                  </label>
-                  <span class="candidate-rank" :class="candidateRecommendationClass(item)">
-                    {{ candidateRecommendationLabel(item) }}
-                  </span>
-                  <button type="button" @click="openPath(item.path)">打开目录</button>
-                </div>
-                <p>
-                  得分：{{ item.score }} | changed={{ item.changedFiles }} added={{ item.addedFiles }}
-                  modified={{ item.modifiedFiles }}
-                </p>
-                <p>推荐理由：{{ candidateSignalSummary(item) }}</p>
-              </li>
-            </ul>
-          </section>
-        </div>
-        <div class="row">
-          <button :disabled="learningState.loading" type="button" class="primary" @click="saveLearningRule">
-            保存到游戏库
-          </button>
-          <button :disabled="learningState.loading" type="button" @click="step = 'setup'">重新学习</button>
-        </div>
-      </section>
-    </template>
-
-    <section v-else-if="activeTab === 'rules'" class="panel rules-shell">
-      <header class="rules-header">
-        <div class="rules-title-row">
-          <h2>规则管理</h2>
-          <button :disabled="rulesState.loading" type="button" @click="reloadRulesWithLoading">刷新</button>
-        </div>
-        <div class="rules-toolbar">
-          <label class="rules-search">
-            <span>搜索规则</span>
-            <input v-model="ruleSearch" placeholder="按 gameId 搜索" />
-          </label>
-          <div class="rules-actions">
-            <button :disabled="rulesState.loading" type="button" @click="exportRulesToFile">导出规则</button>
-            <button :disabled="rulesState.loading" type="button" @click="importRulesFromFile">导入规则</button>
-            <button :disabled="rulesState.loading" type="button" @click="exportMigrationZipToFile">
-              导出迁移包
-            </button>
-            <button :disabled="rulesState.loading" type="button" @click="importMigrationZipFromFile">
-              导入迁移包
-            </button>
-          </div>
-        </div>
-        <div v-if="migrationExportWaiting" class="migration-progress">
-          <p>{{ migrationExportMessage || "正在导出迁移包，文件较多时可能需要一点时间，请稍候..." }}</p>
-          <div class="progress-track" role="progressbar" aria-label="迁移包导出进行中">
-            <span v-if="migrationExportProgress === null" class="progress-indeterminate"></span>
-            <span
-              v-else
-              class="progress-determinate"
-              :style="{ width: `${migrationExportProgress}%` }"
-            ></span>
-          </div>
-          <p v-if="migrationExportProgress !== null">当前进度：{{ migrationExportProgress }}%</p>
-        </div>
-        <div v-if="migrationImportWaiting" class="migration-progress">
-          <p>{{ migrationImportMessage || "正在导入迁移包，文件较多时可能需要一点时间，请稍候..." }}</p>
-          <div class="progress-track" role="progressbar" aria-label="迁移包导入进行中">
-            <span v-if="migrationImportProgress === null" class="progress-indeterminate"></span>
-            <span
-              v-else
-              class="progress-determinate"
-              :style="{ width: `${migrationImportProgress}%` }"
-            ></span>
-          </div>
-          <p v-if="migrationImportProgress !== null">当前进度：{{ migrationImportProgress }}%</p>
-        </div>
-        <p v-if="ruleConflicts.length" class="conflict-summary">
-          检测到 {{ ruleConflicts.length }} 组 exeHash 冲突，建议为每组指定主规则。
-        </p>
-        <p v-if="rulesState.error" class="error inline-error">{{ rulesState.error }}</p>
-      </header>
-
-      <ul v-if="filteredRules.length" class="rule-list rules-grid">
-        <li v-for="rule in filteredRules" :key="rule.ruleId" class="rule-card">
-          <template v-if="ruleDrafts[rule.ruleId]">
-            <div class="rule-head">
-              <div class="rule-title-block">
-                <div class="rule-name-row">
-                  <strong>{{ rule.gameId }}</strong>
-                  <span class="status-pill" :class="rule.enabled ? 'enabled' : 'disabled'">
-                    {{ rule.enabled ? "启用" : "禁用" }}
-                  </span>
-                  <span v-if="hasRuleDraftChanges(rule)" class="pending-chip">未保存变更</span>
-                </div>
-                <div class="rule-meta">
-                  <span>ruleId {{ rule.ruleId }}</span>
-                  <span>置信度 {{ rule.confidence }}</span>
-                  <span>更新 {{ formatUnixTs(rule.updatedAt) }}</span>
-                </div>
-                <section v-if="ruleConflictFor(rule.ruleId)" class="rule-conflict-box">
-                  <p>
-                    冲突：同 exeHash 命中 {{ ruleConflictFor(rule.ruleId)?.conflictCount }} 条规则
-                    （涉及 {{ ruleConflictFor(rule.ruleId)?.gameIds.join(" / ") }}）
-                  </p>
-                  <p class="conflict-warning">
-                    {{ isPrimaryConflictRule(rule.ruleId) ? "已指定主规则，启动不会被冲突拦截" : "未指定主规则会阻止启动，请先设置主规则" }}
-                  </p>
-                  <p>hash {{ shortExeHash(ruleConflictFor(rule.ruleId)?.exeHash || "") }}</p>
-                  <div class="row">
-                    <span class="conflict-primary" :class="isPrimaryConflictRule(rule.ruleId) ? 'on' : 'off'">
-                      {{ isPrimaryConflictRule(rule.ruleId) ? "当前主规则" : "非主规则" }}
-                    </span>
-                    <button
-                      type="button"
-                      :disabled="rulesState.loading || isPrimaryConflictRule(rule.ruleId)"
-                      @click="markPrimaryRule(rule)"
-                    >
-                      设为主规则
-                    </button>
-                  </div>
-                </section>
-              </div>
-              <label class="switch">
-                <input
-                  v-model="ruleDrafts[rule.ruleId].enabled"
-                  type="checkbox"
-                />
-                <span class="slider"></span>
-                <span class="switch-text">启用</span>
-              </label>
-            </div>
-            <label class="field compact-field">
-              <span>游戏名（gameId）</span>
-              <input
-                v-model="ruleDrafts[rule.ruleId].gameIdText"
-                type="text"
-                class="gameid-editor"
-                placeholder="例如：elden_ring"
-              />
-            </label>
-            <label class="field compact-field">
-              <span>存档路径（每行一条）</span>
-              <div v-if="ruleDraftAnchorTokens(rule.ruleId).length" class="anchor-chip-row">
-                <span
-                  v-for="token in ruleDraftAnchorTokens(rule.ruleId)"
-                  :key="`${rule.ruleId}-${token}`"
-                  class="anchor-chip"
-                  :class="{ warning: token === '%GAME_DIR%', fallback: token === '%USERPROFILE%' }"
-                  :title="pathAnchorDescription(token)"
-                >
-                  {{ pathAnchorLabel(token) }}
-                </span>
-              </div>
-              <p v-if="ruleDraftAnchorTokens(rule.ruleId).length" class="field-note anchor-note">
-                {{ ruleAnchorHint(ruleDraftAnchorTokens(rule.ruleId)) }}
-              </p>
-              <p v-if="ruleUsesGameDirToken(rule)" class="field-note token-note">
-                此规则包含 <code>%GAME_DIR%</code>，路径会跟随当前绑定的游戏 EXE 所在目录动态解析。
-              </p>
-              <textarea
-                v-model="ruleDrafts[rule.ruleId].confirmedPathsText"
-                rows="4"
-                class="paths-editor"
-                placeholder="每行一条路径"
-              />
-            </label>
-            <div class="row rule-actions-row">
-              <button
-                :disabled="rulesState.loading || !hasRuleDraftChanges(rule)"
-                type="button"
-                class="primary"
-                @click="saveManagedRule(rule)"
-              >
-                保存变更
-              </button>
-              <button :disabled="rulesState.loading" type="button" class="danger" @click="removeManagedRule(rule)">
-                删除规则
-              </button>
-            </div>
-          </template>
-        </li>
-      </ul>
-      <p v-else class="empty-hint">暂无规则，可先在“学习存档”里生成规则。</p>
-    </section>
-
-    <section v-else class="panel library-shell">
-      <header class="library-header">
-        <div class="library-title-row">
-          <h2>游戏库（自动备份优先）</h2>
-          <button :disabled="libraryState.loading" type="button" @click="reloadLibraryWithLoading">刷新</button>
-        </div>
-        <label class="library-search">
-          <span>搜索游戏</span>
-          <input v-model="librarySearch" placeholder="按 gameId 搜索" />
-        </label>
-        <p v-if="libraryState.error" class="error inline-error">{{ libraryState.error }}</p>
-      </header>
-
-      <div v-if="filteredLibraryItems.length" class="library-layout">
-        <div class="library-grid" :class="{ single: filteredLibraryItems.length === 1 }">
-          <LibraryGameCard
-            v-for="item in filteredLibraryItems"
-            :key="item.gameId"
-            :item="item"
-            :selected="isLibraryGameSelected(item.gameId)"
-            :warning="!!gameDirResolutionIssue(item.gameId)"
-            :card-error="libraryCardErrorFor(item.gameId)"
-            :sync-status-label="cardSyncStatusLabel(item.gameId)"
-            :sync-status-class="syncStatusClass(syncDecisionFor(item.gameId)?.status || '')"
-            :game-dir-status-label="gameDirStatusLabel(item.gameId)"
-            :backup-stats="backupStatsFor(item.gameId)"
-            @select="selectLibraryGame"
-          />
-        </div>
-
-        <LibraryDetailPanel
-          v-if="selectedLibraryItem"
-          :selected-item="selectedLibraryItem"
-          :card-error="libraryCardErrorFor(selectedLibraryItem.gameId)"
-          :loading="libraryState.loading"
-          :launch-busy="isCardBusy(selectedLibraryItem.gameId, 'launch')"
-          :bind-exe-busy="isCardBusy(selectedLibraryItem.gameId, 'bind_exe')"
-          :backup-policy-save-busy="isCardBusy(selectedLibraryItem.gameId, 'backup_policy_save')"
-          :backup-prune-busy="isCardBusy(selectedLibraryItem.gameId, 'backup_prune')"
-          :backup-rollback-busy="isCardBusy(selectedLibraryItem.gameId, 'backup_rollback')"
-          :preferred-exe-path="selectedLibraryItem.preferredExePath || ''"
-          :precheck="launchPrecheckFor(selectedLibraryItem.gameId)"
-          :sync-decision="syncDecisionFor(selectedLibraryItem.gameId)"
-          :anchor-tokens="selectedRuleAnchorTokens(selectedLibraryItem.gameId)"
-          :game-dir-issue="gameDirResolutionIssue(selectedLibraryItem.gameId)"
-          :visible-precheck-checks="visiblePrecheckChecks(selectedLibraryItem.gameId)"
-          :backup-stats="backupStatsFor(selectedLibraryItem.gameId)"
-          :backup-keep-draft="backupKeepDraftFor(selectedLibraryItem.gameId)"
-          :backup-versions="backupVersionsFor(selectedLibraryItem.gameId)"
-          :restore-undo="restoreUndoFor(selectedLibraryItem.gameId)"
-          :restore-task-message="restoreTaskMessageFor(selectedLibraryItem.gameId)"
-          :restore-task-progress="restoreTaskProgressFor(selectedLibraryItem.gameId)"
-          :session-details="sessionDetailsFor(selectedLibraryItem.gameId)"
-          @launch="launchLibraryGame($event, 'backup')"
-          @choose-exe="choosePreferredExeForGame"
-          @update-backup-keep="updateBackupKeepDraft"
-          @save-backup-keep="saveBackupKeepPolicy"
-          @prune-backups="pruneOldBackupsForGame"
-          @rollback-version="rollbackToLibraryBackupVersion"
-          @undo-restore="undoLibraryRestore"
-        />
-      </div>
-      <p v-else>暂无游戏卡片，请先在“学习存档”中生成规则。</p>
-    </section>
+    <LibraryPage
+      v-else
+      :library-state="libraryState"
+      :library-search="librarySearch"
+      :filtered-library-items="filteredLibraryItems"
+      :selected-library-item="selectedLibraryItem"
+      :library-card-error-for="libraryCardErrorFor"
+      :is-library-game-selected="isLibraryGameSelected"
+      :game-dir-resolution-issue="gameDirResolutionIssue"
+      :card-sync-status-label="cardSyncStatusLabel"
+      :sync-status-class="syncStatusClass"
+      :sync-decision-for="syncDecisionFor"
+      :game-dir-status-label="gameDirStatusLabel"
+      :backup-stats-for="backupStatsFor"
+      :is-card-busy="isCardBusy"
+      :launch-precheck-for="launchPrecheckFor"
+      :selected-rule-anchor-tokens="selectedRuleAnchorTokens"
+      :visible-precheck-checks="visiblePrecheckChecks"
+      :backup-keep-draft-for="backupKeepDraftFor"
+      :backup-versions-for="backupVersionsFor"
+      :restore-undo-for="restoreUndoFor"
+      :restore-task-message-for="restoreTaskMessageFor"
+      :restore-task-progress-for="restoreTaskProgressFor"
+      :session-details-for="sessionDetailsFor"
+      @update:library-search="librarySearch = $event"
+      @reload="reloadLibraryWithLoading"
+      @select="selectLibraryGame"
+      @launch="launchLibraryGame($event, 'backup')"
+      @choose-exe="choosePreferredExeForGame"
+      @update-backup-keep="updateBackupKeepDraft"
+      @save-backup-keep="saveBackupKeepPolicy"
+      @prune-backups="pruneOldBackupsForGame"
+      @rollback-version="rollbackToLibraryBackupVersion"
+      @undo-restore="undoLibraryRestore"
+    />
 
     <transition name="toast-fade">
       <div v-if="toast.visible" class="toast" :class="toast.level" role="status" aria-live="polite">
