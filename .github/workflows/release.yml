@@ -34,40 +34,41 @@ jobs:
       - name: Validate Version Consistency
         shell: pwsh
         run: |
-          node -e "
-            const fs = require('fs');
-            const path = require('path');
-            const root = process.cwd();
-            const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
-            const tauri = JSON.parse(fs.readFileSync(path.join(root, 'src-tauri', 'tauri.conf.json'), 'utf8'));
-            const cargoToml = fs.readFileSync(path.join(root, 'src-tauri', 'Cargo.toml'), 'utf8');
-            const cargoMatch = cargoToml.match(/^\s*version\s*=\s*\"([^\"]+)\"/m);
-            if (!cargoMatch) {
-              console.error('Could not parse version from src-tauri/Cargo.toml');
+          $script = @'
+          const fs = require("fs");
+          const path = require("path");
+          const root = process.cwd();
+          const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+          const tauri = JSON.parse(fs.readFileSync(path.join(root, "src-tauri", "tauri.conf.json"), "utf8"));
+          const cargoToml = fs.readFileSync(path.join(root, "src-tauri", "Cargo.toml"), "utf8");
+          const cargoMatch = cargoToml.match(/^\s*version\s*=\s*"([^"]+)"/m);
+          if (!cargoMatch) {
+            console.error("Could not parse version from src-tauri/Cargo.toml");
+            process.exit(1);
+          }
+          const versions = {
+            package_json: pkg.version,
+            cargo_toml: cargoMatch[1],
+            tauri_conf: tauri.version
+          };
+          const unique = new Set(Object.values(versions));
+          if (unique.size !== 1) {
+            console.error("Version mismatch detected:", versions);
+            process.exit(1);
+          }
+          const unified = pkg.version;
+          const ref = process.env.GITHUB_REF || "";
+          if (ref.startsWith("refs/tags/")) {
+            const tag = ref.replace("refs/tags/", "");
+            const expectedTag = "v" + unified;
+            if (tag !== expectedTag) {
+              console.error("Tag/version mismatch: tag=" + tag + ", expected=" + expectedTag);
               process.exit(1);
             }
-            const versions = {
-              package_json: pkg.version,
-              cargo_toml: cargoMatch[1],
-              tauri_conf: tauri.version
-            };
-            const unique = new Set(Object.values(versions));
-            if (unique.size !== 1) {
-              console.error('Version mismatch detected:', versions);
-              process.exit(1);
-            }
-            const unified = pkg.version;
-            const ref = process.env.GITHUB_REF || '';
-            if (ref.startsWith('refs/tags/')) {
-              const tag = ref.replace('refs/tags/', '');
-              const expectedTag = 'v' + unified;
-              if (tag !== expectedTag) {
-                console.error(`Tag/version mismatch: tag=${tag}, expected=${expectedTag}`);
-                process.exit(1);
-              }
-            }
-            console.log('Version check passed:', versions);
-          "
+          }
+          console.log("Version check passed:", versions);
+          '@
+          node -e $script
 
       - name: Install Dependencies
         run: npm ci
