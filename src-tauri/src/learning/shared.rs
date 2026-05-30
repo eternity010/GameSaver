@@ -36,11 +36,17 @@ pub(crate) const WEAK_PATH_FRAGMENTS: [&str; 7] = [
     "\\settings\\",
     "\\shader",
 ];
-pub(crate) const NOISE_PATH_FRAGMENTS: [&str; 7] = [
+pub(crate) const NOISE_PATH_FRAGMENTS: [&str; 13] = [
     "\\appdata\\local\\temp\\",
     "\\appdata\\local\\tencent\\wetype\\",
+    "\\appdata\\locallow\\tencent\\wetype\\",
+    "\\appdata\\roaming\\tencent\\wechat\\",
+    "\\appdata\\roaming\\tencent\\xwechat\\",
     "\\appdata\\local\\microsoft\\edge\\",
+    "\\appdata\\local\\microsoft\\windows\\powershell\\",
     "\\appdata\\local\\google\\chrome\\",
+    "\\appdata\\roaming\\mozilla\\firefox\\profiles\\",
+    "\\appdata\\local\\mozilla\\firefox\\profiles\\",
     "\\appdata\\roaming\\microsoft\\windows\\",
     "\\$recycle.bin\\",
     "\\ebwebview\\",

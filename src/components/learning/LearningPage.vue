@@ -61,7 +61,7 @@ const candidateGroups = computed(() => [
   {
     key: "possible",
     title: "可能相关",
-    description: "有变化但证据不足，适合人工判断。",
+    description: "证据还不够强，只在你确认它是存档目录时选择。",
     items: props.candidates.filter((item) => item.recommendation === "possible"),
   },
   {
@@ -100,6 +100,7 @@ function candidateSignalLabel(signal: string): string {
   if (signal === "user-save-root") return "位于常见用户存档目录";
   if (signal === "game-dir") return "位于游戏目录";
   if (signal === "path-noise") return "包含缓存/日志等弱相关路径";
+  if (signal === "system-noise") return "像系统或常驻应用目录";
   if (signal === "filename-noise") return "文件名像配置/缓存/日志";
   if (signal.startsWith("extension:")) return `命中存档扩展名 .${signal.slice("extension:".length)}`;
   if (signal.startsWith("weak-extension:")) return `命中弱扩展名 .${signal.slice("weak-extension:".length)}`;
@@ -133,7 +134,7 @@ function learningBusyLabel(): string {
     <header class="panel learning-hero">
       <span class="eyebrow">学习存档</span>
       <h1>把游戏加入 GameSaver</h1>
-      <p>选择游戏程序，启动后手动保存一次。GameSaver 会根据文件变化推荐存档目录。</p>
+      <p>选择游戏程序，进游戏保存一次，GameSaver 会帮你找出该备份哪些存档。</p>
       <p v-if="learningState.error" class="error inline-error">{{ learningState.error }}</p>
       <div class="learning-progress">
         <span :class="{ active: step === 'setup', done: step !== 'setup' }">添加游戏</span>
@@ -144,8 +145,8 @@ function learningBusyLabel(): string {
 
     <section v-if="step === 'setup'" class="panel learning-card">
       <span class="eyebrow">第一步</span>
-      <h2>添加游戏</h2>
-      <p class="learning-copy">选择游戏 EXE 后会自动推断游戏名称。名称只是显示和管理用，可以手动修改。</p>
+      <h2>选择要保护的游戏</h2>
+      <p class="learning-copy">先选择游戏 EXE。GameSaver 会自动填入游戏名称，之后也可以在规则里改。</p>
       <label class="field">
         <span>游戏名称</span>
         <input
@@ -165,27 +166,33 @@ function learningBusyLabel(): string {
           <button type="button" @click="emit('choose-exe')">浏览</button>
         </div>
       </label>
-      <label class="field">
-        <span>额外扫描目录（可选）</span>
-        <textarea
-          :value="extraScanRootsText"
-          rows="4"
-          placeholder="每行一个目录，例如：&#10;D:\\SteamLibrary\\steamapps\\compatdata&#10;E:\\Games\\SaveData"
-          @input="emit('update:extraScanRootsText', ($event.target as HTMLTextAreaElement).value)"
-        ></textarea>
-        <div class="row">
+      <details class="advanced-box learning-advanced-options">
+        <summary>找不到存档时再添加扫描目录</summary>
+        <p class="field-note">
+          默认会扫描常见用户目录和游戏目录。只有存档在特殊位置时，才需要在这里补充目录。
+        </p>
+        <label class="field compact-field">
+          <span>额外扫描目录</span>
+          <textarea
+            :value="extraScanRootsText"
+            rows="3"
+            placeholder="每行一个目录，例如：&#10;D:\\SteamLibrary\\steamapps\\compatdata&#10;E:\\Games\\SaveData"
+            @input="emit('update:extraScanRootsText', ($event.target as HTMLTextAreaElement).value)"
+          ></textarea>
+        </label>
+        <div class="row learning-advanced-actions">
           <button type="button" @click="emit('choose-extra-scan-root')">添加目录</button>
         </div>
-      </label>
+      </details>
       <button :disabled="learningState.loading" type="button" class="primary" @click="emit('begin-learning')">
-        {{ learningState.loading ? "正在启动..." : "开始学习并启动游戏" }}
+        {{ learningState.loading ? "正在启动游戏..." : "启动游戏，开始识别存档" }}
       </button>
     </section>
 
     <section v-else-if="step === 'running'" class="panel learning-card">
       <span class="eyebrow">第二步</span>
       <h2>进入游戏并手动保存一次</h2>
-      <p class="learning-copy">请在游戏里完成一次明确的存档动作。保存完成后，可以退出游戏，也可以保持游戏关闭后再点击分析。</p>
+      <p class="learning-copy">在游戏里完成一次明确的保存动作。保存完成后，回到 GameSaver 继续分析。</p>
       <section v-if="learningState.loading && learningBusyStage === 'analyzing'" class="learning-loading-box">
         <strong>{{ learningBusyLabel() }}</strong>
         <div class="progress-track" role="progressbar" aria-label="正在分析存档变化">
@@ -203,10 +210,10 @@ function learningBusyLabel(): string {
         <li>游戏已启动</li>
         <li>进入游戏或读取一个已有存档</li>
         <li>手动保存一次</li>
-        <li>回到 GameSaver 点击分析</li>
+        <li>回到 GameSaver 继续</li>
       </ul>
       <button :disabled="learningState.loading" type="button" class="primary" @click="emit('end-learning')">
-        {{ learningState.loading ? "正在分析..." : "我已经保存，开始分析" }}
+        {{ learningState.loading ? "正在分析..." : "我已保存，查找存档目录" }}
       </button>
       <details class="runtime-diagnostics learning-advanced">
         <summary>采集详情（高级）</summary>
@@ -221,7 +228,7 @@ function learningBusyLabel(): string {
     <section v-else class="panel learning-card">
       <span class="eyebrow">第三步</span>
       <h2>选择存档目录</h2>
-      <p class="learning-copy">优先确认“强推荐”和“推荐”。如果不确定，可以打开目录查看里面是否有存档文件。</p>
+      <p class="learning-copy">通常选择“强推荐”或“推荐”即可。不确定时，打开目录看看里面是否有存档文件。</p>
       <details class="runtime-diagnostics learning-advanced">
         <summary>采集详情（高级）</summary>
         <p>采集模式：{{ eventCaptureMode }} | 捕获事件数：{{ capturedEventCount }}</p>
@@ -275,7 +282,7 @@ function learningBusyLabel(): string {
       </div>
       <div class="row">
         <button :disabled="learningState.loading" type="button" class="primary" @click="emit('save-learning-rule')">
-          保存到游戏库
+          保存规则并加入游戏库
         </button>
         <button :disabled="learningState.loading" type="button" @click="emit('update:step', 'setup')">重新学习</button>
       </div>

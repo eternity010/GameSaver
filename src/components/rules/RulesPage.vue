@@ -225,6 +225,7 @@ function updateRuleDraft(ruleId: string, patch: Partial<RuleDraft>) {
         <h2>规则管理</h2>
         <button :disabled="rulesState.loading" type="button" @click="emit('reload')">刷新</button>
       </div>
+      <p class="rules-copy">这里保存的是每个游戏要备份的存档位置。日常只需要确认规则已启用、路径正确。</p>
       <div class="rules-toolbar">
         <label class="rules-search">
           <span>搜索规则</span>
@@ -266,7 +267,7 @@ function updateRuleDraft(ruleId: string, patch: Partial<RuleDraft>) {
         <p v-if="migrationImportProgress !== null">当前进度：{{ migrationImportProgress }}%</p>
       </div>
       <p v-if="ruleConflicts.length" class="conflict-summary">
-        检测到 {{ ruleConflicts.length }} 组 exeHash 冲突，建议为每组指定主规则。
+        有 {{ ruleConflicts.length }} 组游戏程序命中了多条规则，需要指定启动时优先使用哪一条。
       </p>
       <p v-if="rulesState.error" class="error inline-error">{{ rulesState.error }}</p>
     </header>
@@ -284,22 +285,20 @@ function updateRuleDraft(ruleId: string, patch: Partial<RuleDraft>) {
                 <span v-if="hasRuleDraftChanges(rule)" class="pending-chip">未保存变更</span>
               </div>
               <div class="rule-meta">
-                <span>ruleId {{ rule.ruleId }}</span>
-                <span>置信度 {{ rule.confidence }}</span>
+                <span>{{ rule.confirmedPaths.length }} 条存档路径</span>
                 <span>更新 {{ formatUnixTs(rule.updatedAt) }}</span>
               </div>
               <section v-if="ruleConflictFor(rule.ruleId)" class="rule-conflict-box">
                 <p>
-                  冲突：同 exeHash 命中 {{ ruleConflictFor(rule.ruleId)?.conflictCount }} 条规则
-                  （涉及 {{ ruleConflictFor(rule.ruleId)?.gameIds.join(" / ") }}）
+                  这个游戏程序同时匹配到 {{ ruleConflictFor(rule.ruleId)?.conflictCount }} 条规则：
+                  {{ ruleConflictFor(rule.ruleId)?.gameIds.join(" / ") }}
                 </p>
                 <p class="conflict-warning">
-                  {{ isPrimaryConflictRule(rule.ruleId) ? "已指定主规则，启动不会被冲突拦截" : "未指定主规则会阻止启动，请先设置主规则" }}
+                  {{ isPrimaryConflictRule(rule.ruleId) ? "这条规则会被优先使用。" : "启动前需要先选择一条优先规则。" }}
                 </p>
-                <p>hash {{ shortExeHash(ruleConflictFor(rule.ruleId)?.exeHash || "") }}</p>
                 <div class="row">
                   <span class="conflict-primary" :class="isPrimaryConflictRule(rule.ruleId) ? 'on' : 'off'">
-                    {{ isPrimaryConflictRule(rule.ruleId) ? "当前主规则" : "非主规则" }}
+                    {{ isPrimaryConflictRule(rule.ruleId) ? "优先规则" : "未优先" }}
                   </span>
                   <button
                     type="button"
@@ -310,6 +309,17 @@ function updateRuleDraft(ruleId: string, patch: Partial<RuleDraft>) {
                   </button>
                 </div>
               </section>
+              <details class="rule-technical-details">
+                <summary>技术信息</summary>
+                <div class="rule-tech-grid">
+                  <span>ruleId {{ rule.ruleId }}</span>
+                  <span>exeHash {{ shortExeHash(rule.exeHash) }}</span>
+                  <span>置信度 {{ rule.confidence }}</span>
+                  <span v-if="ruleConflictFor(rule.ruleId)">
+                    冲突 hash {{ shortExeHash(ruleConflictFor(rule.ruleId)?.exeHash || "") }}
+                  </span>
+                </div>
+              </details>
             </div>
             <label class="switch">
               <input

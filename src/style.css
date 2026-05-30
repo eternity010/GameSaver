@@ -132,6 +132,18 @@ body {
   margin-top: 4px;
 }
 
+.learning-advanced-options {
+  margin: 2px 0 4px;
+}
+
+.learning-advanced-options .field-note {
+  padding: 0 12px;
+}
+
+.learning-advanced-actions {
+  padding: 0 12px 12px;
+}
+
 .learning-loading-box {
   border: 1px solid #9dc2de;
   border-radius: 10px;
@@ -376,6 +388,12 @@ button:disabled {
 .rules-header {
   display: grid;
   gap: 10px;
+}
+
+.rules-copy {
+  margin: -2px 0 0;
+  color: #4d687e;
+  line-height: 1.5;
 }
 
 .rules-title-row {
@@ -1554,6 +1572,50 @@ button:disabled {
   background: #f2f7fc;
   border: 1px solid #d6e2ec;
   border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.rule-technical-details {
+  margin-top: 4px;
+}
+
+.rule-technical-details summary {
+  list-style: none;
+  cursor: pointer;
+  color: #5b7287;
+  font-size: 12px;
+  user-select: none;
+}
+
+.rule-technical-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.rule-technical-details summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 0.15s ease;
+}
+
+.rule-technical-details[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.rule-tech-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.rule-tech-grid > span {
+  border: 1px solid #d6e2ec;
+  border-radius: 999px;
+  background: #f7fbff;
+  color: #4f657a;
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 11px;
   padding: 2px 8px;
 }
 
