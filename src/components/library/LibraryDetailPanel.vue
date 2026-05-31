@@ -121,11 +121,11 @@ function syncStatusClass(status: string): string {
 function syncRecommendedActionLabel(action: string): string {
   switch (action) {
     case "launch_direct":
-      return "建议直接启动";
+      return "可以直接启动";
     case "restore_then_launch":
-      return "建议恢复后启动";
+      return "建议先恢复最近备份";
     default:
-      return "建议先人工确认";
+      return "建议先确认存档状态";
   }
 }
 
@@ -172,6 +172,17 @@ function backupSummaryText(): string {
   return `${props.backupStats.versionCount ?? 0} 版 / ${formatBytes(props.backupStats.totalBytes ?? 0)}`;
 }
 
+function launchStatusLabel(): string {
+  if (!props.precheck) return "检查中";
+  return props.precheck.backupReady ? "可启动" : "需要处理";
+}
+
+function launchActionHint(): string {
+  if (props.gameDirIssue) return "先绑定本机 EXE 后再启动。";
+  if (!props.syncDecision) return "启动前会检查存档和备份状态。";
+  return props.syncDecision.message;
+}
+
 function shortExePath(path?: string | null): string {
   const value = (path || "").trim();
   if (!value) return "";
@@ -201,14 +212,15 @@ function onBackupKeepInput(event: Event) {
         :disabled="loading || launchBusy"
         @click="emit('launch', selectedItem.gameId)"
       >
-        启动游戏（自动备份）
+        {{ launchBusy ? "正在启动..." : "启动游戏" }}
       </button>
     </div>
+    <p class="detail-launch-hint">{{ launchActionHint() }}</p>
 
     <section class="detail-summary-strip">
       <div class="detail-summary-item">
         <span>启动状态</span>
-        <strong>{{ precheck?.backupReady ? "可启动" : "需检查" }}</strong>
+        <strong>{{ launchStatusLabel() }}</strong>
       </div>
       <div class="detail-summary-item">
         <span>同步状态</span>
@@ -241,14 +253,14 @@ function onBackupKeepInput(event: Event) {
 
     <section class="precheck-box compact-precheck-box">
       <div class="row precheck-head">
-        <strong>启动检查</strong>
+        <strong>启动前确认</strong>
         <div class="row precheck-head-actions">
           <span
             v-if="precheck"
             class="precheck-state-pill"
             :class="precheck.backupReady ? 'ok' : 'fail'"
           >
-            {{ precheck.backupReady ? "自动备份可启动" : "自动备份需处理" }}
+            {{ precheck.backupReady ? "存档保护就绪" : "需要处理" }}
           </span>
           <span v-else class="precheck-state-pill idle">未检查</span>
         </div>
@@ -331,10 +343,10 @@ function onBackupKeepInput(event: Event) {
 
     <section class="backup-detail-stack">
       <details class="library-collapsible">
-        <summary>备份空间管理</summary>
+        <summary>备份占用与保留数量</summary>
         <section class="backup-policy-box">
           <div class="row backup-policy-head">
-            <h4>备份空间管理</h4>
+            <h4>备份占用</h4>
           </div>
           <div class="backup-policy-stats">
             <span>当前占用：{{ formatBytes(backupStats?.totalBytes ?? 0) }}</span>
@@ -379,9 +391,9 @@ function onBackupKeepInput(event: Event) {
       </details>
 
       <details class="library-collapsible">
-        <summary>备份版本时间线与恢复</summary>
+        <summary>历史备份与恢复</summary>
         <div class="row">
-          <h4>备份版本时间线</h4>
+          <h4>历史备份</h4>
         </div>
         <p class="field-note restore-safety-note">
           恢复任一版本前，GameSaver 会先尝试为当前本地存档创建一份“恢复前备份”，方便你随时撤销。
@@ -449,17 +461,15 @@ function onBackupKeepInput(event: Event) {
         </section>
       </details>
 
-      <details class="library-collapsible">
-        <summary>最近会话日志</summary>
+      <details class="library-collapsible diagnostics-collapsible">
+        <summary>诊断日志</summary>
         <div class="row">
-          <h4>最近会话日志</h4>
+          <h4>最近一次启动记录</h4>
         </div>
         <template v-if="sessionDetails">
-          <p>sessionId={{ sessionDetails.launcherSessionId }}</p>
-          <p>
-            status={{ sessionDetails.status }} |
-            mode={{ sessionDetails.launchMode ?? "backup" }} |
-            pid={{ sessionDetails.pid ?? "无" }}
+          <p class="diagnostic-meta">
+            状态：{{ sessionDetails.status }} · 模式：{{ sessionDetails.launchMode ?? "backup" }} ·
+            PID：{{ sessionDetails.pid ?? "无" }}
           </p>
           <ul class="rule-list">
             <li
@@ -470,7 +480,7 @@ function onBackupKeepInput(event: Event) {
             </li>
           </ul>
         </template>
-        <p v-else>暂无会话日志。</p>
+        <p v-else>暂无诊断日志。</p>
       </details>
     </section>
   </aside>

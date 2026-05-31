@@ -1019,6 +1019,13 @@ button:disabled {
   font-size: 22px;
 }
 
+.detail-launch-hint {
+  margin: -2px 0 0;
+  color: #4d687e;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .detail-summary-strip {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1097,6 +1104,21 @@ button:disabled {
 
 .library-collapsible > :not(summary) {
   padding: 0 10px 10px;
+}
+
+.diagnostics-collapsible {
+  border-style: dashed;
+  background: #fbfdff;
+}
+
+.diagnostics-collapsible > summary {
+  color: #5b7287;
+  font-size: 13px;
+}
+
+.diagnostic-meta {
+  color: #4f657a;
+  font-size: 13px;
 }
 
 .backup-policy-box {
