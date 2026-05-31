@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from "vue";
 import { useConfirmDialog } from "./composables/useConfirmDialog";
 import { useLibraryPage } from "./composables/useLibraryPage";
+import { useRulesPage } from "./composables/useRulesPage";
 import { useToast } from "./composables/useToast";
 import LearningPage from "./components/learning/LearningPage.vue";
 import LibraryPage from "./components/library/LibraryPage.vue";
@@ -12,45 +13,27 @@ import BlockingErrorDialog from "./components/ui/BlockingErrorDialog.vue";
 import ConfirmDialog from "./components/ui/ConfirmDialog.vue";
 import {
   confirmRule,
-  deleteRule,
-  exportRules,
   getSettingsPaths,
   getTask,
   getLearningSession,
   getRuntimeStatus,
-  importRules,
   launchGame,
-  listRuleConflicts,
-  listRules,
   openCandidatePath,
   restartAsAdmin,
-  setPrimaryRule,
   startMigrateDataPathTask,
-  startExportMigrationZipTask,
   startFinishLearningTask,
-  startImportMigrationZipTask,
   startLearning,
   updateSettingsPaths,
-  updateRule,
 } from "./api";
 import type {
   CandidatePath,
   DataPathKind,
   DataPathMigrationResult,
-  ExportMigrationZipResult,
-  GameSaveRule,
-  ImportMigrationZipResult,
-  RuleConflictItem,
   SettingsPaths,
 } from "./types";
 
 type UiStep = "setup" | "running" | "results";
 type TopTab = "learning" | "rules" | "library" | "settings";
-type RuleDraft = {
-  gameIdText: string;
-  confirmedPathsText: string;
-  enabled: boolean;
-};
 type TabState = {
   loading: boolean;
   error: string;
@@ -66,19 +49,8 @@ const sessionId = ref("");
 const pid = ref<number | null>(null);
 const candidates = ref<CandidatePath[]>([]);
 const selected = ref<string[]>([]);
-const rules = ref<GameSaveRule[]>([]);
-const ruleConflicts = ref<RuleConflictItem[]>([]);
-const ruleSearch = ref("");
-const ruleDrafts = ref<Record<string, RuleDraft>>({});
 const learningState = ref<TabState>({ loading: false, error: "" });
-const rulesState = ref<TabState>({ loading: false, error: "" });
 const settingsState = ref<TabState>({ loading: false, error: "" });
-const migrationExportWaiting = ref(false);
-const migrationExportMessage = ref("");
-const migrationExportProgress = ref<number | null>(null);
-const migrationImportWaiting = ref(false);
-const migrationImportMessage = ref("");
-const migrationImportProgress = ref<number | null>(null);
 const settings = ref<SettingsPaths | null>(null);
 const backupRootDraft = ref("");
 const settingsMigrationKind = ref<DataPathKind | "">("");
@@ -97,15 +69,6 @@ const { confirmDialog, askConfirm, resolveConfirm } = useConfirmDialog();
 const blockingErrorMessage = ref("");
 
 const hasHighConfidence = computed(() => candidates.value.some((item) => item.score >= 45));
-const ruleConflictByRuleId = computed<Record<string, RuleConflictItem>>(() => {
-  const map: Record<string, RuleConflictItem> = {};
-  for (const conflict of ruleConflicts.value) {
-    for (const ruleId of conflict.ruleIds) {
-      map[ruleId] = conflict;
-    }
-  }
-  return map;
-});
 
 function inferGameId(path: string): string {
   const parts = path.split(/[\\/]+/).filter(Boolean);
@@ -175,57 +138,6 @@ function toggleSelect(path: string) {
   selected.value = [...selected.value, path];
 }
 
-function normalizePaths(rawText: string): string[] {
-  const dedup = new Set<string>();
-  const output: string[] = [];
-  for (const line of rawText.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    if (!dedup.has(trimmed)) {
-      dedup.add(trimmed);
-      output.push(trimmed);
-    }
-  }
-  return output;
-}
-
-function updateRuleDraft(ruleId: string, patch: Partial<RuleDraft>) {
-  const current = ruleDrafts.value[ruleId];
-  if (!current) return;
-  ruleDrafts.value = {
-    ...ruleDrafts.value,
-    [ruleId]: {
-      ...current,
-      ...patch,
-    },
-  };
-}
-
-function ruleConflictFor(ruleId: string): RuleConflictItem | null {
-  return ruleConflictByRuleId.value[ruleId] ?? null;
-}
-
-function hydrateRuleDrafts() {
-  const next: Record<string, RuleDraft> = {};
-  for (const rule of rules.value) {
-    const previous = ruleDrafts.value[rule.ruleId];
-    next[rule.ruleId] = {
-      gameIdText: previous?.gameIdText ?? rule.gameId,
-      confirmedPathsText: previous?.confirmedPathsText ?? rule.confirmedPaths.join("\n"),
-      enabled: previous?.enabled ?? rule.enabled,
-    };
-  }
-  ruleDrafts.value = next;
-}
-
-function sortRulesByUpdatedTime(items: GameSaveRule[]): GameSaveRule[] {
-  return [...items].sort((a, b) => {
-    const aTime = Number(a.updatedAt || a.createdAt || "0");
-    const bTime = Number(b.updatedAt || b.createdAt || "0");
-    return bTime - aTime;
-  });
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -268,6 +180,35 @@ function showBlockingError(message: string) {
 function closeBlockingError() {
   blockingErrorMessage.value = "";
 }
+
+const {
+  rules,
+  ruleConflicts,
+  ruleSearch,
+  ruleDrafts,
+  rulesState,
+  migrationExportWaiting,
+  migrationExportMessage,
+  migrationExportProgress,
+  migrationImportWaiting,
+  migrationImportMessage,
+  migrationImportProgress,
+  updateRuleDraft,
+  refreshRules,
+  reloadRulesWithLoading,
+  markPrimaryRule,
+  saveManagedRule,
+  removeManagedRule,
+  exportRulesToFile,
+  importRulesFromFile,
+  exportMigrationZipToFile,
+  importMigrationZipFromFile,
+} = useRulesPage({
+  waitForTaskCompletion,
+  askConfirm,
+  showToast,
+  refreshLibraryItems: () => refreshLibraryItems(),
+});
 
 const {
   libraryState,
@@ -437,236 +378,6 @@ async function saveLearningRule() {
   } finally {
     learningState.value.loading = false;
     learningBusyStage.value = "";
-  }
-}
-
-async function refreshRules() {
-  const [data, conflicts] = await Promise.all([listRules(), listRuleConflicts()]);
-  rules.value = sortRulesByUpdatedTime(data);
-  ruleConflicts.value = conflicts;
-  hydrateRuleDrafts();
-}
-async function reloadRulesWithLoading() {
-  rulesState.value.loading = true;
-  rulesState.value.error = "";
-  try {
-    await refreshRules();
-  } catch (err) {
-    rulesState.value.error = String(err);
-  } finally {
-    rulesState.value.loading = false;
-  }
-}
-
-async function markPrimaryRule(rule: GameSaveRule) {
-  const conflict = ruleConflictFor(rule.ruleId);
-  if (!conflict) {
-    rulesState.value.error = "当前规则不存在 exeHash 冲突，无需设置主规则。";
-    return;
-  }
-  rulesState.value.loading = true;
-  rulesState.value.error = "";
-  try {
-    await setPrimaryRule(rule.ruleId);
-    await refreshRules();
-    await refreshLibraryItems();
-    showToast("主规则设置成功", "success");
-  } catch (err) {
-    rulesState.value.error = `设置主规则失败：${String(err)}`;
-    showToast("设置主规则失败", "error");
-  } finally {
-    rulesState.value.loading = false;
-  }
-}
-
-async function saveManagedRule(rule: GameSaveRule) {
-  const draft = ruleDrafts.value[rule.ruleId];
-  if (!draft) return;
-  const normalizedGameId = draft.gameIdText.trim();
-  if (!normalizedGameId) {
-    rulesState.value.error = "游戏名不能为空。";
-    return;
-  }
-  const normalizedPaths = normalizePaths(draft.confirmedPathsText);
-  if (!normalizedPaths.length) {
-    rulesState.value.error = "路径不能为空，至少保留一条路径。";
-    return;
-  }
-
-  rulesState.value.loading = true;
-  rulesState.value.error = "";
-  try {
-    const updated = await updateRule(rule.ruleId, normalizedGameId, normalizedPaths, draft.enabled);
-    await refreshRules();
-    showToast(`规则 ${updated.gameId} 已保存`, "success");
-    await refreshLibraryItems();
-  } catch (err) {
-    rulesState.value.error = `保存规则失败：${String(err)}`;
-    showToast("保存规则失败", "error");
-  } finally {
-    rulesState.value.loading = false;
-  }
-}
-
-async function removeManagedRule(rule: GameSaveRule) {
-  const confirmed = await askConfirm({
-    title: "确认删除规则",
-    message: `确定删除规则 ${rule.gameId} 吗？此操作不可恢复。`,
-    confirmText: "删除",
-    cancelText: "取消",
-    danger: true,
-  });
-  if (!confirmed) {
-    return;
-  }
-  rulesState.value.loading = true;
-  rulesState.value.error = "";
-  try {
-    await deleteRule(rule.ruleId);
-    await refreshRules();
-    showToast(`规则 ${rule.gameId} 已删除`, "success");
-    await refreshLibraryItems();
-  } catch (err) {
-    rulesState.value.error = `删除规则失败：${String(err)}`;
-    showToast("删除规则失败", "error");
-  } finally {
-    rulesState.value.loading = false;
-  }
-}
-
-async function exportRulesToFile() {
-  try {
-    const { save } = await import("@tauri-apps/plugin-dialog");
-    const chosen = await save({
-      defaultPath: "gamesaver-rules.json",
-      filters: [{ name: "JSON", extensions: ["json"] }],
-    });
-    if (!chosen) return;
-    rulesState.value.loading = true;
-    rulesState.value.error = "";
-    const result = await exportRules(chosen);
-    void result;
-    showToast("规则导出成功", "success");
-  } catch (err) {
-    rulesState.value.error = `导出失败：${String(err)}`;
-    showToast("规则导出失败", "error");
-  } finally {
-    rulesState.value.loading = false;
-  }
-}
-
-async function importRulesFromFile() {
-  try {
-    const { open } = await import("@tauri-apps/plugin-dialog");
-    const chosen = await open({
-      multiple: false,
-      filters: [{ name: "JSON", extensions: ["json"] }],
-    });
-    if (!chosen || Array.isArray(chosen)) return;
-    rulesState.value.loading = true;
-    rulesState.value.error = "";
-    const result = await importRules(chosen);
-    await refreshRules();
-    await refreshLibraryItems();
-    void result;
-    showToast("规则导入完成", "success");
-  } catch (err) {
-    rulesState.value.error = `导入失败：${String(err)}`;
-    showToast("规则导入失败", "error");
-  } finally {
-    rulesState.value.loading = false;
-  }
-}
-
-async function exportMigrationZipToFile() {
-  try {
-    const { save } = await import("@tauri-apps/plugin-dialog");
-    const chosen = await save({
-      defaultPath: "gamesaver-migration.zip",
-      filters: [{ name: "ZIP", extensions: ["zip"] }],
-    });
-    if (!chosen) return;
-    rulesState.value.loading = true;
-    rulesState.value.error = "";
-    migrationExportWaiting.value = true;
-    migrationExportMessage.value = "任务已创建，准备导出迁移包...";
-    migrationExportProgress.value = 0;
-    const taskId = await startExportMigrationZipTask(chosen);
-    const finalTask = await waitForTaskCompletion<ExportMigrationZipResult>(
-      taskId,
-      (message, progress) => {
-        migrationExportMessage.value = message || "正在导出迁移包...";
-        migrationExportProgress.value = progress;
-      },
-    );
-    if (finalTask.status === "failed") {
-      throw new Error(finalTask.error || "导出迁移包失败");
-    }
-    const result = finalTask.result;
-    if (result) {
-      showToast(
-        `迁移包导出成功（规则 ${result.ruleCount} 条，备份游戏 ${result.backupGames} 个，文件 ${result.exportedFiles} 个）`,
-        "success",
-        4200,
-      );
-    } else {
-      showToast("迁移包导出成功", "success");
-    }
-  } catch (err) {
-    rulesState.value.error = `导出迁移包失败：${String(err)}`;
-    showToast("迁移包导出失败", "error");
-  } finally {
-    migrationExportWaiting.value = false;
-    migrationExportMessage.value = "";
-    migrationExportProgress.value = null;
-    rulesState.value.loading = false;
-  }
-}
-
-async function importMigrationZipFromFile() {
-  try {
-    const { open } = await import("@tauri-apps/plugin-dialog");
-    const chosen = await open({
-      multiple: false,
-      filters: [{ name: "ZIP", extensions: ["zip"] }],
-    });
-    if (!chosen || Array.isArray(chosen)) return;
-    rulesState.value.loading = true;
-    rulesState.value.error = "";
-    migrationImportWaiting.value = true;
-    migrationImportMessage.value = "任务已创建，准备导入迁移包...";
-    migrationImportProgress.value = 0;
-    const taskId = await startImportMigrationZipTask(chosen);
-    const finalTask = await waitForTaskCompletion<ImportMigrationZipResult>(
-      taskId,
-      (message, progress) => {
-        migrationImportMessage.value = message || "正在导入迁移包...";
-        migrationImportProgress.value = progress;
-      },
-    );
-    if (finalTask.status === "failed") {
-      throw new Error(finalTask.error || "导入迁移包失败");
-    }
-    const result = finalTask.result;
-    await refreshRules();
-    await refreshLibraryItems();
-    if (result) {
-      showToast(
-        `迁移包导入完成（新增规则 ${result.importedRules}，覆盖 ${result.overwrittenRules}，导入备份游戏 ${result.importedBackupGames}）`,
-        "success",
-        4200,
-      );
-    } else {
-      showToast("迁移包导入完成", "success");
-    }
-  } catch (err) {
-    rulesState.value.error = `导入迁移包失败：${String(err)}`;
-    showToast("迁移包导入失败", "error");
-  } finally {
-    migrationImportWaiting.value = false;
-    migrationImportMessage.value = "";
-    migrationImportProgress.value = null;
-    rulesState.value.loading = false;
   }
 }
 
