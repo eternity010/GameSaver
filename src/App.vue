@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
+import { useConfirmDialog } from "./composables/useConfirmDialog";
 import { useLibraryPage } from "./composables/useLibraryPage";
 import { useToast } from "./composables/useToast";
 import LearningPage from "./components/learning/LearningPage.vue";
@@ -54,14 +55,6 @@ type TabState = {
   loading: boolean;
   error: string;
 };
-type ConfirmDialogState = {
-  open: boolean;
-  title: string;
-  message: string;
-  confirmText: string;
-  cancelText: string;
-  danger: boolean;
-};
 type LearningBusyStage = "" | "starting" | "analyzing" | "saving";
 
 const step = ref<UiStep>("setup");
@@ -100,17 +93,8 @@ const eventCaptureError = ref("");
 const runtimeIsAdmin = ref(false);
 const runtimeMessage = ref("");
 const { toast, showToast, closeToast } = useToast();
-const confirmDialog = ref<ConfirmDialogState>({
-  open: false,
-  title: "",
-  message: "",
-  confirmText: "确认",
-  cancelText: "取消",
-  danger: false,
-});
+const { confirmDialog, askConfirm, resolveConfirm } = useConfirmDialog();
 const blockingErrorMessage = ref("");
-
-let confirmResolver: ((value: boolean) => void) | null = null;
 
 const hasHighConfidence = computed(() => candidates.value.some((item) => item.score >= 45));
 const ruleConflictByRuleId = computed<Record<string, RuleConflictItem>>(() => {
@@ -283,35 +267,6 @@ function showBlockingError(message: string) {
 
 function closeBlockingError() {
   blockingErrorMessage.value = "";
-}
-
-function askConfirm(options: {
-  title: string;
-  message: string;
-  confirmText?: string;
-  cancelText?: string;
-  danger?: boolean;
-}) {
-  return new Promise<boolean>((resolve) => {
-    confirmResolver = resolve;
-    confirmDialog.value = {
-      open: true,
-      title: options.title,
-      message: options.message,
-      confirmText: options.confirmText ?? "确认",
-      cancelText: options.cancelText ?? "取消",
-      danger: options.danger ?? false,
-    };
-  });
-}
-
-function resolveConfirm(result: boolean) {
-  const resolver = confirmResolver;
-  confirmResolver = null;
-  confirmDialog.value.open = false;
-  if (resolver) {
-    resolver(result);
-  }
 }
 
 const {
@@ -859,9 +814,6 @@ onMounted(() => {
   void reloadSettings();
 });
 
-onUnmounted(() => {
-  confirmResolver = null;
-});
 </script>
 
 <template>
