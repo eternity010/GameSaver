@@ -6,6 +6,9 @@ import LearningPage from "./components/learning/LearningPage.vue";
 import LibraryPage from "./components/library/LibraryPage.vue";
 import RulesPage from "./components/rules/RulesPage.vue";
 import SettingsPage from "./components/SettingsPage.vue";
+import AppToast from "./components/ui/AppToast.vue";
+import BlockingErrorDialog from "./components/ui/BlockingErrorDialog.vue";
+import ConfirmDialog from "./components/ui/ConfirmDialog.vue";
 import {
   confirmRule,
   deleteRule,
@@ -1008,38 +1011,26 @@ onUnmounted(() => {
       @undo-restore="undoLibraryRestore"
     />
 
-    <transition name="toast-fade">
-      <div v-if="toast.visible" class="toast" :class="toast.level" role="status" aria-live="polite">
-        <span>{{ toast.message }}</span>
-        <button type="button" class="toast-close" @click="closeToast">关闭</button>
-      </div>
-    </transition>
+    <AppToast
+      :visible="toast.visible"
+      :message="toast.message"
+      :level="toast.level"
+      @close="closeToast"
+    />
 
-    <div v-if="confirmDialog.open" class="modal-overlay" role="dialog" aria-modal="true">
-      <section class="modal">
-        <h3>{{ confirmDialog.title }}</h3>
-        <p>{{ confirmDialog.message }}</p>
-        <div class="row modal-actions">
-          <button type="button" @click="resolveConfirm(false)">{{ confirmDialog.cancelText }}</button>
-          <button
-            type="button"
-            :class="confirmDialog.danger ? 'danger' : 'primary'"
-            @click="resolveConfirm(true)"
-          >
-            {{ confirmDialog.confirmText }}
-          </button>
-        </div>
-      </section>
-    </div>
+    <ConfirmDialog
+      :open="confirmDialog.open"
+      :title="confirmDialog.title"
+      :message="confirmDialog.message"
+      :confirm-text="confirmDialog.confirmText"
+      :cancel-text="confirmDialog.cancelText"
+      :danger="confirmDialog.danger"
+      @resolve="resolveConfirm"
+    />
 
-    <div v-if="blockingErrorMessage" class="modal-overlay" role="dialog" aria-modal="true">
-      <section class="modal blocking-modal">
-        <h3>操作被阻止</h3>
-        <p>{{ blockingErrorMessage }}</p>
-        <div class="row modal-actions">
-          <button type="button" class="primary" @click="closeBlockingError">我知道了</button>
-        </div>
-      </section>
-    </div>
+    <BlockingErrorDialog
+      :message="blockingErrorMessage"
+      @close="closeBlockingError"
+    />
   </main>
 </template>
