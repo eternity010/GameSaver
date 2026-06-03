@@ -108,7 +108,7 @@ git push origin v0.1.0
 
 ## 当前开发进度
 
-- 版本状态：远端最新正式版本为 `v0.1.22`。
+- 版本状态：当前最新正式版本为 `v0.1.24`。
 - 后端状态：
   - `src-tauri/src/lib.rs` 是当前模块化入口。
   - `src-tauri/src/lib_legacy.rs` 仅作为历史参考，不再承接新功能。
@@ -118,12 +118,10 @@ git push origin v0.1.0
   - 已完成游戏库详情页第一轮压缩：顶部摘要、同步依据折叠、备份空间管理默认折叠。
   - 已完成设置页压缩：单一备份目录面板，默认路径折叠展示。
   - 已完成学习结果页压缩：候选路径默认展示推荐理由，得分和文件变化数折叠到“查看依据”。
-- 本地待提交改动：
-  - `src/components/SettingsPage.vue`
-  - `src/components/learning/LearningPage.vue`
-  - `src/components/library/LibraryDetailPanel.vue`
-  - `src/style.css`
-  - `README.md`
+- 本轮已完成：
+  - 学习结果页新增“代表性变更文件”依据展示，默认直出前三项，其余折叠。
+  - 规则管理页列表改为摘要优先，编辑区按需展开。
+  - 游戏库列表与详情区域的重叠问题已修复。
 # Version Release Checklist (Important)
 
 To avoid "new tag but old installer version" issues, keep these in sync before every release:
