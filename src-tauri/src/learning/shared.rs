@@ -1,4 +1,4 @@
-use crate::shared::CandidatePath;
+use crate::shared::{CandidatePath, RepresentativeChangedFile};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -15,19 +15,46 @@ pub(crate) const SCORE_USER_SAVE_ROOT_MATCH: i64 = 10;
 pub(crate) const SCORE_GAME_DIR_MATCH: i64 = 6;
 pub(crate) const SCORE_SIZE_REASONABLE: i64 = 6;
 pub(crate) const SCORE_NOISE_PATH_PENALTY: i64 = 30;
+pub(crate) const SCORE_STRONG_NOISE_PATH_PENALTY: i64 = 20;
 pub(crate) const SCORE_NOISE_FILENAME_PENALTY: i64 = 20;
+pub(crate) const SCORE_NOISE_EXTENSION_PENALTY: i64 = 12;
 pub(crate) const SCORE_TOO_MANY_CHANGES_PENALTY: i64 = 20;
 pub(crate) const SCORE_WEAK_ONLY_PENALTY: i64 = 15;
 pub(crate) const LOW_CONFIDENCE_THRESHOLD: i64 = 45;
 pub(crate) const RECOMMENDED_SCORE_THRESHOLD: i64 = 80;
 pub(crate) const STRONG_SCORE_THRESHOLD: i64 = 100;
+pub(crate) const REPRESENTATIVE_FILE_LIMIT: usize = 5;
 pub(crate) const STRONG_SAVE_EXTENSIONS: [&str; 4] = ["sav", "save", "profile", "slot"];
 pub(crate) const WEAK_SAVE_EXTENSIONS: [&str; 3] = ["dat", "json", "bin"];
+pub(crate) const NOISE_EXTENSIONS: [&str; 5] = ["log", "tmp", "bak", "dmp", "mdmp"];
 pub(crate) const PATH_KEYWORDS: [&str; 4] = ["save", "savedata", "profile", "userdata"];
 pub(crate) const FILENAME_SAVE_KEYWORDS: [&str; 5] = ["save", "slot", "profile", "global", "system"];
-pub(crate) const NOISE_FILENAME_KEYWORDS: [&str; 8] =
-    ["config", "settings", "log", "cache", "crash", "tmp", "temp", "shader"];
-pub(crate) const WEAK_PATH_FRAGMENTS: [&str; 7] = [
+pub(crate) const NOISE_FILENAME_KEYWORDS: [&str; 15] = [
+    "config",
+    "settings",
+    "log",
+    "cache",
+    "crash",
+    "tmp",
+    "temp",
+    "shader",
+    "bak",
+    "backup",
+    "dump",
+    "telemetry",
+    "analytics",
+    "prefs",
+    "option",
+];
+pub(crate) const STRONG_NOISE_PATH_FRAGMENTS: [&str; 6] = [
+    "\\telemetry\\",
+    "\\analytics\\",
+    "\\crashdumps\\",
+    "\\dumps\\",
+    "\\gpucache\\",
+    "\\webcache\\",
+];
+pub(crate) const WEAK_PATH_FRAGMENTS: [&str; 14] = [
     "\\cache\\",
     "\\logs\\",
     "\\log\\",
@@ -35,8 +62,15 @@ pub(crate) const WEAK_PATH_FRAGMENTS: [&str; 7] = [
     "\\config\\",
     "\\settings\\",
     "\\shader",
+    "\\backup\\",
+    "\\temp\\",
+    "\\tmp\\",
+    "\\telemetry\\",
+    "\\analytics\\",
+    "\\dumps\\",
+    "\\crashdumps\\",
 ];
-pub(crate) const NOISE_PATH_FRAGMENTS: [&str; 13] = [
+pub(crate) const NOISE_PATH_FRAGMENTS: [&str; 15] = [
     "\\appdata\\local\\temp\\",
     "\\appdata\\local\\tencent\\wetype\\",
     "\\appdata\\locallow\\tencent\\wetype\\",
@@ -48,6 +82,8 @@ pub(crate) const NOISE_PATH_FRAGMENTS: [&str; 13] = [
     "\\appdata\\roaming\\mozilla\\firefox\\profiles\\",
     "\\appdata\\local\\mozilla\\firefox\\profiles\\",
     "\\appdata\\roaming\\microsoft\\windows\\",
+    "\\appdata\\local\\discord\\",
+    "\\appdata\\roaming\\discord\\",
     "\\$recycle.bin\\",
     "\\ebwebview\\",
 ];
@@ -66,6 +102,16 @@ pub(crate) struct EventCaptureHandle {
     pub(crate) etl_path: PathBuf,
 }
 
+#[derive(Clone)]
+pub(crate) struct RepresentativeFileAccumulator {
+    pub(crate) path: String,
+    pub(crate) change_kind: String,
+    pub(crate) size: u64,
+    pub(crate) modified_unix: u64,
+    pub(crate) extension: String,
+    pub(crate) score: i64,
+}
+
 #[derive(Default)]
 pub(crate) struct CandidateAccumulator {
     pub(crate) path: String,
@@ -82,7 +128,10 @@ pub(crate) struct CandidateAccumulator {
     pub(crate) user_save_root_hits: usize,
     pub(crate) game_dir_hits: usize,
     pub(crate) noise_hits: usize,
+    pub(crate) strong_noise_hits: usize,
     pub(crate) noise_filename_hits: usize,
+    pub(crate) noise_extension_hits: usize,
+    pub(crate) representative_files: Vec<RepresentativeFileAccumulator>,
     pub(crate) signals: HashSet<String>,
 }
 
@@ -125,8 +174,14 @@ impl CandidateAccumulator {
         if self.noise_hits > 0 {
             score -= SCORE_NOISE_PATH_PENALTY;
         }
+        if self.strong_noise_hits > 0 {
+            score -= SCORE_STRONG_NOISE_PATH_PENALTY;
+        }
         if self.noise_filename_hits > 0 {
             score -= SCORE_NOISE_FILENAME_PENALTY;
+        }
+        if self.noise_extension_hits > 0 {
+            score -= SCORE_NOISE_EXTENSION_PENALTY;
         }
         if self.changed_files > 200 {
             score -= SCORE_TOO_MANY_CHANGES_PENALTY;
@@ -150,7 +205,11 @@ impl CandidateAccumulator {
         .into_iter()
         .filter(|hit| *hit)
         .count();
-        let noisy = self.noise_hits > 0 || self.noise_filename_hits > 0 || self.changed_files > 200;
+        let noisy = self.noise_hits > 0
+            || self.strong_noise_hits > 0
+            || self.noise_filename_hits > 0
+            || self.noise_extension_hits > 0
+            || self.changed_files > 200;
         let strong_signals = self.time_hits > 0
             && self.keyword_hits > 0
             && (self.extension_hits > 0 || self.game_name_hits > 0);
@@ -173,6 +232,25 @@ impl CandidateAccumulator {
             base_recommendation
         };
 
+        let mut representative_files = self.representative_files;
+        representative_files.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| b.modified_unix.cmp(&a.modified_unix))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        representative_files.truncate(REPRESENTATIVE_FILE_LIMIT);
+        let representative_changed_files = representative_files
+            .into_iter()
+            .map(|file| RepresentativeChangedFile {
+                path: file.path,
+                change_kind: file.change_kind,
+                size: file.size,
+                modified_unix: file.modified_unix,
+                extension: file.extension,
+            })
+            .collect::<Vec<_>>();
+
         CandidatePath {
             path: self.path,
             score,
@@ -180,6 +258,7 @@ impl CandidateAccumulator {
             added_files: self.added_files,
             modified_files: self.modified_files,
             matched_signals: signals,
+            representative_changed_files,
             recommendation: recommendation.to_string(),
             collapsed: score < LOW_CONFIDENCE_THRESHOLD,
         }

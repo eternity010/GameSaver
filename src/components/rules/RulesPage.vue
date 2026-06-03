@@ -153,6 +153,14 @@ function ruleDraftAnchorTokens(ruleId: string): string[] {
   return collectAnchorTokens(paths);
 }
 
+function firstRuleDraftPath(ruleId: string): string {
+  const raw = props.ruleDrafts[ruleId]?.confirmedPathsText ?? "";
+  return raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean) ?? "";
+}
+
 function ruleUsesGameDirToken(rule: GameSaveRule | null | undefined): boolean {
   if (!rule) return false;
   return rule.confirmedPaths.some((path) => path.toUpperCase().includes("%GAME_DIR%"));
@@ -288,6 +296,20 @@ function updateRuleDraft(ruleId: string, patch: Partial<RuleDraft>) {
                 <span>{{ rule.confirmedPaths.length }} 条存档路径</span>
                 <span>更新 {{ formatUnixTs(rule.updatedAt) }}</span>
               </div>
+              <div class="rule-summary-line">
+                <span
+                  v-for="token in ruleDraftAnchorTokens(rule.ruleId)"
+                  :key="`${rule.ruleId}-summary-${token}`"
+                  class="anchor-chip compact"
+                  :class="{ warning: token === '%GAME_DIR%', fallback: token === '%USERPROFILE%' }"
+                  :title="pathAnchorDescription(token)"
+                >
+                  {{ pathAnchorLabel(token) }}
+                </span>
+                <code v-if="firstRuleDraftPath(rule.ruleId)" class="rule-path-preview">
+                  {{ firstRuleDraftPath(rule.ruleId) }}
+                </code>
+              </div>
               <section v-if="ruleConflictFor(rule.ruleId)" class="rule-conflict-box">
                 <p>
                   这个游戏程序同时匹配到 {{ ruleConflictFor(rule.ruleId)?.conflictCount }} 条规则：
@@ -331,56 +353,50 @@ function updateRuleDraft(ruleId: string, patch: Partial<RuleDraft>) {
               <span class="switch-text">启用</span>
             </label>
           </div>
-          <label class="field compact-field">
-            <span>游戏名（gameId）</span>
-            <input
-              :value="ruleDrafts[rule.ruleId].gameIdText"
-              type="text"
-              class="gameid-editor"
-              placeholder="例如：elden_ring"
-              @input="updateRuleDraft(rule.ruleId, { gameIdText: ($event.target as HTMLInputElement).value })"
-            />
-          </label>
-          <label class="field compact-field">
-            <span>存档路径（每行一条）</span>
-            <div v-if="ruleDraftAnchorTokens(rule.ruleId).length" class="anchor-chip-row">
-              <span
-                v-for="token in ruleDraftAnchorTokens(rule.ruleId)"
-                :key="`${rule.ruleId}-${token}`"
-                class="anchor-chip"
-                :class="{ warning: token === '%GAME_DIR%', fallback: token === '%USERPROFILE%' }"
-                :title="pathAnchorDescription(token)"
-              >
-                {{ pathAnchorLabel(token) }}
-              </span>
+          <details class="rule-edit-details" :open="hasRuleDraftChanges(rule)">
+            <summary>{{ hasRuleDraftChanges(rule) ? "继续编辑" : "编辑规则" }}</summary>
+            <div class="rule-edit-body">
+              <label class="field compact-field">
+                <span>游戏名（gameId）</span>
+                <input
+                  :value="ruleDrafts[rule.ruleId].gameIdText"
+                  type="text"
+                  class="gameid-editor"
+                  placeholder="例如：elden_ring"
+                  @input="updateRuleDraft(rule.ruleId, { gameIdText: ($event.target as HTMLInputElement).value })"
+                />
+              </label>
+              <label class="field compact-field">
+                <span>存档路径（每行一条）</span>
+                <p v-if="ruleDraftAnchorTokens(rule.ruleId).length" class="field-note anchor-note">
+                  {{ ruleAnchorHint(ruleDraftAnchorTokens(rule.ruleId)) }}
+                </p>
+                <p v-if="ruleUsesGameDirToken(rule)" class="field-note token-note">
+                  此规则包含 <code>%GAME_DIR%</code>，路径会跟随当前绑定的游戏 EXE 所在目录动态解析。
+                </p>
+                <textarea
+                  :value="ruleDrafts[rule.ruleId].confirmedPathsText"
+                  rows="4"
+                  class="paths-editor"
+                  placeholder="每行一条路径"
+                  @input="updateRuleDraft(rule.ruleId, { confirmedPathsText: ($event.target as HTMLTextAreaElement).value })"
+                />
+              </label>
+              <div class="row rule-actions-row">
+                <button
+                  :disabled="rulesState.loading || !hasRuleDraftChanges(rule)"
+                  type="button"
+                  class="primary"
+                  @click="emit('save-rule', rule)"
+                >
+                  保存变更
+                </button>
+                <button :disabled="rulesState.loading" type="button" class="danger" @click="emit('remove-rule', rule)">
+                  删除规则
+                </button>
+              </div>
             </div>
-            <p v-if="ruleDraftAnchorTokens(rule.ruleId).length" class="field-note anchor-note">
-              {{ ruleAnchorHint(ruleDraftAnchorTokens(rule.ruleId)) }}
-            </p>
-            <p v-if="ruleUsesGameDirToken(rule)" class="field-note token-note">
-              此规则包含 <code>%GAME_DIR%</code>，路径会跟随当前绑定的游戏 EXE 所在目录动态解析。
-            </p>
-            <textarea
-              :value="ruleDrafts[rule.ruleId].confirmedPathsText"
-              rows="4"
-              class="paths-editor"
-              placeholder="每行一条路径"
-              @input="updateRuleDraft(rule.ruleId, { confirmedPathsText: ($event.target as HTMLTextAreaElement).value })"
-            />
-          </label>
-          <div class="row rule-actions-row">
-            <button
-              :disabled="rulesState.loading || !hasRuleDraftChanges(rule)"
-              type="button"
-              class="primary"
-              @click="emit('save-rule', rule)"
-            >
-              保存变更
-            </button>
-            <button :disabled="rulesState.loading" type="button" class="danger" @click="emit('remove-rule', rule)">
-              删除规则
-            </button>
-          </div>
+          </details>
         </template>
       </li>
     </ul>

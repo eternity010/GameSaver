@@ -19,6 +19,16 @@ pub(crate) struct Snapshot {
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct RepresentativeChangedFile {
+    pub(crate) path: String,
+    pub(crate) change_kind: String,
+    pub(crate) size: u64,
+    pub(crate) modified_unix: u64,
+    pub(crate) extension: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct CandidatePath {
     pub(crate) path: String,
     pub(crate) score: i64,
@@ -26,6 +36,8 @@ pub(crate) struct CandidatePath {
     pub(crate) added_files: usize,
     pub(crate) modified_files: usize,
     pub(crate) matched_signals: Vec<String>,
+    #[serde(default)]
+    pub(crate) representative_changed_files: Vec<RepresentativeChangedFile>,
     pub(crate) recommendation: String,
     pub(crate) collapsed: bool,
 }

@@ -100,16 +100,58 @@ function candidateSignalLabel(signal: string): string {
   if (signal === "user-save-root") return "位于常见用户存档目录";
   if (signal === "game-dir") return "位于游戏目录";
   if (signal === "path-noise") return "包含缓存/日志等弱相关路径";
+  if (signal === "path-noise-strong") return "命中强噪声目录";
   if (signal === "system-noise") return "像系统或常驻应用目录";
   if (signal === "filename-noise") return "文件名像配置/缓存/日志";
   if (signal.startsWith("extension:")) return `命中存档扩展名 .${signal.slice("extension:".length)}`;
   if (signal.startsWith("weak-extension:")) return `命中弱扩展名 .${signal.slice("weak-extension:".length)}`;
+  if (signal.startsWith("noise-extension:")) return `命中噪声扩展名 .${signal.slice("noise-extension:".length)}`;
   return signal;
 }
 
 function candidateSignalSummary(item: CandidatePath): string {
   if (!item.matchedSignals.length) return "暂无明显理由";
   return item.matchedSignals.map(candidateSignalLabel).join(" / ");
+}
+
+function representativeFiles(item: CandidatePath) {
+  return item.representativeChangedFiles ?? [];
+}
+
+function changedFileName(path: string): string {
+  return path.split(/[\\/]+/).filter(Boolean).pop() || path;
+}
+
+function changedFileRelativePath(filePath: string, parentPath: string): string {
+  const normalizedFile = filePath.replace(/\//g, "\\");
+  const normalizedParent = parentPath.replace(/\//g, "\\").replace(/\\+$/, "");
+  if (normalizedFile.toLowerCase().startsWith(`${normalizedParent.toLowerCase()}\\`)) {
+    return normalizedFile.slice(normalizedParent.length + 1);
+  }
+  return normalizedFile;
+}
+
+function changedFileKindLabel(kind: string): string {
+  return kind === "added" ? "新增" : "修改";
+}
+
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let size = value;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  return `${size >= 10 || unitIndex === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function formatUnixTime(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "时间未知";
+  const date = new Date(value * 1000);
+  if (Number.isNaN(date.getTime())) return "时间未知";
+  return date.toLocaleString();
 }
 
 function learningBusyLabel(): string {
@@ -275,6 +317,20 @@ function learningBusyLabel(): string {
                   得分 {{ item.score }} · changed {{ item.changedFiles }} · added {{ item.addedFiles }} ·
                   modified {{ item.modifiedFiles }}
                 </p>
+                <div v-if="representativeFiles(item).length" class="candidate-file-evidence">
+                  <strong>代表性变更文件</strong>
+                  <ul>
+                    <li v-for="file in representativeFiles(item)" :key="file.path">
+                      <div>
+                        <span class="candidate-file-name">{{ changedFileName(file.path) }}</span>
+                        <code>{{ changedFileRelativePath(file.path, item.path) }}</code>
+                      </div>
+                      <span>{{ changedFileKindLabel(file.changeKind) }}</span>
+                      <span>{{ formatBytes(file.size) }}</span>
+                      <time>{{ formatUnixTime(file.modifiedUnix) }}</time>
+                    </li>
+                  </ul>
+                </div>
               </details>
             </li>
           </ul>

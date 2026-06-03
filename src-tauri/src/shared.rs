@@ -25,7 +25,7 @@ pub(crate) use backup::{
 };
 pub(crate) use config::ExecutionConfig;
 pub(crate) use launcher::LauncherSession;
-pub(crate) use learning::{CandidatePath, FileMeta, LearningSession, Snapshot};
+pub(crate) use learning::{CandidatePath, FileMeta, LearningSession, RepresentativeChangedFile, Snapshot};
 pub(crate) use migration::{ExportMigrationZipResult, ImportMigrationZipResult};
 pub(crate) use precheck::{
     GameLaunchPrecheck, GameLibraryItem, LaunchPrecheckCheck, LaunchSyncDecision,

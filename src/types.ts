@@ -1,3 +1,11 @@
+export interface RepresentativeChangedFile {
+  path: string;
+  changeKind: "added" | "modified" | string;
+  size: number;
+  modifiedUnix: number;
+  extension: string;
+}
+
 export interface CandidatePath {
   path: string;
   score: number;
@@ -5,6 +13,7 @@ export interface CandidatePath {
   addedFiles: number;
   modifiedFiles: number;
   matchedSignals: string[];
+  representativeChangedFiles?: RepresentativeChangedFile[];
   recommendation: "strong" | "recommended" | "possible" | "weak";
   collapsed: boolean;
 }

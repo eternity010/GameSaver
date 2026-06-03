@@ -370,6 +370,7 @@ button:disabled {
   grid-template-columns: 1fr;
   gap: 6px;
   align-items: start;
+  min-width: 0;
 }
 
 .library-grid.single {
@@ -502,7 +503,7 @@ button:disabled {
 .rule-card {
   border: 1px solid #c8d7e3;
   border-radius: 12px;
-  padding: 12px;
+  padding: 10px 12px;
   background: #ffffff;
 }
 
@@ -539,6 +540,8 @@ button:disabled {
   background: transparent;
   padding: 8px 10px;
   cursor: pointer;
+  min-width: 0;
+  overflow: hidden;
   transition:
     background 0.15s ease,
     border-color 0.15s ease,
@@ -869,7 +872,7 @@ button:disabled {
 
 .library-game-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 10px;
   min-width: 0;
 }
@@ -940,7 +943,11 @@ button:disabled {
 }
 
 .session-mini {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  max-width: 72px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 12px;
   color: #35536c;
   background: #f2f7fc;
@@ -1005,6 +1012,7 @@ button:disabled {
   background: #fbfdff;
   max-height: calc(100vh - 32px);
   overflow: auto;
+  min-width: 0;
 }
 
 .detail-head {
@@ -1558,6 +1566,73 @@ button:disabled {
   font-size: 12px;
 }
 
+.candidate-file-evidence {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+  border: 1px solid #d9e6f0;
+  border-radius: 8px;
+  background: #f7fbff;
+  padding: 8px;
+}
+
+.candidate-file-evidence > strong {
+  color: #2e5068;
+  font-size: 12px;
+}
+
+.candidate-file-evidence ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.candidate-file-evidence li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #e0ebf3;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 6px 8px;
+}
+
+.candidate-file-evidence li > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.candidate-file-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #23455f;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.candidate-file-evidence code {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #5f768a;
+  font-size: 11px;
+}
+
+.candidate-file-evidence li > span,
+.candidate-file-evidence time {
+  color: #5a7286;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
 .rule-head {
   display: flex;
   justify-content: space-between;
@@ -1568,6 +1643,7 @@ button:disabled {
 .rule-title-block {
   display: grid;
   gap: 6px;
+  min-width: 0;
 }
 
 .rule-name-row {
@@ -1578,7 +1654,11 @@ button:disabled {
 }
 
 .rule-name-row strong {
-  font-size: 24px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 22px;
   line-height: 1.2;
 }
 
@@ -1595,6 +1675,29 @@ button:disabled {
   border: 1px solid #d6e2ec;
   border-radius: 999px;
   padding: 2px 8px;
+}
+
+.rule-summary-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.rule-path-preview {
+  display: inline-block;
+  min-width: 180px;
+  max-width: min(720px, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #26465e;
+  background: #f7fbff;
+  border: 1px solid #d6e2ec;
+  border-radius: 999px;
+  padding: 3px 9px;
+  font-size: 12px;
 }
 
 .rule-technical-details {
@@ -1697,6 +1800,43 @@ button:disabled {
   margin-bottom: 0;
 }
 
+.rule-edit-details {
+  margin-top: 8px;
+  border-top: 1px solid #edf3f8;
+  padding-top: 8px;
+}
+
+.rule-edit-details summary {
+  list-style: none;
+  cursor: pointer;
+  color: #315a75;
+  font-size: 13px;
+  font-weight: 600;
+  user-select: none;
+}
+
+.rule-edit-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.rule-edit-details summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  color: #5a7892;
+  transition: transform 0.15s ease;
+}
+
+.rule-edit-details[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.rule-edit-body {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
 .paths-editor {
   margin: 0;
   font-family: "Cascadia Code", "Consolas", monospace;
@@ -1721,7 +1861,6 @@ button:disabled {
 
 .status-pill {
   display: inline-block;
-  margin-left: 8px;
   padding: 2px 8px;
   border-radius: 999px;
   font-size: 12px;
