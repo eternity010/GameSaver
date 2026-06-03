@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import type { CandidatePath } from "../../types";
+import type { CandidatePath, RepresentativeChangedFile } from "../../types";
 
 type UiStep = "setup" | "running" | "results";
 type TabState = {
@@ -116,6 +116,14 @@ function candidateSignalSummary(item: CandidatePath): string {
 
 function representativeFiles(item: CandidatePath) {
   return item.representativeChangedFiles ?? [];
+}
+
+function representativeFilesPreview(item: CandidatePath): RepresentativeChangedFile[] {
+  return representativeFiles(item).slice(0, 3);
+}
+
+function representativeFilesRemaining(item: CandidatePath): RepresentativeChangedFile[] {
+  return representativeFiles(item).slice(3);
 }
 
 function changedFileName(path: string): string {
@@ -320,7 +328,7 @@ function learningBusyLabel(): string {
                 <div v-if="representativeFiles(item).length" class="candidate-file-evidence">
                   <strong>代表性变更文件</strong>
                   <ul>
-                    <li v-for="file in representativeFiles(item)" :key="file.path">
+                    <li v-for="file in representativeFilesPreview(item)" :key="file.path">
                       <div>
                         <span class="candidate-file-name">{{ changedFileName(file.path) }}</span>
                         <code>{{ changedFileRelativePath(file.path, item.path) }}</code>
@@ -330,6 +338,20 @@ function learningBusyLabel(): string {
                       <time>{{ formatUnixTime(file.modifiedUnix) }}</time>
                     </li>
                   </ul>
+                  <details v-if="representativeFilesRemaining(item).length" class="candidate-file-more">
+                    <summary>还有 {{ representativeFilesRemaining(item).length }} 个代表性变更文件</summary>
+                    <ul>
+                      <li v-for="file in representativeFilesRemaining(item)" :key="`${item.path}-${file.path}`">
+                        <div>
+                          <span class="candidate-file-name">{{ changedFileName(file.path) }}</span>
+                          <code>{{ changedFileRelativePath(file.path, item.path) }}</code>
+                        </div>
+                        <span>{{ changedFileKindLabel(file.changeKind) }}</span>
+                        <span>{{ formatBytes(file.size) }}</span>
+                        <time>{{ formatUnixTime(file.modifiedUnix) }}</time>
+                      </li>
+                    </ul>
+                  </details>
                 </div>
               </details>
             </li>

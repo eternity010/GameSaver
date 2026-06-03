@@ -1633,6 +1633,37 @@ button:disabled {
   white-space: nowrap;
 }
 
+.candidate-file-more {
+  display: grid;
+  gap: 6px;
+  margin-top: 2px;
+  padding-top: 2px;
+  border-top: 1px dashed #dce8f2;
+}
+
+.candidate-file-more summary {
+  list-style: none;
+  cursor: pointer;
+  color: #3a5a72;
+  font-size: 12px;
+  user-select: none;
+}
+
+.candidate-file-more summary::-webkit-details-marker {
+  display: none;
+}
+
+.candidate-file-more summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 0.15s ease;
+}
+
+.candidate-file-more[open] summary::before {
+  transform: rotate(90deg);
+}
+
 .rule-head {
   display: flex;
   justify-content: space-between;
