@@ -18,6 +18,8 @@ use tauri::{AppHandle, Manager, State};
 use walkdir::WalkDir;
 use uuid::Uuid;
 
+const MAX_BACKUP_FILE_BYTES: u64 = 100 * 1024 * 1024;
+
 pub(crate) struct LaunchPreparation {
     pub(crate) session: LauncherSession,
     pub(crate) execution_config: ExecutionConfig,
@@ -26,6 +28,12 @@ pub(crate) struct LaunchPreparation {
     pub(crate) unresolved_primary_conflict: bool,
     pub(crate) require_rule_match: bool,
     pub(crate) expected_game_key: Option<String>,
+}
+
+#[derive(Default)]
+struct BackupSyncSummary {
+    changed_files: usize,
+    skipped_large_files: usize,
 }
 
 pub(crate) fn append_session_log(session: &mut LauncherSession, message: &str) {
@@ -494,6 +502,36 @@ fn sync_directory(source: &Path, target: &Path) -> Result<usize, String> {
     Ok(copied)
 }
 
+fn is_backup_file_too_large(path: &Path) -> bool {
+    path.metadata()
+        .map(|metadata| metadata.len() > MAX_BACKUP_FILE_BYTES)
+        .unwrap_or(false)
+}
+
+fn sync_backup_directory(source: &Path, target: &Path) -> Result<usize, String> {
+    if !source.exists() {
+        return Ok(0);
+    }
+    fs::create_dir_all(target).map_err(|err| format!("create directory failed: {err}"))?;
+    let mut copied = 0usize;
+    for entry in WalkDir::new(source).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() || is_backup_file_too_large(entry.path()) {
+            continue;
+        }
+        let relative = match entry.path().strip_prefix(source) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let dest = target.join(relative);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|err| format!("create directory failed: {err}"))?;
+        }
+        fs::copy(entry.path(), &dest).map_err(|err| format!("copy file failed: {err}"))?;
+        copied += 1;
+    }
+    Ok(copied)
+}
+
 fn file_signature(path: &Path) -> Option<(u64, u64)> {
     let metadata = path.metadata().ok()?;
     let size = metadata.len();
@@ -505,16 +543,16 @@ fn file_signature(path: &Path) -> Option<(u64, u64)> {
     Some((size, modified))
 }
 
-fn sync_source_to_backup_slot(source: &Path, latest_slot: &Path, version_slot: &Path) -> Result<usize, String> {
+fn sync_source_to_backup_slot(source: &Path, latest_slot: &Path, version_slot: &Path) -> Result<BackupSyncSummary, String> {
     if !source.exists() {
         if latest_slot.exists() {
             fs::remove_dir_all(latest_slot).map_err(|err| format!("clean old latest failed: {err}"))?;
         }
-        return Ok(0);
+        return Ok(BackupSyncSummary::default());
     }
     fs::create_dir_all(latest_slot).map_err(|err| format!("create directory failed: {err}"))?;
 
-    let mut changed = 0usize;
+    let mut summary = BackupSyncSummary::default();
     let mut source_files = HashSet::new();
     for entry in WalkDir::new(source).into_iter().filter_map(Result::ok) {
         if !entry.file_type().is_file() {
@@ -524,6 +562,10 @@ fn sync_source_to_backup_slot(source: &Path, latest_slot: &Path, version_slot: &
             Ok(value) => value,
             Err(_) => continue,
         };
+        if is_backup_file_too_large(entry.path()) {
+            summary.skipped_large_files += 1;
+            continue;
+        }
         let key = normalize_windows_path(&relative.to_string_lossy());
         source_files.insert(key);
         let latest_file = latest_slot.join(relative);
@@ -537,7 +579,7 @@ fn sync_source_to_backup_slot(source: &Path, latest_slot: &Path, version_slot: &
                 fs::create_dir_all(parent).map_err(|err| format!("create directory failed: {err}"))?;
             }
             fs::copy(entry.path(), &version_file).map_err(|err| format!("copy file failed: {err}"))?;
-            changed += 1;
+            summary.changed_files += 1;
         }
     }
 
@@ -560,17 +602,17 @@ fn sync_source_to_backup_slot(source: &Path, latest_slot: &Path, version_slot: &
         let _ = fs::remove_file(stale);
     }
     if stale_count > 0 {
-        changed += stale_count;
+        summary.changed_files += stale_count;
     }
 
-    if changed > 0 {
+    if summary.changed_files > 0 {
         if version_slot.exists() {
             fs::remove_dir_all(version_slot).map_err(|err| format!("cleanup version snapshot failed: {err}"))?;
         }
-        let _ = sync_directory(source, version_slot)?;
+        let _ = sync_backup_directory(source, version_slot)?;
     }
 
-    Ok(changed)
+    Ok(summary)
 }
 
 fn build_backup_manifest(version_root: &Path, snapshot_id: &str, game_uid: &str) -> Result<BackupManifest, String> {
@@ -649,24 +691,26 @@ fn backup_current_state_for_rule(
     let snapshot_id = now_unix().to_string();
     let version_root = versions.join(&snapshot_id);
 
-    let mut changed_total = 0usize;
+    let mut summary = BackupSyncSummary::default();
     for source in &rule.confirmed_paths {
         let runtime_path = expand_confirmed_path_for_runtime(source, exe_path)?;
         let runtime_source = Path::new(&runtime_path);
         let slot = backup_slot_name(source);
-        let changed = sync_source_to_backup_slot(runtime_source, &latest.join(&slot), &version_root.join(&slot))?;
-        changed_total += changed;
+        let source_summary = sync_source_to_backup_slot(runtime_source, &latest.join(&slot), &version_root.join(&slot))?;
+        summary.changed_files += source_summary.changed_files;
+        summary.skipped_large_files += source_summary.skipped_large_files;
     }
-    if changed_total == 0 && version_root.exists() {
+    if summary.changed_files == 0 && version_root.exists() {
         let _ = fs::remove_dir_all(&version_root);
-    } else if changed_total > 0 {
+    } else if summary.changed_files > 0 {
         let manifest = build_backup_manifest(&version_root, &snapshot_id, &rule.game_uid)?;
         write_pretty_json_file(&version_root.join("manifest.json"), &manifest)?;
     }
     cleanup_backup_versions(&versions, keep_versions)?;
     Ok(BackupRunResult {
-        changed_files: changed_total,
-        version_id: if changed_total > 0 { Some(snapshot_id) } else { None },
+        changed_files: summary.changed_files,
+        skipped_large_files: summary.skipped_large_files,
+        version_id: if summary.changed_files > 0 { Some(snapshot_id) } else { None },
     })
 }
 
@@ -693,17 +737,27 @@ fn spawn_post_exit_backup_worker(
                 match backup_result {
                     Ok(result) => {
                         if let Some(snapshot) = result.version_id {
+                            let skipped_note = if result.skipped_large_files > 0 {
+                                format!(", skipped {} files over 100 MB", result.skipped_large_files)
+                            } else {
+                                String::new()
+                            };
                             append_session_log(
                                 session,
                                 &format!(
-                                    "Automatic backup completed: detected {} changed files, created version {}, keep {}",
-                                    result.changed_files, snapshot, keep_versions
+                                    "Automatic backup completed: detected {} changed files{}, created version {}, keep {}",
+                                    result.changed_files, skipped_note, snapshot, keep_versions
                                 ),
                             );
                         } else {
+                            let skipped_note = if result.skipped_large_files > 0 {
+                                format!(" (skipped {} files over 100 MB)", result.skipped_large_files)
+                            } else {
+                                String::new()
+                            };
                             append_session_log(
                                 session,
-                                "No save changes detected, skipped creating a new backup version",
+                                &format!("No save changes detected, skipped creating a new backup version{skipped_note}"),
                             );
                         }
                     }

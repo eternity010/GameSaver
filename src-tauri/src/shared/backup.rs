@@ -12,6 +12,7 @@ pub(crate) struct BackupVersion {
 
 pub(crate) struct BackupRunResult {
     pub(crate) changed_files: usize,
+    pub(crate) skipped_large_files: usize,
     pub(crate) version_id: Option<String>,
 }
 
