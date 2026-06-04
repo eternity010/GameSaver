@@ -13,8 +13,8 @@ mod snapshot;
 pub(crate) use capture::is_running_as_admin;
 #[allow(unused_imports)]
 pub(crate) use commands::{
-    confirm_rule, finish_learning, get_learning_session, launch_game, open_candidate_path,
-    start_finish_learning_task, start_learning,
+    cancel_learning, confirm_rule, finish_learning, get_learning_session, launch_game, open_candidate_path,
+    start_finish_learning_task, start_learning, start_retry_finish_learning_task,
 };
 #[allow(unused_imports)]
 pub(crate) use snapshot::normalize_learning_scan_root;

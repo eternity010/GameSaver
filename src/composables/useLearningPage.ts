@@ -1,5 +1,6 @@
 import { computed, ref } from "vue";
 import {
+  cancelLearning,
   confirmRule,
   getLearningSession,
   getRuntimeStatus,
@@ -8,6 +9,7 @@ import {
   restartAsAdmin,
   startFinishLearningTask,
   startLearning,
+  startRetryFinishLearningTask,
 } from "../api";
 import type { CandidatePath, TaskState } from "../types";
 
@@ -86,6 +88,13 @@ function inferGameId(path: string): string {
 
 export function useLearningPage(options: {
   waitForTaskCompletion: WaitForTaskCompletion;
+  askConfirm: (options: {
+    title: string;
+    message: string;
+    confirmText?: string;
+    cancelText?: string;
+    danger?: boolean;
+  }) => Promise<boolean>;
   showToast: (message: string, level?: "success" | "error" | "info", timeoutMs?: number) => void;
   afterRuleSaved: (gameId: string) => Promise<void>;
 }) {
@@ -108,6 +117,24 @@ export function useLearningPage(options: {
   const runtimeMessage = ref("");
 
   const hasHighConfidence = computed(() => candidates.value.some((item) => item.score >= 45));
+
+  function resetLearningState() {
+    step.value = "setup";
+    gameId.value = "";
+    exePath.value = "";
+    extraScanRootsText.value = "";
+    sessionId.value = "";
+    pid.value = null;
+    candidates.value = [];
+    selected.value = [];
+    learningState.value = { loading: false, error: "" };
+    learningBusyStage.value = "";
+    learningTaskMessage.value = "";
+    learningTaskProgress.value = null;
+    eventCaptureMode.value = "unknown";
+    capturedEventCount.value = 0;
+    eventCaptureError.value = "";
+  }
 
   function toggleSelect(path: string) {
     if (selected.value.includes(path)) {
@@ -222,6 +249,77 @@ export function useLearningPage(options: {
     }
   }
 
+  async function retryLearningAnalysis() {
+    if (!sessionId.value.trim()) {
+      learningState.value.error = "当前没有可重新分析的学习会话。";
+      return;
+    }
+    learningBusyStage.value = "analyzing";
+    learningState.value.loading = true;
+    learningState.value.error = "";
+    learningTaskMessage.value = "正在重新分析存档变化...";
+    learningTaskProgress.value = null;
+    candidates.value = [];
+    selected.value = [];
+    step.value = "running";
+    try {
+      const taskId = await startRetryFinishLearningTask(sessionId.value);
+      const finalTask = await options.waitForTaskCompletion<CandidatePath[]>(
+        taskId,
+        (message, progress) => {
+          learningTaskMessage.value = message || "正在重新分析存档变化...";
+          learningTaskProgress.value = progress;
+        },
+      );
+      if (finalTask.status === "failed") {
+        throw new Error(finalTask.error || "重新分析失败");
+      }
+      const taskResult = finalTask.result;
+      candidates.value = Array.isArray(taskResult) ? taskResult : [];
+      const session = await getLearningSession(sessionId.value);
+      eventCaptureMode.value = session.eventCaptureMode ?? "unknown";
+      capturedEventCount.value = session.capturedEventCount ?? 0;
+      eventCaptureError.value = session.eventCaptureError ?? "";
+      const autoSelectable = candidates.value.filter(
+        (item) => item.recommendation === "strong" || item.recommendation === "recommended",
+      );
+      selected.value = autoSelectable.slice(0, 2).map((item) => item.path);
+      step.value = "results";
+      if (!hasHighConfidence.value) {
+        options.showToast("仍未检测到高可信候选，请确认游戏内已完成保存动作", "info", 3600);
+      }
+    } catch (err) {
+      learningState.value.error = String(err);
+      step.value = "results";
+    } finally {
+      learningState.value.loading = false;
+      learningBusyStage.value = "";
+      learningTaskMessage.value = "";
+      learningTaskProgress.value = null;
+    }
+  }
+
+  async function abandonLearning() {
+    const confirmed = await options.askConfirm({
+      title: "放弃本次学习？",
+      message: "当前学习会话和候选结果会被清空。已经保存的规则不会受影响。",
+      confirmText: "放弃学习",
+      cancelText: "继续保留",
+      danger: true,
+    });
+    if (!confirmed) return;
+    const currentSessionId = sessionId.value.trim();
+    if (currentSessionId) {
+      try {
+        await cancelLearning(currentSessionId);
+      } catch (err) {
+        options.showToast(`学习会话取消失败：${String(err)}`, "error");
+      }
+    }
+    resetLearningState();
+    options.showToast("已放弃本次学习", "info");
+  }
+
   async function saveLearningRule() {
     if (!selected.value.length) {
       learningState.value.error = "请至少选择一个候选路径。";
@@ -296,6 +394,8 @@ export function useLearningPage(options: {
     toggleSelect,
     openPath,
     saveLearningRule,
+    retryLearningAnalysis,
+    abandonLearning,
     loadRuntimeStatus,
     relaunchAsAdmin,
   };

@@ -178,10 +178,13 @@ const {
   toggleSelect,
   openPath,
   saveLearningRule,
+  retryLearningAnalysis,
+  abandonLearning,
   loadRuntimeStatus,
   relaunchAsAdmin,
 } = useLearningPage({
   waitForTaskCompletion,
+  askConfirm,
   showToast,
   afterRuleSaved: async (savedGameId) => {
     await refreshRules();
@@ -267,6 +270,8 @@ onMounted(() => {
       @toggle-select="toggleSelect"
       @open-path="openPath"
       @save-learning-rule="saveLearningRule"
+      @retry-learning-analysis="retryLearningAnalysis"
+      @abandon-learning="abandonLearning"
       @relaunch-as-admin="relaunchAsAdmin"
     />
 

@@ -56,6 +56,7 @@ fn finish_learning_impl(
     app: &AppHandle,
     app_state: &AppState,
     session_id: &str,
+    force_rerun: bool,
 ) -> Result<Vec<CandidatePath>, String> {
     let mut store = app_state
         .store
@@ -72,8 +73,19 @@ fn finish_learning_impl(
         }
     }
 
-    if session.status != "running" {
+    if session.status != "running" && !force_rerun {
         return Ok(session.candidates.clone());
+    }
+    if force_rerun {
+        session.status = "running".to_string();
+        session.ended_at = None;
+        session.final_snapshot_ref = None;
+        session.candidates.clear();
+        session.event_capture_mode = "snapshot".to_string();
+        session.event_trace_name = None;
+        session.event_trace_path = None;
+        session.captured_event_count = 0;
+        session.event_capture_error = None;
     }
 
     let end_unix = now_unix();
@@ -82,21 +94,25 @@ fn finish_learning_impl(
     write_snapshot(app, &final_snapshot_ref, &final_snapshot)?;
 
     let baseline_snapshot: Snapshot = read_snapshot(app, &session.baseline_snapshot_ref)?;
-    let related_files = match collect_related_files_by_trace(
-        session.event_trace_name.as_deref(),
-        session.event_trace_path.as_deref(),
-        &session.tracked_pids,
-    ) {
-        Ok(files) => {
-            session.captured_event_count = files.len();
-            files
-        }
-        Err(err) => {
-            session.captured_event_count = 0;
-            if session.event_capture_mode == "etw" {
-                session.event_capture_error = Some(err);
+    let related_files = if force_rerun {
+        HashSet::new()
+    } else {
+        match collect_related_files_by_trace(
+            session.event_trace_name.as_deref(),
+            session.event_trace_path.as_deref(),
+            &session.tracked_pids,
+        ) {
+            Ok(files) => {
+                session.captured_event_count = files.len();
+                files
             }
-            HashSet::new()
+            Err(err) => {
+                session.captured_event_count = 0;
+                if session.event_capture_mode == "etw" {
+                    session.event_capture_error = Some(err);
+                }
+                HashSet::new()
+            }
         }
     };
     let candidates = build_candidates(
@@ -116,6 +132,102 @@ fn finish_learning_impl(
 
     persist_store(app, &store)?;
     Ok(candidates)
+}
+
+fn start_finish_learning_task_impl(
+    app: AppHandle,
+    state: State<AppState>,
+    session_id: String,
+    force_rerun: bool,
+) -> Result<String, String> {
+    let trimmed_session_id = session_id.trim().to_string();
+    if trimmed_session_id.is_empty() {
+        return Err("sessionId cannot be empty".to_string());
+    }
+    {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "failed to lock app state".to_string())?;
+        if !store
+            .sessions
+            .iter()
+            .any(|item| item.session_id == trimmed_session_id)
+        {
+            return Err("sessionId not found".to_string());
+        }
+    }
+
+    let task_id = Uuid::new_v4().to_string();
+    let now = now_iso_string();
+    let task = BackgroundTask {
+        task_id: task_id.clone(),
+        task_type: if force_rerun {
+            "retry_finish_learning".to_string()
+        } else {
+            "finish_learning".to_string()
+        },
+        status: "pending".to_string(),
+        progress: Some(0),
+        message: Some("task created, waiting to run".to_string()),
+        result: None,
+        error: None,
+        started_at: now.clone(),
+        updated_at: now,
+    };
+    {
+        let mut tasks = state
+            .tasks
+            .lock()
+            .map_err(|_| "failed to lock tasks".to_string())?;
+        tasks.insert(task_id.clone(), task);
+    }
+
+    let app_handle = app.clone();
+    let task_id_for_thread = task_id.clone();
+    let session_id_for_thread = trimmed_session_id.clone();
+    std::thread::spawn(move || {
+        update_background_task(
+            &app_handle,
+            &task_id_for_thread,
+            "running",
+            Some(15),
+            Some(if force_rerun {
+                "reanalyzing save changes...".to_string()
+            } else {
+                "analyzing save changes...".to_string()
+            }),
+            None,
+            None,
+        );
+        let app_state: State<AppState> = app_handle.state();
+        match finish_learning_impl(&app_handle, app_state.inner(), &session_id_for_thread, force_rerun) {
+            Ok(candidates) => {
+                update_background_task(
+                    &app_handle,
+                    &task_id_for_thread,
+                    "success",
+                    Some(100),
+                    Some(format!("analysis completed, found {} candidates", candidates.len())),
+                    serde_json::to_value(candidates).ok(),
+                    None,
+                );
+            }
+            Err(err) => {
+                update_background_task(
+                    &app_handle,
+                    &task_id_for_thread,
+                    "failed",
+                    Some(100),
+                    Some("analysis failed".to_string()),
+                    None,
+                    Some(err),
+                );
+            }
+        }
+    });
+
+    Ok(task_id)
 }
 
 #[tauri::command]
@@ -220,86 +332,16 @@ pub(crate) fn start_finish_learning_task(
     state: State<AppState>,
     session_id: String,
 ) -> Result<String, String> {
-    let trimmed_session_id = session_id.trim().to_string();
-    if trimmed_session_id.is_empty() {
-        return Err("sessionId cannot be empty".to_string());
-    }
-    {
-        let store = state
-            .store
-            .lock()
-            .map_err(|_| "failed to lock app state".to_string())?;
-        if !store
-            .sessions
-            .iter()
-            .any(|item| item.session_id == trimmed_session_id)
-        {
-            return Err("sessionId not found".to_string());
-        }
-    }
+    start_finish_learning_task_impl(app, state, session_id, false)
+}
 
-    let task_id = Uuid::new_v4().to_string();
-    let now = now_iso_string();
-    let task = BackgroundTask {
-        task_id: task_id.clone(),
-        task_type: "finish_learning".to_string(),
-        status: "pending".to_string(),
-        progress: Some(0),
-        message: Some("task created, waiting to run".to_string()),
-        result: None,
-        error: None,
-        started_at: now.clone(),
-        updated_at: now,
-    };
-    {
-        let mut tasks = state
-            .tasks
-            .lock()
-            .map_err(|_| "failed to lock tasks".to_string())?;
-        tasks.insert(task_id.clone(), task);
-    }
-
-    let app_handle = app.clone();
-    let task_id_for_thread = task_id.clone();
-    let session_id_for_thread = trimmed_session_id.clone();
-    std::thread::spawn(move || {
-        update_background_task(
-            &app_handle,
-            &task_id_for_thread,
-            "running",
-            Some(15),
-            Some("analyzing save changes...".to_string()),
-            None,
-            None,
-        );
-        let app_state: State<AppState> = app_handle.state();
-        match finish_learning_impl(&app_handle, app_state.inner(), &session_id_for_thread) {
-            Ok(candidates) => {
-                update_background_task(
-                    &app_handle,
-                    &task_id_for_thread,
-                    "success",
-                    Some(100),
-                    Some(format!("analysis completed, found {} candidates", candidates.len())),
-                    serde_json::to_value(candidates).ok(),
-                    None,
-                );
-            }
-            Err(err) => {
-                update_background_task(
-                    &app_handle,
-                    &task_id_for_thread,
-                    "failed",
-                    Some(100),
-                    Some("analysis failed".to_string()),
-                    None,
-                    Some(err),
-                );
-            }
-        }
-    });
-
-    Ok(task_id)
+#[tauri::command]
+pub(crate) fn start_retry_finish_learning_task(
+    app: AppHandle,
+    state: State<AppState>,
+    session_id: String,
+) -> Result<String, String> {
+    start_finish_learning_task_impl(app, state, session_id, true)
 }
 
 #[tauri::command]
@@ -308,7 +350,27 @@ pub(crate) fn finish_learning(
     state: State<AppState>,
     session_id: String,
 ) -> Result<Vec<CandidatePath>, String> {
-    finish_learning_impl(&app, state.inner(), &session_id)
+    finish_learning_impl(&app, state.inner(), &session_id, false)
+}
+
+#[tauri::command]
+pub(crate) fn cancel_learning(
+    app: AppHandle,
+    state: State<AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "failed to lock app state".to_string())?;
+    let session = store
+        .sessions
+        .iter_mut()
+        .find(|item| item.session_id == session_id)
+        .ok_or_else(|| "sessionId not found".to_string())?;
+    session.status = "cancelled".to_string();
+    session.ended_at = Some(now_iso_string());
+    persist_store(&app, &store)
 }
 
 #[tauri::command]

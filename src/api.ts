@@ -40,6 +40,14 @@ export async function startFinishLearningTask(sessionId: string): Promise<string
   return invoke("start_finish_learning_task", { sessionId });
 }
 
+export async function startRetryFinishLearningTask(sessionId: string): Promise<string> {
+  return invoke("start_retry_finish_learning_task", { sessionId });
+}
+
+export async function cancelLearning(sessionId: string): Promise<void> {
+  return invoke("cancel_learning", { sessionId });
+}
+
 export async function getTask<T = unknown>(taskId: string): Promise<TaskState<T>> {
   return invoke("get_task", { taskId });
 }

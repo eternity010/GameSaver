@@ -41,6 +41,8 @@ const emit = defineEmits<{
   (e: "toggle-select", path: string): void;
   (e: "open-path", path: string): void;
   (e: "save-learning-rule"): void;
+  (e: "retry-learning-analysis"): void;
+  (e: "abandon-learning"): void;
   (e: "relaunch-as-admin"): void;
 }>();
 
@@ -262,9 +264,14 @@ function learningBusyLabel(): string {
         <li>手动保存一次</li>
         <li>回到 GameSaver 继续</li>
       </ul>
-      <button :disabled="learningState.loading" type="button" class="primary" @click="emit('end-learning')">
-        {{ learningState.loading ? "正在分析..." : "我已保存，查找存档目录" }}
-      </button>
+      <div class="row">
+        <button :disabled="learningState.loading" type="button" class="primary" @click="emit('end-learning')">
+          {{ learningState.loading ? "正在分析..." : "我已保存，查找存档目录" }}
+        </button>
+        <button :disabled="learningState.loading" type="button" class="danger" @click="emit('abandon-learning')">
+          放弃本次学习
+        </button>
+      </div>
       <details class="runtime-diagnostics learning-advanced">
         <summary>采集详情（高级）</summary>
         <p>运行权限：{{ runtimeIsAdmin ? "管理员" : "普通用户" }}</p>
@@ -362,7 +369,12 @@ function learningBusyLabel(): string {
         <button :disabled="learningState.loading" type="button" class="primary" @click="emit('save-learning-rule')">
           保存规则并加入游戏库
         </button>
-        <button :disabled="learningState.loading" type="button" @click="emit('update:step', 'setup')">重新学习</button>
+        <button :disabled="learningState.loading" type="button" @click="emit('retry-learning-analysis')">
+          补存档后重新分析
+        </button>
+        <button :disabled="learningState.loading" type="button" class="danger" @click="emit('abandon-learning')">
+          放弃本次学习
+        </button>
       </div>
     </section>
   </div>
