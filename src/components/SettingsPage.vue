@@ -10,6 +10,7 @@ const props = defineProps<{
   settings: SettingsPaths | null;
   settingsState: TabState;
   backupRootDraft: string;
+  backupMaxFileMbDraft: string;
   migrationKind: DataPathKind | "";
   migrationMessage: string;
   migrationProgress: number | null;
@@ -17,6 +18,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "update:backupRootDraft", value: string): void;
+  (e: "update:backupMaxFileMbDraft", value: string): void;
   (e: "reload"): void;
   (e: "choose-directory", kind: DataPathKind): void;
   (e: "open-directory", path: string): void;
@@ -26,7 +28,11 @@ const emit = defineEmits<{
 
 function isChanged(): boolean {
   if (!props.settings) return false;
-  return props.backupRootDraft.trim() !== props.settings.backupRoot.trim();
+  const currentMb = Math.round(props.settings.backupMaxFileBytes / 1024 / 1024);
+  return (
+    props.backupRootDraft.trim() !== props.settings.backupRoot.trim()
+    || props.backupMaxFileMbDraft.trim() !== String(currentMb)
+  );
 }
 
 function currentPath(): string {
@@ -103,6 +109,36 @@ function currentPath(): string {
             @click="emit('migrate-path', 'backupRoot')"
           >
             迁移到新路径
+          </button>
+        </div>
+      </section>
+
+      <section class="settings-card">
+        <div class="settings-card-head">
+          <div>
+            <h3>大文件过滤</h3>
+            <p>自动备份会跳过超过阈值的单个文件，减少无关缓存或录像进入存档备份。</p>
+          </div>
+          <span class="settings-kind-chip">backupLimit</span>
+        </div>
+        <label class="field">
+          <span>跳过大于 N MB 的文件</span>
+          <input
+            :value="backupMaxFileMbDraft"
+            type="number"
+            min="0"
+            step="1"
+            placeholder="100"
+            @input="emit('update:backupMaxFileMbDraft', ($event.target as HTMLInputElement).value)"
+          />
+        </label>
+        <p class="field-note settings-note">
+          默认 {{ Math.round(settings.defaultBackupMaxFileBytes / 1024 / 1024) }} MB；填 0 表示不限制。
+          当前生效：{{ settings.backupMaxFileBytes === 0 ? "不限制" : `${Math.round(settings.backupMaxFileBytes / 1024 / 1024)} MB` }}。
+        </p>
+        <div class="row settings-actions-row">
+          <button :disabled="settingsState.loading || !isChanged()" type="button" class="primary" @click="emit('save-path', 'backupRoot')">
+            保存备份设置
           </button>
         </div>
       </section>

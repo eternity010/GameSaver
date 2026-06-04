@@ -9,7 +9,7 @@ use crate::{
     storage::{
         has_unresolved_primary_rule_conflict_for_exe_hash, match_enabled_rule_for_exe_hash,
         normalize_game_key, normalize_game_uid, select_enabled_rule_for_game, JsonStoreRepository,
-        normalize_backup_keep_versions, StoreRepository,
+        default_backup_max_file_bytes, normalize_backup_keep_versions, StoreRepository,
     },
     task_support::update_background_task,
 };
@@ -17,8 +17,6 @@ use std::{collections::HashSet, fs, path::{Path, PathBuf}, process::Command};
 use tauri::{AppHandle, Manager, State};
 use walkdir::WalkDir;
 use uuid::Uuid;
-
-const MAX_BACKUP_FILE_BYTES: u64 = 100 * 1024 * 1024;
 
 pub(crate) struct LaunchPreparation {
     pub(crate) session: LauncherSession,
@@ -379,6 +377,9 @@ fn execute_basic_launch(
     if is_backup_mode {
         if let Some(rule) = matched_rule.cloned() {
             let keep_versions = resolve_backup_keep_versions(execution_config, &rule.game_uid);
+            let backup_max_file_bytes = execution_config
+                .backup_max_file_bytes
+                .unwrap_or_else(default_backup_max_file_bytes);
             spawn_post_exit_backup_worker(
                 app.clone(),
                 session.launcher_session_id.clone(),
@@ -386,6 +387,7 @@ fn execute_basic_launch(
                 rule,
                 execution_config.backup_root.clone(),
                 keep_versions,
+                backup_max_file_bytes,
                 session.exe_path.clone(),
             );
             append_session_log(
@@ -502,20 +504,22 @@ fn sync_directory(source: &Path, target: &Path) -> Result<usize, String> {
     Ok(copied)
 }
 
-fn is_backup_file_too_large(path: &Path) -> bool {
-    path.metadata()
-        .map(|metadata| metadata.len() > MAX_BACKUP_FILE_BYTES)
-        .unwrap_or(false)
+fn is_backup_file_too_large(path: &Path, max_file_bytes: u64) -> bool {
+    max_file_bytes > 0
+        && path
+            .metadata()
+            .map(|metadata| metadata.len() > max_file_bytes)
+            .unwrap_or(false)
 }
 
-fn sync_backup_directory(source: &Path, target: &Path) -> Result<usize, String> {
+fn sync_backup_directory(source: &Path, target: &Path, max_file_bytes: u64) -> Result<usize, String> {
     if !source.exists() {
         return Ok(0);
     }
     fs::create_dir_all(target).map_err(|err| format!("create directory failed: {err}"))?;
     let mut copied = 0usize;
     for entry in WalkDir::new(source).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() || is_backup_file_too_large(entry.path()) {
+        if !entry.file_type().is_file() || is_backup_file_too_large(entry.path(), max_file_bytes) {
             continue;
         }
         let relative = match entry.path().strip_prefix(source) {
@@ -543,7 +547,12 @@ fn file_signature(path: &Path) -> Option<(u64, u64)> {
     Some((size, modified))
 }
 
-fn sync_source_to_backup_slot(source: &Path, latest_slot: &Path, version_slot: &Path) -> Result<BackupSyncSummary, String> {
+fn sync_source_to_backup_slot(
+    source: &Path,
+    latest_slot: &Path,
+    version_slot: &Path,
+    max_file_bytes: u64,
+) -> Result<BackupSyncSummary, String> {
     if !source.exists() {
         if latest_slot.exists() {
             fs::remove_dir_all(latest_slot).map_err(|err| format!("clean old latest failed: {err}"))?;
@@ -562,7 +571,7 @@ fn sync_source_to_backup_slot(source: &Path, latest_slot: &Path, version_slot: &
             Ok(value) => value,
             Err(_) => continue,
         };
-        if is_backup_file_too_large(entry.path()) {
+        if is_backup_file_too_large(entry.path(), max_file_bytes) {
             summary.skipped_large_files += 1;
             continue;
         }
@@ -609,7 +618,7 @@ fn sync_source_to_backup_slot(source: &Path, latest_slot: &Path, version_slot: &
         if version_slot.exists() {
             fs::remove_dir_all(version_slot).map_err(|err| format!("cleanup version snapshot failed: {err}"))?;
         }
-        let _ = sync_backup_directory(source, version_slot)?;
+        let _ = sync_backup_directory(source, version_slot, max_file_bytes)?;
     }
 
     Ok(summary)
@@ -681,6 +690,7 @@ fn backup_current_state_for_rule(
     rule: &GameSaveRule,
     backup_root: &str,
     keep_versions: usize,
+    max_file_bytes: u64,
     exe_path: Option<&str>,
 ) -> Result<BackupRunResult, String> {
     let base = ensure_backup_root_for_rule(rule, backup_root)?;
@@ -696,7 +706,12 @@ fn backup_current_state_for_rule(
         let runtime_path = expand_confirmed_path_for_runtime(source, exe_path)?;
         let runtime_source = Path::new(&runtime_path);
         let slot = backup_slot_name(source);
-        let source_summary = sync_source_to_backup_slot(runtime_source, &latest.join(&slot), &version_root.join(&slot))?;
+        let source_summary = sync_source_to_backup_slot(
+            runtime_source,
+            &latest.join(&slot),
+            &version_root.join(&slot),
+            max_file_bytes,
+        )?;
         summary.changed_files += source_summary.changed_files;
         summary.skipped_large_files += source_summary.skipped_large_files;
     }
@@ -721,11 +736,13 @@ fn spawn_post_exit_backup_worker(
     rule: GameSaveRule,
     backup_root: String,
     keep_versions: usize,
+    max_file_bytes: u64,
     exe_path: String,
 ) {
     std::thread::spawn(move || {
         let _ = child.wait();
-        let backup_result = backup_current_state_for_rule(&rule, &backup_root, keep_versions, Some(&exe_path));
+        let backup_result =
+            backup_current_state_for_rule(&rule, &backup_root, keep_versions, max_file_bytes, Some(&exe_path));
         let state: State<AppState> = app.state();
         let lock_result = state.store.lock();
         if let Ok(mut store) = lock_result {
@@ -1136,7 +1153,7 @@ fn restore_backup_version_impl(
     }
 
     on_progress(10, "Checking backup metadata".to_string());
-    let (backup_root, rule, keep_versions, restore_exe_path) = {
+    let (backup_root, rule, keep_versions, backup_max_file_bytes, restore_exe_path) = {
         let store = app_state
             .store
             .lock()
@@ -1144,6 +1161,10 @@ fn restore_backup_version_impl(
         let rule = select_enabled_rule_for_game(&store, &trimmed_game_id)
             .ok_or_else(|| "no enabled rule for this game".to_string())?;
         let keep_versions = resolve_backup_keep_versions(&store.execution_config, &rule.game_uid);
+        let backup_max_file_bytes = store
+            .execution_config
+            .backup_max_file_bytes
+            .unwrap_or_else(default_backup_max_file_bytes);
         let normalized_uid = normalize_game_uid(&rule.game_uid);
         let restore_exe_path = if normalized_uid.is_empty() {
             None
@@ -1154,6 +1175,7 @@ fn restore_backup_version_impl(
             store.execution_config.backup_root.clone(),
             rule,
             keep_versions,
+            backup_max_file_bytes,
             restore_exe_path,
         )
     };
@@ -1166,7 +1188,13 @@ fn restore_backup_version_impl(
 
     on_progress(25, "Creating pre-restore backup snapshot".to_string());
     let pre_restore_version_id =
-        match backup_current_state_for_rule(&rule, &backup_root, keep_versions + 1, restore_exe_path.as_deref()) {
+        match backup_current_state_for_rule(
+            &rule,
+            &backup_root,
+            keep_versions + 1,
+            backup_max_file_bytes,
+            restore_exe_path.as_deref(),
+        ) {
             Ok(result) if result.changed_files > 0 => result.version_id,
             Ok(_) => None,
             Err(err) => return Err(format!("failed to create pre-restore backup: {err}")),

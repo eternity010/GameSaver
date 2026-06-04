@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { LibraryGameProductStatus } from "../../composables/useLibraryPage";
 import type {
   BackupStatsResult,
   BackupVersion,
@@ -37,6 +38,7 @@ const props = defineProps<{
   restoreTaskMessage: string;
   restoreTaskProgress: number | null;
   sessionDetails: LauncherSession | null;
+  productStatus: LibraryGameProductStatus;
 }>();
 
 const emit = defineEmits<{
@@ -173,14 +175,11 @@ function backupSummaryText(): string {
 }
 
 function launchStatusLabel(): string {
-  if (!props.precheck) return "检查中";
-  return props.precheck.backupReady ? "可启动" : "需要处理";
+  return props.productStatus.label;
 }
 
 function launchActionHint(): string {
-  if (props.gameDirIssue) return "先绑定本机 EXE 后再启动。";
-  if (!props.syncDecision) return "启动前会检查存档和备份状态。";
-  return props.syncDecision.message;
+  return props.productStatus.description;
 }
 
 function shortExePath(path?: string | null): string {
@@ -219,12 +218,12 @@ function onBackupKeepInput(event: Event) {
 
     <section class="detail-summary-strip">
       <div class="detail-summary-item">
-        <span>启动状态</span>
+        <span>当前状态</span>
         <strong>{{ launchStatusLabel() }}</strong>
       </div>
       <div class="detail-summary-item">
-        <span>同步状态</span>
-        <strong>{{ syncDecision ? syncStatusLabel(syncDecision.status) : "未检查" }}</strong>
+        <span>建议操作</span>
+        <strong>{{ productStatus.actionHint }}</strong>
       </div>
       <div class="detail-summary-item">
         <span>备份</span>

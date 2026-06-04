@@ -2,7 +2,10 @@ use crate::{
     app_state::{AppState, BackgroundTask},
     runtime::now_iso_string,
     shared::{DataPathKind, DataPathMigrationResult, SettingsPaths, UpdateSettingsPathsInput},
-    storage::{default_backup_root, JsonStoreRepository, StoreRepository},
+    storage::{
+        default_backup_max_file_bytes, default_backup_root, normalize_backup_max_file_bytes,
+        JsonStoreRepository, StoreRepository,
+    },
     task_support::update_background_task,
 };
 use std::{
@@ -85,6 +88,11 @@ fn build_settings_paths(app_state: &AppState) -> Result<SettingsPaths, String> {
     Ok(SettingsPaths {
         backup_root: store.execution_config.backup_root.clone(),
         default_backup_root: default_backup_root(),
+        backup_max_file_bytes: store
+            .execution_config
+            .backup_max_file_bytes
+            .unwrap_or_else(default_backup_max_file_bytes),
+        default_backup_max_file_bytes: default_backup_max_file_bytes(),
     })
 }
 
@@ -176,12 +184,20 @@ pub(crate) fn update_settings_paths(
     if let Some(path) = backup_root {
         store.execution_config.backup_root = path.to_string_lossy().to_string();
     }
+    if let Some(value) = input.backup_max_file_bytes {
+        store.execution_config.backup_max_file_bytes = Some(normalize_backup_max_file_bytes(value));
+    }
     JsonStoreRepository::new().normalize(&mut store);
     JsonStoreRepository::new().persist(&app, &store)?;
 
     Ok(SettingsPaths {
         backup_root: store.execution_config.backup_root.clone(),
         default_backup_root: default_backup_root(),
+        backup_max_file_bytes: store
+            .execution_config
+            .backup_max_file_bytes
+            .unwrap_or_else(default_backup_max_file_bytes),
+        default_backup_max_file_bytes: default_backup_max_file_bytes(),
     })
 }
 

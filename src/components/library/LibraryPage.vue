@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import LibraryDetailPanel from "./LibraryDetailPanel.vue";
 import LibraryGameCard from "./LibraryGameCard.vue";
+import type { LibraryGameProductStatus } from "../../composables/useLibraryPage";
 import type {
   BackupStatsResult,
   BackupVersion,
@@ -41,10 +42,8 @@ defineProps<{
   libraryCardErrorFor: (gameId: string) => string;
   isLibraryGameSelected: (gameId: string) => boolean;
   gameDirResolutionIssue: (gameId: string) => string;
-  cardSyncStatusLabel: (gameId: string) => string;
-  syncStatusClass: (status: string) => string;
   syncDecisionFor: (gameId: string) => LaunchSyncDecision | null;
-  gameDirStatusLabel: (gameId: string) => string;
+  libraryGameProductStatus: (item: GameLibraryItem) => LibraryGameProductStatus;
   backupStatsFor: (gameId: string) => BackupStatsResult | null;
   isCardBusy: (gameId: string, action?: LibraryCardAction) => boolean;
   launchPrecheckFor: (gameId: string) => GameLaunchPrecheck | null;
@@ -99,10 +98,7 @@ const emit = defineEmits<{
           :selected="isLibraryGameSelected(item.gameId)"
           :warning="!!gameDirResolutionIssue(item.gameId)"
           :card-error="libraryCardErrorFor(item.gameId)"
-          :sync-status-label="cardSyncStatusLabel(item.gameId)"
-          :sync-status-class="syncStatusClass(syncDecisionFor(item.gameId)?.status || '')"
-          :game-dir-status-label="gameDirStatusLabel(item.gameId)"
-          :backup-stats="backupStatsFor(item.gameId)"
+          :product-status="libraryGameProductStatus(item)"
           @select="emit('select', $event)"
         />
       </div>
@@ -130,6 +126,7 @@ const emit = defineEmits<{
         :restore-task-message="restoreTaskMessageFor(selectedLibraryItem.gameId)"
         :restore-task-progress="restoreTaskProgressFor(selectedLibraryItem.gameId)"
         :session-details="sessionDetailsFor(selectedLibraryItem.gameId)"
+        :product-status="libraryGameProductStatus(selectedLibraryItem)"
         @launch="(gameId) => emit('launch', gameId)"
         @choose-exe="(gameId) => emit('choose-exe', gameId)"
         @update-backup-keep="(gameId, value) => emit('update-backup-keep', gameId, value)"

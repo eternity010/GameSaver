@@ -6,6 +6,8 @@ use std::collections::HashMap;
 pub(crate) struct ExecutionConfig {
     pub(crate) backup_root: String,
     #[serde(default)]
+    pub(crate) backup_max_file_bytes: Option<u64>,
+    #[serde(default)]
     pub(crate) preferred_exe_by_uid: HashMap<String, String>,
     #[serde(default)]
     pub(crate) preferred_rule_uid_by_game: HashMap<String, String>,
@@ -23,6 +25,7 @@ impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
             backup_root: String::new(),
+            backup_max_file_bytes: None,
             preferred_exe_by_uid: HashMap::new(),
             preferred_rule_uid_by_game: HashMap::new(),
             preferred_rule_id_by_exe_hash: HashMap::new(),

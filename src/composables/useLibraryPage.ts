@@ -46,6 +46,13 @@ type RestoreUndoState = {
   restoredVersionId: string;
 };
 
+export type LibraryGameProductStatus = {
+  label: string;
+  description: string;
+  tone: "ready" | "warning" | "paused" | "busy";
+  actionHint: string;
+};
+
 type WaitForTaskCompletion = <T>(
   taskId: string,
   onProgress?: (message: string, progress: number | null) => void,
@@ -375,6 +382,68 @@ export function useLibraryPage(options: {
     const status = syncDecisionFor(gameIdText)?.status;
     if (!status) return "";
     return syncStatusLabel(status);
+  }
+
+  function libraryGameProductStatus(item: GameLibraryItem): LibraryGameProductStatus {
+    if (isCardBusy(item.gameId, "launch")) {
+      return {
+        label: "保护中",
+        description: "游戏正在运行，退出后会自动检查并备份存档。",
+        tone: "busy",
+        actionHint: "等待游戏退出后完成备份",
+      };
+    }
+    if (item.enabledRules === 0) {
+      return {
+        label: item.totalRules > 0 ? "保护已暂停" : "需要学习存档",
+        description: item.totalRules > 0
+          ? "当前没有启用的存档规则，GameSaver 不会自动保护这个游戏。"
+          : "还没有可用的存档规则，先学习一次存档位置。",
+        tone: "paused",
+        actionHint: item.totalRules > 0 ? "启用规则后再启动" : "先学习存档规则",
+      };
+    }
+    if (!item.preferredExePath) {
+      return {
+        label: "需要设置",
+        description: "还没有绑定本机启动程序，选择 EXE 后即可像 Steam 一样启动。",
+        tone: "warning",
+        actionHint: "先选择启动 EXE",
+      };
+    }
+    if (gameDirResolutionIssue(item.gameId)) {
+      return {
+        label: "需要设置",
+        description: "规则里包含游戏目录路径，需要重新确认当前绑定的 EXE。",
+        tone: "warning",
+        actionHint: "确认或更换启动 EXE",
+      };
+    }
+
+    const syncDecision = syncDecisionFor(item.gameId);
+    if (syncDecision?.status === "backup_only" || syncDecision?.status === "backup_newer") {
+      return {
+        label: "存档需确认",
+        description: "历史备份看起来比本地存档更新，启动前会让你选择恢复或直接启动。",
+        tone: "warning",
+        actionHint: "启动时确认使用哪份存档",
+      };
+    }
+    if (syncDecision?.status === "conflict_unknown") {
+      return {
+        label: "存档需确认",
+        description: "本地和备份状态无法可靠判断，启动前建议确认一次。",
+        tone: "warning",
+        actionHint: "查看存档状态后启动",
+      };
+    }
+
+    return {
+      label: "可启动",
+      description: "存档保护已就绪，启动后退出游戏会自动备份变化。",
+      tone: "ready",
+      actionHint: "点击启动游戏",
+    };
   }
 
   async function loadLaunchPrecheckForGame(gameIdText: string, withCardLoading = true) {
@@ -838,6 +907,7 @@ export function useLibraryPage(options: {
     syncStatusClass,
     syncDecisionFor,
     gameDirStatusLabel,
+    libraryGameProductStatus,
     backupStatsFor,
     isCardBusy,
     launchPrecheckFor,

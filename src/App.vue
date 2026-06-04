@@ -102,10 +102,8 @@ const {
   libraryCardErrorFor,
   isLibraryGameSelected,
   gameDirResolutionIssue,
-  cardSyncStatusLabel,
-  syncStatusClass,
   syncDecisionFor,
-  gameDirStatusLabel,
+  libraryGameProductStatus,
   backupStatsFor,
   isCardBusy,
   launchPrecheckFor,
@@ -139,6 +137,7 @@ const {
   settings,
   settingsState,
   backupRootDraft,
+  backupMaxFileMbDraft,
   settingsMigrationKind,
   settingsMigrationMessage,
   settingsMigrationProgress,
@@ -291,10 +290,12 @@ onMounted(() => {
       :settings="settings"
       :settings-state="settingsState"
       :backup-root-draft="backupRootDraft"
+      :backup-max-file-mb-draft="backupMaxFileMbDraft"
       :migration-kind="settingsMigrationKind"
       :migration-message="settingsMigrationMessage"
       :migration-progress="settingsMigrationProgress"
       @update:backup-root-draft="backupRootDraft = $event"
+      @update:backup-max-file-mb-draft="backupMaxFileMbDraft = $event"
       @reload="reloadSettings"
       @choose-directory="chooseSettingsDirectory"
       @open-directory="openDirectory"
@@ -311,10 +312,8 @@ onMounted(() => {
       :library-card-error-for="libraryCardErrorFor"
       :is-library-game-selected="isLibraryGameSelected"
       :game-dir-resolution-issue="gameDirResolutionIssue"
-      :card-sync-status-label="cardSyncStatusLabel"
-      :sync-status-class="syncStatusClass"
       :sync-decision-for="syncDecisionFor"
-      :game-dir-status-label="gameDirStatusLabel"
+      :library-game-product-status="libraryGameProductStatus"
       :backup-stats-for="backupStatsFor"
       :is-card-busy="isCardBusy"
       :launch-precheck-for="launchPrecheckFor"

@@ -70,12 +70,15 @@ export interface RuntimeStatus {
 export interface SettingsPaths {
   backupRoot: string;
   defaultBackupRoot: string;
+  backupMaxFileBytes: number;
+  defaultBackupMaxFileBytes: number;
 }
 
 export type DataPathKind = "backupRoot";
 
 export interface UpdateSettingsPathsInput {
   backupRoot?: string;
+  backupMaxFileBytes?: number;
 }
 
 export interface DataPathMigrationResult {

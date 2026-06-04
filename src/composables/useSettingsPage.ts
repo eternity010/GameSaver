@@ -22,6 +22,15 @@ type WaitForTaskCompletion = <T>(
   onProgress?: (message: string, progress: number | null) => void,
 ) => Promise<TaskState<T>>;
 
+const BYTES_PER_MB = 1024 * 1024;
+
+function bytesToMegabytesText(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0";
+  }
+  return String(Math.round(bytes / BYTES_PER_MB));
+}
+
 export function useSettingsPage(options: {
   waitForTaskCompletion: WaitForTaskCompletion;
   askConfirm: (options: {
@@ -36,6 +45,7 @@ export function useSettingsPage(options: {
   const settingsState = ref<TabState>({ loading: false, error: "" });
   const settings = ref<SettingsPaths | null>(null);
   const backupRootDraft = ref("");
+  const backupMaxFileMbDraft = ref("");
   const settingsMigrationKind = ref<DataPathKind | "">("");
   const settingsMigrationMessage = ref("");
   const settingsMigrationProgress = ref<number | null>(null);
@@ -56,6 +66,7 @@ export function useSettingsPage(options: {
       const data = await getSettingsPaths();
       settings.value = data;
       backupRootDraft.value = data.backupRoot;
+      backupMaxFileMbDraft.value = bytesToMegabytesText(data.backupMaxFileBytes);
     } catch (err) {
       settingsState.value.error = `读取设置失败：${String(err)}`;
     } finally {
@@ -77,15 +88,37 @@ export function useSettingsPage(options: {
     }
   }
 
+  function parseBackupMaxFileBytesDraft(): number | null {
+    const raw = backupMaxFileMbDraft.value.trim();
+    if (!raw || !/^\d+$/.test(raw)) {
+      return null;
+    }
+    const mb = Number(raw);
+    if (!Number.isFinite(mb) || mb < 0) {
+      return null;
+    }
+    return Math.trunc(mb) * BYTES_PER_MB;
+  }
+
   async function saveSettingsPath(_kind: DataPathKind) {
+    const backupMaxFileBytes = parseBackupMaxFileBytesDraft();
+    if (backupMaxFileBytes === null) {
+      settingsState.value.error = "大文件过滤阈值必须是大于等于 0 的整数 MB，0 表示不限制。";
+      options.showToast("请输入有效的大文件过滤阈值", "error");
+      return;
+    }
     settingsState.value.loading = true;
     settingsState.value.error = "";
     try {
-      const input = { backupRoot: backupRootDraft.value.trim() };
+      const input = {
+        backupRoot: backupRootDraft.value.trim(),
+        backupMaxFileBytes,
+      };
       const updated = await updateSettingsPaths(input);
       settings.value = updated;
       backupRootDraft.value = updated.backupRoot;
-      options.showToast("备份路径已保存", "success");
+      backupMaxFileMbDraft.value = bytesToMegabytesText(updated.backupMaxFileBytes);
+      options.showToast("备份设置已保存", "success");
     } catch (err) {
       settingsState.value.error = `保存设置失败：${String(err)}`;
       options.showToast("保存设置失败", "error");
@@ -153,6 +186,7 @@ export function useSettingsPage(options: {
     settings,
     settingsState,
     backupRootDraft,
+    backupMaxFileMbDraft,
     settingsMigrationKind,
     settingsMigrationMessage,
     settingsMigrationProgress,

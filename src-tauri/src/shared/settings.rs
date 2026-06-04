@@ -5,12 +5,15 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct SettingsPaths {
     pub(crate) backup_root: String,
     pub(crate) default_backup_root: String,
+    pub(crate) backup_max_file_bytes: u64,
+    pub(crate) default_backup_max_file_bytes: u64,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UpdateSettingsPathsInput {
     pub(crate) backup_root: Option<String>,
+    pub(crate) backup_max_file_bytes: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]

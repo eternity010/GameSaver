@@ -9,6 +9,7 @@ use tauri::{AppHandle, Manager, Runtime};
 use uuid::Uuid;
 
 const MAX_BACKUP_KEEP_VERSIONS: usize = 10;
+const DEFAULT_BACKUP_MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 
 pub(crate) trait StoreRepository {
     fn load<R: Runtime>(&self, app: &AppHandle<R>) -> Result<PersistedStore, String>;
@@ -90,6 +91,9 @@ impl StoreRepository for JsonStoreRepository {
         if store.execution_config.backup_root.trim().is_empty() {
             store.execution_config.backup_root = default_backup_root();
         }
+        if let Some(value) = store.execution_config.backup_max_file_bytes.as_mut() {
+            *value = normalize_backup_max_file_bytes(*value);
+        }
 
         let mut normalized_keep_versions = HashMap::new();
         for (uid_key, keep_versions) in store.execution_config.backup_keep_versions_by_uid.clone() {
@@ -160,6 +164,14 @@ pub(crate) fn default_backup_root() -> String {
     PathBuf::from(r"D:\GameSaverData\Backups")
         .to_string_lossy()
         .to_string()
+}
+
+pub(crate) fn default_backup_max_file_bytes() -> u64 {
+    DEFAULT_BACKUP_MAX_FILE_BYTES
+}
+
+pub(crate) fn normalize_backup_max_file_bytes(value: u64) -> u64 {
+    value.min(1024 * 1024 * 1024)
 }
 
 pub(crate) fn normalize_game_key(game_id: &str) -> String {
