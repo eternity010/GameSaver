@@ -19,12 +19,6 @@ const props = defineProps<{
   ruleSearch: string;
   ruleDrafts: Record<string, RuleDraft>;
   rulesState: TabState;
-  migrationExportWaiting: boolean;
-  migrationExportMessage: string;
-  migrationExportProgress: number | null;
-  migrationImportWaiting: boolean;
-  migrationImportMessage: string;
-  migrationImportProgress: number | null;
 }>();
 
 const emit = defineEmits<{
@@ -33,8 +27,6 @@ const emit = defineEmits<{
   (e: "reload"): void;
   (e: "export-rules"): void;
   (e: "import-rules"): void;
-  (e: "export-migration"): void;
-  (e: "import-migration"): void;
   (e: "mark-primary", rule: GameSaveRule): void;
   (e: "save-rule", rule: GameSaveRule): void;
   (e: "remove-rule", rule: GameSaveRule): void;
@@ -246,33 +238,7 @@ function updateRuleDraft(ruleId: string, patch: Partial<RuleDraft>) {
         <div class="rules-actions">
           <button :disabled="rulesState.loading" type="button" @click="emit('export-rules')">导出规则</button>
           <button :disabled="rulesState.loading" type="button" @click="emit('import-rules')">导入规则</button>
-          <button :disabled="rulesState.loading" type="button" @click="emit('export-migration')">导出迁移包</button>
-          <button :disabled="rulesState.loading" type="button" @click="emit('import-migration')">导入迁移包</button>
         </div>
-      </div>
-      <div v-if="migrationExportWaiting" class="migration-progress">
-        <p>{{ migrationExportMessage || "正在导出迁移包，文件较多时可能需要一点时间，请稍候..." }}</p>
-        <div class="progress-track" role="progressbar" aria-label="迁移包导出进行中">
-          <span v-if="migrationExportProgress === null" class="progress-indeterminate"></span>
-          <span
-            v-else
-            class="progress-determinate"
-            :style="{ width: `${migrationExportProgress}%` }"
-          ></span>
-        </div>
-        <p v-if="migrationExportProgress !== null">当前进度：{{ migrationExportProgress }}%</p>
-      </div>
-      <div v-if="migrationImportWaiting" class="migration-progress">
-        <p>{{ migrationImportMessage || "正在导入迁移包，文件较多时可能需要一点时间，请稍候..." }}</p>
-        <div class="progress-track" role="progressbar" aria-label="迁移包导入进行中">
-          <span v-if="migrationImportProgress === null" class="progress-indeterminate"></span>
-          <span
-            v-else
-            class="progress-determinate"
-            :style="{ width: `${migrationImportProgress}%` }"
-          ></span>
-        </div>
-        <p v-if="migrationImportProgress !== null">当前进度：{{ migrationImportProgress }}%</p>
       </div>
       <p v-if="ruleConflicts.length" class="conflict-summary">
         有 {{ ruleConflicts.length }} 组游戏程序命中了多条规则，需要指定启动时优先使用哪一条。

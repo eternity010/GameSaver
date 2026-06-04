@@ -14,6 +14,7 @@ import type {
   LauncherSession,
   LearningSession,
   LauncherMode,
+  PreviewMigrationZipResult,
   RuleConflictItem,
   PruneBackupResult,
   RestoreBackupResult,
@@ -95,6 +96,10 @@ export async function exportMigrationZip(filePath: string): Promise<ExportMigrat
 
 export async function startExportMigrationZipTask(filePath: string): Promise<string> {
   return invoke("start_export_migration_zip_task", { filePath });
+}
+
+export async function previewMigrationZip(filePath: string): Promise<PreviewMigrationZipResult> {
+  return invoke("preview_migration_zip", { filePath });
 }
 
 export async function importMigrationZip(filePath: string): Promise<ImportMigrationZipResult> {

@@ -5,6 +5,7 @@ import {
   importRules,
   listRuleConflicts,
   listRules,
+  previewMigrationZip,
   setPrimaryRule,
   startExportMigrationZipTask,
   startImportMigrationZipTask,
@@ -14,6 +15,7 @@ import type {
   ExportMigrationZipResult,
   GameSaveRule,
   ImportMigrationZipResult,
+  PreviewMigrationZipResult,
   RuleConflictItem,
   TaskState,
 } from "../types";
@@ -54,6 +56,23 @@ function sortRulesByUpdatedTime(items: GameSaveRule[]): GameSaveRule[] {
     const bTime = Number(b.updatedAt || b.createdAt || "0");
     return bTime - aTime;
   });
+}
+
+function formatMigrationPreviewMessage(preview: PreviewMigrationZipResult): string {
+  const lines = [
+    "即将导入迁移包：",
+    "",
+    `规则：${preview.ruleCount} 条（新增 ${preview.newRules}，覆盖 ${preview.overwrittenRules}，跳过 ${preview.skippedRules}）`,
+    `备份：${preview.backupGames} 个游戏，${preview.backupFiles} 个文件`,
+  ];
+  if (preview.createdAt) {
+    lines.push(`创建时间：${preview.createdAt}`);
+  }
+  if (preview.manifestFormat) {
+    lines.push(`格式：${preview.manifestFormat}`);
+  }
+  lines.push("", "导入会写入规则，并把迁移包内备份复制到当前备份目录。是否继续？");
+  return lines.join("\n");
 }
 
 export function useRulesPage(options: {
@@ -309,6 +328,19 @@ export function useRulesPage(options: {
         filters: [{ name: "ZIP", extensions: ["zip"] }],
       });
       if (!chosen || Array.isArray(chosen)) return;
+      rulesState.value.loading = true;
+      rulesState.value.error = "";
+      const preview = await previewMigrationZip(chosen);
+      const confirmed = await options.askConfirm({
+        title: "确认导入迁移包",
+        message: formatMigrationPreviewMessage(preview),
+        confirmText: "导入迁移包",
+        cancelText: "取消",
+        danger: preview.overwrittenRules > 0,
+      });
+      if (!confirmed) {
+        return;
+      }
       rulesState.value.loading = true;
       rulesState.value.error = "";
       migrationImportWaiting.value = true;

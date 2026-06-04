@@ -14,6 +14,12 @@ const props = defineProps<{
   migrationKind: DataPathKind | "";
   migrationMessage: string;
   migrationProgress: number | null;
+  migrationExportWaiting: boolean;
+  migrationExportMessage: string;
+  migrationExportProgress: number | null;
+  migrationImportWaiting: boolean;
+  migrationImportMessage: string;
+  migrationImportProgress: number | null;
 }>();
 
 const emit = defineEmits<{
@@ -24,6 +30,8 @@ const emit = defineEmits<{
   (e: "open-directory", path: string): void;
   (e: "save-path", kind: DataPathKind): void;
   (e: "migrate-path", kind: DataPathKind): void;
+  (e: "export-migration"): void;
+  (e: "import-migration"): void;
 }>();
 
 function isChanged(): boolean {
@@ -63,6 +71,30 @@ function currentPath(): string {
           ></span>
         </div>
         <p v-if="migrationProgress !== null">当前进度：{{ migrationProgress }}%</p>
+      </div>
+      <div v-if="migrationExportWaiting" class="migration-progress">
+        <p>{{ migrationExportMessage || "正在导出迁移包，文件较多时可能需要一点时间，请稍候..." }}</p>
+        <div class="progress-track" role="progressbar" aria-label="迁移包导出进行中">
+          <span v-if="migrationExportProgress === null" class="progress-indeterminate"></span>
+          <span
+            v-else
+            class="progress-determinate"
+            :style="{ width: `${migrationExportProgress}%` }"
+          ></span>
+        </div>
+        <p v-if="migrationExportProgress !== null">当前进度：{{ migrationExportProgress }}%</p>
+      </div>
+      <div v-if="migrationImportWaiting" class="migration-progress">
+        <p>{{ migrationImportMessage || "正在导入迁移包，文件较多时可能需要一点时间，请稍候..." }}</p>
+        <div class="progress-track" role="progressbar" aria-label="迁移包导入进行中">
+          <span v-if="migrationImportProgress === null" class="progress-indeterminate"></span>
+          <span
+            v-else
+            class="progress-determinate"
+            :style="{ width: `${migrationImportProgress}%` }"
+          ></span>
+        </div>
+        <p v-if="migrationImportProgress !== null">当前进度：{{ migrationImportProgress }}%</p>
       </div>
     </header>
 
@@ -139,6 +171,36 @@ function currentPath(): string {
         <div class="row settings-actions-row">
           <button :disabled="settingsState.loading || !isChanged()" type="button" class="primary" @click="emit('save-path', 'backupRoot')">
             保存备份设置
+          </button>
+        </div>
+      </section>
+
+      <section class="settings-card">
+        <div class="settings-card-head">
+          <div>
+            <h3>换电脑 / 搬家</h3>
+            <p>迁移包会包含规则和当前备份目录下的历史备份，用于在另一台电脑恢复 GameSaver 数据。</p>
+          </div>
+          <span class="settings-kind-chip">migration</span>
+        </div>
+        <p class="field-note settings-note">
+          导入迁移包前会先预览将新增、覆盖的规则和备份数量，确认后才会写入本机数据。
+        </p>
+        <div class="row settings-actions-row">
+          <button
+            :disabled="settingsState.loading || migrationExportWaiting || migrationImportWaiting"
+            type="button"
+            @click="emit('export-migration')"
+          >
+            导出迁移包
+          </button>
+          <button
+            :disabled="settingsState.loading || migrationExportWaiting || migrationImportWaiting"
+            type="button"
+            class="primary"
+            @click="emit('import-migration')"
+          >
+            导入迁移包
           </button>
         </div>
       </section>

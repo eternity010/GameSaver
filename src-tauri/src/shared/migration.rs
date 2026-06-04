@@ -19,3 +19,16 @@ pub(crate) struct ImportMigrationZipResult {
     pub(crate) copied_backup_files: usize,
     pub(crate) skipped_backup_games: usize,
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PreviewMigrationZipResult {
+    pub(crate) rule_count: usize,
+    pub(crate) new_rules: usize,
+    pub(crate) overwritten_rules: usize,
+    pub(crate) skipped_rules: usize,
+    pub(crate) backup_games: usize,
+    pub(crate) backup_files: usize,
+    pub(crate) manifest_format: Option<String>,
+    pub(crate) created_at: Option<String>,
+}

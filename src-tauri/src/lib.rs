@@ -78,6 +78,7 @@ pub fn run() {
             launcher::start_restore_backup_version_task,
             migration::export_migration_zip,
             migration::start_export_migration_zip_task,
+            migration::preview_migration_zip,
             migration::import_migration_zip,
             migration::start_import_migration_zip_task,
             precheck::precheck_game_launch,

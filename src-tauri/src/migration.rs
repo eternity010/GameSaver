@@ -1,7 +1,7 @@
 use crate::{
     app_state::{AppState, BackgroundTask},
     runtime::now_iso_string,
-    shared::{ExportMigrationZipResult, GameSaveRule, ImportMigrationZipResult},
+    shared::{ExportMigrationZipResult, GameSaveRule, ImportMigrationZipResult, PreviewMigrationZipResult},
     storage::{decode_text_bytes, new_game_uid, normalize_game_uid, JsonStoreRepository, StoreRepository},
     task_support::update_background_task,
 };
@@ -219,6 +219,118 @@ pub(crate) fn export_migration_zip(
             backup_games,
             exported_files,
             skipped_backup_games,
+        })
+    })();
+    let _ = fs::remove_dir_all(&temp_root);
+    result
+}
+
+#[tauri::command]
+pub(crate) fn preview_migration_zip(
+    state: State<AppState>,
+    file_path: String,
+) -> Result<PreviewMigrationZipResult, String> {
+    let source_path = file_path.trim().to_string();
+    if source_path.is_empty() {
+        return Err("filePath cannot be empty".to_string());
+    }
+    let temp_root = create_migration_temp_dir("preview")?;
+    let result = (|| -> Result<PreviewMigrationZipResult, String> {
+        unzip_archive_to_directory(Path::new(&source_path), &temp_root)?;
+        let manifest_path = temp_root.join("manifest.json");
+        let manifest = if manifest_path.exists() {
+            let raw = fs::read(&manifest_path).map_err(|err| format!("read manifest failed: {err}"))?;
+            serde_json::from_slice::<serde_json::Value>(&raw).ok()
+        } else {
+            None
+        };
+        let rules_file_path = [
+            temp_root.join("rules").join("gamesaver-rules.json"),
+            temp_root.join("gamesaver-rules.json"),
+        ]
+        .into_iter()
+        .find(|path| path.exists())
+        .ok_or_else(|| "migration zip missing rules/gamesaver-rules.json".to_string())?;
+        let raw_rules = fs::read(&rules_file_path).map_err(|err| format!("read rules failed: {err}"))?;
+        let rules_text = decode_text_bytes(&raw_rules);
+        let rules_value: serde_json::Value =
+            serde_json::from_str(&rules_text).map_err(|err| format!("parse rules failed: {err}"))?;
+        let rules_array = rules_value
+            .as_array()
+            .ok_or_else(|| "rules json must be array".to_string())?;
+
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "failed to lock app state".to_string())?;
+        let existing_rule_ids = store
+            .rules
+            .iter()
+            .map(|rule| rule.rule_id.clone())
+            .collect::<HashSet<_>>();
+
+        let mut rule_count = 0usize;
+        let mut new_rules = 0usize;
+        let mut overwritten_rules = 0usize;
+        let mut skipped_rules = 0usize;
+        for item in rules_array {
+            let parsed = match serde_json::from_value::<crate::shared::ImportRuleInput>(item.clone()) {
+                Ok(value) => value,
+                Err(_) => {
+                    skipped_rules += 1;
+                    continue;
+                }
+            };
+            let game_id = parsed.game_id.trim();
+            let exe_hash = parsed.exe_hash.trim();
+            let has_paths = parsed.confirmed_paths.iter().any(|path| !path.trim().is_empty());
+            if game_id.is_empty() || exe_hash.is_empty() || !has_paths {
+                skipped_rules += 1;
+                continue;
+            }
+            rule_count += 1;
+            let incoming_rule_id = parsed.rule_id.unwrap_or_default();
+            if !incoming_rule_id.is_empty() && existing_rule_ids.contains(&incoming_rule_id) {
+                overwritten_rules += 1;
+            } else {
+                new_rules += 1;
+            }
+        }
+
+        let backups_root = temp_root.join("backups");
+        let (backup_games, backup_files) = if backups_root.exists() {
+            let backup_games = fs::read_dir(&backups_root)
+                .map_err(|err| format!("read backups failed: {err}"))?
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+                .count();
+            let backup_files = WalkDir::new(&backups_root)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_file())
+                .count();
+            (backup_games, backup_files)
+        } else {
+            (0, 0)
+        };
+
+        Ok(PreviewMigrationZipResult {
+            rule_count,
+            new_rules,
+            overwritten_rules,
+            skipped_rules,
+            backup_games,
+            backup_files,
+            manifest_format: manifest
+                .as_ref()
+                .and_then(|value| value.get("format"))
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string),
+            created_at: manifest
+                .as_ref()
+                .and_then(|value| value.get("createdAt"))
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string),
         })
     })();
     let _ = fs::remove_dir_all(&temp_root);
