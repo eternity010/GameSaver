@@ -122,6 +122,54 @@ function restoreProtectionSummary(result: RestoreBackupResult): string {
   return "当前本地存档无新增变化，未额外创建恢复前备份";
 }
 
+function formatBytes(totalBytes: number): string {
+  if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = totalBytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const precision = value >= 100 || unitIndex === 0 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(precision)} ${units[unitIndex]}`;
+}
+
+function formatUnixTimestamp(value?: string | null): string {
+  if (!value) return "未知";
+  const timestamp = Number(value.startsWith("pre_restore_") ? value.slice("pre_restore_".length) : value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    return value;
+  }
+  const date = new Date(timestamp * 1000);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function formatSaveSummary(summary: LaunchSyncDecision["localSummary"] | null | undefined, versionLabel = false): string {
+  if (!summary || !summary.exists) {
+    return "未检测到文件";
+  }
+  const time = versionLabel
+    ? formatUnixTimestamp(summary.latestVersionId || summary.latestModifiedAt)
+    : formatUnixTimestamp(summary.latestModifiedAt);
+  return `${summary.fileCount} 个文件 / ${formatBytes(summary.totalBytes)} / ${versionLabel ? "最近版本" : "最近修改"}：${time}`;
+}
+
+function buildSaveConflictMessage(decision: LaunchSyncDecision): string {
+  return [
+    "GameSaver 发现历史备份可能比当前本地存档更适合启动。",
+    "",
+    `本地存档：${formatSaveSummary(decision.localSummary)}`,
+    `历史备份：${formatSaveSummary(decision.backupSummary, true)}`,
+    "",
+    decision.message,
+    "",
+    "选择“恢复历史备份后启动”会先把历史备份恢复到本地；选择“使用本地存档启动”会保留当前本地状态，退出游戏后再自动备份。",
+  ].join("\n");
+}
+
 export function useLibraryPage(options: {
   rules: Ref<GameSaveRule[]>;
   waitForTaskCompletion: WaitForTaskCompletion;
@@ -653,10 +701,10 @@ export function useLibraryPage(options: {
       case "backup_only":
       case "backup_newer": {
         const restoreFirst = await options.askConfirm({
-          title: "检测到较新的历史备份",
-          message: `${decision.message}\n\n点击“恢复后启动”会先恢复最近备份；点击“直接启动”会保留当前本地状态直接进入游戏。`,
-          confirmText: "恢复后启动",
-          cancelText: "直接启动",
+          title: "选择要使用的存档",
+          message: buildSaveConflictMessage(decision),
+          confirmText: "恢复历史备份后启动",
+          cancelText: "使用本地存档启动",
           danger: false,
         });
         return restoreFirst ? "backup" : "backup_direct";
