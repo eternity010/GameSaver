@@ -96,6 +96,7 @@ pub(crate) struct CimProcessRow {
     pub(crate) parent_process_id: u32,
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct EventCaptureHandle {
     pub(crate) trace_name: String,

@@ -11,7 +11,7 @@ use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
 use super::analysis::{build_candidates, default_confidence};
-use super::capture::{collect_process_tree_pids, collect_related_files_by_trace, try_start_etw_capture};
+use super::capture::collect_process_tree_pids;
 use super::snapshot::{collect_snapshot, normalize_learning_scan_root, read_snapshot, write_snapshot};
 
 fn build_rule_key(game_id: &str, exe_hash: &str) -> String {
@@ -94,27 +94,6 @@ fn finish_learning_impl(
     write_snapshot(app, &final_snapshot_ref, &final_snapshot)?;
 
     let baseline_snapshot: Snapshot = read_snapshot(app, &session.baseline_snapshot_ref)?;
-    let related_files = if force_rerun {
-        HashSet::new()
-    } else {
-        match collect_related_files_by_trace(
-            session.event_trace_name.as_deref(),
-            session.event_trace_path.as_deref(),
-            &session.tracked_pids,
-        ) {
-            Ok(files) => {
-                session.captured_event_count = files.len();
-                files
-            }
-            Err(err) => {
-                session.captured_event_count = 0;
-                if session.event_capture_mode == "etw" {
-                    session.event_capture_error = Some(err);
-                }
-                HashSet::new()
-            }
-        }
-    };
     let candidates = build_candidates(
         &baseline_snapshot,
         &final_snapshot,
@@ -122,7 +101,7 @@ fn finish_learning_impl(
         &session.exe_path,
         iso_to_unix(&session.started_at).unwrap_or(end_unix),
         end_unix + 120,
-        Some(&related_files),
+        None,
     );
 
     session.status = "finished".to_string();
@@ -308,20 +287,11 @@ pub(crate) fn launch_game(app: AppHandle, state: State<AppState>, session_id: St
     let pid = child.id();
     session.pid = Some(pid);
     session.tracked_pids = collect_process_tree_pids(pid).unwrap_or_else(|_| vec![pid]);
-    match try_start_etw_capture(&app, &session.session_id) {
-        Ok(handle) => {
-            session.event_capture_mode = "etw".to_string();
-            session.event_trace_name = Some(handle.trace_name);
-            session.event_trace_path = Some(handle.etl_path.to_string_lossy().to_string());
-            session.event_capture_error = None;
-        }
-        Err(err) => {
-            session.event_capture_mode = "snapshot".to_string();
-            session.event_trace_name = None;
-            session.event_trace_path = None;
-            session.event_capture_error = Some(err);
-        }
-    }
+    session.event_capture_mode = "snapshot".to_string();
+    session.event_trace_name = None;
+    session.event_trace_path = None;
+    session.captured_event_count = 0;
+    session.event_capture_error = None;
     persist_store(&app, &store)?;
     Ok(pid)
 }

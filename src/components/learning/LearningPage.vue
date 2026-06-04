@@ -22,11 +22,6 @@ const props = defineProps<{
   learningBusyStage: LearningBusyStage;
   learningTaskMessage: string;
   learningTaskProgress: number | null;
-  eventCaptureMode: string;
-  capturedEventCount: number;
-  eventCaptureError: string;
-  runtimeIsAdmin: boolean;
-  runtimeMessage: string;
 }>();
 
 const emit = defineEmits<{
@@ -43,7 +38,6 @@ const emit = defineEmits<{
   (e: "save-learning-rule"): void;
   (e: "retry-learning-analysis"): void;
   (e: "abandon-learning"): void;
-  (e: "relaunch-as-admin"): void;
 }>();
 
 const hasHighConfidence = computed(() => props.candidates.some((item) => item.score >= 45));
@@ -245,6 +239,10 @@ function learningBusyLabel(): string {
       <span class="eyebrow">第二步</span>
       <h2>进入游戏并手动保存一次</h2>
       <p class="learning-copy">在游戏里完成一次明确的保存动作。保存完成后，回到 GameSaver 继续分析。</p>
+      <section class="learning-method-note">
+        <strong>基于保存前后变化分析</strong>
+        <p>GameSaver 会对比启动游戏前后的文件变化，优先找出刚刚被修改、且像存档目录的位置。</p>
+      </section>
       <section v-if="learningState.loading && learningBusyStage === 'analyzing'" class="learning-loading-box">
         <strong>{{ learningBusyLabel() }}</strong>
         <div class="progress-track" role="progressbar" aria-label="正在分析存档变化">
@@ -273,12 +271,9 @@ function learningBusyLabel(): string {
         </button>
       </div>
       <details class="runtime-diagnostics learning-advanced">
-        <summary>采集详情（高级）</summary>
-        <p>运行权限：{{ runtimeIsAdmin ? "管理员" : "普通用户" }}</p>
+        <summary>学习会话信息</summary>
         <p>会话 ID：<code>{{ sessionId }}</code></p>
         <p>游戏 PID：{{ pid ?? "未获取" }}</p>
-        <p>{{ runtimeMessage }}</p>
-        <button v-if="!runtimeIsAdmin" type="button" @click="emit('relaunch-as-admin')">一键管理员重启</button>
       </details>
     </section>
 
@@ -286,11 +281,6 @@ function learningBusyLabel(): string {
       <span class="eyebrow">第三步</span>
       <h2>选择存档目录</h2>
       <p class="learning-copy">通常选择“强推荐”或“推荐”即可。不确定时，打开目录看看里面是否有存档文件。</p>
-      <details class="runtime-diagnostics learning-advanced">
-        <summary>采集详情（高级）</summary>
-        <p>采集模式：{{ eventCaptureMode }} | 捕获事件数：{{ capturedEventCount }}</p>
-        <p v-if="eventCaptureError" class="error">ETW 信息：{{ eventCaptureError }}</p>
-      </details>
       <p v-if="!candidates.length" class="empty-hint">没有检测到候选目录。请确认刚才在游戏内执行了保存动作。</p>
       <div v-else class="candidate-groups">
         <section

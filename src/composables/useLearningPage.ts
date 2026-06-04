@@ -2,11 +2,8 @@ import { computed, ref } from "vue";
 import {
   cancelLearning,
   confirmRule,
-  getLearningSession,
-  getRuntimeStatus,
   launchGame,
   openCandidatePath,
-  restartAsAdmin,
   startFinishLearningTask,
   startLearning,
   startRetryFinishLearningTask,
@@ -110,11 +107,6 @@ export function useLearningPage(options: {
   const learningBusyStage = ref<LearningBusyStage>("");
   const learningTaskMessage = ref("");
   const learningTaskProgress = ref<number | null>(null);
-  const eventCaptureMode = ref("unknown");
-  const capturedEventCount = ref(0);
-  const eventCaptureError = ref("");
-  const runtimeIsAdmin = ref(false);
-  const runtimeMessage = ref("");
 
   const hasHighConfidence = computed(() => candidates.value.some((item) => item.score >= 45));
 
@@ -131,9 +123,6 @@ export function useLearningPage(options: {
     learningBusyStage.value = "";
     learningTaskMessage.value = "";
     learningTaskProgress.value = null;
-    eventCaptureMode.value = "unknown";
-    capturedEventCount.value = 0;
-    eventCaptureError.value = "";
   }
 
   function toggleSelect(path: string) {
@@ -227,10 +216,6 @@ export function useLearningPage(options: {
       }
       const taskResult = finalTask.result;
       candidates.value = Array.isArray(taskResult) ? taskResult : [];
-      const session = await getLearningSession(sessionId.value);
-      eventCaptureMode.value = session.eventCaptureMode ?? "unknown";
-      capturedEventCount.value = session.capturedEventCount ?? 0;
-      eventCaptureError.value = session.eventCaptureError ?? "";
       const autoSelectable = candidates.value.filter(
         (item) => item.recommendation === "strong" || item.recommendation === "recommended",
       );
@@ -276,10 +261,6 @@ export function useLearningPage(options: {
       }
       const taskResult = finalTask.result;
       candidates.value = Array.isArray(taskResult) ? taskResult : [];
-      const session = await getLearningSession(sessionId.value);
-      eventCaptureMode.value = session.eventCaptureMode ?? "unknown";
-      capturedEventCount.value = session.capturedEventCount ?? 0;
-      eventCaptureError.value = session.eventCaptureError ?? "";
       const autoSelectable = candidates.value.filter(
         (item) => item.recommendation === "strong" || item.recommendation === "recommended",
       );
@@ -350,25 +331,6 @@ export function useLearningPage(options: {
     }
   }
 
-  async function loadRuntimeStatus() {
-    try {
-      const status = await getRuntimeStatus();
-      runtimeIsAdmin.value = status.isAdmin;
-      runtimeMessage.value = status.message;
-    } catch (err) {
-      runtimeMessage.value = `运行状态读取失败：${String(err)}`;
-    }
-  }
-
-  async function relaunchAsAdmin() {
-    learningState.value.error = "";
-    try {
-      await restartAsAdmin();
-    } catch (err) {
-      learningState.value.error = `管理员重启失败：${String(err)}`;
-    }
-  }
-
   return {
     step,
     gameId,
@@ -382,11 +344,6 @@ export function useLearningPage(options: {
     learningBusyStage,
     learningTaskMessage,
     learningTaskProgress,
-    eventCaptureMode,
-    capturedEventCount,
-    eventCaptureError,
-    runtimeIsAdmin,
-    runtimeMessage,
     chooseExePath,
     chooseExtraScanRoot,
     beginLearning,
@@ -396,7 +353,5 @@ export function useLearningPage(options: {
     saveLearningRule,
     retryLearningAnalysis,
     abandonLearning,
-    loadRuntimeStatus,
-    relaunchAsAdmin,
   };
 }

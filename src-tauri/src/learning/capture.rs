@@ -63,6 +63,7 @@ pub(crate) fn collect_process_tree_pids(root_pid: u32) -> Result<Vec<u32>, Strin
     Ok(tracked)
 }
 
+#[allow(dead_code)]
 pub(crate) fn try_start_etw_capture(app: &AppHandle, session_id: &str) -> Result<EventCaptureHandle, String> {
     if !is_running_as_admin() {
         return Err("current process is not elevated, fallback to snapshot mode".to_string());
@@ -121,6 +122,7 @@ pub(crate) fn is_running_as_admin() -> bool {
     text.contains("true")
 }
 
+#[allow(dead_code)]
 pub(crate) fn collect_related_files_by_trace(
     trace_name: Option<&str>,
     trace_path: Option<&str>,

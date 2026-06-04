@@ -93,6 +93,7 @@ pub(crate) fn snapshots_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(base)
 }
 
+#[allow(dead_code)]
 pub(crate) fn event_logs_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
         .path()

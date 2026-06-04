@@ -166,11 +166,6 @@ const {
   learningBusyStage,
   learningTaskMessage,
   learningTaskProgress,
-  eventCaptureMode,
-  capturedEventCount,
-  eventCaptureError,
-  runtimeIsAdmin,
-  runtimeMessage,
   chooseExePath,
   chooseExtraScanRoot,
   beginLearning,
@@ -180,8 +175,6 @@ const {
   saveLearningRule,
   retryLearningAnalysis,
   abandonLearning,
-  loadRuntimeStatus,
-  relaunchAsAdmin,
 } = useLearningPage({
   waitForTaskCompletion,
   askConfirm,
@@ -195,7 +188,6 @@ const {
 });
 
 onMounted(() => {
-  void loadRuntimeStatus();
   void reloadRulesWithLoading();
   void reloadLibraryWithLoading();
   void reloadSettings();
@@ -254,11 +246,6 @@ onMounted(() => {
       :learning-busy-stage="learningBusyStage"
       :learning-task-message="learningTaskMessage"
       :learning-task-progress="learningTaskProgress"
-      :event-capture-mode="eventCaptureMode"
-      :captured-event-count="capturedEventCount"
-      :event-capture-error="eventCaptureError"
-      :runtime-is-admin="runtimeIsAdmin"
-      :runtime-message="runtimeMessage"
       @update:game-id="gameId = $event"
       @update:exe-path="exePath = $event"
       @update:extra-scan-roots-text="extraScanRootsText = $event"
@@ -272,7 +259,6 @@ onMounted(() => {
       @save-learning-rule="saveLearningRule"
       @retry-learning-analysis="retryLearningAnalysis"
       @abandon-learning="abandonLearning"
-      @relaunch-as-admin="relaunchAsAdmin"
     />
 
     <RulesPage
