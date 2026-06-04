@@ -225,6 +225,42 @@ pub(crate) fn select_rule_for_game(store: &PersistedStore, game_id: &str) -> Opt
         .cloned()
 }
 
+pub(crate) fn select_enabled_rule_for_game(store: &PersistedStore, game_id: &str) -> Option<GameSaveRule> {
+    let game_key = normalize_game_key(game_id);
+    if game_key.is_empty() {
+        return None;
+    }
+
+    if let Some(target_uid) = store
+        .execution_config
+        .preferred_rule_uid_by_game
+        .get(&game_key)
+        .map(|uid| normalize_game_uid(uid))
+        .filter(|uid| !uid.is_empty())
+    {
+        let preferred = store
+            .rules
+            .iter()
+            .filter(|rule| {
+                rule.enabled
+                    && normalize_game_key(&rule.game_id) == game_key
+                    && normalize_game_uid(&rule.game_uid) == target_uid
+            })
+            .max_by_key(|rule| rule_updated_ts(rule))
+            .cloned();
+        if preferred.is_some() {
+            return preferred;
+        }
+    }
+
+    store
+        .rules
+        .iter()
+        .filter(|rule| rule.enabled && normalize_game_key(&rule.game_id) == game_key)
+        .max_by_key(|rule| rule_updated_ts(rule))
+        .cloned()
+}
+
 pub(crate) fn resolve_preferred_rule_id_for_exe_hash(
     execution_config: &ExecutionConfig,
     exe_hash: &str,

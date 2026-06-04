@@ -8,7 +8,7 @@ use crate::{
     },
     storage::{
         has_unresolved_primary_rule_conflict_for_exe_hash, match_enabled_rule_for_exe_hash,
-        normalize_game_key, normalize_game_uid, select_rule_for_game, JsonStoreRepository,
+        normalize_game_key, normalize_game_uid, select_enabled_rule_for_game, JsonStoreRepository,
         normalize_backup_keep_versions, StoreRepository,
     },
     task_support::update_background_task,
@@ -73,8 +73,8 @@ pub(crate) fn resolve_preferred_exe_path_for_game(
             .store
             .lock()
             .map_err(|_| "failed to lock app state".to_string())?;
-        let rule = select_rule_for_game(&store, game_id)
-            .ok_or_else(|| format!("no available rule for game {}", game_id.trim()))?;
+        let rule = select_enabled_rule_for_game(&store, game_id)
+            .ok_or_else(|| format!("no enabled rule for game {}", game_id.trim()))?;
         let game_uid = normalize_game_uid(&rule.game_uid);
         if game_uid.is_empty() {
             return Err(format!("game {} rule is missing gameUid", game_id.trim()));
@@ -787,8 +787,8 @@ pub(crate) fn list_backup_versions(
         .store
         .lock()
         .map_err(|_| "failed to lock app state".to_string())?;
-    let rule = select_rule_for_game(&store, trimmed_game_id)
-        .ok_or_else(|| "no available rule for this game".to_string())?;
+    let rule = select_enabled_rule_for_game(&store, trimmed_game_id)
+        .ok_or_else(|| "no enabled rule for this game".to_string())?;
     let base = ensure_backup_root_for_rule(&rule, &store.execution_config.backup_root)?;
     let versions_dir = base.join("versions");
     let mut versions = list_version_directories(&versions_dir)?
@@ -820,8 +820,8 @@ pub(crate) fn get_backup_stats(state: State<AppState>, game_id: String) -> Resul
             .store
             .lock()
             .map_err(|_| "failed to lock app state".to_string())?;
-        let rule = select_rule_for_game(&store, trimmed_game_id)
-            .ok_or_else(|| "no available rule for this game".to_string())?;
+        let rule = select_enabled_rule_for_game(&store, trimmed_game_id)
+            .ok_or_else(|| "no enabled rule for this game".to_string())?;
         let keep_versions = resolve_backup_keep_versions(&store.execution_config, &rule.game_uid);
         (rule, store.execution_config.backup_root.clone(), keep_versions)
     };
@@ -849,8 +849,8 @@ pub(crate) fn set_backup_keep_versions(
             .store
             .lock()
             .map_err(|_| "failed to lock app state".to_string())?;
-        let rule = select_rule_for_game(&store, trimmed_game_id)
-            .ok_or_else(|| "no available rule for this game".to_string())?;
+        let rule = select_enabled_rule_for_game(&store, trimmed_game_id)
+            .ok_or_else(|| "no enabled rule for this game".to_string())?;
         let game_uid = normalize_game_uid(&rule.game_uid);
         if game_uid.is_empty() {
             return Err("selected rule is missing gameUid".to_string());
@@ -886,8 +886,8 @@ pub(crate) fn prune_backup_versions(
             .store
             .lock()
             .map_err(|_| "failed to lock app state".to_string())?;
-        let rule = select_rule_for_game(&store, trimmed_game_id)
-            .ok_or_else(|| "no available rule for this game".to_string())?;
+        let rule = select_enabled_rule_for_game(&store, trimmed_game_id)
+            .ok_or_else(|| "no enabled rule for this game".to_string())?;
         let game_uid = normalize_game_uid(&rule.game_uid);
         if game_uid.is_empty() {
             return Err("selected rule is missing gameUid".to_string());
@@ -1087,8 +1087,8 @@ fn restore_backup_version_impl(
             .store
             .lock()
             .map_err(|_| "failed to lock app state".to_string())?;
-        let rule = select_rule_for_game(&store, &trimmed_game_id)
-            .ok_or_else(|| "no available rule for this game".to_string())?;
+        let rule = select_enabled_rule_for_game(&store, &trimmed_game_id)
+            .ok_or_else(|| "no enabled rule for this game".to_string())?;
         let keep_versions = resolve_backup_keep_versions(&store.execution_config, &rule.game_uid);
         let normalized_uid = normalize_game_uid(&rule.game_uid);
         let restore_exe_path = if normalized_uid.is_empty() {

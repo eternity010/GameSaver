@@ -8,7 +8,7 @@ use crate::{
     },
     storage::{
         has_unresolved_primary_rule_conflict_for_exe_hash, match_enabled_rule_for_exe_hash,
-        normalize_game_key, normalize_game_uid, select_rule_for_game,
+        normalize_game_key, normalize_game_uid, select_enabled_rule_for_game,
     },
 };
 use std::{
@@ -40,7 +40,7 @@ pub(crate) fn precheck_game_launch(
             .store
             .lock()
             .map_err(|_| "failed to lock app state".to_string())?;
-        let selected_rule = select_rule_for_game(&store, &trimmed_game_id);
+        let selected_rule = select_enabled_rule_for_game(&store, &trimmed_game_id);
         let preferred_exe_path = selected_rule.as_ref().and_then(|rule| {
             let game_uid = normalize_game_uid(&rule.game_uid);
             if game_uid.is_empty() {
