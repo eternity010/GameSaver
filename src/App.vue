@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onMounted, onUnmounted, ref } from "vue";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useConfirmDialog } from "./composables/useConfirmDialog";
 import { useLearningPage } from "./composables/useLearningPage";
 import { useLibraryPage } from "./composables/useLibraryPage";
@@ -17,10 +18,20 @@ import { getTask } from "./api";
 
 type TopTab = "learning" | "rules" | "library" | "settings";
 
+type PostExitBackupCompletedEvent = {
+  gameId: string;
+  sessionId: string;
+  changedFiles: number;
+  skippedLargeFiles: number;
+  versionId?: string;
+  error?: string;
+};
+
 const activeTab = ref<TopTab>("library");
 const { toast, showToast, closeToast } = useToast();
 const { confirmDialog, askConfirm, resolveConfirm } = useConfirmDialog();
 const blockingErrorMessage = ref("");
+let unlistenPostExitBackup: UnlistenFn | null = null;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -63,6 +74,33 @@ function showBlockingError(message: string) {
 
 function closeBlockingError() {
   blockingErrorMessage.value = "";
+}
+
+function buildPostExitBackupToast(payload: PostExitBackupCompletedEvent): {
+  message: string;
+  level: "success" | "error" | "info";
+  timeoutMs: number;
+} {
+  if (payload.error) {
+    return {
+      message: `${payload.gameId} 自动备份失败：${payload.error}`,
+      level: "error",
+      timeoutMs: 5200,
+    };
+  }
+  const skippedNote = payload.skippedLargeFiles > 0 ? `，跳过 ${payload.skippedLargeFiles} 个大文件` : "";
+  if (payload.versionId) {
+    return {
+      message: `${payload.gameId} 已自动保护本次存档：变更 ${payload.changedFiles} 个文件${skippedNote}`,
+      level: "success",
+      timeoutMs: 4200,
+    };
+  }
+  return {
+    message: `${payload.gameId} 本次没有检测到存档变化${skippedNote}`,
+    level: "info",
+    timeoutMs: 3600,
+  };
 }
 
 const {
@@ -125,6 +163,7 @@ const {
   pruneOldBackupsForGame,
   rollbackToLibraryBackupVersion,
   undoLibraryRestore,
+  loadSelectedLibraryGameDetails,
 } = useLibraryPage({
   rules,
   waitForTaskCompletion,
@@ -190,6 +229,23 @@ onMounted(() => {
   void reloadRulesWithLoading();
   void reloadLibraryWithLoading();
   void reloadSettings();
+  void listen<PostExitBackupCompletedEvent>("post_exit_backup_completed", async (event) => {
+    const toastResult = buildPostExitBackupToast(event.payload);
+    showToast(toastResult.message, toastResult.level, toastResult.timeoutMs);
+    await refreshLibraryItems();
+    if (selectedLibraryItem.value?.gameId === event.payload.gameId) {
+      await loadSelectedLibraryGameDetails();
+    }
+  }).then((unlisten) => {
+    unlistenPostExitBackup = unlisten;
+  });
+});
+
+onUnmounted(() => {
+  if (unlistenPostExitBackup) {
+    unlistenPostExitBackup();
+    unlistenPostExitBackup = null;
+  }
 });
 
 </script>
@@ -272,6 +328,7 @@ onMounted(() => {
       @reload="reloadRulesWithLoading"
       @export-rules="exportRulesToFile"
       @import-rules="importRulesFromFile"
+      @open-migration-settings="activeTab = 'settings'"
       @mark-primary="markPrimaryRule"
       @save-rule="saveManagedRule"
       @remove-rule="removeManagedRule"

@@ -27,6 +27,7 @@ const emit = defineEmits<{
   (e: "reload"): void;
   (e: "export-rules"): void;
   (e: "import-rules"): void;
+  (e: "open-migration-settings"): void;
   (e: "mark-primary", rule: GameSaveRule): void;
   (e: "save-rule", rule: GameSaveRule): void;
   (e: "remove-rule", rule: GameSaveRule): void;
@@ -240,6 +241,12 @@ function updateRuleDraft(ruleId: string, patch: Partial<RuleDraft>) {
           <button :disabled="rulesState.loading" type="button" @click="emit('import-rules')">导入规则</button>
         </div>
       </div>
+      <p class="rules-copy migration-settings-hint">
+        需要换电脑或搬家？
+        <button type="button" class="link-button" @click="emit('open-migration-settings')">
+          去设置页导入/导出迁移包
+        </button>
+      </p>
       <p v-if="ruleConflicts.length" class="conflict-summary">
         有 {{ ruleConflicts.length }} 组游戏程序命中了多条规则，需要指定启动时优先使用哪一条。
       </p>

@@ -14,9 +14,20 @@ use crate::{
     task_support::update_background_task,
 };
 use std::{collections::HashSet, fs, path::{Path, PathBuf}, process::Command};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use walkdir::WalkDir;
 use uuid::Uuid;
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PostExitBackupCompletedEvent {
+    game_id: String,
+    session_id: String,
+    changed_files: usize,
+    skipped_large_files: usize,
+    version_id: Option<String>,
+    error: Option<String>,
+}
 
 pub(crate) struct LaunchPreparation {
     pub(crate) session: LauncherSession,
@@ -743,6 +754,24 @@ fn spawn_post_exit_backup_worker(
         let _ = child.wait();
         let backup_result =
             backup_current_state_for_rule(&rule, &backup_root, keep_versions, max_file_bytes, Some(&exe_path));
+        let mut event = PostExitBackupCompletedEvent {
+            game_id: rule.game_id.clone(),
+            session_id: session_id.clone(),
+            changed_files: 0,
+            skipped_large_files: 0,
+            version_id: None,
+            error: None,
+        };
+        match &backup_result {
+            Ok(result) => {
+                event.changed_files = result.changed_files;
+                event.skipped_large_files = result.skipped_large_files;
+                event.version_id = result.version_id.clone();
+            }
+            Err(err) => {
+                event.error = Some(err.clone());
+            }
+        }
         let state: State<AppState> = app.state();
         let lock_result = state.store.lock();
         if let Ok(mut store) = lock_result {
@@ -778,13 +807,16 @@ fn spawn_post_exit_backup_worker(
                             );
                         }
                     }
-                    Err(err) => append_session_log(session, &format!("Automatic backup failed: {err}")),
+                    Err(err) => {
+                        append_session_log(session, &format!("Automatic backup failed: {err}"));
+                    }
                 }
                 session.status = "exited".to_string();
                 session.updated_at = now_iso_string();
             }
             let _ = JsonStoreRepository::new().persist(&app, &store);
         };
+        let _ = app.emit("post_exit_backup_completed", event);
     });
 }
 
