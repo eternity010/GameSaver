@@ -13,7 +13,7 @@ use crate::{
     },
     task_support::update_background_task,
 };
-use std::{collections::HashSet, fs, path::{Path, PathBuf}, process::Command};
+use std::{collections::{HashMap, HashSet}, fs, path::{Path, PathBuf}, process::Command, time::Duration};
 use tauri::{AppHandle, Emitter, Manager, State};
 use walkdir::WalkDir;
 use uuid::Uuid;
@@ -497,7 +497,8 @@ fn sync_directory(source: &Path, target: &Path) -> Result<usize, String> {
     }
     fs::create_dir_all(target).map_err(|err| format!("create directory failed: {err}"))?;
     let mut copied = 0usize;
-    for entry in WalkDir::new(source).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(source) {
+        let entry = entry.map_err(|err| format!("scan directory failed: {err}"))?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -529,7 +530,8 @@ fn sync_backup_directory(source: &Path, target: &Path, max_file_bytes: u64) -> R
     }
     fs::create_dir_all(target).map_err(|err| format!("create directory failed: {err}"))?;
     let mut copied = 0usize;
-    for entry in WalkDir::new(source).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(source) {
+        let entry = entry.map_err(|err| format!("scan backup source failed: {err}"))?;
         if !entry.file_type().is_file() || is_backup_file_too_large(entry.path(), max_file_bytes) {
             continue;
         }
@@ -547,15 +549,31 @@ fn sync_backup_directory(source: &Path, target: &Path, max_file_bytes: u64) -> R
     Ok(copied)
 }
 
-fn file_signature(path: &Path) -> Option<(u64, u64)> {
-    let metadata = path.metadata().ok()?;
+fn file_signature(path: &Path) -> Result<Option<(u64, u128)>, String> {
+    let metadata = match path.metadata() {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("read file metadata failed for {}: {err}", path.display())),
+    };
     let size = metadata.len();
     let modified = metadata
         .modified()
-        .ok()
-        .and_then(|value| crate::runtime::system_time_to_unix(value))
-        .unwrap_or(0);
-    Some((size, modified))
+        .map_err(|err| format!("read modified time failed for {}: {err}", path.display()))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|err| format!("invalid modified time for {}: {err}", path.display()))?
+        .as_nanos();
+    Ok(Some((size, modified)))
+}
+
+fn backup_files_differ(source: &Path, latest: &Path) -> Result<bool, String> {
+    if file_signature(source)? != file_signature(latest)? {
+        return Ok(true);
+    }
+    if !latest.exists() {
+        return Ok(true);
+    }
+    Ok(file_sha256_hex_with_context(source, "save file")?
+        != file_sha256_hex_with_context(latest, "latest backup file")?)
 }
 
 fn sync_source_to_backup_slot(
@@ -565,16 +583,28 @@ fn sync_source_to_backup_slot(
     max_file_bytes: u64,
 ) -> Result<BackupSyncSummary, String> {
     if !source.exists() {
+        let removed_files = if latest_slot.exists() {
+            WalkDir::new(latest_slot).into_iter().try_fold(0usize, |count, entry| {
+                let entry = entry.map_err(|err| format!("scan old latest backup failed: {err}"))?;
+                Ok::<usize, String>(count + usize::from(entry.file_type().is_file()))
+            })?
+        } else {
+            0
+        };
         if latest_slot.exists() {
             fs::remove_dir_all(latest_slot).map_err(|err| format!("clean old latest failed: {err}"))?;
         }
-        return Ok(BackupSyncSummary::default());
+        if removed_files > 0 {
+            fs::create_dir_all(version_slot).map_err(|err| format!("create empty version slot failed: {err}"))?;
+        }
+        return Ok(BackupSyncSummary { changed_files: removed_files, skipped_large_files: 0 });
     }
     fs::create_dir_all(latest_slot).map_err(|err| format!("create directory failed: {err}"))?;
 
     let mut summary = BackupSyncSummary::default();
     let mut source_files = HashSet::new();
-    for entry in WalkDir::new(source).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(source) {
+        let entry = entry.map_err(|err| format!("scan save source failed: {err}"))?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -589,7 +619,7 @@ fn sync_source_to_backup_slot(
         let key = normalize_windows_path(&relative.to_string_lossy());
         source_files.insert(key);
         let latest_file = latest_slot.join(relative);
-        if file_signature(entry.path()) != file_signature(&latest_file) {
+        if backup_files_differ(entry.path(), &latest_file)? {
             if let Some(parent) = latest_file.parent() {
                 fs::create_dir_all(parent).map_err(|err| format!("create directory failed: {err}"))?;
             }
@@ -604,7 +634,8 @@ fn sync_source_to_backup_slot(
     }
 
     let mut stale_files = Vec::new();
-    for entry in WalkDir::new(latest_slot).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(latest_slot) {
+        let entry = entry.map_err(|err| format!("scan latest backup failed: {err}"))?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -637,7 +668,8 @@ fn sync_source_to_backup_slot(
 
 fn build_backup_manifest(version_root: &Path, snapshot_id: &str, game_uid: &str) -> Result<BackupManifest, String> {
     let mut files = Vec::new();
-    for entry in WalkDir::new(version_root).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(version_root) {
+        let entry = entry.map_err(|err| format!("scan backup version failed: {err}"))?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -709,7 +741,11 @@ fn backup_current_state_for_rule(
     let versions = base.join("versions");
     fs::create_dir_all(&latest).map_err(|err| format!("create directory failed: {err}"))?;
     fs::create_dir_all(&versions).map_err(|err| format!("create directory failed: {err}"))?;
-    let snapshot_id = now_unix().to_string();
+    let mut snapshot_timestamp = now_unix();
+    while versions.join(snapshot_timestamp.to_string()).exists() {
+        snapshot_timestamp += 1;
+    }
+    let snapshot_id = snapshot_timestamp.to_string();
     let version_root = versions.join(&snapshot_id);
 
     let mut summary = BackupSyncSummary::default();
@@ -740,6 +776,85 @@ fn backup_current_state_for_rule(
     })
 }
 
+#[cfg(target_os = "windows")]
+fn snapshot_process_parents() -> Result<HashMap<u32, u32>, String> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+        },
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err("create process snapshot failed".to_string());
+    }
+    let mut parents = HashMap::new();
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while has_entry {
+        parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot); }
+    Ok(parents)
+}
+
+#[cfg(target_os = "windows")]
+fn extend_tracked_process_tree(tracked: &mut HashSet<u32>, parents: &HashMap<u32, u32>) {
+    loop {
+        let descendants = parents
+            .iter()
+            .filter_map(|(pid, parent_pid)| tracked.contains(parent_pid).then_some(*pid))
+            .collect::<Vec<_>>();
+        let previous_len = tracked.len();
+        tracked.extend(descendants);
+        if tracked.len() == previous_len {
+            break;
+        }
+    }
+}
+
+fn wait_for_game_process_tree(child: &mut std::process::Child) -> Result<(), String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        child.wait().map_err(|err| format!("wait for game process failed: {err}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let root_pid = child.id();
+        let mut tracked = HashSet::from([root_pid]);
+        let mut root_exited = false;
+        let mut empty_polls_after_exit = 0u8;
+        loop {
+            let parents = snapshot_process_parents()?;
+            extend_tracked_process_tree(&mut tracked, &parents);
+            if !root_exited {
+                root_exited = child
+                    .try_wait()
+                    .map_err(|err| format!("check game process failed: {err}"))?
+                    .is_some();
+            }
+            let descendants_running = tracked
+                .iter()
+                .any(|pid| *pid != root_pid && parents.contains_key(pid));
+            if root_exited && !descendants_running {
+                empty_polls_after_exit += 1;
+                if empty_polls_after_exit >= 2 {
+                    return Ok(());
+                }
+            } else {
+                empty_polls_after_exit = 0;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
 fn spawn_post_exit_backup_worker(
     app: AppHandle,
     session_id: String,
@@ -751,9 +866,9 @@ fn spawn_post_exit_backup_worker(
     exe_path: String,
 ) {
     std::thread::spawn(move || {
-        let _ = child.wait();
-        let backup_result =
-            backup_current_state_for_rule(&rule, &backup_root, keep_versions, max_file_bytes, Some(&exe_path));
+        let backup_result = wait_for_game_process_tree(&mut child).and_then(|_| {
+            backup_current_state_for_rule(&rule, &backup_root, keep_versions, max_file_bytes, Some(&exe_path))
+        });
         let mut event = PostExitBackupCompletedEvent {
             game_id: rule.game_id.clone(),
             session_id: session_id.clone(),
@@ -784,7 +899,11 @@ fn spawn_post_exit_backup_worker(
                     Ok(result) => {
                         if let Some(snapshot) = result.version_id {
                             let skipped_note = if result.skipped_large_files > 0 {
-                                format!(", skipped {} files over 100 MB", result.skipped_large_files)
+                                format!(
+                                    ", skipped {} files over {}",
+                                    result.skipped_large_files,
+                                    format_file_size_limit(max_file_bytes)
+                                )
                             } else {
                                 String::new()
                             };
@@ -797,7 +916,11 @@ fn spawn_post_exit_backup_worker(
                             );
                         } else {
                             let skipped_note = if result.skipped_large_files > 0 {
-                                format!(" (skipped {} files over 100 MB)", result.skipped_large_files)
+                                format!(
+                                    " (skipped {} files over {})",
+                                    result.skipped_large_files,
+                                    format_file_size_limit(max_file_bytes)
+                                )
                             } else {
                                 String::new()
                             };
@@ -818,6 +941,19 @@ fn spawn_post_exit_backup_worker(
         };
         let _ = app.emit("post_exit_backup_completed", event);
     });
+}
+
+fn format_file_size_limit(bytes: u64) -> String {
+    if bytes == 0 {
+        return "the configured limit".to_string();
+    }
+    if bytes % (1024 * 1024 * 1024) == 0 {
+        return format!("{} GB", bytes / (1024 * 1024 * 1024));
+    }
+    if bytes % (1024 * 1024) == 0 {
+        return format!("{} MB", bytes / (1024 * 1024));
+    }
+    format!("{} bytes", bytes)
 }
 
 fn backup_version_label(version_id: &str) -> String {
@@ -1390,4 +1526,50 @@ fn persist_launcher_session(
         .map_err(|_| "failed to lock app state".to_string())?;
     store.launcher_sessions.push(session.clone());
     JsonStoreRepository::new().persist(app, &store)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_directory(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("gamesaver_{name}_{}", Uuid::new_v4().simple()))
+    }
+
+    #[test]
+    fn backup_comparison_detects_content_changes() {
+        let root = test_directory("content_change");
+        fs::create_dir_all(&root).expect("create test directory");
+        let source = root.join("source.sav");
+        let latest = root.join("latest.sav");
+        fs::write(&source, b"first").expect("write source");
+        fs::write(&latest, b"other").expect("write latest");
+        assert!(backup_files_differ(&source, &latest).expect("compare backup files"));
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[test]
+    fn missing_source_creates_restorable_empty_version() {
+        let root = test_directory("missing_source");
+        let source = root.join("missing");
+        let latest = root.join("latest");
+        let version = root.join("version");
+        fs::create_dir_all(&latest).expect("create latest directory");
+        fs::write(latest.join("save.sav"), b"save").expect("write latest file");
+        let summary = sync_source_to_backup_slot(&source, &latest, &version, 0)
+            .expect("sync missing source");
+        assert_eq!(summary.changed_files, 1);
+        assert!(!latest.exists());
+        assert!(version.is_dir());
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn tracked_process_tree_expands_transitively() {
+        let mut tracked = HashSet::from([10]);
+        let parents = HashMap::from([(11, 10), (12, 11), (20, 99)]);
+        extend_tracked_process_tree(&mut tracked, &parents);
+        assert_eq!(tracked, HashSet::from([10, 11, 12]));
+    }
 }
