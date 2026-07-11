@@ -177,6 +177,10 @@ export async function listGameLibraryItems(): Promise<GameLibraryItem[]> {
   return invoke("list_game_library_items");
 }
 
+export async function getGameIcon(gameId: string): Promise<string | null> {
+  return invoke("get_game_icon", { gameId });
+}
+
 export async function setPreferredExePath(gameId: string, exePath: string): Promise<GameLibraryItem> {
   return invoke("set_preferred_exe_path", { gameId, exePath });
 }

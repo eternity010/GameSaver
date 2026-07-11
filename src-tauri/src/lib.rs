@@ -69,6 +69,7 @@ pub fn run() {
             library::get_launcher_session,
             library::list_launcher_sessions,
             library::list_game_library_items,
+            library::get_game_icon,
             launcher::launch_with_rule,
             launcher::launch_game_from_library,
             launcher::list_backup_versions,

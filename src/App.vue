@@ -3,7 +3,7 @@ import { onMounted, onUnmounted, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useConfirmDialog } from "./composables/useConfirmDialog";
 import { useLearningPage } from "./composables/useLearningPage";
-import { useLibraryPage } from "./composables/useLibraryPage";
+import { useLibraryPage, type LibraryGameProductStatus } from "./composables/useLibraryPage";
 import { useRulesPage } from "./composables/useRulesPage";
 import { useSettingsPage } from "./composables/useSettingsPage";
 import { useToast } from "./composables/useToast";
@@ -15,6 +15,7 @@ import AppToast from "./components/ui/AppToast.vue";
 import BlockingErrorDialog from "./components/ui/BlockingErrorDialog.vue";
 import ConfirmDialog from "./components/ui/ConfirmDialog.vue";
 import { getTask } from "./api";
+import { BookOpenCheck, Gamepad2, Library, Settings, SlidersHorizontal } from "@lucide/vue";
 
 type TopTab = "learning" | "rules" | "library" | "settings";
 
@@ -135,7 +136,9 @@ const {
 const {
   libraryState,
   librarySearch,
+  librarySortMode,
   filteredLibraryItems,
+  libraryIconFor,
   selectedLibraryItem,
   libraryCardErrorFor,
   isLibraryGameSelected,
@@ -225,6 +228,33 @@ const {
   },
 });
 
+async function handleLibraryPrimaryAction(payload: {
+  gameId: string;
+  action: LibraryGameProductStatus["action"];
+}) {
+  await selectLibraryGame(payload.gameId);
+  switch (payload.action) {
+    case "launch":
+      await launchLibraryGame(payload.gameId, "backup");
+      break;
+    case "bind_exe":
+      await choosePreferredExeForGame(payload.gameId, true);
+      break;
+    case "enable_rule":
+      ruleSearch.value = payload.gameId;
+      activeTab.value = "rules";
+      showToast("已定位到对应规则，请启用后返回游戏库", "info", 3600);
+      break;
+    case "learn":
+      gameId.value = payload.gameId;
+      exePath.value = selectedLibraryItem.value?.preferredExePath || "";
+      activeTab.value = "learning";
+      break;
+    default:
+      break;
+  }
+}
+
 onMounted(() => {
   void reloadRulesWithLoading();
   void reloadLibraryWithLoading();
@@ -251,41 +281,56 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <main class="layout">
-    <nav class="tabs panel">
+  <main class="app-shell">
+    <aside class="app-sidebar">
+      <div class="app-brand">
+        <span class="app-brand-mark"><Gamepad2 :size="22" stroke-width="2" /></span>
+        <div>
+          <strong>GameSaver</strong>
+          <span>存档保护</span>
+        </div>
+      </div>
+      <nav class="app-nav" aria-label="主导航">
       <button
-        class="tab"
+        class="app-nav-item"
         :class="{ active: activeTab === 'library' }"
         type="button"
         @click="activeTab = 'library'"
       >
-        游戏库
+        <Library :size="19" />
+        <span>游戏库</span>
       </button>
       <button
-        class="tab"
+        class="app-nav-item"
         :class="{ active: activeTab === 'learning' }"
         type="button"
         @click="activeTab = 'learning'"
       >
-        学习存档
+        <BookOpenCheck :size="19" />
+        <span>添加游戏</span>
       </button>
       <button
-        class="tab"
+        class="app-nav-item"
         :class="{ active: activeTab === 'rules' }"
         type="button"
         @click="activeTab = 'rules'"
       >
-        规则管理
+        <SlidersHorizontal :size="19" />
+        <span>规则</span>
       </button>
       <button
-        class="tab"
+        class="app-nav-item"
         :class="{ active: activeTab === 'settings' }"
         type="button"
         @click="activeTab = 'settings'"
       >
-        设置
+        <Settings :size="19" />
+        <span>设置</span>
       </button>
-    </nav>
+      </nav>
+    </aside>
+
+    <section class="app-content">
 
     <LearningPage
       v-if="activeTab === 'learning'"
@@ -364,7 +409,9 @@ onUnmounted(() => {
       v-else
       :library-state="libraryState"
       :library-search="librarySearch"
+      :library-sort-mode="librarySortMode"
       :filtered-library-items="filteredLibraryItems"
+      :library-icon-for="libraryIconFor"
       :selected-library-item="selectedLibraryItem"
       :library-card-error-for="libraryCardErrorFor"
       :is-library-game-selected="isLibraryGameSelected"
@@ -383,9 +430,11 @@ onUnmounted(() => {
       :restore-task-progress-for="restoreTaskProgressFor"
       :session-details-for="sessionDetailsFor"
       @update:library-search="librarySearch = $event"
+      @update:library-sort-mode="librarySortMode = $event"
       @reload="reloadLibraryWithLoading"
       @select="selectLibraryGame"
       @launch="launchLibraryGame($event, 'backup')"
+      @primary-action="handleLibraryPrimaryAction"
       @choose-exe="choosePreferredExeForGame"
       @update-backup-keep="updateBackupKeepDraft"
       @save-backup-keep="saveBackupKeepPolicy"
@@ -393,6 +442,7 @@ onUnmounted(() => {
       @rollback-version="rollbackToLibraryBackupVersion"
       @undo-restore="undoLibraryRestore"
     />
+    </section>
 
     <AppToast
       :visible="toast.visible"

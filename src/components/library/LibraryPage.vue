@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import LibraryDetailPanel from "./LibraryDetailPanel.vue";
 import LibraryGameCard from "./LibraryGameCard.vue";
-import type { LibraryGameProductStatus } from "../../composables/useLibraryPage";
+import { ArrowDownAZ, Clock3, RefreshCw, Search, ShieldCheck } from "@lucide/vue";
+import type { LibraryGameProductStatus, LibrarySortMode } from "../../composables/useLibraryPage";
 import type {
   BackupStatsResult,
   BackupVersion,
@@ -37,7 +38,9 @@ type LibraryCardAction =
 defineProps<{
   libraryState: TabState;
   librarySearch: string;
+  librarySortMode: LibrarySortMode;
   filteredLibraryItems: GameLibraryItem[];
+  libraryIconFor: (gameId: string) => string;
   selectedLibraryItem: GameLibraryItem | null;
   libraryCardErrorFor: (gameId: string) => string;
   isLibraryGameSelected: (gameId: string) => boolean;
@@ -59,9 +62,11 @@ defineProps<{
 
 const emit = defineEmits<{
   (e: "update:librarySearch", value: string): void;
+  (e: "update:librarySortMode", value: LibrarySortMode): void;
   (e: "reload"): void;
   (e: "select", gameId: string): void;
   (e: "launch", gameId: string): void;
+  (e: "primary-action", payload: { gameId: string; action: LibraryGameProductStatus["action"] }): void;
   (e: "choose-exe", gameId: string): void;
   (e: "update-backup-keep", gameId: string, value: string): void;
   (e: "save-backup-keep", gameId: string): void;
@@ -72,20 +77,64 @@ const emit = defineEmits<{
 </script>
 
 <template>
-  <section class="panel library-shell">
+  <section class="library-shell">
     <header class="library-header">
       <div class="library-title-row">
-        <h2>游戏库（自动备份优先）</h2>
-        <button :disabled="libraryState.loading" type="button" @click="emit('reload')">刷新</button>
+        <div>
+          <h1>游戏库</h1>
+          <p>选择游戏，或直接开始游玩。</p>
+        </div>
+        <button
+          class="icon-button"
+          :disabled="libraryState.loading"
+          type="button"
+          title="刷新游戏库"
+          aria-label="刷新游戏库"
+          @click="emit('reload')"
+        >
+          <RefreshCw :size="18" :class="{ spinning: libraryState.loading }" />
+        </button>
       </div>
-      <label class="library-search">
-        <span>搜索游戏</span>
-        <input
-          :value="librarySearch"
-          placeholder="按 gameId 搜索"
-          @input="emit('update:librarySearch', ($event.target as HTMLInputElement).value)"
-        />
-      </label>
+      <div class="library-toolbar">
+        <label class="library-search">
+          <Search :size="17" />
+          <input
+            :value="librarySearch"
+            placeholder="搜索游戏"
+            aria-label="搜索游戏"
+            @input="emit('update:librarySearch', ($event.target as HTMLInputElement).value)"
+          />
+        </label>
+        <div class="library-sort-control" aria-label="游戏排序方式">
+          <button
+            type="button"
+            :class="{ active: librarySortMode === 'recent' }"
+            title="按最近游玩排序"
+            @click="emit('update:librarySortMode', 'recent')"
+          >
+            <Clock3 :size="15" />
+            <span>最近</span>
+          </button>
+          <button
+            type="button"
+            :class="{ active: librarySortMode === 'name' }"
+            title="按游戏名称排序"
+            @click="emit('update:librarySortMode', 'name')"
+          >
+            <ArrowDownAZ :size="15" />
+            <span>名称</span>
+          </button>
+          <button
+            type="button"
+            :class="{ active: librarySortMode === 'status' }"
+            title="按保护状态排序"
+            @click="emit('update:librarySortMode', 'status')"
+          >
+            <ShieldCheck :size="15" />
+            <span>状态</span>
+          </button>
+        </div>
+      </div>
       <p v-if="libraryState.error" class="error inline-error">{{ libraryState.error }}</p>
     </header>
 
@@ -95,11 +144,14 @@ const emit = defineEmits<{
           v-for="item in filteredLibraryItems"
           :key="item.gameId"
           :item="item"
+          :icon-url="libraryIconFor(item.gameId)"
           :selected="isLibraryGameSelected(item.gameId)"
           :warning="!!gameDirResolutionIssue(item.gameId)"
           :card-error="libraryCardErrorFor(item.gameId)"
           :product-status="libraryGameProductStatus(item)"
+          :busy="isCardBusy(item.gameId)"
           @select="emit('select', $event)"
+          @primary-action="emit('primary-action', $event)"
         />
       </div>
 
@@ -127,7 +179,7 @@ const emit = defineEmits<{
         :restore-task-progress="restoreTaskProgressFor(selectedLibraryItem.gameId)"
         :session-details="sessionDetailsFor(selectedLibraryItem.gameId)"
         :product-status="libraryGameProductStatus(selectedLibraryItem)"
-        @launch="(gameId) => emit('launch', gameId)"
+        @primary-action="emit('primary-action', $event)"
         @choose-exe="(gameId) => emit('choose-exe', gameId)"
         @update-backup-keep="(gameId, value) => emit('update-backup-keep', gameId, value)"
         @save-backup-keep="(gameId) => emit('save-backup-keep', gameId)"

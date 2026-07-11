@@ -27,3 +27,4 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",
 ] }
+windows-icons = "0.3.0"

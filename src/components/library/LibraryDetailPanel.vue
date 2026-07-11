@@ -9,6 +9,7 @@ import type {
   LaunchSyncDecision,
   LauncherSession,
 } from "../../types";
+import { BookOpenCheck, Play, Settings2, SlidersHorizontal } from "@lucide/vue";
 
 type RestoreUndoState = {
   gameId: string;
@@ -43,6 +44,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "launch", gameId: string): void;
+  (e: "primary-action", payload: { gameId: string; action: LibraryGameProductStatus["action"] }): void;
   (e: "choose-exe", gameId: string): void;
   (e: "update-backup-keep", gameId: string, value: string): void;
   (e: "save-backup-keep", gameId: string): void;
@@ -182,6 +184,21 @@ function launchActionHint(): string {
   return props.productStatus.description;
 }
 
+function primaryActionLabel(): string {
+  switch (props.productStatus.action) {
+    case "launch":
+      return props.launchBusy ? "正在启动..." : "启动游戏";
+    case "bind_exe":
+      return "设置并启动";
+    case "enable_rule":
+      return "启用规则";
+    case "learn":
+      return "添加存档保护";
+    default:
+      return "保护中";
+  }
+}
+
 function shortExePath(path?: string | null): string {
   const value = (path || "").trim();
   if (!value) return "";
@@ -208,10 +225,14 @@ function onBackupKeepInput(event: Event) {
       <button
         type="button"
         class="primary"
-        :disabled="loading || launchBusy"
-        @click="emit('launch', selectedItem.gameId)"
+        :disabled="loading || launchBusy || productStatus.action === 'wait'"
+        @click="emit('primary-action', { gameId: selectedItem.gameId, action: productStatus.action })"
       >
-        {{ launchBusy ? "正在启动..." : "启动游戏" }}
+        <Play v-if="productStatus.action === 'launch'" :size="17" fill="currentColor" />
+        <Settings2 v-else-if="productStatus.action === 'bind_exe'" :size="17" />
+        <SlidersHorizontal v-else-if="productStatus.action === 'enable_rule'" :size="17" />
+        <BookOpenCheck v-else :size="17" />
+        {{ primaryActionLabel() }}
       </button>
     </div>
     <p class="detail-launch-hint">{{ launchActionHint() }}</p>
@@ -222,16 +243,15 @@ function onBackupKeepInput(event: Event) {
         <strong>{{ launchStatusLabel() }}</strong>
       </div>
       <div class="detail-summary-item">
-        <span>建议操作</span>
-        <strong>{{ productStatus.actionHint }}</strong>
-      </div>
-      <div class="detail-summary-item">
         <span>备份</span>
         <strong>{{ backupSummaryText() }}</strong>
       </div>
     </section>
 
-    <label class="field compact-detail-field">
+    <details class="library-collapsible launch-settings-collapsible">
+      <summary>启动与保护设置</summary>
+      <div class="launch-settings-content">
+      <label class="field compact-detail-field">
       <span>启动 EXE</span>
       <div class="row">
         <input
@@ -338,7 +358,9 @@ function onBackupKeepInput(event: Event) {
         </details>
       </template>
       <p v-else class="empty-hint">尚未检查，点击“刷新”查看启动条件。</p>
-    </section>
+      </section>
+      </div>
+    </details>
 
     <section class="backup-detail-stack">
       <details class="library-collapsible">

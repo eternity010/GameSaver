@@ -1,6 +1,7 @@
 import { computed, ref, watch, type Ref } from "vue";
 import {
   getBackupStats,
+  getGameIcon,
   getLauncherSession,
   launchGameFromLibrary,
   listBackupVersions,
@@ -51,7 +52,10 @@ export type LibraryGameProductStatus = {
   description: string;
   tone: "ready" | "warning" | "paused" | "busy";
   actionHint: string;
+  action: "launch" | "bind_exe" | "enable_rule" | "learn" | "wait";
 };
+
+export type LibrarySortMode = "recent" | "name" | "status";
 
 type WaitForTaskCompletion = <T>(
   taskId: string,
@@ -76,11 +80,22 @@ function cardKey(gameIdText: string): string {
   return normalizeGameId(gameIdText);
 }
 
-function sortLibraryItems(items: GameLibraryItem[]): GameLibraryItem[] {
+function libraryStatusRank(item: GameLibraryItem): number {
+  if (item.enabledRules === 0) return 2;
+  if (!item.preferredExePath) return 1;
+  return 0;
+}
+
+function sortLibraryItems(items: GameLibraryItem[], mode: LibrarySortMode): GameLibraryItem[] {
   return [...items].sort((a, b) => {
-    const aTime = Math.max(Number(a.lastSessionUpdatedAt || "0"), Number(a.lastRuleUpdatedAt || "0"));
-    const bTime = Math.max(Number(b.lastSessionUpdatedAt || "0"), Number(b.lastRuleUpdatedAt || "0"));
-    return bTime - aTime;
+    if (mode === "name") {
+      return a.gameId.localeCompare(b.gameId);
+    }
+    if (mode === "status") {
+      return libraryStatusRank(a) - libraryStatusRank(b) || a.gameId.localeCompare(b.gameId);
+    }
+    const recentDifference = Number(b.lastSessionUpdatedAt || "0") - Number(a.lastSessionUpdatedAt || "0");
+    return recentDifference || a.gameId.localeCompare(b.gameId);
   });
 }
 
@@ -186,6 +201,9 @@ export function useLibraryPage(options: {
   const libraryState = ref<TabState>({ loading: false, error: "" });
   const libraryItems = ref<GameLibraryItem[]>([]);
   const librarySearch = ref("");
+  const librarySortMode = ref<LibrarySortMode>("recent");
+  const libraryIcons = ref<Record<string, string>>({});
+  const libraryIconExePaths = ref<Record<string, string>>({});
   const cardLoading = ref<Record<string, Partial<Record<CardAction, boolean>>>>({});
   const libraryCardErrors = ref<Record<string, string>>({});
   const selectedLibraryGameId = ref("");
@@ -201,8 +219,10 @@ export function useLibraryPage(options: {
 
   const filteredLibraryItems = computed(() => {
     const keyword = librarySearch.value.trim().toLowerCase();
-    if (!keyword) return libraryItems.value;
-    return libraryItems.value.filter((item) => item.gameId.toLowerCase().includes(keyword));
+    const items = keyword
+      ? libraryItems.value.filter((item) => item.gameId.toLowerCase().includes(keyword))
+      : libraryItems.value;
+    return sortLibraryItems(items, librarySortMode.value);
   });
 
   const selectedLibraryItem = computed(() => {
@@ -439,6 +459,7 @@ export function useLibraryPage(options: {
         description: "游戏正在运行，退出后会自动检查并备份存档。",
         tone: "busy",
         actionHint: "等待游戏退出后完成备份",
+        action: "wait",
       };
     }
     if (item.enabledRules === 0) {
@@ -449,6 +470,7 @@ export function useLibraryPage(options: {
           : "还没有可用的存档规则，先学习一次存档位置。",
         tone: "paused",
         actionHint: item.totalRules > 0 ? "启用规则后再启动" : "先学习存档规则",
+        action: item.totalRules > 0 ? "enable_rule" : "learn",
       };
     }
     if (!item.preferredExePath) {
@@ -457,6 +479,7 @@ export function useLibraryPage(options: {
         description: "还没有绑定本机启动程序，选择 EXE 后即可像 Steam 一样启动。",
         tone: "warning",
         actionHint: "先选择启动 EXE",
+        action: "bind_exe",
       };
     }
     if (gameDirResolutionIssue(item.gameId)) {
@@ -465,6 +488,7 @@ export function useLibraryPage(options: {
         description: "规则里包含游戏目录路径，需要重新确认当前绑定的 EXE。",
         tone: "warning",
         actionHint: "确认或更换启动 EXE",
+        action: "bind_exe",
       };
     }
 
@@ -475,6 +499,7 @@ export function useLibraryPage(options: {
         description: "历史备份看起来比本地存档更新，启动前会让你选择恢复或直接启动。",
         tone: "warning",
         actionHint: "启动时确认使用哪份存档",
+        action: "launch",
       };
     }
     if (syncDecision?.status === "conflict_unknown") {
@@ -483,6 +508,7 @@ export function useLibraryPage(options: {
         description: "本地和备份状态无法可靠判断，启动前建议确认一次。",
         tone: "warning",
         actionHint: "查看存档状态后启动",
+        action: "launch",
       };
     }
 
@@ -491,6 +517,7 @@ export function useLibraryPage(options: {
       description: "存档保护已就绪，启动后退出游戏会自动备份变化。",
       tone: "ready",
       actionHint: "点击启动游戏",
+      action: "launch",
     };
   }
 
@@ -619,8 +646,38 @@ export function useLibraryPage(options: {
 
   async function refreshLibraryItems() {
     const data = await listGameLibraryItems();
-    libraryItems.value = sortLibraryItems(data);
+    libraryItems.value = data;
     ensureSelectedLibraryGame();
+    void loadLibraryIcons(data);
+  }
+
+  async function loadLibraryIcons(items: GameLibraryItem[]) {
+    for (const item of items) {
+      const key = cardKey(item.gameId);
+      const exePath = item.preferredExePath || "";
+      if (libraryIconExePaths.value[key] === exePath) {
+        continue;
+      }
+      libraryIconExePaths.value = { ...libraryIconExePaths.value, [key]: exePath };
+      if (!exePath) {
+        const nextIcons = { ...libraryIcons.value };
+        delete nextIcons[key];
+        libraryIcons.value = nextIcons;
+        continue;
+      }
+      try {
+        const icon = await getGameIcon(item.gameId);
+        if (icon) {
+          libraryIcons.value = { ...libraryIcons.value, [key]: icon };
+        }
+      } catch {
+        // The card keeps its text fallback when Windows cannot extract an icon.
+      }
+    }
+  }
+
+  function libraryIconFor(gameIdText: string): string {
+    return libraryIcons.value[cardKey(gameIdText)] || "";
   }
 
   async function refreshLaunchPrechecksForLibraryItems() {
@@ -663,7 +720,7 @@ export function useLibraryPage(options: {
     await loadSelectedLibraryGameDetails();
   }
 
-  async function choosePreferredExeForGame(gameIdText: string) {
+  async function choosePreferredExeForGame(gameIdText: string, launchAfterBinding = false) {
     try {
       const { open } = await import("@tauri-apps/plugin-dialog");
       const chosen = await open({
@@ -679,6 +736,9 @@ export function useLibraryPage(options: {
       await refreshLibraryItems();
       await loadLaunchPrecheckForGame(gameIdText, false);
       options.showToast(`${gameIdText} 启动 EXE 已更新`, "success");
+      if (launchAfterBinding) {
+        await launchLibraryGame(gameIdText, "backup");
+      }
     } catch (err) {
       setLibraryCardError(gameIdText, `绑定 EXE 失败：${String(err)}`);
       options.showToast("绑定 EXE 失败", "error");
@@ -946,7 +1006,9 @@ export function useLibraryPage(options: {
   return {
     libraryState,
     librarySearch,
+    librarySortMode,
     filteredLibraryItems,
+    libraryIconFor,
     selectedLibraryItem,
     libraryCardErrorFor,
     isLibraryGameSelected,

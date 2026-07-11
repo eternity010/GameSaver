@@ -80,6 +80,39 @@ pub(crate) fn list_game_library_items(state: State<AppState>) -> Result<Vec<Game
 }
 
 #[tauri::command]
+pub(crate) fn get_game_icon(state: State<AppState>, game_id: String) -> Result<Option<String>, String> {
+    let normalized_game_key = normalize_game_key(&game_id);
+    if normalized_game_key.is_empty() {
+        return Err("gameId cannot be empty".to_string());
+    }
+    let exe_path = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "failed to lock app state".to_string())?;
+        let rule = select_rule_for_game(&store, &game_id);
+        rule.and_then(|rule| {
+            let game_uid = normalize_game_uid(&rule.game_uid);
+            store.execution_config.preferred_exe_by_uid.get(&game_uid).cloned()
+        })
+    };
+    let Some(exe_path) = exe_path else {
+        return Ok(None);
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        let base64 = match windows_icons::get_icon_base64_by_path(&exe_path) {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        };
+        return Ok(Some(format!("data:image/png;base64,{base64}")));
+    }
+    #[cfg(not(target_os = "windows"))]
+    Ok(None)
+}
+
+#[tauri::command]
 pub(crate) fn set_preferred_exe_path(
     app: AppHandle,
     state: State<AppState>,
