@@ -1,17 +1,12 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
+import { AlertTriangle, ArrowDownAZ, Clock3, Download, RefreshCw, Search, Upload } from "@lucide/vue";
 import type { GameSaveRule, RuleConflictItem } from "../../types";
 
-type RuleDraft = {
-  gameIdText: string;
-  confirmedPathsText: string;
-  enabled: boolean;
-};
-
-type TabState = {
-  loading: boolean;
-  error: string;
-};
+type RuleDraft = { gameIdText: string; confirmedPathsText: string; enabled: boolean };
+type TabState = { loading: boolean; error: string };
+type RuleFilter = "all" | "enabled" | "disabled" | "conflict";
+type RuleSort = "updated" | "name";
 
 const props = defineProps<{
   rules: GameSaveRule[];
@@ -30,349 +25,211 @@ const emit = defineEmits<{
   (e: "open-migration-settings"): void;
   (e: "mark-primary", rule: GameSaveRule): void;
   (e: "save-rule", rule: GameSaveRule): void;
+  (e: "toggle-rule", payload: { rule: GameSaveRule; enabled: boolean }): void;
   (e: "remove-rule", rule: GameSaveRule): void;
 }>();
 
-const PATH_ANCHOR_TOKENS = [
-  "%GAME_DIR%",
-  "%SAVED_GAMES%",
-  "%DOCUMENTS%",
-  "%LOCALLOW%",
-  "%LOCALAPPDATA%",
-  "%APPDATA%",
-  "%USERPROFILE%",
-] as const;
+const ruleFilter = ref<RuleFilter>("all");
+const ruleSort = ref<RuleSort>("updated");
+
+const conflictByRuleId = computed<Record<string, RuleConflictItem>>(() => {
+  const output: Record<string, RuleConflictItem> = {};
+  for (const conflict of props.ruleConflicts) {
+    for (const ruleId of conflict.ruleIds) output[ruleId] = conflict;
+  }
+  return output;
+});
 
 const filteredRules = computed(() => {
   const keyword = props.ruleSearch.trim().toLowerCase();
-  if (!keyword) return props.rules;
-  return props.rules.filter((rule) => rule.gameId.toLowerCase().includes(keyword));
-});
-
-const ruleConflictByRuleId = computed<Record<string, RuleConflictItem>>(() => {
-  const map: Record<string, RuleConflictItem> = {};
-  for (const conflict of props.ruleConflicts) {
-    for (const ruleId of conflict.ruleIds) {
-      map[ruleId] = conflict;
-    }
-  }
-  return map;
+  const items = props.rules.filter((rule) => {
+    if (keyword && !rule.gameId.toLowerCase().includes(keyword)) return false;
+    if (ruleFilter.value === "enabled" && !rule.enabled) return false;
+    if (ruleFilter.value === "disabled" && rule.enabled) return false;
+    if (ruleFilter.value === "conflict" && !conflictByRuleId.value[rule.ruleId]) return false;
+    return true;
+  });
+  return [...items].sort((a, b) => {
+    if (ruleSort.value === "name") return a.gameId.localeCompare(b.gameId);
+    return Number(b.updatedAt || b.createdAt || "0") - Number(a.updatedAt || a.createdAt || "0");
+  });
 });
 
 function normalizePaths(rawText: string): string[] {
-  const dedup = new Set<string>();
-  const output: string[] = [];
-  for (const line of rawText.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    if (!dedup.has(trimmed)) {
-      dedup.add(trimmed);
-      output.push(trimmed);
-    }
-  }
-  return output;
+  return [...new Set(rawText.split(/\r?\n/).map((item) => item.trim()).filter(Boolean))];
 }
 
 function hasRuleDraftChanges(rule: GameSaveRule): boolean {
   const draft = props.ruleDrafts[rule.ruleId];
   if (!draft) return false;
-  if (draft.gameIdText.trim() !== rule.gameId) {
-    return true;
-  }
-  const draftPaths = normalizePaths(draft.confirmedPathsText);
-  const savedPaths = rule.confirmedPaths;
-  if (draft.enabled !== rule.enabled) {
-    return true;
-  }
-  if (draftPaths.length !== savedPaths.length) {
-    return true;
-  }
-  return draftPaths.some((path, index) => path !== savedPaths[index]);
-}
-
-function ruleConflictFor(ruleId: string): RuleConflictItem | null {
-  return ruleConflictByRuleId.value[ruleId] ?? null;
-}
-
-function isPrimaryConflictRule(ruleId: string): boolean {
-  const conflict = ruleConflictFor(ruleId);
-  return !!conflict && conflict.primaryRuleId === ruleId;
-}
-
-function shortExeHash(exeHash: string): string {
-  if (exeHash.length <= 16) return exeHash;
-  return `${exeHash.slice(0, 8)}...${exeHash.slice(-8)}`;
+  const paths = normalizePaths(draft.confirmedPathsText);
+  return draft.gameIdText.trim() !== rule.gameId
+    || paths.length !== rule.confirmedPaths.length
+    || paths.some((path, index) => path !== rule.confirmedPaths[index]);
 }
 
 function formatUnixTs(value: string): string {
-  const timestamp = Number(value.startsWith("pre_restore_") ? value.slice("pre_restore_".length) : value);
-  if (!Number.isFinite(timestamp) || timestamp <= 0) {
-    return value || "未知";
-  }
-  const date = new Date(timestamp * 1000);
-  if (Number.isNaN(date.getTime())) {
-    return value || "未知";
-  }
-  return date.toLocaleString();
+  const timestamp = Number(value || "0");
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return "未知";
+  return new Date(timestamp * 1000).toLocaleString();
 }
 
-function extractPathAnchorToken(path: string): string | null {
-  const normalized = path.trim().replace(/\//g, "\\").toUpperCase();
-  for (const token of PATH_ANCHOR_TOKENS) {
-    if (normalized === token || normalized.startsWith(`${token}\\`)) {
-      return token;
-    }
-  }
-  return null;
+function shortValue(value: string): string {
+  return value.length <= 18 ? value : `${value.slice(0, 8)}...${value.slice(-8)}`;
 }
 
-function collectAnchorTokens(paths: string[]): string[] {
-  const ordered = new Set<string>();
-  for (const path of paths) {
-    const token = extractPathAnchorToken(path);
-    if (token) {
-      ordered.add(token);
-    }
-  }
-  return Array.from(ordered);
+function ruleConflict(ruleId: string): RuleConflictItem | null {
+  return conflictByRuleId.value[ruleId] || null;
 }
 
-function ruleDraftAnchorTokens(ruleId: string): string[] {
-  const raw = props.ruleDrafts[ruleId]?.confirmedPathsText ?? "";
-  const paths = raw
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  return collectAnchorTokens(paths);
+function isPrimary(ruleId: string): boolean {
+  return ruleConflict(ruleId)?.primaryRuleId === ruleId;
 }
 
-function firstRuleDraftPath(ruleId: string): string {
-  const raw = props.ruleDrafts[ruleId]?.confirmedPathsText ?? "";
-  return raw
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find(Boolean) ?? "";
+function pathLabel(path: string): string {
+  const normalized = path.toUpperCase();
+  if (normalized.startsWith("%GAME_DIR%")) return "游戏目录";
+  if (normalized.startsWith("%SAVED_GAMES%")) return "Saved Games";
+  if (normalized.startsWith("%DOCUMENTS%")) return "文档";
+  if (normalized.startsWith("%LOCALLOW%")) return "LocalLow";
+  if (normalized.startsWith("%LOCALAPPDATA%")) return "Local";
+  if (normalized.startsWith("%APPDATA%")) return "Roaming";
+  if (normalized.startsWith("%USERPROFILE%")) return "用户目录";
+  return "自定义目录";
 }
 
-function ruleUsesGameDirToken(rule: GameSaveRule | null | undefined): boolean {
-  if (!rule) return false;
-  return rule.confirmedPaths.some((path) => path.toUpperCase().includes("%GAME_DIR%"));
-}
-
-function pathAnchorLabel(token: string): string {
-  switch (token.toUpperCase()) {
-    case "%GAME_DIR%":
-      return "游戏目录";
-    case "%SAVED_GAMES%":
-      return "Saved Games";
-    case "%DOCUMENTS%":
-      return "文档";
-    case "%LOCALLOW%":
-      return "LocalLow";
-    case "%LOCALAPPDATA%":
-      return "Local";
-    case "%APPDATA%":
-      return "Roaming";
-    case "%USERPROFILE%":
-      return "用户目录（兼容）";
-    default:
-      return token;
-  }
-}
-
-function pathAnchorDescription(token: string): string {
-  switch (token.toUpperCase()) {
-    case "%GAME_DIR%":
-      return "跟随当前绑定的游戏 EXE 所在目录动态解析";
-    case "%SAVED_GAMES%":
-      return "Windows 的 Saved Games 存档目录";
-    case "%DOCUMENTS%":
-      return "当前用户的 Documents 目录";
-    case "%LOCALLOW%":
-      return "当前用户的 AppData\\LocalLow 目录";
-    case "%LOCALAPPDATA%":
-      return "当前用户的 AppData\\Local 目录";
-    case "%APPDATA%":
-      return "当前用户的 AppData\\Roaming 目录";
-    case "%USERPROFILE%":
-      return "当前用户根目录，属于兼容兜底锚点，范围较宽，优先级低于文档和 AppData 类锚点";
-    default:
-      return "使用路径锚点进行动态解析";
-  }
-}
-
-function ruleAnchorHint(tokens: string[]): string {
-  if (!tokens.length) {
-    return "";
-  }
-  if (tokens.includes("%USERPROFILE%")) {
-    return "当前规则含“用户目录（兼容）”锚点，建议优先使用更具体的文档 / AppData / 游戏目录锚点。";
-  }
-  if (tokens.includes("%GAME_DIR%")) {
-    return "当前规则含“游戏目录”锚点，路径会跟随已绑定 EXE 所在目录动态解析。";
-  }
-  return "当前规则已使用具体路径锚点，跨机器时会比纯用户目录规则更稳定。";
-}
-
-function updateRuleDraft(ruleId: string, patch: Partial<RuleDraft>) {
+function updateDraft(ruleId: string, patch: Partial<RuleDraft>) {
   emit("update:ruleDraft", { ruleId, patch });
 }
 </script>
 
 <template>
-  <section class="panel rules-shell">
+  <section class="rules-shell compact-rules-page">
     <header class="rules-header">
       <div class="rules-title-row">
-        <h2>规则管理</h2>
-        <button :disabled="rulesState.loading" type="button" @click="emit('reload')">刷新</button>
+        <div>
+          <h1>规则管理</h1>
+          <p class="rules-copy">管理游戏的存档保护状态和存档目录。</p>
+        </div>
+        <button class="icon-button" :disabled="rulesState.loading" type="button" title="刷新规则" @click="emit('reload')">
+          <RefreshCw :size="18" :class="{ spinning: rulesState.loading }" />
+        </button>
       </div>
-      <p class="rules-copy">这里保存的是每个游戏要备份的存档位置。日常只需要确认规则已启用、路径正确。</p>
-      <div class="rules-toolbar">
-        <label class="rules-search">
-          <span>搜索规则</span>
+
+      <div class="rules-toolbar compact-rules-toolbar">
+        <label class="rules-search compact-search">
+          <Search :size="17" />
           <input
             :value="ruleSearch"
-            placeholder="按 gameId 搜索"
+            placeholder="搜索游戏"
+            aria-label="搜索规则"
             @input="emit('update:ruleSearch', ($event.target as HTMLInputElement).value)"
           />
         </label>
-        <div class="rules-actions">
-          <button :disabled="rulesState.loading" type="button" @click="emit('export-rules')">导出规则</button>
-          <button :disabled="rulesState.loading" type="button" @click="emit('import-rules')">导入规则</button>
+        <div class="rule-filter-control" aria-label="规则状态筛选">
+          <button type="button" :class="{ active: ruleFilter === 'all' }" @click="ruleFilter = 'all'">全部</button>
+          <button type="button" :class="{ active: ruleFilter === 'enabled' }" @click="ruleFilter = 'enabled'">已启用</button>
+          <button type="button" :class="{ active: ruleFilter === 'disabled' }" @click="ruleFilter = 'disabled'">已暂停</button>
+          <button type="button" :class="{ active: ruleFilter === 'conflict' }" @click="ruleFilter = 'conflict'">有冲突</button>
+        </div>
+        <div class="rule-sort-control" aria-label="规则排序">
+          <button type="button" :class="{ active: ruleSort === 'updated' }" title="按最近更新排序" @click="ruleSort = 'updated'"><Clock3 :size="15" />最近</button>
+          <button type="button" :class="{ active: ruleSort === 'name' }" title="按名称排序" @click="ruleSort = 'name'"><ArrowDownAZ :size="15" />名称</button>
         </div>
       </div>
-      <p class="rules-copy migration-settings-hint">
-        需要换电脑或搬家？
-        <button type="button" class="link-button" @click="emit('open-migration-settings')">
-          去设置页导入/导出迁移包
-        </button>
-      </p>
+
+      <div class="rules-secondary-actions">
+        <button :disabled="rulesState.loading" type="button" @click="emit('export-rules')"><Download :size="16" />导出规则</button>
+        <button :disabled="rulesState.loading" type="button" @click="emit('import-rules')"><Upload :size="16" />导入规则</button>
+        <button type="button" class="link-button" @click="emit('open-migration-settings')">换电脑或迁移数据</button>
+      </div>
+
       <p v-if="ruleConflicts.length" class="conflict-summary">
-        有 {{ ruleConflicts.length }} 组游戏程序命中了多条规则，需要指定启动时优先使用哪一条。
+        <AlertTriangle :size="16" />{{ ruleConflicts.length }} 组规则需要指定优先项。
       </p>
       <p v-if="rulesState.error" class="error inline-error">{{ rulesState.error }}</p>
     </header>
 
-    <ul v-if="filteredRules.length" class="rule-list rules-grid">
-      <li v-for="rule in filteredRules" :key="rule.ruleId" class="rule-card">
+    <div v-if="filteredRules.length" class="compact-rule-list">
+      <article
+        v-for="rule in filteredRules"
+        :key="rule.ruleId"
+        class="compact-rule-item"
+        :class="{ conflict: !!ruleConflict(rule.ruleId), disabled: !rule.enabled }"
+      >
         <template v-if="ruleDrafts[rule.ruleId]">
-          <div class="rule-head">
-            <div class="rule-title-block">
+          <div class="compact-rule-summary">
+            <div class="rule-avatar" aria-hidden="true">{{ rule.gameId.trim().charAt(0).toUpperCase() || 'G' }}</div>
+            <div class="compact-rule-main">
               <div class="rule-name-row">
-                <strong>{{ rule.gameId }}</strong>
-                <span class="status-pill" :class="rule.enabled ? 'enabled' : 'disabled'">
-                  {{ rule.enabled ? "启用" : "禁用" }}
+                <h3>{{ rule.gameId }}</h3>
+                <span v-if="ruleConflict(rule.ruleId)" class="status-pill conflict-pill">冲突</span>
+                <span v-if="hasRuleDraftChanges(rule)" class="pending-chip">未保存</span>
+              </div>
+              <p>{{ rule.confirmedPaths.length }} 个存档位置 · 更新于 {{ formatUnixTs(rule.updatedAt) }}</p>
+              <div class="rule-path-chips">
+                <span v-for="path in rule.confirmedPaths.slice(0, 3)" :key="`${rule.ruleId}-${path}`" class="anchor-chip compact">
+                  {{ pathLabel(path) }}
                 </span>
-                <span v-if="hasRuleDraftChanges(rule)" class="pending-chip">未保存变更</span>
+                <span v-if="rule.confirmedPaths.length > 3" class="anchor-chip compact">+{{ rule.confirmedPaths.length - 3 }}</span>
               </div>
-              <div class="rule-meta">
-                <span>{{ rule.confirmedPaths.length }} 条存档路径</span>
-                <span>更新 {{ formatUnixTs(rule.updatedAt) }}</span>
-              </div>
-              <div class="rule-summary-line">
-                <span
-                  v-for="token in ruleDraftAnchorTokens(rule.ruleId)"
-                  :key="`${rule.ruleId}-summary-${token}`"
-                  class="anchor-chip compact"
-                  :class="{ warning: token === '%GAME_DIR%', fallback: token === '%USERPROFILE%' }"
-                  :title="pathAnchorDescription(token)"
-                >
-                  {{ pathAnchorLabel(token) }}
-                </span>
-                <code v-if="firstRuleDraftPath(rule.ruleId)" class="rule-path-preview">
-                  {{ firstRuleDraftPath(rule.ruleId) }}
-                </code>
-              </div>
-              <section v-if="ruleConflictFor(rule.ruleId)" class="rule-conflict-box">
-                <p>
-                  这个游戏程序同时匹配到 {{ ruleConflictFor(rule.ruleId)?.conflictCount }} 条规则：
-                  {{ ruleConflictFor(rule.ruleId)?.gameIds.join(" / ") }}
-                </p>
-                <p class="conflict-warning">
-                  {{ isPrimaryConflictRule(rule.ruleId) ? "这条规则会被优先使用。" : "启动前需要先选择一条优先规则。" }}
-                </p>
-                <div class="row">
-                  <span class="conflict-primary" :class="isPrimaryConflictRule(rule.ruleId) ? 'on' : 'off'">
-                    {{ isPrimaryConflictRule(rule.ruleId) ? "优先规则" : "未优先" }}
-                  </span>
-                  <button
-                    type="button"
-                    :disabled="rulesState.loading || isPrimaryConflictRule(rule.ruleId)"
-                    @click="emit('mark-primary', rule)"
-                  >
-                    设为主规则
-                  </button>
-                </div>
-              </section>
-              <details class="rule-technical-details">
-                <summary>技术信息</summary>
-                <div class="rule-tech-grid">
-                  <span>ruleId {{ rule.ruleId }}</span>
-                  <span>exeHash {{ shortExeHash(rule.exeHash) }}</span>
-                  <span>置信度 {{ rule.confidence }}</span>
-                  <span v-if="ruleConflictFor(rule.ruleId)">
-                    冲突 hash {{ shortExeHash(ruleConflictFor(rule.ruleId)?.exeHash || "") }}
-                  </span>
-                </div>
-              </details>
             </div>
-            <label class="switch">
+            <label class="switch compact-rule-switch" :title="rule.enabled ? '暂停存档保护' : '启用存档保护'">
               <input
-                :checked="ruleDrafts[rule.ruleId].enabled"
+                :checked="rule.enabled"
+                :disabled="rulesState.loading"
                 type="checkbox"
-                @change="updateRuleDraft(rule.ruleId, { enabled: ($event.target as HTMLInputElement).checked })"
+                @change="emit('toggle-rule', { rule, enabled: ($event.target as HTMLInputElement).checked })"
               />
               <span class="slider"></span>
-              <span class="switch-text">启用</span>
+              <span class="switch-text">{{ rule.enabled ? "已启用" : "已暂停" }}</span>
             </label>
           </div>
-          <details class="rule-edit-details" :open="hasRuleDraftChanges(rule)">
-            <summary>{{ hasRuleDraftChanges(rule) ? "继续编辑" : "编辑规则" }}</summary>
-            <div class="rule-edit-body">
+
+          <section v-if="ruleConflict(rule.ruleId)" class="compact-conflict-row">
+            <span>{{ isPrimary(rule.ruleId) ? "当前优先使用此规则" : `同一程序匹配 ${ruleConflict(rule.ruleId)?.conflictCount} 条规则` }}</span>
+            <button :disabled="rulesState.loading || isPrimary(rule.ruleId)" type="button" @click="emit('mark-primary', rule)">
+              {{ isPrimary(rule.ruleId) ? "已设为主要规则" : "设为主要规则" }}
+            </button>
+          </section>
+
+          <details class="rule-manage-details" :open="hasRuleDraftChanges(rule)">
+            <summary>{{ hasRuleDraftChanges(rule) ? "继续编辑" : "管理规则" }}</summary>
+            <div class="rule-manage-body">
               <label class="field compact-field">
-                <span>游戏名（gameId）</span>
+                <span>游戏名称</span>
                 <input
                   :value="ruleDrafts[rule.ruleId].gameIdText"
                   type="text"
-                  class="gameid-editor"
-                  placeholder="例如：elden_ring"
-                  @input="updateRuleDraft(rule.ruleId, { gameIdText: ($event.target as HTMLInputElement).value })"
+                  @input="updateDraft(rule.ruleId, { gameIdText: ($event.target as HTMLInputElement).value })"
                 />
               </label>
               <label class="field compact-field">
                 <span>存档路径（每行一条）</span>
-                <p v-if="ruleDraftAnchorTokens(rule.ruleId).length" class="field-note anchor-note">
-                  {{ ruleAnchorHint(ruleDraftAnchorTokens(rule.ruleId)) }}
-                </p>
-                <p v-if="ruleUsesGameDirToken(rule)" class="field-note token-note">
-                  此规则包含 <code>%GAME_DIR%</code>，路径会跟随当前绑定的游戏 EXE 所在目录动态解析。
-                </p>
                 <textarea
                   :value="ruleDrafts[rule.ruleId].confirmedPathsText"
                   rows="4"
-                  class="paths-editor"
-                  placeholder="每行一条路径"
-                  @input="updateRuleDraft(rule.ruleId, { confirmedPathsText: ($event.target as HTMLTextAreaElement).value })"
-                />
+                  @input="updateDraft(rule.ruleId, { confirmedPathsText: ($event.target as HTMLTextAreaElement).value })"
+                ></textarea>
               </label>
-              <div class="row rule-actions-row">
-                <button
-                  :disabled="rulesState.loading || !hasRuleDraftChanges(rule)"
-                  type="button"
-                  class="primary"
-                  @click="emit('save-rule', rule)"
-                >
-                  保存变更
-                </button>
-                <button :disabled="rulesState.loading" type="button" class="danger" @click="emit('remove-rule', rule)">
-                  删除规则
-                </button>
+              <details class="rule-technical-details">
+                <summary>技术信息</summary>
+                <div class="rule-tech-grid">
+                  <span>ruleId {{ rule.ruleId }}</span>
+                  <span>gameUid {{ rule.gameUid }}</span>
+                  <span>exeHash {{ shortValue(rule.exeHash) }}</span>
+                  <span>置信度 {{ rule.confidence }}</span>
+                </div>
+              </details>
+              <div class="rule-manage-actions">
+                <button :disabled="rulesState.loading || !hasRuleDraftChanges(rule)" type="button" class="primary" @click="emit('save-rule', rule)">保存变更</button>
+                <button :disabled="rulesState.loading" type="button" class="danger" @click="emit('remove-rule', rule)">删除规则</button>
               </div>
             </div>
           </details>
         </template>
-      </li>
-    </ul>
-    <p v-else class="empty-hint">暂无规则，可先在“学习存档”里生成规则。</p>
+      </article>
+    </div>
+    <p v-else class="empty-hint">当前筛选条件下没有规则。</p>
   </section>
 </template>

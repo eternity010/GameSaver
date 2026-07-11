@@ -1,12 +1,19 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import {
+  BookOpenCheck,
+  FolderOpen,
+  Gamepad2,
+  Play,
+  RotateCcw,
+  Save,
+  ShieldCheck,
+  X,
+} from "@lucide/vue";
 import type { CandidatePath, RepresentativeChangedFile } from "../../types";
 
 type UiStep = "setup" | "running" | "results";
-type TabState = {
-  loading: boolean;
-  error: string;
-};
+type TabState = { loading: boolean; error: string };
 type LearningBusyStage = "" | "starting" | "analyzing" | "saving";
 
 const props = defineProps<{
@@ -41,45 +48,16 @@ const emit = defineEmits<{
 }>();
 
 const hasHighConfidence = computed(() => props.candidates.some((item) => item.score >= 45));
-const candidateGroups = computed(() => [
-  {
-    key: "strong",
-    title: "强推荐",
-    description: "最像真实存档目录，通常可以直接选择。",
-    items: props.candidates.filter((item) => item.recommendation === "strong"),
-  },
-  {
-    key: "recommended",
-    title: "推荐",
-    description: "命中了多个有效信号，建议打开目录确认。",
-    items: props.candidates.filter((item) => item.recommendation === "recommended"),
-  },
-  {
-    key: "possible",
-    title: "可能相关",
-    description: "证据还不够强，只在你确认它是存档目录时选择。",
-    items: props.candidates.filter((item) => item.recommendation === "possible"),
-  },
-  {
-    key: "weak",
-    title: "低可信",
-    description: hasHighConfidence.value
-      ? "多为配置、缓存或弱信号，不会自动勾选。"
-      : "当前没有高可信候选，这一组也值得人工复查。",
-    items: props.candidates.filter((item) => item.recommendation === "weak"),
-  },
-]);
+const primaryCandidates = computed(() => props.candidates.slice(0, 3));
+const remainingCandidates = computed(() => props.candidates.slice(3));
+const isAnalyzing = computed(() => props.learningState.loading && props.learningBusyStage === "analyzing");
 
 function candidateRecommendationLabel(item: CandidatePath): string {
   switch (item.recommendation) {
-    case "strong":
-      return "强推荐";
-    case "recommended":
-      return "推荐";
-    case "possible":
-      return "可能相关";
-    default:
-      return "低可信";
+    case "strong": return "强推荐";
+    case "recommended": return "推荐";
+    case "possible": return "可能相关";
+    default: return "低可信";
   }
 }
 
@@ -93,33 +71,19 @@ function candidateSignalLabel(signal: string): string {
   if (signal === "game-name-path") return "路径包含游戏名";
   if (signal === "save-filename") return "文件名像存档";
   if (signal === "size-reasonable") return "文件大小合理";
-  if (signal === "user-save-root") return "位于常见用户存档目录";
+  if (signal === "user-save-root") return "位于常见存档目录";
   if (signal === "game-dir") return "位于游戏目录";
-  if (signal === "path-noise") return "包含缓存/日志等弱相关路径";
-  if (signal === "path-noise-strong") return "命中强噪声目录";
-  if (signal === "system-noise") return "像系统或常驻应用目录";
-  if (signal === "filename-noise") return "文件名像配置/缓存/日志";
   if (signal.startsWith("extension:")) return `命中存档扩展名 .${signal.slice("extension:".length)}`;
-  if (signal.startsWith("weak-extension:")) return `命中弱扩展名 .${signal.slice("weak-extension:".length)}`;
-  if (signal.startsWith("noise-extension:")) return `命中噪声扩展名 .${signal.slice("noise-extension:".length)}`;
   return signal;
 }
 
 function candidateSignalSummary(item: CandidatePath): string {
-  if (!item.matchedSignals.length) return "暂无明显理由";
-  return item.matchedSignals.map(candidateSignalLabel).join(" / ");
-}
-
-function representativeFiles(item: CandidatePath) {
-  return item.representativeChangedFiles ?? [];
+  if (!item.matchedSignals.length) return "暂无明显依据";
+  return item.matchedSignals.slice(0, 4).map(candidateSignalLabel).join(" / ");
 }
 
 function representativeFilesPreview(item: CandidatePath): RepresentativeChangedFile[] {
-  return representativeFiles(item).slice(0, 3);
-}
-
-function representativeFilesRemaining(item: CandidatePath): RepresentativeChangedFile[] {
-  return representativeFiles(item).slice(3);
+  return (item.representativeChangedFiles ?? []).slice(0, 3);
 }
 
 function changedFileName(path: string): string {
@@ -153,218 +117,164 @@ function formatBytes(value: number): string {
 
 function formatUnixTime(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "时间未知";
-  const date = new Date(value * 1000);
-  if (Number.isNaN(date.getTime())) return "时间未知";
-  return date.toLocaleString();
+  return new Date(value * 1000).toLocaleString();
 }
 
 function learningBusyLabel(): string {
-  if (props.learningBusyStage === "analyzing" && props.learningTaskMessage.trim()) {
-    return props.learningTaskMessage.trim();
-  }
-  switch (props.learningBusyStage) {
-    case "starting":
-      return "正在启动游戏并创建学习会话...";
-    case "analyzing":
-      return "正在分析存档变化，这一步可能需要几十秒，请耐心等待。";
-    case "saving":
-      return "正在保存规则并同步到游戏库...";
-    default:
-      return "处理中...";
-  }
+  return props.learningTaskMessage.trim() || "正在分析存档变化，请稍候...";
 }
 </script>
 
 <template>
-  <div class="learning-page">
-    <header class="panel learning-hero">
-      <span class="eyebrow">学习存档</span>
-      <h1>把游戏加入 GameSaver</h1>
-      <p>选择游戏程序，进游戏保存一次，GameSaver 会帮你找出该备份哪些存档。</p>
-      <p v-if="learningState.error" class="error inline-error">{{ learningState.error }}</p>
-      <div class="learning-progress">
-        <span :class="{ active: step === 'setup', done: step !== 'setup' }">添加游戏</span>
-        <span :class="{ active: step === 'running', done: step === 'results' }">执行一次存档</span>
-        <span :class="{ active: step === 'results' }">选择存档目录</span>
+  <div class="learning-page add-game-wizard">
+    <header class="learning-wizard-header">
+      <div>
+        <span class="eyebrow">添加游戏</span>
+        <h1>启用自动存档保护</h1>
+        <p>选择游戏并完成一次保存，GameSaver 会自动识别存档位置。</p>
       </div>
+      <div class="wizard-steps" aria-label="添加游戏进度">
+        <span :class="{ active: step === 'setup', done: step !== 'setup' }"><Gamepad2 :size="16" />选择游戏</span>
+        <span :class="{ active: step === 'running' && !isAnalyzing, done: step === 'results' || isAnalyzing }"><Save :size="16" />保存一次</span>
+        <span :class="{ active: isAnalyzing, done: step === 'results' }"><BookOpenCheck :size="16" />分析变化</span>
+        <span :class="{ active: step === 'results' }"><ShieldCheck :size="16" />确认保护</span>
+      </div>
+      <p v-if="learningState.error" class="error inline-error">{{ learningState.error }}</p>
     </header>
 
-    <section v-if="step === 'setup'" class="panel learning-card">
-      <span class="eyebrow">第一步</span>
-      <h2>选择要保护的游戏</h2>
-      <p class="learning-copy">先选择游戏 EXE。GameSaver 会自动填入游戏名称，之后也可以在规则里改。</p>
-      <label class="field">
-        <span>游戏名称</span>
-        <input
-          :value="gameId"
-          placeholder="例如：MonsterBlackMarket"
-          @input="emit('update:gameId', ($event.target as HTMLInputElement).value)"
-        />
-      </label>
-      <label class="field">
-        <span>游戏 EXE 路径</span>
-        <div class="row">
-          <input
-            :value="exePath"
-            placeholder="D:\\Games\\xxx\\game.exe"
-            @input="emit('update:exePath', ($event.target as HTMLInputElement).value)"
-          />
-          <button type="button" @click="emit('choose-exe')">浏览</button>
-        </div>
-      </label>
-      <details class="advanced-box learning-advanced-options">
-        <summary>找不到存档时再添加扫描目录</summary>
-        <p class="field-note">
-          默认会扫描常见用户目录和游戏目录。只有存档在特殊位置时，才需要在这里补充目录。
-        </p>
-        <label class="field compact-field">
-          <span>额外扫描目录</span>
-          <textarea
-            :value="extraScanRootsText"
-            rows="3"
-            placeholder="每行一个目录，例如：&#10;D:\\SteamLibrary\\steamapps\\compatdata&#10;E:\\Games\\SaveData"
-            @input="emit('update:extraScanRootsText', ($event.target as HTMLTextAreaElement).value)"
-          ></textarea>
-        </label>
-        <div class="row learning-advanced-actions">
-          <button type="button" @click="emit('choose-extra-scan-root')">添加目录</button>
+    <section v-if="step === 'setup'" class="wizard-surface wizard-select-game">
+      <div class="wizard-icon"><Gamepad2 :size="30" /></div>
+      <div class="wizard-intro">
+        <span class="eyebrow">第一步</span>
+        <h2>选择游戏程序</h2>
+        <p>找到平时用于启动游戏的 EXE，游戏名称会自动填写。</p>
+      </div>
+      <button type="button" class="wizard-file-picker" @click="emit('choose-exe')">
+        <Gamepad2 :size="22" />
+        <span>
+          <strong>{{ exePath ? gameId || "已选择游戏" : "选择游戏 EXE" }}</strong>
+          <small>{{ exePath || "例如 Steam 游戏目录中的主程序" }}</small>
+        </span>
+      </button>
+      <details class="advanced-box wizard-advanced">
+        <summary>高级设置</summary>
+        <div class="wizard-advanced-body">
+          <label class="field">
+            <span>游戏名称</span>
+            <input
+              :value="gameId"
+              placeholder="自动从游戏路径识别"
+              @input="emit('update:gameId', ($event.target as HTMLInputElement).value)"
+            />
+          </label>
+          <label class="field">
+            <span>额外扫描目录</span>
+            <textarea
+              :value="extraScanRootsText"
+              rows="3"
+              placeholder="仅在存档位于特殊目录时添加，每行一个目录"
+              @input="emit('update:extraScanRootsText', ($event.target as HTMLTextAreaElement).value)"
+            ></textarea>
+          </label>
+          <button type="button" @click="emit('choose-extra-scan-root')"><FolderOpen :size="16" />添加目录</button>
         </div>
       </details>
-      <button :disabled="learningState.loading" type="button" class="primary" @click="emit('begin-learning')">
-        {{ learningState.loading ? "正在启动游戏..." : "启动游戏，开始识别存档" }}
+      <button :disabled="learningState.loading || !exePath" type="button" class="primary wizard-primary" @click="emit('begin-learning')">
+        <Play :size="18" fill="currentColor" />{{ learningState.loading ? "正在启动..." : "启动游戏" }}
       </button>
     </section>
 
-    <section v-else-if="step === 'running'" class="panel learning-card">
-      <span class="eyebrow">第二步</span>
-      <h2>进入游戏并手动保存一次</h2>
-      <p class="learning-copy">在游戏里完成一次明确的保存动作。保存完成后，回到 GameSaver 继续分析。</p>
-      <section class="learning-method-note">
-        <strong>基于保存前后变化分析</strong>
-        <p>GameSaver 会对比启动游戏前后的文件变化，优先找出刚刚被修改、且像存档目录的位置。</p>
-      </section>
-      <section v-if="learningState.loading && learningBusyStage === 'analyzing'" class="learning-loading-box">
-        <strong>{{ learningBusyLabel() }}</strong>
-        <div class="progress-track" role="progressbar" aria-label="正在分析存档变化">
-          <span v-if="learningTaskProgress === null" class="progress-indeterminate"></span>
-          <span
-            v-else
-            class="progress-determinate"
-            :style="{ width: `${learningTaskProgress}%` }"
-          ></span>
+    <section v-else-if="step === 'running'" class="wizard-surface wizard-save-step">
+      <template v-if="isAnalyzing">
+        <div class="wizard-icon analyzing"><BookOpenCheck :size="30" /></div>
+        <div class="wizard-intro">
+          <span class="eyebrow">第三步</span>
+          <h2>正在分析存档变化</h2>
+          <p>{{ learningBusyLabel() }}</p>
         </div>
-        <p v-if="learningTaskProgress !== null">当前进度：{{ learningTaskProgress }}%</p>
-        <p>期间请不要重复点击按钮，也不要关闭程序窗口。</p>
-      </section>
-      <ul class="learning-checklist">
-        <li>游戏已启动</li>
-        <li>进入游戏或读取一个已有存档</li>
-        <li>手动保存一次</li>
-        <li>回到 GameSaver 继续</li>
-      </ul>
-      <div class="row">
-        <button :disabled="learningState.loading" type="button" class="primary" @click="emit('end-learning')">
-          {{ learningState.loading ? "正在分析..." : "我已保存，查找存档目录" }}
-        </button>
-        <button :disabled="learningState.loading" type="button" class="danger" @click="emit('abandon-learning')">
-          放弃本次学习
-        </button>
-      </div>
-      <details class="runtime-diagnostics learning-advanced">
-        <summary>学习会话信息</summary>
+        <div class="progress-track wizard-progress" role="progressbar" aria-label="正在分析存档变化">
+          <span v-if="learningTaskProgress === null" class="progress-indeterminate"></span>
+          <span v-else class="progress-determinate" :style="{ width: `${learningTaskProgress}%` }"></span>
+        </div>
+        <p v-if="learningTaskProgress !== null" class="wizard-progress-label">{{ learningTaskProgress }}%</p>
+      </template>
+      <template v-else>
+        <div class="wizard-icon"><Save :size="30" /></div>
+        <div class="wizard-intro">
+          <span class="eyebrow">第二步</span>
+          <h2>在游戏中保存一次</h2>
+          <p>进入游戏或读取已有进度，然后执行一次明确的手动保存。</p>
+        </div>
+        <ol class="wizard-save-list">
+          <li><span>1</span>进入游戏或读取已有存档</li>
+          <li><span>2</span>完成一次手动保存</li>
+          <li><span>3</span>回到这里继续分析</li>
+        </ol>
+        <div class="wizard-actions">
+          <button :disabled="learningState.loading" type="button" class="primary" @click="emit('end-learning')"><Save :size="17" />我已经保存</button>
+          <button :disabled="learningState.loading" type="button" class="ghost danger-text" @click="emit('abandon-learning')"><X :size="17" />放弃添加</button>
+        </div>
+      </template>
+      <details class="runtime-diagnostics wizard-diagnostics">
+        <summary>诊断信息</summary>
         <p>会话 ID：<code>{{ sessionId }}</code></p>
         <p>游戏 PID：{{ pid ?? "未获取" }}</p>
       </details>
     </section>
 
-    <section v-else class="panel learning-card">
-      <span class="eyebrow">第三步</span>
-      <h2>选择存档目录</h2>
-      <p class="learning-copy">通常选择“强推荐”或“推荐”即可。不确定时，打开目录看看里面是否有存档文件。</p>
-      <p v-if="!candidates.length" class="empty-hint">没有检测到候选目录。请确认刚才在游戏内执行了保存动作。</p>
-      <div v-else class="candidate-groups">
-        <section
-          v-for="group in candidateGroups"
-          :key="group.key"
-          v-show="group.items.length"
-          class="candidate-group"
-        >
-          <div class="candidate-group-head">
-            <div>
-              <h3>{{ group.title }}</h3>
-              <p>{{ group.description }}</p>
-            </div>
-            <span>{{ group.items.length }} 项</span>
-          </div>
-          <ul class="candidate-list">
-            <li v-for="item in group.items" :key="item.path" :class="{ collapsed: item.collapsed }">
-              <div class="candidate-header">
-                <label>
-                  <input
-                    :checked="selectedPaths.includes(item.path)"
-                    type="checkbox"
-                    :disabled="item.collapsed"
-                    @change="emit('toggle-select', item.path)"
-                  />
-                  <strong>{{ item.path }}</strong>
-                </label>
-                <span class="candidate-rank" :class="candidateRecommendationClass(item)">
-                  {{ candidateRecommendationLabel(item) }}
-                </span>
-                <button type="button" @click="emit('open-path', item.path)">打开目录</button>
-              </div>
-              <p>
-                {{ candidateSignalSummary(item) }}
-              </p>
-              <details class="candidate-evidence">
-                <summary>查看依据</summary>
-                <p>
-                  得分 {{ item.score }} · changed {{ item.changedFiles }} · added {{ item.addedFiles }} ·
-                  modified {{ item.modifiedFiles }}
-                </p>
-                <div v-if="representativeFiles(item).length" class="candidate-file-evidence">
-                  <strong>代表性变更文件</strong>
-                  <ul>
-                    <li v-for="file in representativeFilesPreview(item)" :key="file.path">
-                      <div>
-                        <span class="candidate-file-name">{{ changedFileName(file.path) }}</span>
-                        <code>{{ changedFileRelativePath(file.path, item.path) }}</code>
-                      </div>
-                      <span>{{ changedFileKindLabel(file.changeKind) }}</span>
-                      <span>{{ formatBytes(file.size) }}</span>
-                      <time>{{ formatUnixTime(file.modifiedUnix) }}</time>
-                    </li>
-                  </ul>
-                  <details v-if="representativeFilesRemaining(item).length" class="candidate-file-more">
-                    <summary>还有 {{ representativeFilesRemaining(item).length }} 个代表性变更文件</summary>
-                    <ul>
-                      <li v-for="file in representativeFilesRemaining(item)" :key="`${item.path}-${file.path}`">
-                        <div>
-                          <span class="candidate-file-name">{{ changedFileName(file.path) }}</span>
-                          <code>{{ changedFileRelativePath(file.path, item.path) }}</code>
-                        </div>
-                        <span>{{ changedFileKindLabel(file.changeKind) }}</span>
-                        <span>{{ formatBytes(file.size) }}</span>
-                        <time>{{ formatUnixTime(file.modifiedUnix) }}</time>
-                      </li>
-                    </ul>
-                  </details>
-                </div>
-              </details>
-            </li>
-          </ul>
-        </section>
+    <section v-else class="wizard-surface wizard-results">
+      <div class="wizard-results-head">
+        <div>
+          <span class="eyebrow">第四步</span>
+          <h2>确认要保护的存档目录</h2>
+          <p>{{ hasHighConfidence ? "已优先选出最可能的存档位置。" : "结果可信度较低，建议打开目录确认后再启用。" }}</p>
+        </div>
+        <span class="wizard-result-count">{{ candidates.length }} 个候选</span>
       </div>
-      <div class="row">
-        <button :disabled="learningState.loading" type="button" class="primary" @click="emit('save-learning-rule')">
-          保存规则并加入游戏库
-        </button>
-        <button :disabled="learningState.loading" type="button" @click="emit('retry-learning-analysis')">
-          补存档后重新分析
-        </button>
-        <button :disabled="learningState.loading" type="button" class="danger" @click="emit('abandon-learning')">
-          放弃本次学习
-        </button>
+      <p v-if="!candidates.length" class="empty-hint">没有检测到存档变化。回到游戏再保存一次，然后重新分析。</p>
+      <ul v-else class="candidate-list wizard-candidate-list">
+        <li v-for="item in primaryCandidates" :key="item.path" :class="{ selected: selectedPaths.includes(item.path) }">
+          <div class="candidate-header">
+            <label>
+              <input :checked="selectedPaths.includes(item.path)" type="checkbox" :disabled="item.collapsed" @change="emit('toggle-select', item.path)" />
+              <strong>{{ item.path }}</strong>
+            </label>
+            <span class="candidate-rank" :class="candidateRecommendationClass(item)">{{ candidateRecommendationLabel(item) }}</span>
+            <button class="icon-button" type="button" title="打开目录" @click="emit('open-path', item.path)"><FolderOpen :size="16" /></button>
+          </div>
+          <p>{{ candidateSignalSummary(item) }}</p>
+          <details v-if="representativeFilesPreview(item).length" class="candidate-evidence">
+            <summary>查看代表性变更文件</summary>
+            <div class="candidate-file-evidence">
+              <ul>
+                <li v-for="file in representativeFilesPreview(item)" :key="file.path">
+                  <div><span class="candidate-file-name">{{ changedFileName(file.path) }}</span><code>{{ changedFileRelativePath(file.path, item.path) }}</code></div>
+                  <span>{{ changedFileKindLabel(file.changeKind) }}</span>
+                  <span>{{ formatBytes(file.size) }}</span>
+                  <time>{{ formatUnixTime(file.modifiedUnix) }}</time>
+                </li>
+              </ul>
+            </div>
+          </details>
+        </li>
+      </ul>
+      <details v-if="remainingCandidates.length" class="advanced-box other-candidates">
+        <summary>查看其他候选（{{ remainingCandidates.length }}）</summary>
+        <ul class="candidate-list compact-candidate-list">
+          <li v-for="item in remainingCandidates" :key="item.path">
+            <label>
+              <input :checked="selectedPaths.includes(item.path)" type="checkbox" :disabled="item.collapsed" @change="emit('toggle-select', item.path)" />
+              <span>{{ item.path }}</span>
+            </label>
+            <span class="candidate-rank" :class="candidateRecommendationClass(item)">{{ candidateRecommendationLabel(item) }}</span>
+            <button class="icon-button" type="button" title="打开目录" @click="emit('open-path', item.path)"><FolderOpen :size="15" /></button>
+          </li>
+        </ul>
+      </details>
+      <div class="wizard-actions wizard-result-actions">
+        <button :disabled="learningState.loading || !selectedPaths.length" type="button" class="primary" @click="emit('save-learning-rule')"><ShieldCheck :size="18" />{{ learningBusyStage === "saving" ? "正在启用..." : "启用存档保护" }}</button>
+        <button :disabled="learningState.loading" type="button" @click="emit('retry-learning-analysis')"><RotateCcw :size="17" />回到游戏再保存</button>
+        <button :disabled="learningState.loading" type="button" class="ghost danger-text" @click="emit('abandon-learning')"><X :size="17" />放弃添加</button>
       </div>
     </section>
   </div>

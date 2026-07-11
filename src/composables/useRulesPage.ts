@@ -211,6 +211,22 @@ export function useRulesPage(options: {
     }
   }
 
+  async function toggleManagedRule(rule: GameSaveRule, enabled: boolean) {
+    rulesState.value.loading = true;
+    rulesState.value.error = "";
+    try {
+      await updateRule(rule.ruleId, rule.gameId, rule.confirmedPaths, enabled);
+      await refreshRules();
+      await options.refreshLibraryItems();
+      options.showToast(`${rule.gameId} 存档保护已${enabled ? "启用" : "暂停"}`, enabled ? "success" : "info");
+    } catch (err) {
+      rulesState.value.error = `更新规则状态失败：${String(err)}`;
+      options.showToast("规则状态更新失败", "error");
+    } finally {
+      rulesState.value.loading = false;
+    }
+  }
+
   async function removeManagedRule(rule: GameSaveRule) {
     const confirmed = await options.askConfirm({
       title: "确认删除规则",
@@ -421,6 +437,7 @@ export function useRulesPage(options: {
     reloadRulesWithLoading,
     markPrimaryRule,
     saveManagedRule,
+    toggleManagedRule,
     removeManagedRule,
     exportRulesToFile,
     importRulesFromFile,

@@ -121,6 +121,7 @@ const {
   reloadRulesWithLoading,
   markPrimaryRule,
   saveManagedRule,
+  toggleManagedRule,
   removeManagedRule,
   exportRulesToFile,
   importRulesFromFile,
@@ -376,6 +377,7 @@ onUnmounted(() => {
       @open-migration-settings="activeTab = 'settings'"
       @mark-primary="markPrimaryRule"
       @save-rule="saveManagedRule"
+      @toggle-rule="toggleManagedRule($event.rule, $event.enabled)"
       @remove-rule="removeManagedRule"
     />
 
