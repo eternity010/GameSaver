@@ -12,18 +12,31 @@ use walkdir::WalkDir;
 
 use super::analysis::should_ignore_snapshot_path;
 
+pub(crate) struct SnapshotCapture {
+    pub(crate) snapshot: Snapshot,
+    pub(crate) skipped_entries: usize,
+}
+
 pub(crate) fn collect_snapshot(
     game_id: &str,
     exe_path: &str,
     extra_scan_roots: &[String],
-) -> Result<Snapshot, String> {
+) -> Result<SnapshotCapture, String> {
     let roots = collect_scan_roots(exe_path, extra_scan_roots)?;
     let mut files = HashMap::new();
+    let mut skipped_entries = 0usize;
     for root in roots {
         if !root.exists() {
             continue;
         }
-        for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
+        for entry in WalkDir::new(&root) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    skipped_entries += 1;
+                    continue;
+                }
+            };
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -32,7 +45,10 @@ pub(crate) fn collect_snapshot(
             }
             let metadata = match entry.metadata() {
                 Ok(value) => value,
-                Err(_) => continue,
+                Err(_) => {
+                    skipped_entries += 1;
+                    continue;
+                }
             };
             let modified_unix = metadata
                 .modified()
@@ -57,10 +73,13 @@ pub(crate) fn collect_snapshot(
         }
     }
 
-    Ok(Snapshot {
-        snapshot_ref: format!("snapshot_{}_{}.json", game_id, now_unix()),
-        created_at_unix: now_unix(),
-        files,
+    Ok(SnapshotCapture {
+        snapshot: Snapshot {
+            snapshot_ref: format!("snapshot_{}_{}.json", game_id, now_unix()),
+            created_at_unix: now_unix(),
+            files,
+        },
+        skipped_entries,
     })
 }
 

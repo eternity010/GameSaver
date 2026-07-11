@@ -2,6 +2,7 @@ import { computed, ref } from "vue";
 import {
   cancelLearning,
   confirmRule,
+  getLearningSession,
   launchGame,
   openCandidatePath,
   startFinishLearningTask,
@@ -172,6 +173,7 @@ export function useLearningPage(options: {
   }
 
   async function beginLearning() {
+    let createdSessionId = "";
     learningBusyStage.value = "starting";
     learningState.value.loading = true;
     learningState.value.error = "";
@@ -185,10 +187,19 @@ export function useLearningPage(options: {
       if (!trimmedGameId || !trimmedExePath) {
         throw new Error("请先填写 gameId 并选择 exePath");
       }
-      sessionId.value = await startLearning(trimmedGameId, trimmedExePath, extraScanRoots);
+      createdSessionId = await startLearning(trimmedGameId, trimmedExePath, extraScanRoots);
+      sessionId.value = createdSessionId;
       pid.value = await launchGame(sessionId.value);
       step.value = "running";
     } catch (err) {
+      if (createdSessionId && pid.value === null) {
+        try {
+          await cancelLearning(createdSessionId);
+        } catch {
+          // Preserve the original launch error; the stale session can still be abandoned manually.
+        }
+        sessionId.value = "";
+      }
       learningState.value.error = String(err);
     } finally {
       learningState.value.loading = false;
@@ -221,6 +232,7 @@ export function useLearningPage(options: {
       );
       selected.value = autoSelectable.slice(0, 2).map((item) => item.path);
       step.value = "results";
+      await showSnapshotWarning(sessionId.value);
       if (!hasHighConfidence.value) {
         options.showToast("未检测到高可信候选，请确认学习阶段已执行存档动作", "info", 3600);
       }
@@ -244,9 +256,6 @@ export function useLearningPage(options: {
     learningState.value.error = "";
     learningTaskMessage.value = "正在重新分析存档变化...";
     learningTaskProgress.value = null;
-    candidates.value = [];
-    selected.value = [];
-    step.value = "running";
     try {
       const taskId = await startRetryFinishLearningTask(sessionId.value);
       const finalTask = await options.waitForTaskCompletion<CandidatePath[]>(
@@ -266,6 +275,7 @@ export function useLearningPage(options: {
       );
       selected.value = autoSelectable.slice(0, 2).map((item) => item.path);
       step.value = "results";
+      await showSnapshotWarning(sessionId.value);
       if (!hasHighConfidence.value) {
         options.showToast("仍未检测到高可信候选，请确认游戏内已完成保存动作", "info", 3600);
       }
@@ -277,6 +287,17 @@ export function useLearningPage(options: {
       learningBusyStage.value = "";
       learningTaskMessage.value = "";
       learningTaskProgress.value = null;
+    }
+  }
+
+  async function showSnapshotWarning(currentSessionId: string) {
+    try {
+      const session = await getLearningSession(currentSessionId);
+      if (session.eventCaptureError) {
+        options.showToast(`扫描未完全覆盖：${session.eventCaptureError}`, "info", 5000);
+      }
+    } catch {
+      // Candidate results remain usable even if the session warning cannot be refreshed.
     }
   }
 

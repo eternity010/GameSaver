@@ -11,7 +11,6 @@ use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
 use super::analysis::{build_candidates, default_confidence};
-use super::capture::collect_process_tree_pids;
 use super::snapshot::{collect_snapshot, normalize_learning_scan_root, read_snapshot, write_snapshot};
 
 fn build_rule_key(game_id: &str, exe_hash: &str) -> String {
@@ -58,6 +57,45 @@ fn finish_learning_impl(
     session_id: &str,
     force_rerun: bool,
 ) -> Result<Vec<CandidatePath>, String> {
+    let session_snapshot = {
+        let store = app_state
+            .store
+            .lock()
+            .map_err(|_| "failed to lock app state".to_string())?;
+        let session = store
+            .sessions
+            .iter()
+            .find(|item| item.session_id == session_id)
+            .ok_or_else(|| "sessionId not found".to_string())?;
+        if session.status != "running" && !force_rerun {
+            return Ok(session.candidates.clone());
+        }
+        if force_rerun && session.status == "cancelled" {
+            return Err("cancelled learning session cannot be reanalyzed".to_string());
+        }
+        session.clone()
+    };
+
+    let end_unix = now_unix();
+    let final_snapshot_ref = format!("final_{session_id}.json");
+    let final_capture = collect_snapshot(
+        &session_snapshot.game_id,
+        &session_snapshot.exe_path,
+        &session_snapshot.extra_scan_roots,
+    )?;
+    write_snapshot(app, &final_snapshot_ref, &final_capture.snapshot)?;
+
+    let baseline_snapshot: Snapshot = read_snapshot(app, &session_snapshot.baseline_snapshot_ref)?;
+    let candidates = build_candidates(
+        &baseline_snapshot,
+        &final_capture.snapshot,
+        &session_snapshot.game_id,
+        &session_snapshot.exe_path,
+        iso_to_unix(&session_snapshot.started_at).unwrap_or(end_unix),
+        end_unix + 120,
+        None,
+    );
+
     let mut store = app_state
         .store
         .lock()
@@ -67,50 +105,28 @@ fn finish_learning_impl(
         .iter_mut()
         .find(|item| item.session_id == session_id)
         .ok_or_else(|| "sessionId not found".to_string())?;
-    if let Some(root_pid) = session.pid {
-        if let Ok(pids) = collect_process_tree_pids(root_pid) {
-            session.tracked_pids = pids;
-        }
+    if session.status == "cancelled" {
+        return Err("learning session was cancelled during analysis".to_string());
     }
-
-    if session.status != "running" && !force_rerun {
-        return Ok(session.candidates.clone());
-    }
-    if force_rerun {
-        session.status = "running".to_string();
-        session.ended_at = None;
-        session.final_snapshot_ref = None;
-        session.candidates.clear();
-        session.event_capture_mode = "snapshot".to_string();
-        session.event_trace_name = None;
-        session.event_trace_path = None;
-        session.captured_event_count = 0;
-        session.event_capture_error = None;
-    }
-
-    let end_unix = now_unix();
-    let final_snapshot_ref = format!("final_{session_id}.json");
-    let final_snapshot = collect_snapshot(&session.game_id, &session.exe_path, &session.extra_scan_roots)?;
-    write_snapshot(app, &final_snapshot_ref, &final_snapshot)?;
-
-    let baseline_snapshot: Snapshot = read_snapshot(app, &session.baseline_snapshot_ref)?;
-    let candidates = build_candidates(
-        &baseline_snapshot,
-        &final_snapshot,
-        &session.game_id,
-        &session.exe_path,
-        iso_to_unix(&session.started_at).unwrap_or(end_unix),
-        end_unix + 120,
-        None,
-    );
-
     session.status = "finished".to_string();
     session.ended_at = Some(now_iso_string());
     session.final_snapshot_ref = Some(final_snapshot_ref);
     session.candidates = candidates.clone();
+    session.event_capture_mode = "snapshot".to_string();
+    session.event_trace_name = None;
+    session.event_trace_path = None;
+    session.captured_event_count = 0;
+    session.event_capture_error = snapshot_warning(final_capture.skipped_entries)
+        .or_else(|| session_snapshot.event_capture_error.clone());
 
     persist_store(app, &store)?;
     Ok(candidates)
+}
+
+fn snapshot_warning(skipped_entries: usize) -> Option<String> {
+    (skipped_entries > 0).then(|| {
+        format!("snapshot scan skipped {skipped_entries} inaccessible files or directories")
+    })
 }
 
 fn start_finish_learning_task_impl(
@@ -232,8 +248,8 @@ pub(crate) fn start_learning(
 
     let session_id = Uuid::new_v4().to_string();
     let snapshot_ref = format!("baseline_{session_id}.json");
-    let snapshot = collect_snapshot(&game_id, &exe_path, &normalized_extra_scan_roots)?;
-    write_snapshot(&app, &snapshot_ref, &snapshot)?;
+    let baseline_capture = collect_snapshot(&game_id, &exe_path, &normalized_extra_scan_roots)?;
+    write_snapshot(&app, &snapshot_ref, &baseline_capture.snapshot)?;
 
     let session = LearningSession {
         session_id: session_id.clone(),
@@ -251,7 +267,7 @@ pub(crate) fn start_learning(
         event_trace_name: None,
         event_trace_path: None,
         captured_event_count: 0,
-        event_capture_error: None,
+        event_capture_error: snapshot_warning(baseline_capture.skipped_entries),
         extra_scan_roots: normalized_extra_scan_roots,
     };
 
@@ -286,7 +302,7 @@ pub(crate) fn launch_game(app: AppHandle, state: State<AppState>, session_id: St
 
     let pid = child.id();
     session.pid = Some(pid);
-    session.tracked_pids = collect_process_tree_pids(pid).unwrap_or_else(|_| vec![pid]);
+    session.tracked_pids = vec![pid];
     session.event_capture_mode = "snapshot".to_string();
     session.event_trace_name = None;
     session.event_trace_path = None;

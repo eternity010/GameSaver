@@ -1,67 +1,15 @@
 use crate::path_utils::normalize_windows_path;
 use crate::runtime::apply_background_process_flags;
 use crate::storage::decode_text_bytes;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use tauri::AppHandle;
 
 use super::analysis::should_ignore_snapshot_path;
-use super::shared::{CimProcessRow, EventCaptureHandle};
+use super::shared::EventCaptureHandle;
 use super::snapshot::event_logs_dir;
-
-pub(crate) fn collect_process_tree_pids(root_pid: u32) -> Result<Vec<u32>, String> {
-    let script = "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress";
-    let mut command = Command::new("powershell");
-    command.args(["-NoProfile", "-Command", script]);
-    let output = apply_background_process_flags(&mut command)
-        .output()
-        .map_err(|err| format!("read process list failed: {err}"))?;
-    if !output.status.success() {
-        return Err("read process list failed: powershell returned non-zero".to_string());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() {
-        return Ok(vec![root_pid]);
-    }
-
-    let rows = if stdout.starts_with('[') {
-        serde_json::from_str::<Vec<CimProcessRow>>(&stdout)
-            .map_err(|err| format!("parse process list failed: {err}"))?
-    } else {
-        let single = serde_json::from_str::<CimProcessRow>(&stdout)
-            .map_err(|err| format!("parse process list failed: {err}"))?;
-        vec![single]
-    };
-
-    let mut child_map: HashMap<u32, Vec<u32>> = HashMap::new();
-    for row in rows {
-        child_map
-            .entry(row.parent_process_id)
-            .or_default()
-            .push(row.process_id);
-    }
-
-    let mut tracked = Vec::new();
-    let mut visited = HashSet::new();
-    let mut stack = vec![root_pid];
-    while let Some(current) = stack.pop() {
-        if !visited.insert(current) {
-            continue;
-        }
-        tracked.push(current);
-        if let Some(children) = child_map.get(&current) {
-            for child in children {
-                stack.push(*child);
-            }
-        }
-    }
-
-    tracked.sort_unstable();
-    Ok(tracked)
-}
 
 #[allow(dead_code)]
 pub(crate) fn try_start_etw_capture(app: &AppHandle, session_id: &str) -> Result<EventCaptureHandle, String> {

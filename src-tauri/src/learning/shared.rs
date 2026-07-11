@@ -1,5 +1,4 @@
 use crate::shared::{CandidatePath, RepresentativeChangedFile};
-use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -88,13 +87,6 @@ pub(crate) const NOISE_PATH_FRAGMENTS: [&str; 15] = [
     "\\ebwebview\\",
 ];
 pub(crate) const APP_IDENTIFIER: &str = "com.gamesaver.desktop";
-
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub(crate) struct CimProcessRow {
-    pub(crate) process_id: u32,
-    pub(crate) parent_process_id: u32,
-}
 
 #[allow(dead_code)]
 #[derive(Clone)]
