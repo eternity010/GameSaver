@@ -34,7 +34,8 @@ pub(crate) use precheck::{
     SaveLocationSummary,
 };
 pub(crate) use rules::{
-    ExportRulesResult, GameSaveRule, ImportRuleInput, ImportRulesResult, RuleConflictItem,
+    ExportRulesResult, GameSaveRule, ImportRuleInput, ImportRulesResult, PreviewRulesResult,
+    RuleConflictItem,
 };
 pub(crate) use rules::ResolveRuleResult;
 pub(crate) use runtime_info::RuntimeStatus;

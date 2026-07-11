@@ -63,6 +63,7 @@ pub fn run() {
             rules::update_rule,
             rules::delete_rule,
             rules::export_rules,
+            rules::preview_rules_import,
             rules::import_rules,
             library::resolve_rule_for_exe,
             library::get_launcher_session,

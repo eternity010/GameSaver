@@ -29,6 +29,8 @@ pub(crate) struct PreviewMigrationZipResult {
     pub(crate) skipped_rules: usize,
     pub(crate) backup_games: usize,
     pub(crate) backup_files: usize,
+    pub(crate) conflicting_backup_games: usize,
     pub(crate) manifest_format: Option<String>,
     pub(crate) created_at: Option<String>,
+    pub(crate) archive_sha256: String,
 }

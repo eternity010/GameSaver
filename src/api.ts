@@ -15,6 +15,7 @@ import type {
   LearningSession,
   LauncherMode,
   PreviewMigrationZipResult,
+  PreviewRulesResult,
   RuleConflictItem,
   PruneBackupResult,
   RestoreBackupResult,
@@ -86,8 +87,12 @@ export async function exportRules(filePath: string): Promise<ExportRulesResult> 
   return invoke("export_rules", { filePath });
 }
 
-export async function importRules(filePath: string): Promise<ImportRulesResult> {
-  return invoke("import_rules", { filePath });
+export async function importRules(filePath: string, expectedFileSha256?: string): Promise<ImportRulesResult> {
+  return invoke("import_rules", { filePath, expectedFileSha256 });
+}
+
+export async function previewRulesImport(filePath: string): Promise<PreviewRulesResult> {
+  return invoke("preview_rules_import", { filePath });
 }
 
 export async function exportMigrationZip(filePath: string): Promise<ExportMigrationZipResult> {
@@ -102,12 +107,15 @@ export async function previewMigrationZip(filePath: string): Promise<PreviewMigr
   return invoke("preview_migration_zip", { filePath });
 }
 
-export async function importMigrationZip(filePath: string): Promise<ImportMigrationZipResult> {
-  return invoke("import_migration_zip", { filePath });
+export async function importMigrationZip(
+  filePath: string,
+  expectedArchiveSha256?: string,
+): Promise<ImportMigrationZipResult> {
+  return invoke("import_migration_zip", { filePath, expectedArchiveSha256 });
 }
 
-export async function startImportMigrationZipTask(filePath: string): Promise<string> {
-  return invoke("start_import_migration_zip_task", { filePath });
+export async function startImportMigrationZipTask(filePath: string, expectedArchiveSha256?: string): Promise<string> {
+  return invoke("start_import_migration_zip_task", { filePath, expectedArchiveSha256 });
 }
 
 export async function openCandidatePath(path: string): Promise<void> {

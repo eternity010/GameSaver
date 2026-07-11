@@ -37,6 +37,16 @@ pub(crate) struct ImportRulesResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct PreviewRulesResult {
+    pub(crate) rule_count: usize,
+    pub(crate) imported: usize,
+    pub(crate) overwritten: usize,
+    pub(crate) skipped: usize,
+    pub(crate) file_sha256: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ResolveRuleResult {
     pub(crate) exe_hash: String,
     pub(crate) matched_rule: Option<GameSaveRule>,

@@ -6,6 +6,7 @@ import {
   listRuleConflicts,
   listRules,
   previewMigrationZip,
+  previewRulesImport,
   setPrimaryRule,
   startExportMigrationZipTask,
   startImportMigrationZipTask,
@@ -71,7 +72,10 @@ function formatMigrationPreviewMessage(preview: PreviewMigrationZipResult): stri
   if (preview.manifestFormat) {
     lines.push(`格式：${preview.manifestFormat}`);
   }
-  lines.push("", "导入会写入规则，并把迁移包内备份复制到当前备份目录。是否继续？");
+  if (preview.conflictingBackupGames > 0) {
+    lines.push(`已有备份冲突：${preview.conflictingBackupGames} 个游戏（将保留本机备份并跳过迁移包中的对应备份）`);
+  }
+  lines.push("", "导入会写入规则，并把没有冲突的备份复制到当前备份目录。是否继续？");
   return lines.join("\n");
 }
 
@@ -263,10 +267,30 @@ export function useRulesPage(options: {
       if (!chosen || Array.isArray(chosen)) return;
       rulesState.value.loading = true;
       rulesState.value.error = "";
-      await importRules(chosen);
+      const preview = await previewRulesImport(chosen);
+      const confirmed = await options.askConfirm({
+        title: "确认导入规则",
+        message: [
+          `有效规则：${preview.ruleCount} 条`,
+          `新增：${preview.imported} 条`,
+          `覆盖：${preview.overwritten} 条`,
+          `跳过无效项：${preview.skipped} 条`,
+          "",
+          "相同规则 ID，或游戏与 EXE Hash 相同的规则会被覆盖。是否继续？",
+        ].join("\n"),
+        confirmText: "导入规则",
+        cancelText: "取消",
+        danger: preview.overwritten > 0,
+      });
+      if (!confirmed) return;
+      const result = await importRules(chosen, preview.fileSha256);
       await refreshRules();
       await options.refreshLibraryItems();
-      options.showToast("规则导入完成", "success");
+      options.showToast(
+        `规则导入完成（新增 ${result.imported}，覆盖 ${result.overwritten}，跳过 ${result.skipped}）`,
+        "success",
+        4200,
+      );
     } catch (err) {
       rulesState.value.error = `导入失败：${String(err)}`;
       options.showToast("规则导入失败", "error");
@@ -346,7 +370,7 @@ export function useRulesPage(options: {
       migrationImportWaiting.value = true;
       migrationImportMessage.value = "任务已创建，准备导入迁移包...";
       migrationImportProgress.value = 0;
-      const taskId = await startImportMigrationZipTask(chosen);
+      const taskId = await startImportMigrationZipTask(chosen, preview.archiveSha256);
       const finalTask = await options.waitForTaskCompletion<ImportMigrationZipResult>(
         taskId,
         (message, progress) => {
@@ -362,7 +386,7 @@ export function useRulesPage(options: {
       await options.refreshLibraryItems();
       if (result) {
         options.showToast(
-          `迁移包导入完成（新增规则 ${result.importedRules}，覆盖 ${result.overwrittenRules}，导入备份游戏 ${result.importedBackupGames}）`,
+          `迁移包导入完成（新增规则 ${result.importedRules}，覆盖 ${result.overwrittenRules}，导入备份游戏 ${result.importedBackupGames}，跳过备份 ${result.skippedBackupGames}）`,
           "success",
           4200,
         );

@@ -197,6 +197,14 @@ export interface ImportMigrationZipResult {
   skippedBackupGames: number;
 }
 
+export interface PreviewRulesResult {
+  ruleCount: number;
+  imported: number;
+  overwritten: number;
+  skipped: number;
+  fileSha256: string;
+}
+
 export interface PreviewMigrationZipResult {
   ruleCount: number;
   newRules: number;
@@ -204,8 +212,10 @@ export interface PreviewMigrationZipResult {
   skippedRules: number;
   backupGames: number;
   backupFiles: number;
+  conflictingBackupGames: number;
   manifestFormat?: string;
   createdAt?: string;
+  archiveSha256: string;
 }
 
 export interface LaunchPrecheckCheck {
