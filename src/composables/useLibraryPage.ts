@@ -624,15 +624,6 @@ export function useLibraryPage(options: {
     }
   }
 
-  async function loadSelectedLibraryGameSessionAndVersions() {
-    const gameIdText = selectedLibraryGameId.value;
-    if (!gameIdText) return;
-    await Promise.all([
-      loadBackupVersionsForGame(gameIdText, false),
-      loadSessionDetailsForGame(gameIdText, false),
-    ]);
-  }
-
   async function loadSelectedLibraryGameDetails() {
     const gameIdText = selectedLibraryGameId.value;
     if (!gameIdText) return;
@@ -680,34 +671,13 @@ export function useLibraryPage(options: {
     return libraryIcons.value[cardKey(gameIdText)] || "";
   }
 
-  async function refreshLaunchPrechecksForLibraryItems() {
-    const items = [...libraryItems.value];
-    if (!items.length) {
-      launchPrecheckByGame.value = {};
-      return;
-    }
-    await Promise.all(items.map((item) => loadLaunchPrecheckForGame(item.gameId, false)));
-  }
-
-  async function refreshBackupStatsForLibraryItems() {
-    const items = [...libraryItems.value];
-    if (!items.length) {
-      backupStatsByGame.value = {};
-      backupKeepDraftByGame.value = {};
-      return;
-    }
-    await Promise.all(items.map((item) => loadBackupStatsForGame(item.gameId, false)));
-  }
-
   async function reloadLibraryWithLoading() {
     libraryState.value.loading = true;
     libraryState.value.error = "";
     clearAllLibraryCardErrors();
     try {
       await refreshLibraryItems();
-      void loadSelectedLibraryGameSessionAndVersions();
-      void refreshLaunchPrechecksForLibraryItems();
-      void refreshBackupStatsForLibraryItems();
+      void loadSelectedLibraryGameDetails();
     } catch (err) {
       libraryState.value.error = `读取游戏库失败：${String(err)}`;
     } finally {

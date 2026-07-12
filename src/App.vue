@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from "vue";
+import { onMounted, onUnmounted, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useConfirmDialog } from "./composables/useConfirmDialog";
 import { useLearningPage } from "./composables/useLearningPage";
@@ -33,6 +33,7 @@ const { toast, showToast, closeToast } = useToast();
 const { confirmDialog, askConfirm, resolveConfirm } = useConfirmDialog();
 const blockingErrorMessage = ref("");
 let unlistenPostExitBackup: UnlistenFn | null = null;
+const initializedTabs = new Set<TopTab>(["library"]);
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -256,10 +257,22 @@ async function handleLibraryPrimaryAction(payload: {
   }
 }
 
+async function ensureTabInitialized(tab: TopTab) {
+  if (initializedTabs.has(tab)) return;
+  initializedTabs.add(tab);
+  if (tab === "rules") {
+    await reloadRulesWithLoading();
+  } else if (tab === "settings") {
+    await reloadSettings();
+  }
+}
+
+watch(activeTab, (tab) => {
+  void ensureTabInitialized(tab);
+});
+
 onMounted(() => {
-  void reloadRulesWithLoading();
   void reloadLibraryWithLoading();
-  void reloadSettings();
   void listen<PostExitBackupCompletedEvent>("post_exit_backup_completed", async (event) => {
     const toastResult = buildPostExitBackupToast(event.payload);
     showToast(toastResult.message, toastResult.level, toastResult.timeoutMs);
