@@ -1,4 +1,4 @@
-use super::{Game, SaveProfile, SaveVersion};
+use super::{Game, GameBodyVersion, SaveProfile, SaveVersion};
 use serde::{Deserialize, Serialize};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -13,6 +13,8 @@ pub struct AppStore {
     pub save_profiles: Vec<SaveProfile>,
     #[serde(default)]
     pub save_versions: Vec<SaveVersion>,
+    #[serde(default)]
+    pub body_versions: Vec<GameBodyVersion>,
 }
 
 impl Default for AppStore {
@@ -22,6 +24,7 @@ impl Default for AppStore {
             games: Vec::new(),
             save_profiles: Vec::new(),
             save_versions: Vec::new(),
+            body_versions: Vec::new(),
         }
     }
 }
@@ -46,6 +49,13 @@ impl AppStore {
             !version.version_id.trim().is_empty()
                 && !version.game_uid.trim().is_empty()
                 && !version.files.is_empty()
+                && self.games.iter().any(|game| game.game_uid == version.game_uid)
+        });
+        self.body_versions.retain(|version| {
+            !version.version_id.trim().is_empty()
+                && !version.game_uid.trim().is_empty()
+                && !version.archive_path.trim().is_empty()
+                && version.file_count > 0
                 && self.games.iter().any(|game| game.game_uid == version.game_uid)
         });
     }

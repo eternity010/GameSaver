@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Game, GameRuntime, LaunchPrecheck, SaveLearningResult, SaveLearningSession, SaveProfile, SaveScope, SaveVersion } from "./domain/game";
+import type { Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveLearningResult, SaveLearningSession, SaveProfile, SaveScope, SaveVersion } from "./domain/game";
 
 export interface AppTask {
   taskId: string;
@@ -70,6 +70,26 @@ export function getGameRuntime(gameUid: string): Promise<GameRuntime | null> {
 
 export function listSaveVersions(gameUid: string): Promise<SaveVersion[]> {
   return invoke<SaveVersion[]>("list_save_versions", { gameUid });
+}
+
+export function restoreSaveVersion(gameUid: string, versionId: string): Promise<string> {
+  return invoke<string>("restore_save_version", { gameUid, versionId });
+}
+
+export function deleteSaveVersion(gameUid: string, versionId: string): Promise<string> {
+  return invoke<string>("delete_save_version", { gameUid, versionId });
+}
+
+export function pruneSaveVersions(gameUid: string, keepVersions: number): Promise<string> {
+  return invoke<string>("prune_save_versions", { gameUid, keepVersions });
+}
+
+export function listGameBodyVersions(gameUid: string): Promise<GameBodyVersion[]> {
+  return invoke<GameBodyVersion[]>("list_game_body_versions", { gameUid });
+}
+
+export function updateGameBody(gameUid: string, sourcePath: string): Promise<string> {
+  return invoke<string>("update_game_body", { gameUid, sourcePath });
 }
 
 export type { SaveLearningResult, SaveLearningSession };

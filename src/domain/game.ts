@@ -30,6 +30,15 @@ export interface GameRuntime {
   taskId?: string;
 }
 
+export interface GameBodyVersion {
+  versionId: string;
+  gameUid: string;
+  createdAt: string;
+  archivePath: string;
+  fileCount: number;
+  totalBytes: number;
+}
+
 export interface LaunchPrecheck {
   gameUid: string;
   canLaunch: boolean;

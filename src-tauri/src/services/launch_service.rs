@@ -72,6 +72,10 @@ impl LaunchService {
 
     pub fn launch(app: &AppHandle, state: &AppState, game_uid: String) -> Result<String, String> {
         let game_uid = game_uid.trim().to_string();
+        let operation_lock = state.save_operations.lock().map_err(|_| "lock save operation state failed".to_string())?;
+        if operation_lock.contains(&game_uid) {
+            return Err("游戏正在进行存档版本操作".to_string());
+        }
         {
             let mut running = state.running_games.lock().map_err(|_| "lock running game state failed".to_string())?;
             if running.contains_key(&game_uid) {
@@ -88,6 +92,7 @@ impl LaunchService {
                 },
             );
         }
+        drop(operation_lock);
         let loaded = (|| -> Result<(Game, SaveProfile, Option<SaveVersion>), String> {
             let store = state.store.lock().map_err(|_| "lock GameSaver store failed".to_string())?;
             let check = Self::precheck(&store, &game_uid)?;
@@ -191,16 +196,23 @@ fn run_game_session(
     let version = SaveRepository::commit(app, game, profile, latest, |progress, message| {
         TaskService::update(&state, task_id, TaskStatus::Running, 70 + progress / 3, message, None);
     })?;
+    let pending_version = version.clone();
     let mut candidate = state.store.lock().map_err(|_| "lock GameSaver store failed".to_string())?.clone();
     let now = now_iso();
     let version_summary = if let Some(version) = version {
         let version_id = version.version_id.clone();
         let file_count = version.files.len();
         candidate.save_versions.push(version);
-        let game_record = candidate.games.iter_mut().find(|item| item.game_uid == game.game_uid).ok_or_else(|| "游戏记录不存在".to_string())?;
+        let Some(game_record) = candidate.games.iter_mut().find(|item| item.game_uid == game.game_uid) else {
+            if let Some(version) = pending_version.as_ref() { crate::repositories::release_pending_objects(version); }
+            return Err("游戏记录不存在".to_string());
+        };
         game_record.latest_save_version_id = Some(version_id.clone());
         game_record.last_played_at = Some(now);
-        GameRepository::persist(app, &candidate)?;
+        if let Err(error) = GameRepository::persist(app, &candidate) {
+            if let Some(version) = pending_version.as_ref() { crate::repositories::release_pending_objects(version); }
+            return Err(error);
+        }
         serde_json::json!({ "created": true, "versionId": version_id, "fileCount": file_count })
     } else {
         if let Some(game_record) = candidate.games.iter_mut().find(|item| item.game_uid == game.game_uid) {
@@ -210,6 +222,7 @@ fn run_game_session(
         serde_json::json!({ "created": false, "fileCount": 0 })
     };
     *state.store.lock().map_err(|_| "lock GameSaver store failed".to_string())? = candidate;
+    if let Some(version) = pending_version.as_ref() { crate::repositories::release_pending_objects(version); }
     let message = if version_summary.get("created").and_then(|value| value.as_bool()).unwrap_or(false) {
         "游戏已退出，存档版本已提交"
     } else {

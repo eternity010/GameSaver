@@ -97,7 +97,18 @@ h1 { margin-bottom: 0; font-size: 30px; letter-spacing: 0; }
 .detail-facts div { display: flex; justify-content: space-between; gap: 14px; color: var(--text-secondary); font-size: 13px; }
 .detail-facts dt, .detail-facts dd { margin: 0; }
 .detail-facts dd { max-width: 65%; color: var(--text-primary); text-align: right; overflow-wrap: anywhere; }
+.body-update-button { width: 100%; margin-top: 18px; }
+.body-version-list { display: grid; gap: 7px; margin-top: 18px; padding-top: 14px; border-top: 1px solid #303641; }
+.body-version-row { display: flex; justify-content: space-between; gap: 12px; color: var(--text-secondary); font-size: 12px; }
+.body-version-row strong { color: var(--text-primary); font-weight: 500; text-align: right; }
 .save-timeline { margin-bottom: 18px; }
+.version-header { margin-bottom: 8px; }
+.version-tools, .version-actions { display: flex; align-items: center; gap: 7px; }
+.version-tools label { display: inline-flex; align-items: center; gap: 6px; color: var(--text-secondary); font-size: 12px; white-space: nowrap; }
+.version-tools select { padding: 7px 8px; border: 1px solid #3b4350; border-radius: 5px; color: var(--text-primary); background: var(--surface-raised); }
+.compact-button { padding: 7px 10px; font-size: 12px; }
+.danger-button { color: var(--text-secondary); }
+.danger-button:hover { color: var(--danger); border-color: #82515a; }
 .timeline-caption { color: var(--text-secondary); font-size: 12px; }
 .timeline-empty { display: flex; align-items: center; gap: 11px; padding: 18px 0 4px; color: #7f8897; }
 .timeline-empty p { margin: 0; font-size: 13px; line-height: 1.5; }
@@ -215,4 +226,9 @@ h1 { margin-bottom: 0; font-size: 30px; letter-spacing: 0; }
   .detail-launch { margin-top: 8px; }
   .detail-columns { grid-template-columns: 1fr; }
   .detail-section { padding: 16px; }
+  .version-header { align-items: flex-start; flex-direction: column; }
+  .version-tools { width: 100%; justify-content: space-between; }
+  .version-row { align-items: flex-start; flex-wrap: wrap; }
+  .version-meta { margin-left: auto; }
+  .version-actions { width: 100%; justify-content: flex-end; padding-top: 4px; }
 }

@@ -1,12 +1,13 @@
 use crate::domain::{ActiveLearningSession, AppStore, GameRuntime};
 use crate::domain::AppTask;
-use std::{collections::HashMap, sync::Mutex};
+use std::{collections::{HashMap, HashSet}, sync::Mutex};
 
 pub struct AppState {
     pub store: Mutex<AppStore>,
     pub tasks: Mutex<HashMap<String, AppTask>>,
     pub learning_sessions: Mutex<HashMap<String, ActiveLearningSession>>,
     pub running_games: Mutex<HashMap<String, GameRuntime>>,
+    pub save_operations: Mutex<HashSet<String>>,
 }
 
 impl AppState {
@@ -16,6 +17,7 @@ impl AppState {
             tasks: Mutex::new(HashMap::new()),
             learning_sessions: Mutex::new(HashMap::new()),
             running_games: Mutex::new(HashMap::new()),
+            save_operations: Mutex::new(HashSet::new()),
         }
     }
 }

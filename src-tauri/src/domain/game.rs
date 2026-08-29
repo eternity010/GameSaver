@@ -85,6 +85,17 @@ pub struct GameRuntime {
     pub task_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameBodyVersion {
+    pub version_id: String,
+    pub game_uid: String,
+    pub created_at: String,
+    pub archive_path: String,
+    pub file_count: usize,
+    pub total_bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GameRuntimeStatus {
