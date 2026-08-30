@@ -38,8 +38,11 @@ impl AppStore {
                 && !game.managed_path.trim().is_empty()
                 && !game.launch.executable_relative_path.trim().is_empty()
         });
-        self.games
-            .sort_by(|left, right| left.display_name.to_lowercase().cmp(&right.display_name.to_lowercase()));
+        self.games.sort_by(|left, right| {
+            left.display_name
+                .to_lowercase()
+                .cmp(&right.display_name.to_lowercase())
+        });
         self.save_profiles.retain(|profile| {
             !profile.profile_id.trim().is_empty()
                 && !profile.game_uid.trim().is_empty()
@@ -49,14 +52,24 @@ impl AppStore {
             !version.version_id.trim().is_empty()
                 && !version.game_uid.trim().is_empty()
                 && !version.files.is_empty()
-                && self.games.iter().any(|game| game.game_uid == version.game_uid)
+                && self
+                    .games
+                    .iter()
+                    .any(|game| game.game_uid == version.game_uid)
         });
         self.body_versions.retain(|version| {
             !version.version_id.trim().is_empty()
                 && !version.game_uid.trim().is_empty()
-                && !version.archive_path.trim().is_empty()
+                && (!version.archive_path.trim().is_empty()
+                    || version
+                        .package_path
+                        .as_deref()
+                        .is_some_and(|path| !path.trim().is_empty()))
                 && version.file_count > 0
-                && self.games.iter().any(|game| game.game_uid == version.game_uid)
+                && self
+                    .games
+                    .iter()
+                    .any(|game| game.game_uid == version.game_uid)
         });
     }
 }

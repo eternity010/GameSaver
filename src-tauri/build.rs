@@ -1,3 +1,10 @@
 fn main() {
-    tauri_build::build()
+    if std::env::var("PROFILE").as_deref() == Ok("release") {
+        let windows = tauri_build::WindowsAttributes::new()
+            .app_manifest(include_str!("windows/app.manifest"));
+        tauri_build::try_build(tauri_build::Attributes::new().windows_attributes(windows))
+            .expect("failed to run build script");
+    } else {
+        tauri_build::build();
+    }
 }

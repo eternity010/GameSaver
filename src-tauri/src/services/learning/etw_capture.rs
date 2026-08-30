@@ -831,6 +831,7 @@ pub(crate) fn should_ignore_snapshot_path(path: &Path) -> bool {
     let text = path.to_string_lossy().to_ascii_lowercase();
     [
         "com.gamesaver.desktop",
+        "com.gamesaver.next",
         "\\appdata\\local\\temp\\",
         "\\appdata\\local\\microsoft\\windows\\powershell\\",
         "\\shadervariantanalytics\\",

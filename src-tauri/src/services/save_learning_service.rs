@@ -320,8 +320,17 @@ fn infer_scope_drafts(active: &ActiveLearningSession, final_snapshot: &HashMap<S
     for path in &changed {
         if !etw_files.is_empty() && !etw_files.contains(path) { continue; }
         let Some(fingerprint) = final_snapshot.get(path) else { continue; };
-        if fingerprint.size > MAX_CANDIDATE_FILE_BYTES || !is_save_candidate(path) { continue; }
-        let Some(scan_root) = active.roots.iter().filter(|root| Path::new(path).starts_with(&root.physical_path)).max_by_key(|root| root.physical_path.components().count()) else { continue; };
+        let candidate_by_etw = !etw_files.is_empty() && is_etw_candidate(path);
+        let candidate_by_snapshot = etw_files.is_empty() && is_save_candidate(path);
+        if fingerprint.size > MAX_CANDIDATE_FILE_BYTES || (!candidate_by_etw && !candidate_by_snapshot) { continue; }
+        let Some(scan_root) = active
+            .roots
+            .iter()
+            .filter(|root| path_is_within_root(path, &root.physical_path))
+            .max_by_key(|root| root.physical_path.components().count())
+        else {
+            continue;
+        };
         let file_path = Path::new(path);
         let Some(parent) = file_path.parent() else { continue; };
         let key = normalize_path(parent);
@@ -351,7 +360,11 @@ fn infer_scope_drafts(active: &ActiveLearningSession, final_snapshot: &HashMap<S
             confidence: if count >= 2 { 80 } else { 65 },
         });
     }
-    let mut notes = vec!["当前使用快照差异按文件夹归类，候选范围保存前仍可编辑。".to_string()];
+    let mut notes = vec![(if etw_files.is_empty() {
+        "当前使用快照差异按文件夹归类，候选范围保存前仍可编辑。"
+    } else {
+        "当前优先使用 ETW 写入证据按文件夹归类，候选范围保存前仍可编辑。"
+    }).to_string()];
     if drafts.is_empty() { notes.push("没有发现符合存档特征的变化，请确认游戏内完成了一次保存，或手动添加存档目录。".to_string()); }
     else { notes.push("默认只保护 10 MB 以内的存档候选，大文件和游戏资源不会自动加入。".to_string()); }
     (changed, drafts, notes)
@@ -399,9 +412,39 @@ fn is_save_candidate(path: &str) -> bool {
     SAVE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()) || NAME_HINTS.iter().any(|hint| Path::new(path).file_stem().and_then(|value| value.to_str()).unwrap_or_default().to_ascii_lowercase().contains(hint)) || path_lower.contains("\\savedata\\") || path_lower.contains("/savedata/")
 }
 
+fn is_etw_candidate(path: &str) -> bool {
+    if is_noise_path(Path::new(path)) {
+        return false;
+    }
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    !RESOURCE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+}
+
+fn path_is_within_root(path: &str, root: &Path) -> bool {
+    let normalized_path = normalize_path(Path::new(path));
+    let normalized_root = normalize_path(root);
+    normalized_path == normalized_root
+        || normalized_path.starts_with(&(normalized_root + "\\"))
+}
+
 fn is_noise_path(path: &Path) -> bool {
     let text = path.to_string_lossy().to_ascii_lowercase();
-    ["\\cache\\", "\\logs\\", "\\temp\\", "\\crashdumps\\", "\\shadercache\\", "/cache/", "/logs/"].iter().any(|item| text.contains(item))
+    [
+        "com.gamesaver.desktop",
+        "com.gamesaver.next",
+        "\\cache\\",
+        "\\logs\\",
+        "\\temp\\",
+        "\\crashdumps\\",
+        "\\shadercache\\",
+        "/cache/",
+        "/logs/",
+    ]
+    .iter()
+    .any(|item| text.contains(item))
 }
 
 fn modified_unix(metadata: &fs::Metadata) -> u64 {
@@ -414,4 +457,39 @@ fn normalize_path(path: &Path) -> String {
 
 fn now_iso() -> String {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_secs().to_string()).unwrap_or_else(|_| "0".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{is_etw_candidate, path_is_within_root};
+
+    #[test]
+    fn etw_candidates_accept_non_resource_files() {
+        assert!(is_etw_candidate(r"C:\GameSaver\save\slot.xml"));
+        assert!(is_etw_candidate(r"C:\GameSaver\Data\profile.bin"));
+    }
+
+    #[test]
+    fn etw_candidates_reject_resources_and_noise() {
+        assert!(!is_etw_candidate(r"C:\GameSaver\Game.exe"));
+        assert!(!is_etw_candidate(r"C:\GameSaver\cache\profile.bin"));
+        assert!(!is_etw_candidate(r"C:\GameSaver\logs\session.dat"));
+        assert!(!is_etw_candidate(
+            r"C:\Users\Player\AppData\Roaming\com.gamesaver.next\events\trace.etl"
+        ));
+    }
+
+    #[test]
+    fn path_matching_is_case_insensitive_for_windows_roots() {
+        assert!(path_is_within_root(
+            r"c:\users\player\gamesaver\save.dat",
+            Path::new(r"C:\Users\Player\GameSaver")
+        ));
+        assert!(!path_is_within_root(
+            r"c:\users\player\gamesaver-old\save.dat",
+            Path::new(r"C:\Users\Player\GameSaver")
+        ));
+    }
 }

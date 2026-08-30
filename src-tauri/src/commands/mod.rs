@@ -5,3 +5,5 @@ pub mod launch_commands;
 pub mod save_commands;
 pub mod save_version_commands;
 pub mod game_body_commands;
+pub mod baidu_commands;
+pub mod baidu_config_commands;

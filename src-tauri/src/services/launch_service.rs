@@ -53,13 +53,7 @@ impl LaunchService {
                 && profile.enabled
         });
         let save_profile_ready = profile.is_some();
-        if !save_profile_ready {
-            issues.push("存档保护尚未完成设置".to_string());
-        }
         let valid_scope_count = profile.map(GameLibraryService::valid_scope_count).unwrap_or_default();
-        if save_profile_ready && valid_scope_count == 0 {
-            issues.push("没有可访问的存档保护目录".to_string());
-        }
         Ok(LaunchPrecheck {
             game_uid: game.game_uid,
             can_launch: issues.is_empty(),
@@ -93,7 +87,7 @@ impl LaunchService {
             );
         }
         drop(operation_lock);
-        let loaded = (|| -> Result<(Game, SaveProfile, Option<SaveVersion>), String> {
+        let loaded = (|| -> Result<(Game, Option<SaveProfile>, Option<SaveVersion>), String> {
             let store = state.store.lock().map_err(|_| "lock GameSaver store failed".to_string())?;
             let check = Self::precheck(&store, &game_uid)?;
             if !check.can_launch {
@@ -104,8 +98,7 @@ impl LaunchService {
                 .save_profiles
                 .iter()
                 .find(|profile| profile.game_uid == game_uid && game.save_profile_id.as_deref() == Some(profile.profile_id.as_str()) && profile.enabled)
-                .cloned()
-                .ok_or_else(|| "存档保护配置不存在".to_string())?;
+                .cloned();
             let latest = game
                 .latest_save_version_id
                 .as_ref()
@@ -139,7 +132,7 @@ impl LaunchService {
         let app_handle = app.clone();
         let task_id_for_thread = task_id.clone();
         thread::spawn(move || {
-            let result = run_game_session(&app_handle, &game, &profile, latest.as_ref(), &task_id_for_thread);
+            let result = run_game_session(&app_handle, &game, profile.as_ref(), latest.as_ref(), &task_id_for_thread);
             let state = app_handle.state::<AppState>();
             if let Ok(mut running) = state.running_games.lock() {
                 running.remove(&game.game_uid);
@@ -156,7 +149,7 @@ impl LaunchService {
 fn run_game_session(
     app: &AppHandle,
     game: &Game,
-    profile: &SaveProfile,
+    profile: Option<&SaveProfile>,
     latest: Option<&SaveVersion>,
     task_id: &str,
 ) -> Result<(String, serde_json::Value), String> {
@@ -185,17 +178,20 @@ fn run_game_session(
             },
         );
     }
-    TaskService::update(&state, task_id, TaskStatus::Running, 10, "游戏正在运行，退出后将提交存档版本", None);
+    TaskService::update(&state, task_id, TaskStatus::Running, 10, if profile.is_some() { "游戏正在运行，退出后将提交存档版本" } else { "游戏正在运行，存档保护尚未设置" }, None);
     wait_for_process_tree(&mut child)?;
     if let Ok(mut running) = state.running_games.lock() {
         if let Some(runtime) = running.get_mut(&game.game_uid) {
             runtime.status = GameRuntimeStatus::Saving;
         }
     }
-    TaskService::update(&state, task_id, TaskStatus::Running, 70, "游戏已退出，正在提交存档版本", None);
-    let version = SaveRepository::commit(app, game, profile, latest, |progress, message| {
-        TaskService::update(&state, task_id, TaskStatus::Running, 70 + progress / 3, message, None);
-    })?;
+    TaskService::update(&state, task_id, TaskStatus::Running, 70, if profile.is_some() { "游戏已退出，正在提交存档版本" } else { "游戏已退出，正在更新游戏状态" }, None);
+    let version = profile
+        .map(|profile| SaveRepository::commit(app, game, profile, latest, |progress, message| {
+            TaskService::update(&state, task_id, TaskStatus::Running, 70 + progress / 3, message, None);
+        }))
+        .transpose()?
+        .flatten();
     let pending_version = version.clone();
     let mut candidate = state.store.lock().map_err(|_| "lock GameSaver store failed".to_string())?.clone();
     let now = now_iso();

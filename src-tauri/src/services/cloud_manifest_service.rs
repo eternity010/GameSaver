@@ -1,0 +1,593 @@
+use crate::{
+    domain::{Game, GameBodyVersion},
+    services::{BaiduNetdiskClient, RemoteFile},
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    fs,
+    io::Write,
+    path::Path,
+};
+use uuid::Uuid;
+
+const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_FILE_NAME: &str = "manifest.json";
+const CATALOG_FILE_NAME: &str = "game.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudBodyManifest {
+    pub format_version: u32,
+    pub game_uid: String,
+    pub updated_at: String,
+    pub versions: Vec<CloudBodyManifestVersion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudGameCatalog {
+    pub format_version: u32,
+    pub game_uid: String,
+    pub display_name: String,
+    pub executable_relative_path: String,
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    #[serde(default)]
+    pub working_directory_relative_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudBodyManifestVersion {
+    pub version_id: String,
+    pub created_at: String,
+    pub package_path: String,
+    pub package_fs_id: u64,
+    pub package_size: u64,
+    pub package_sha256: Option<String>,
+    pub file_count: usize,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteBodyPackage {
+    pub version_id: String,
+    pub path: String,
+    pub fs_id: u64,
+    pub size: u64,
+    pub md5: Option<String>,
+    pub is_dir: bool,
+    pub server_mtime: Option<u64>,
+    pub package_sha256: Option<String>,
+    pub file_count: Option<usize>,
+    pub total_bytes: Option<u64>,
+    pub created_at: Option<String>,
+    pub sync_state: String,
+    pub manifest_verified: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteBodyPackageList {
+    pub packages: Vec<RemoteBodyPackage>,
+    pub manifest_available: bool,
+    pub manifest_status: String,
+    pub manifest_updated_at: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudGameSummary {
+    pub game_uid: String,
+    pub display_name: String,
+    pub executable_relative_path: Option<String>,
+    pub arguments: Vec<String>,
+    pub working_directory_relative_path: Option<String>,
+    pub version_id: String,
+    pub package_path: String,
+    pub package_fs_id: u64,
+    pub package_size: u64,
+    pub package_sha256: Option<String>,
+    pub file_count: Option<usize>,
+    pub total_bytes: Option<u64>,
+    pub created_at: Option<String>,
+    pub installed: bool,
+}
+
+pub struct CloudManifestService;
+
+impl CloudManifestService {
+    pub fn manifest_path(remote_dir: &str) -> String {
+        format!("{remote_dir}/{MANIFEST_FILE_NAME}")
+    }
+
+    pub fn catalog_path(remote_dir: &str) -> String {
+        format!("{remote_dir}/{CATALOG_FILE_NAME}")
+    }
+
+    pub fn catalog_from_game(game: &Game) -> CloudGameCatalog {
+        CloudGameCatalog {
+            format_version: MANIFEST_VERSION,
+            game_uid: game.game_uid.clone(),
+            display_name: game.display_name.clone(),
+            executable_relative_path: game.launch.executable_relative_path.clone(),
+            arguments: game.launch.arguments.clone(),
+            working_directory_relative_path: game.launch.working_directory_relative_path.clone(),
+        }
+    }
+
+    pub fn write_catalog(
+        client: &BaiduNetdiskClient,
+        remote_dir: &str,
+        catalog: &CloudGameCatalog,
+        temporary_root: &Path,
+    ) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(catalog)
+            .map_err(|error| format!("序列化云端游戏信息失败：{error}"))?;
+        fs::create_dir_all(temporary_root)
+            .map_err(|error| format!("创建云端游戏信息临时目录失败：{error}"))?;
+        let temporary = temporary_root.join(format!(".cloud-game-{}.json", Uuid::new_v4().simple()));
+        let result = (|| -> Result<(), String> {
+            let mut file = fs::File::create(&temporary)
+                .map_err(|error| format!("创建云端游戏信息临时文件失败：{error}"))?;
+            file.write_all(&bytes)
+                .map_err(|error| format!("写入云端游戏信息临时文件失败：{error}"))?;
+            file.sync_all()
+                .map_err(|error| format!("刷新云端游戏信息临时文件失败：{error}"))?;
+            client.upload_file(&temporary, &Self::catalog_path(remote_dir), |_, _| true)?;
+            Ok(())
+        })();
+        let _ = fs::remove_file(&temporary);
+        result
+    }
+
+    pub fn read_catalog(
+        client: &BaiduNetdiskClient,
+        remote_files: &[RemoteFile],
+        remote_dir: &str,
+        temporary_root: &Path,
+    ) -> Result<Option<CloudGameCatalog>, String> {
+        let catalog_path = Self::catalog_path(remote_dir);
+        let Some(remote_catalog) = remote_files
+            .iter()
+            .find(|file| file.path == catalog_path && !file.is_dir)
+        else {
+            return Ok(None);
+        };
+        fs::create_dir_all(temporary_root)
+            .map_err(|error| format!("创建云端游戏信息下载目录失败：{error}"))?;
+        let temporary = temporary_root.join(format!(".cloud-game-download-{}.json", Uuid::new_v4().simple()));
+        let result = (|| -> Result<CloudGameCatalog, String> {
+            client.download_file(remote_catalog, &temporary, |_, _| true)?;
+            let raw = fs::read(&temporary)
+                .map_err(|error| format!("读取云端游戏信息失败：{error}"))?;
+            let catalog = serde_json::from_slice::<CloudGameCatalog>(&raw)
+                .map_err(|error| format!("解析云端游戏信息失败：{error}"))?;
+            validate_catalog(&catalog, remote_dir)?;
+            Ok(catalog)
+        })();
+        let _ = fs::remove_file(&temporary);
+        let _ = fs::remove_file(temporary.with_extension("download.tmp"));
+        result.map(Some)
+    }
+
+    pub fn build(
+        game_uid: &str,
+        body_versions: &[GameBodyVersion],
+        updated_at: String,
+    ) -> CloudBodyManifest {
+        let mut versions = body_versions
+            .iter()
+            .filter(|version| {
+                version.game_uid == game_uid
+                    && version.remote_path.as_deref().is_some_and(|path| !path.is_empty())
+                    && version.remote_fs_id.is_some()
+            })
+            .map(|version| CloudBodyManifestVersion {
+                version_id: version.version_id.clone(),
+                created_at: version.created_at.clone(),
+                package_path: version.remote_path.clone().unwrap_or_default(),
+                package_fs_id: version.remote_fs_id.unwrap_or_default(),
+                package_size: version.remote_size.unwrap_or(version.total_bytes),
+                package_sha256: version.sha256.clone(),
+                file_count: version.file_count,
+                total_bytes: version.total_bytes,
+            })
+            .collect::<Vec<_>>();
+        versions.sort_by(|left, right| left.version_id.cmp(&right.version_id));
+        CloudBodyManifest {
+            format_version: MANIFEST_VERSION,
+            game_uid: game_uid.to_string(),
+            updated_at,
+            versions,
+        }
+    }
+
+    pub fn rebuild(
+        client: &BaiduNetdiskClient,
+        remote_dir: &str,
+        game_uid: &str,
+        remote_files: &[RemoteFile],
+        local_versions: &[GameBodyVersion],
+        temporary_root: &Path,
+    ) -> Result<CloudBodyManifest, String> {
+        let existing = Self::read(client, remote_files, remote_dir, temporary_root)
+            .ok()
+            .flatten();
+        let existing_by_path = existing
+            .as_ref()
+            .map(|manifest| {
+                manifest
+                    .versions
+                    .iter()
+                    .map(|version| (version.package_path.clone(), version))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let local_manifest = Self::build(game_uid, local_versions, now_iso());
+        let local_by_path = local_manifest
+            .versions
+            .iter()
+            .map(|version| (version.package_path.clone(), version))
+            .collect::<HashMap<_, _>>();
+        let mut versions = remote_files
+            .iter()
+            .filter(|file| !file.is_dir && file.path.to_ascii_lowercase().ends_with(".zip"))
+            .map(|file| {
+                let local = local_by_path
+                    .get(&file.path)
+                    .and_then(|version| {
+                        local_versions.iter().find(|local| {
+                            local.version_id == version.version_id
+                        })
+                    })
+                    .or_else(|| {
+                        local_versions.iter().find(|version| {
+                            version.version_id == file_name_without_extension(&file.path)
+                        })
+                    });
+                let existing = existing_by_path.get(&file.path).copied();
+                CloudBodyManifestVersion {
+                    version_id: existing
+                        .map(|version| version.version_id.clone())
+                        .or_else(|| local.map(|version| version.version_id.clone()))
+                        .unwrap_or_else(|| file_name_without_extension(&file.path)),
+                    created_at: existing
+                        .map(|version| version.created_at.clone())
+                        .or_else(|| local.map(|version| version.created_at.clone()))
+                        .unwrap_or_else(now_iso),
+                    package_path: file.path.clone(),
+                    package_fs_id: file.fs_id,
+                    package_size: file.size,
+                    package_sha256: existing
+                        .and_then(|version| version.package_sha256.clone())
+                        .or_else(|| local.and_then(|version| version.sha256.clone())),
+                    file_count: existing
+                        .map(|version| version.file_count)
+                        .or_else(|| local.map(|version| version.file_count))
+                        .unwrap_or_default(),
+                    total_bytes: existing
+                        .map(|version| version.total_bytes)
+                        .or_else(|| local.map(|version| version.total_bytes))
+                        .unwrap_or_default(),
+                }
+            })
+            .collect::<Vec<_>>();
+        versions.sort_by(|left, right| left.version_id.cmp(&right.version_id));
+        let manifest = CloudBodyManifest {
+            format_version: MANIFEST_VERSION,
+            game_uid: game_uid.to_string(),
+            updated_at: now_iso(),
+            versions,
+        };
+        Self::write_manifest(client, remote_dir, manifest.clone(), temporary_root)?;
+        Ok(manifest)
+    }
+
+    fn write_manifest(
+        client: &BaiduNetdiskClient,
+        remote_dir: &str,
+        manifest: CloudBodyManifest,
+        temporary_root: &Path,
+    ) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|error| format!("序列化云端本体版本清单失败：{error}"))?;
+        fs::create_dir_all(temporary_root)
+            .map_err(|error| format!("创建云端版本清单临时目录失败：{error}"))?;
+        let temporary = temporary_root.join(format!(".cloud-manifest-{}.json", Uuid::new_v4().simple()));
+        let result = (|| -> Result<(), String> {
+            let mut file = fs::File::create(&temporary)
+                .map_err(|error| format!("创建云端版本清单临时文件失败：{error}"))?;
+            file.write_all(&bytes)
+                .map_err(|error| format!("写入云端版本清单临时文件失败：{error}"))?;
+            file.sync_all()
+                .map_err(|error| format!("刷新云端版本清单临时文件失败：{error}"))?;
+            client.upload_file(
+                &temporary,
+                &Self::manifest_path(remote_dir),
+                |_, _| true,
+            )?;
+            Ok(())
+        })();
+        let _ = fs::remove_file(&temporary);
+        result
+    }
+
+    pub fn read(
+        client: &BaiduNetdiskClient,
+        remote_files: &[RemoteFile],
+        remote_dir: &str,
+        temporary_root: &Path,
+    ) -> Result<Option<CloudBodyManifest>, String> {
+        let manifest_path = Self::manifest_path(remote_dir);
+        let Some(remote_manifest) = remote_files
+            .iter()
+            .find(|file| file.path == manifest_path && !file.is_dir)
+        else {
+            return Ok(None);
+        };
+        fs::create_dir_all(temporary_root)
+            .map_err(|error| format!("创建云端版本清单下载目录失败：{error}"))?;
+        let temporary = temporary_root.join(format!(".cloud-manifest-download-{}.json", Uuid::new_v4().simple()));
+        let result = (|| -> Result<CloudBodyManifest, String> {
+            client.download_file(remote_manifest, &temporary, |_, _| true)?;
+            let raw = fs::read(&temporary)
+                .map_err(|error| format!("读取云端版本清单失败：{error}"))?;
+            let manifest = serde_json::from_slice::<CloudBodyManifest>(&raw)
+                .map_err(|error| format!("解析云端版本清单失败：{error}"))?;
+            validate(&manifest, remote_dir)?;
+            Ok(manifest)
+        })();
+        let _ = fs::remove_file(&temporary);
+        let _ = fs::remove_file(temporary.with_extension("download.tmp"));
+        result.map(Some)
+    }
+
+    pub fn project(
+        remote_files: &[RemoteFile],
+        manifest: Option<&CloudBodyManifest>,
+        local_versions: &[GameBodyVersion],
+    ) -> RemoteBodyPackageList {
+        let manifest_versions = manifest
+            .map(|value| {
+                value
+                    .versions
+                    .iter()
+                    .map(|version| (version.package_path.clone(), version))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let mut packages = remote_files
+            .iter()
+            .filter(|file| !file.is_dir && file.path.to_ascii_lowercase().ends_with(".zip"))
+            .map(|file| {
+                let manifest_version = manifest_versions.get(&file.path).copied();
+                let local_version = local_versions.iter().find(|version| {
+                    version.remote_path.as_deref() == Some(file.path.as_str())
+                        || manifest_version.is_some_and(|item| item.version_id == version.version_id)
+                        || version.version_id == file_name_without_extension(&file.path)
+                });
+                let package_sha256 = manifest_version.and_then(|item| item.package_sha256.clone());
+                let sync_state = if let Some(local) = local_version {
+                    if manifest_version.is_some_and(|item| {
+                        item.package_sha256.is_some()
+                            && local.sha256.as_deref() != item.package_sha256.as_deref()
+                    }) {
+                        "mismatch"
+                    } else if manifest_version.is_some_and(|item| item.package_sha256.is_some()) {
+                        "synced"
+                    } else if manifest_version.is_some() {
+                        "unverified"
+                    } else if manifest.is_some() {
+                        "manifest_pending"
+                    } else {
+                        "unverified"
+                    }
+                } else {
+                    "remote_only"
+                };
+                RemoteBodyPackage {
+                    version_id: manifest_version
+                        .map(|item| item.version_id.clone())
+                        .unwrap_or_else(|| file_name_without_extension(&file.path)),
+                    path: file.path.clone(),
+                    fs_id: file.fs_id,
+                    size: file.size,
+                    md5: file.md5.clone(),
+                    is_dir: file.is_dir,
+                    server_mtime: file.server_mtime,
+                    package_sha256,
+                    file_count: manifest_version.map(|item| item.file_count),
+                    total_bytes: manifest_version.map(|item| item.total_bytes),
+                    created_at: manifest_version.map(|item| item.created_at.clone()),
+                    sync_state: sync_state.to_string(),
+                    manifest_verified: manifest_version.is_some_and(|item| item.package_sha256.is_some()),
+                }
+            })
+            .collect::<Vec<_>>();
+        packages.sort_by(|left, right| right.path.cmp(&left.path));
+        let mut warnings = Vec::new();
+        let manifest_present = remote_files
+            .iter()
+            .any(|file| file.path.to_ascii_lowercase().ends_with("/manifest.json"));
+        if manifest.is_none() && !packages.is_empty() {
+            if manifest_present {
+                warnings.push("云端版本清单无法读取，当前本体包等待重建清单。".to_string());
+            } else {
+                warnings.push("云端版本清单不存在，当前本体包只能按文件名识别。".to_string());
+            }
+        }
+        if manifest.is_some() {
+            for package in &packages {
+                if package.sync_state == "manifest_pending" {
+                    warnings.push(format!("云端本体包未登记在版本清单中：{}", package.version_id));
+                }
+            }
+            for version in manifest
+                .into_iter()
+                .flat_map(|value| value.versions.iter())
+            {
+                if !remote_files.iter().any(|file| file.path == version.package_path) {
+                    warnings.push(format!("版本清单记录的本体包不存在：{}", version.version_id));
+                }
+            }
+        }
+        for package in &packages {
+            if package.sync_state == "mismatch" {
+                warnings.push(format!("云端本体包与本地版本校验值不一致：{}", package.version_id));
+            }
+        }
+        RemoteBodyPackageList {
+            packages,
+            manifest_available: manifest.is_some(),
+            manifest_status: if manifest.is_some() {
+                "synced".to_string()
+            } else if manifest_present {
+                "invalid".to_string()
+            } else {
+                "missing".to_string()
+            },
+            manifest_updated_at: manifest.map(|value| value.updated_at.clone()),
+            warnings,
+        }
+    }
+}
+
+fn validate(manifest: &CloudBodyManifest, remote_dir: &str) -> Result<(), String> {
+    if manifest.format_version != MANIFEST_VERSION {
+        return Err(format!("不支持的云端版本清单格式：{}", manifest.format_version));
+    }
+    let expected_uid = remote_dir
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    if manifest.game_uid != expected_uid {
+        return Err("云端版本清单不属于当前游戏".to_string());
+    }
+    if manifest.versions.iter().any(|version| {
+        version.version_id.trim().is_empty()
+            || version.package_path.trim().is_empty()
+            || version.package_fs_id == 0
+            || !version.package_path.to_ascii_lowercase().ends_with(".zip")
+    }) {
+        return Err("云端版本清单包含无效本体包记录".to_string());
+    }
+    Ok(())
+}
+
+fn validate_catalog(catalog: &CloudGameCatalog, remote_dir: &str) -> Result<(), String> {
+    let expected_uid = remote_dir
+        .rsplit('/')
+        .nth(1)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    if catalog.format_version != MANIFEST_VERSION {
+        return Err(format!("不支持的云端游戏信息格式：{}", catalog.format_version));
+    }
+    if catalog.game_uid != expected_uid {
+        return Err("云端游戏信息不属于当前游戏".to_string());
+    }
+    if catalog.display_name.trim().is_empty() || catalog.executable_relative_path.trim().is_empty() {
+        return Err("云端游戏信息缺少启动配置".to_string());
+    }
+    Ok(())
+}
+
+fn file_name_without_extension(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn now_iso() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CloudManifestService, CloudBodyManifest, CloudBodyManifestVersion};
+    use crate::{domain::GameBodyVersion, services::RemoteFile};
+
+    fn version() -> GameBodyVersion {
+        GameBodyVersion {
+            version_id: "v1".to_string(),
+            game_uid: "game-1".to_string(),
+            created_at: "1".to_string(),
+            archive_path: String::new(),
+            file_count: 2,
+            total_bytes: 20,
+            package_path: Some("cache/v1.zip".to_string()),
+            sha256: Some("abc".to_string()),
+            excluded_items: Vec::new(),
+            upload_status: Some("synced".to_string()),
+            remote_path: Some("/apps/GameSaver/games/game-1/v1.zip".to_string()),
+            remote_fs_id: Some(10),
+            remote_size: Some(30),
+        }
+    }
+
+    #[test]
+    fn manifest_contains_only_remote_versions() {
+        let local = version();
+        let mut not_uploaded = version();
+        not_uploaded.version_id = "v2".to_string();
+        not_uploaded.remote_path = None;
+        not_uploaded.remote_fs_id = None;
+        let manifest = CloudManifestService::build("game-1", &[local.clone(), not_uploaded], "2".to_string());
+        assert_eq!(manifest.versions.len(), 1);
+        assert_eq!(manifest.versions[0].package_size, 30);
+    }
+
+    #[test]
+    fn project_marks_remote_only_and_checksum_mismatch() {
+        let local = version();
+        let manifest = CloudBodyManifest {
+            format_version: 1,
+            game_uid: "game-1".to_string(),
+            updated_at: "2".to_string(),
+            versions: vec![CloudBodyManifestVersion {
+                version_id: "v1".to_string(),
+                created_at: "1".to_string(),
+                package_path: "/apps/GameSaver/games/game-1/v1.zip".to_string(),
+                package_fs_id: 10,
+                package_size: 30,
+                package_sha256: Some("different".to_string()),
+                file_count: 2,
+                total_bytes: 20,
+            }],
+        };
+        let remote_files = vec![
+            RemoteFile {
+                path: "/apps/GameSaver/games/game-1/v1.zip".to_string(),
+                fs_id: 10,
+                size: 30,
+                md5: None,
+                is_dir: false,
+                server_mtime: None,
+            },
+            RemoteFile {
+                path: "/apps/GameSaver/games/game-1/v2.zip".to_string(),
+                fs_id: 11,
+                size: 40,
+                md5: None,
+                is_dir: false,
+                server_mtime: None,
+            },
+        ];
+        let result = CloudManifestService::project(&remote_files, Some(&manifest), &[local]);
+        assert_eq!(result.packages[0].version_id, "v2");
+        assert_eq!(result.packages[0].sync_state, "remote_only");
+        assert_eq!(result.packages[1].version_id, "v1");
+        assert_eq!(result.packages[1].sync_state, "mismatch");
+        assert!(result.warnings.iter().any(|warning| warning.contains("v1")));
+    }
+}

@@ -1,6 +1,6 @@
 [package]
 name = "gamesaver_next"
-version = "0.1.0"
+version = "0.1.1"
 description = "GameSaver next-generation game library"
 authors = ["GameSaver"]
 edition = "2021"
@@ -21,6 +21,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Etw",
     "Win32_System_Diagnostics_ToolHelp",
@@ -29,6 +30,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 sha2 = "0.10"
 hex = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "multipart", "query", "rustls"] }
 
 [profile.release]
 codegen-units = 1

@@ -1,4 +1,4 @@
-use crate::{app_state::AppState, domain::{AppTask, TaskStatus}};
+use crate::{app_state::AppState, domain::{AppTask, TaskRetry, TaskStatus}, repositories::TaskRepository};
 use uuid::Uuid;
 
 pub struct TaskService;
@@ -15,10 +15,25 @@ impl TaskService {
             game_uid,
             error: None,
             result: None,
+            retry: None,
+            created_at: now_millis(),
             cancel_requested: false,
         };
-        state.tasks.lock().map_err(|_| "lock task state failed".to_string())?.insert(task_id.clone(), task);
+        let mut tasks = state.tasks.lock().map_err(|_| "lock task state failed".to_string())?;
+        tasks.insert(task_id.clone(), task);
+        if let Err(error) = TaskRepository::persist(&state.tasks_path, &tasks) {
+            tasks.remove(&task_id);
+            return Err(error);
+        }
         Ok(task_id)
+    }
+
+    pub fn set_retry(state: &AppState, task_id: &str, retry: TaskRetry) -> Result<(), String> {
+        let mut tasks = state.tasks.lock().map_err(|_| "lock task state failed".to_string())?;
+        let task = tasks.get_mut(task_id).ok_or_else(|| "task not found".to_string())?;
+        task.retry = Some(retry);
+        persist_locked(state, &tasks);
+        Ok(())
     }
 
     pub fn update(state: &AppState, task_id: &str, status: TaskStatus, progress: u8, message: impl Into<String>, error: Option<String>) {
@@ -48,6 +63,7 @@ impl TaskService {
                 task.message = message.into();
                 task.result = result;
                 task.error = error;
+                persist_locked(state, &tasks);
             }
         }
     }
@@ -61,6 +77,7 @@ impl TaskService {
         let task = tasks.get_mut(task_id).ok_or_else(|| "task not found".to_string())?;
         if matches!(task.status, TaskStatus::Pending | TaskStatus::Running) {
             task.cancel_requested = true;
+            persist_locked(state, &tasks);
         }
         Ok(())
     }
@@ -71,7 +88,20 @@ impl TaskService {
 
     pub fn list(state: &AppState) -> Result<Vec<AppTask>, String> {
         let mut tasks = state.tasks.lock().map_err(|_| "lock task state failed".to_string())?.values().cloned().collect::<Vec<_>>();
-        tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+        tasks.sort_by(|left, right| right.created_at.cmp(&left.created_at));
         Ok(tasks)
     }
+}
+
+fn persist_locked(state: &AppState, tasks: &std::collections::HashMap<String, AppTask>) {
+    if let Err(error) = TaskRepository::persist(&state.tasks_path, tasks) {
+        eprintln!("GameSaver 任务记录持久化失败：{error}");
+    }
+}
+
+fn now_millis() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }

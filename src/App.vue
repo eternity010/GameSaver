@@ -1,15 +1,19 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { CloudUpload, Gamepad2, Library, Plus, Settings, Search } from "@lucide/vue";
-import { launchGame, listGames } from "./api";
+import { getTask, installCloudGame, launchGame, listCloudGames, listGames } from "./api";
+import type { CloudGameSummary } from "./api";
 import { gameStatusLabel, type Game } from "./domain/game";
 import AddGameWizard from "./components/AddGameWizard.vue";
 import GameDetailPage from "./components/GameDetailPage.vue";
+import TransferCenter from "./components/TransferCenter.vue";
+import PlatformSettings from "./components/PlatformSettings.vue";
 
 type LibraryView = "all" | "recent" | "favorites" | "attention";
-type AppPage = "library" | "add" | "detail";
+type AppPage = "library" | "add" | "detail" | "transfers" | "settings";
 
 const games = ref<Game[]>([]);
+const cloudGames = ref<CloudGameSummary[]>([]);
 const activePage = ref<AppPage>("library");
 const activeView = ref<LibraryView>("all");
 const search = ref("");
@@ -17,6 +21,11 @@ const loading = ref(true);
 const error = ref("");
 const selectedGame = ref<Game | null>(null);
 const selectedGameError = ref("");
+const cloudInstallUid = ref("");
+const cloudInstallProgress = ref(0);
+const cloudInstallMessage = ref("");
+const cloudInstallError = ref("");
+let cloudInstallTimer: ReturnType<typeof setTimeout> | undefined;
 
 const filteredGames = computed(() => {
   const keyword = search.value.trim().toLocaleLowerCase();
@@ -31,6 +40,12 @@ const filteredGames = computed(() => {
   return result;
 });
 
+const filteredCloudGames = computed(() => {
+  if (activeView.value !== "all") return [];
+  const keyword = search.value.trim().toLocaleLowerCase();
+  return cloudGames.value.filter((game) => !game.installed && (!keyword || game.displayName.toLocaleLowerCase().includes(keyword)));
+});
+
 const pageTitle = computed(() => activeView.value === "all" ? "游戏库" : activeView.value === "recent" ? "最近游玩" : activeView.value === "favorites" ? "收藏" : "需要处理");
 
 async function loadGames() {
@@ -38,6 +53,11 @@ async function loadGames() {
   error.value = "";
   try {
     games.value = await listGames();
+    try {
+      cloudGames.value = await listCloudGames();
+    } catch {
+      cloudGames.value = [];
+    }
     if (selectedGame.value) {
       selectedGame.value = games.value.find((game) => game.gameUid === selectedGame.value?.gameUid) || selectedGame.value;
     }
@@ -49,6 +69,9 @@ async function loadGames() {
 }
 
 onMounted(() => void loadGames());
+onUnmounted(() => {
+  if (cloudInstallTimer) clearTimeout(cloudInstallTimer);
+});
 
 function openAddGame() {
   activePage.value = "add";
@@ -73,6 +96,45 @@ async function quickLaunch(game: Game) {
   }
 }
 
+async function installAndLaunch(cloudGame: CloudGameSummary) {
+  if (cloudInstallUid.value) return;
+  if (!cloudGame.executableRelativePath) {
+    cloudInstallError.value = "这个云端游戏缺少启动信息，请重新上传游戏本体包。";
+    return;
+  }
+  cloudInstallUid.value = cloudGame.gameUid;
+  cloudInstallProgress.value = 0;
+  cloudInstallMessage.value = "准备下载游戏本体";
+  cloudInstallError.value = "";
+  try {
+    const taskId = await installCloudGame(cloudGame.gameUid, cloudGame.packagePath, cloudGame.packageFsId);
+    await watchCloudInstall(taskId, cloudGame);
+  } catch (reason) {
+    cloudInstallUid.value = "";
+    cloudInstallError.value = String(reason);
+  }
+}
+
+async function watchCloudInstall(taskId: string, cloudGame: CloudGameSummary) {
+  const task = await getTask(taskId);
+  cloudInstallProgress.value = task.progress;
+  cloudInstallMessage.value = task.message;
+  if (task.status === "success") {
+    cloudInstallUid.value = "";
+    await loadGames();
+    const installed = games.value.find((game) => game.gameUid === cloudGame.gameUid);
+    if (installed) await quickLaunch(installed);
+    return;
+  }
+  if (task.status === "failed" || task.status === "cancelled" || task.status === "interrupted") {
+    cloudInstallUid.value = "";
+    cloudInstallError.value = task.error || task.message;
+    return;
+  }
+  if (cloudInstallTimer) clearTimeout(cloudInstallTimer);
+  cloudInstallTimer = setTimeout(() => void watchCloudInstall(taskId, cloudGame), 700);
+}
+
 async function finishAddGame() {
   await loadGames();
 }
@@ -88,10 +150,10 @@ async function finishAddGame() {
       <nav class="primary-nav" aria-label="主导航">
         <button class="nav-item" :class="{ active: activePage === 'library' }" type="button" @click="activePage = 'library'"><Library :size="18" /><span>游戏库</span></button>
         <button class="nav-item" :class="{ active: activePage === 'add' }" type="button" @click="openAddGame"><Plus :size="18" /><span>添加游戏</span></button>
-        <button class="nav-item disabled-nav" type="button" disabled title="传输中心将在本体版本阶段开放"><CloudUpload :size="18" /><span>传输中心</span></button>
+        <button class="nav-item" :class="{ active: activePage === 'transfers' }" type="button" @click="activePage = 'transfers'"><CloudUpload :size="18" /><span>传输中心</span></button>
       </nav>
       <div class="sidebar-bottom">
-        <button class="nav-item disabled-nav" type="button" disabled title="平台设置将在后续阶段开放"><Settings :size="18" /><span>GameSaver 设置</span></button>
+        <button class="nav-item" :class="{ active: activePage === 'settings' }" type="button" @click="activePage = 'settings'"><Settings :size="18" /><span>GameSaver 设置</span></button>
         <span class="local-status"><i></i> 本地优先</span>
       </div>
     </aside>
@@ -110,6 +172,8 @@ async function finishAddGame() {
 
       <AddGameWizard v-if="activePage === 'add'" @back="activePage = 'library'" @completed="finishAddGame" />
       <GameDetailPage v-else-if="activePage === 'detail' && selectedGame" :game="selectedGame" :initial-error="selectedGameError" @back="activePage = 'library'" @refresh="loadGames" />
+      <TransferCenter v-else-if="activePage === 'transfers'" :games="games" :cloud-games="cloudGames" />
+      <PlatformSettings v-else-if="activePage === 'settings'" />
 
       <template v-else-if="activePage === 'library'">
       <div class="library-toolbar" role="tablist" aria-label="游戏库视图">
@@ -119,13 +183,19 @@ async function finishAddGame() {
 
       <div v-if="loading" class="state-panel"><span class="loader"></span><strong>正在加载游戏库</strong></div>
       <div v-else-if="error" class="state-panel error-state"><strong>游戏库加载失败</strong><p>{{ error }}</p><button type="button" @click="loadGames">重试</button></div>
-      <div v-else-if="!filteredGames.length" class="state-panel empty-state"><div class="empty-icon"><Gamepad2 :size="28" /></div><strong>{{ games.length ? "没有匹配的游戏" : "还没有加入游戏" }}</strong><p>{{ games.length ? "调整搜索或筛选条件。" : "添加游戏本体后，它会出现在这里。" }}</p><button class="primary-button" type="button" @click="openAddGame"><Plus :size="17" /> 添加游戏</button></div>
+      <div v-else-if="!filteredGames.length && !filteredCloudGames.length" class="state-panel empty-state"><div class="empty-icon"><Gamepad2 :size="28" /></div><strong>{{ games.length || cloudGames.length ? "没有匹配的游戏" : "还没有加入游戏" }}</strong><p>{{ games.length || cloudGames.length ? "调整搜索或筛选条件。" : "添加游戏本体后，它会出现在这里。" }}</p><button class="primary-button" type="button" @click="openAddGame"><Plus :size="17" /> 添加游戏</button></div>
       <div v-else class="game-grid">
         <article v-for="game in filteredGames" :key="game.gameUid" class="game-card" tabindex="0" @click="openGame(game)" @keyup.enter="openGame(game)">
           <div class="cover-placeholder"><Gamepad2 :size="34" /></div>
           <div class="game-card-body"><div><h2>{{ game.displayName }}</h2><span class="status-label">{{ gameStatusLabel(game) }}</span></div><button class="launch-button" type="button" :disabled="game.lifecycle !== 'active'" @click.stop="quickLaunch(game)">启动</button></div>
         </article>
+        <article v-for="cloudGame in filteredCloudGames" :key="`cloud-${cloudGame.gameUid}`" class="game-card cloud-game-card" tabindex="0" @click="installAndLaunch(cloudGame)" @keyup.enter="installAndLaunch(cloudGame)">
+          <div class="cover-placeholder cloud-cover"><CloudUpload :size="34" /></div>
+          <div class="game-card-body"><div><h2>{{ cloudGame.displayName }}</h2><span class="status-label cloud-status-label">仅云端 · {{ Math.round(cloudGame.packageSize / 1024 / 1024) }} MB</span></div><button class="launch-button" type="button" :disabled="!!cloudInstallUid" @click.stop="installAndLaunch(cloudGame)">{{ cloudInstallUid === cloudGame.gameUid ? "安装中" : "下载" }}</button></div>
+          <div v-if="cloudInstallUid === cloudGame.gameUid" class="cloud-install-progress"><div class="task-progress-heading"><span>{{ cloudInstallMessage }}</span><strong>{{ cloudInstallProgress }}%</strong></div><div class="progress-track"><span :style="{ width: `${cloudInstallProgress}%` }"></span></div></div>
+        </article>
       </div>
+      <p v-if="cloudInstallError" class="error-message cloud-install-error" role="alert">{{ cloudInstallError }}</p>
       </template>
     </section>
   </main>

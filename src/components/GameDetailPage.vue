@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
-import { AlertTriangle, ArrowLeft, CheckCircle2, Clock3, Folder, FolderOpen, Gamepad2, HardDrive, LoaderCircle, Play, RefreshCw, RotateCcw, ShieldCheck, Trash2 } from "@lucide/vue";
-import { deleteSaveVersion, getGameRuntime, getTask, launchGame, listGameBodyVersions, listSaveVersions, precheckGameLaunch, pruneSaveVersions, restoreSaveVersion, updateGameBody } from "../api";
+import { AlertTriangle, Archive, ArrowLeft, CheckCircle2, Clock3, Folder, FolderOpen, Gamepad2, HardDrive, LoaderCircle, Play, RefreshCw, RotateCcw, ShieldCheck, Trash2 } from "@lucide/vue";
+import { deleteGameBodyPackage, deleteRemoteBodyPackage, deleteSaveVersion, downloadGameBodyPackage, getBaiduStatus, getGameRuntime, getTask, launchGame, listGameBodyVersions, listRemoteBodyPackages, listSaveVersions, packageGameBody, precheckGameLaunch, pruneSaveVersions, repairCloudBodyManifest, restoreGameBodyPackage, restoreSaveVersion, updateGameBody, uploadGameBodyPackage } from "../api";
+import type { BaiduStatus, RemoteBodyPackage } from "../api";
 import type { Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveVersion } from "../domain/game";
 
 const props = defineProps<{ game: Game; initialError?: string }>();
@@ -12,10 +13,16 @@ const precheck = ref<LaunchPrecheck | null>(null);
 const runtime = ref<GameRuntime | null>(null);
 const versions = ref<SaveVersion[]>([]);
 const bodyVersions = ref<GameBodyVersion[]>([]);
+const baiduStatus = ref<BaiduStatus | null>(null);
+const remotePackages = ref<RemoteBodyPackage[]>([]);
+const cloudWarnings = ref<string[]>([]);
+const cloudManifestStatus = ref("missing");
+const cloudManifestUpdatedAt = ref<string | undefined>();
 const loading = ref(true);
 const busy = ref(false);
 const error = ref(props.initialError || "");
 const message = ref("");
+const taskProgress = ref(0);
 const keepVersions = ref(5);
 let pollTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -23,16 +30,31 @@ async function refresh() {
   loading.value = true;
   error.value = "";
   try {
-    const [nextPrecheck, nextVersions, nextRuntime, nextBodyVersions] = await Promise.all([
+    const [nextPrecheck, nextVersions, nextRuntime, nextBodyVersions, nextBaiduStatus] = await Promise.all([
       precheckGameLaunch(props.game.gameUid),
       listSaveVersions(props.game.gameUid),
       getGameRuntime(props.game.gameUid),
       listGameBodyVersions(props.game.gameUid),
+      getBaiduStatus(),
     ]);
     precheck.value = nextPrecheck;
     versions.value = nextVersions;
     runtime.value = nextRuntime;
     bodyVersions.value = nextBodyVersions;
+    baiduStatus.value = nextBaiduStatus;
+    if (nextBaiduStatus.authorized && !nextBaiduStatus.expired) {
+      const remoteResult = await listRemoteBodyPackages(props.game.gameUid);
+      remotePackages.value = remoteResult.packages;
+      cloudWarnings.value = remoteResult.warnings;
+      cloudManifestStatus.value = remoteResult.manifestStatus;
+      cloudManifestUpdatedAt.value = remoteResult.manifestUpdatedAt;
+      bodyVersions.value = await listGameBodyVersions(props.game.gameUid);
+    } else {
+      remotePackages.value = [];
+      cloudWarnings.value = [];
+      cloudManifestStatus.value = "missing";
+      cloudManifestUpdatedAt.value = undefined;
+    }
   } catch (reason) {
     error.value = String(reason);
   } finally {
@@ -59,6 +81,7 @@ async function watchTask(taskId: string) {
     const task = await getTask(taskId);
     runtime.value = await getGameRuntime(props.game.gameUid);
     message.value = task.message;
+    taskProgress.value = task.progress;
     if (task.status === "success") {
       busy.value = false;
       await refresh();
@@ -137,6 +160,141 @@ async function updateBody() {
   }
 }
 
+async function packageBody() {
+  if (busy.value || runtime.value) return;
+  if (!window.confirm("将当前受管游戏本体压缩为 ZIP，并保存到本地缓存，确定继续吗？")) return;
+  busy.value = true;
+  error.value = "";
+  message.value = "准备创建游戏本体包";
+  try {
+    await watchTask(await packageGameBody(props.game.gameUid));
+  } catch (reason) {
+    busy.value = false;
+    error.value = String(reason);
+  }
+}
+
+async function restoreBodyPackage(version: GameBodyVersion) {
+  if (busy.value || runtime.value || !version.packagePath) return;
+  if (!window.confirm("恢复本体包会替换当前受管游戏目录，当前目录会先保留为回滚版本，确定继续吗？")) return;
+  busy.value = true;
+  error.value = "";
+  message.value = "准备恢复游戏本体包";
+  try {
+    await watchTask(await restoreGameBodyPackage(props.game.gameUid, version.versionId));
+  } catch (reason) {
+    busy.value = false;
+    error.value = String(reason);
+  }
+}
+
+async function deleteBodyPackage(version: GameBodyVersion) {
+  if (busy.value || runtime.value || !version.packagePath) return;
+  if (!window.confirm(version.archivePath ? "删除本地 ZIP 后仍保留旧本体目录，确定继续吗？" : "删除本地 ZIP 后将无法从这个本体版本恢复，确定继续吗？")) return;
+  busy.value = true;
+  error.value = "";
+  message.value = "准备删除本地本体包";
+  try {
+    await watchTask(await deleteGameBodyPackage(props.game.gameUid, version.versionId));
+  } catch (reason) {
+    busy.value = false;
+    error.value = String(reason);
+  }
+}
+
+async function uploadBody(version: GameBodyVersion) {
+  if (busy.value || runtime.value || !version.packagePath || !baiduStatus.value?.authorized) return;
+  if (!window.confirm("将此版本的游戏本体 ZIP 上传到百度网盘，确定继续吗？")) return;
+  busy.value = true;
+  error.value = "";
+  message.value = "准备上传游戏本体包";
+  try {
+    await watchTask(await uploadGameBodyPackage(props.game.gameUid, version.versionId));
+  } catch (reason) {
+    busy.value = false;
+    error.value = String(reason);
+  }
+}
+
+async function downloadBody(remote: RemoteBodyPackage) {
+  if (busy.value || runtime.value) return;
+  if (!window.confirm("下载此百度网盘本体 ZIP 到本地，完成后可在版本列表中恢复，确定继续吗？")) return;
+  busy.value = true;
+  error.value = "";
+  message.value = "准备下载游戏本体包";
+  try {
+    await watchTask(await downloadGameBodyPackage(props.game.gameUid, remote.path, remote.fsId));
+  } catch (reason) {
+    busy.value = false;
+    error.value = String(reason);
+  }
+}
+
+async function deleteRemoteBody(remote: RemoteBodyPackage) {
+  if (busy.value || runtime.value) return;
+  const localCopy = bodyVersions.value.some((version) => version.packagePath && version.remotePath === remote.path && version.remoteFsId === remote.fsId);
+  const warning = localCopy
+    ? `删除云端本体包将释放约 ${formatBytes(remote.size)}，本地仍保留一个副本，确定继续吗？`
+    : `本地没有这个本体包的副本，删除后将无法直接恢复，确定删除约 ${formatBytes(remote.size)} 的云端版本吗？`;
+  if (!window.confirm(warning)) return;
+  busy.value = true;
+  error.value = "";
+  message.value = "准备删除云端本体包";
+  try {
+    await watchTask(await deleteRemoteBodyPackage(props.game.gameUid, remote.path, remote.fsId));
+  } catch (reason) {
+    busy.value = false;
+    error.value = String(reason);
+  }
+}
+
+async function repairCloudManifest() {
+  if (busy.value || runtime.value || !baiduReady()) return;
+  if (!window.confirm("GameSaver 会扫描该游戏的云端 ZIP，并重建版本清单。不会修改本地游戏文件，确定继续吗？")) return;
+  busy.value = true;
+  error.value = "";
+  message.value = "准备修复云端版本清单";
+  try {
+    await watchTask(await repairCloudBodyManifest(props.game.gameUid));
+  } catch (reason) {
+    busy.value = false;
+    error.value = String(reason);
+  }
+}
+
+function remoteName(path: string): string {
+  return path.split("/").pop() || path;
+}
+
+function bodyUploadLabel(version: GameBodyVersion): string {
+  if (version.uploadStatus === "synced") {
+    const present = remotePackages.value.some((remote) => remote.path === version.remotePath && remote.fsId === version.remoteFsId);
+    return present ? "已上传" : "云端缺失";
+  }
+  if (version.uploadStatus === "failed") {
+    const remote = remotePackages.value.find((item) => item.versionId === version.versionId);
+    return remote?.syncState === "mismatch" ? "云端校验不一致" : "上传失败";
+  }
+  if (version.uploadStatus === "syncing") return "上传中";
+  if (version.uploadStatus === "manifest_pending") return "清单待修复";
+  return "未上传";
+}
+
+function baiduReady(): boolean {
+  return !!baiduStatus.value?.authorized && !baiduStatus.value.expired;
+}
+
+function baiduLabel(): string {
+  if (!baiduStatus.value?.authorized) return "未授权";
+  return baiduStatus.value.expired ? "授权已过期" : "已连接";
+}
+
+function cloudManifestLabel(): string {
+  if (cloudManifestStatus.value === "synced") return "版本清单已同步";
+  if (cloudManifestStatus.value === "invalid") return "版本清单异常";
+  return "版本清单缺失";
+}
+
 function stopPolling() {
   if (pollTimer) clearTimeout(pollTimer);
   pollTimer = undefined;
@@ -147,6 +305,13 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
   return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+function remoteSyncLabel(remote: RemoteBodyPackage): string {
+  if (remote.syncState === "synced") return remote.manifestVerified ? "已校验" : "已存在，未校验";
+  if (remote.syncState === "mismatch") return "校验不一致";
+  if (remote.syncState === "remote_only") return "仅云端";
+  return "待确认";
 }
 
 function formatDate(value: string): string {
@@ -182,6 +347,7 @@ onUnmounted(stopPolling);
       </section>
 
       <p v-if="error" class="error-message" role="alert">{{ error }}</p>
+      <div v-if="busy" class="task-progress"><div class="task-progress-heading"><strong>{{ message || "正在处理" }}</strong><span>{{ taskProgress }}%</span></div><div class="progress-track"><span :style="{ width: `${taskProgress}%` }"></span></div></div>
 
       <div class="detail-columns">
         <section class="detail-section"><header class="detail-section-header"><div><p class="eyebrow">启动前检查</p><h2>运行环境</h2></div><CheckCircle2 v-if="precheck?.canLaunch" class="detail-ok" :size="20" /><AlertTriangle v-else class="detail-warning" :size="20" /></header><div class="check-list"><div class="check-row"><span><Folder :size="16" />游戏本体目录</span><strong :class="{ good: game.managedPath && precheck?.canLaunch }">{{ game.managedPath ? "已找到" : "缺失" }}</strong></div><div class="check-row"><span><Play :size="16" />启动程序</span><strong :class="{ good: precheck?.executableExists }">{{ precheck?.executableExists ? "已找到" : "缺失" }}</strong></div><div class="check-row"><span><ShieldCheck :size="16" />存档保护</span><strong :class="{ good: precheck?.saveProfileReady && (precheck?.validScopeCount || 0) > 0 }">{{ precheck?.saveProfileReady ? `${precheck?.validScopeCount} 个范围` : "未设置" }}</strong></div></div><div v-if="precheck?.issues.length" class="issue-list"><p v-for="issue in precheck.issues" :key="issue">{{ issue }}</p></div></section>
@@ -190,8 +356,11 @@ onUnmounted(stopPolling);
           <header class="detail-section-header"><div><p class="eyebrow">游戏本体</p><h2>受管目录</h2></div><HardDrive :size="20" class="detail-muted" /></header>
           <p class="managed-path">{{ game.managedPath }}</p>
           <dl class="detail-facts"><div><dt>启动文件</dt><dd>{{ game.launch.executableRelativePath }}</dd></div><div><dt>保存版本</dt><dd>{{ versions.length }} 个</dd></div><div><dt>旧本体版本</dt><dd>{{ bodyVersions.length }} 个</dd></div></dl>
-          <button class="secondary-button body-update-button" type="button" :disabled="busy || !!runtime" title="选择新版游戏文件夹并更新" @click="updateBody"><LoaderCircle v-if="busy && (message.includes('更新') || message.includes('新版'))" :size="16" class="spin" /><FolderOpen v-else :size="16" />更新游戏本体</button>
-          <div v-if="bodyVersions.length" class="body-version-list"><p class="timeline-caption">保留的旧本体</p><div v-for="version in bodyVersions" :key="version.versionId" class="body-version-row"><span>{{ formatDate(version.createdAt) }}</span><strong>{{ version.fileCount }} 个文件 · {{ formatBytes(version.totalBytes) }}</strong></div></div>
+          <div class="body-action-row"><button class="secondary-button" type="button" :disabled="busy || !!runtime" title="选择新版游戏文件夹并更新" @click="updateBody"><LoaderCircle v-if="busy && (message.includes('更新') || message.includes('新版'))" :size="16" class="spin" /><FolderOpen v-else :size="16" />更新游戏本体</button><button class="secondary-button" type="button" :disabled="busy || !!runtime" title="创建本体 ZIP 缓存" @click="packageBody"><LoaderCircle v-if="busy && message.includes('本体包')" :size="16" class="spin" /><Archive v-else :size="16" />创建本体包</button></div>
+          <div class="cloud-summary"><span class="status-dot" :class="{ active: baiduReady() }"></span><strong>百度网盘</strong><span>{{ baiduLabel() }}</span><span v-if="baiduReady()">· {{ cloudManifestLabel() }}<template v-if="cloudManifestUpdatedAt"> · {{ formatDate(cloudManifestUpdatedAt) }}</template></span><button v-if="baiduReady() && (cloudManifestStatus !== 'synced' || cloudWarnings.length)" class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" title="扫描云端 ZIP 并重建版本清单" @click="repairCloudManifest"><RefreshCw :size="14" />修复清单</button></div>
+          <div v-if="cloudWarnings.length" class="cloud-warnings"><p v-for="warning in cloudWarnings" :key="warning">{{ warning }}</p></div>
+          <div v-if="bodyVersions.length" class="body-version-list"><p class="timeline-caption">本体版本与本地包</p><div v-for="version in bodyVersions" :key="version.versionId" class="body-version-row"><div><span>{{ version.packagePath ? "ZIP 本体包" : "旧本体目录" }} · {{ formatDate(version.createdAt) }}</span><small v-if="version.packagePath">本地缓存 · {{ version.excludedItems.length }} 项排除 · {{ bodyUploadLabel(version) }}</small></div><strong>{{ version.fileCount }} 个文件 · {{ formatBytes(version.totalBytes) }}</strong><div v-if="version.packagePath" class="version-actions"><button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" title="校验并恢复本体包" @click="restoreBodyPackage(version)"><RotateCcw :size="15" />恢复</button><button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime || !baiduReady()" title="上传本体包到百度网盘" @click="uploadBody(version)">上传</button><button class="icon-button danger-button" type="button" :disabled="busy || !!runtime" title="删除本地本体包" aria-label="删除本地本体包" @click="deleteBodyPackage(version)"><Trash2 :size="15" /></button></div></div></div>
+          <div v-if="baiduReady() && remotePackages.length" class="body-version-list"><p class="timeline-caption">百度网盘本体包</p><div v-for="remote in remotePackages" :key="remote.fsId" class="body-version-row"><div><span>{{ remote.versionId }} · {{ remoteSyncLabel(remote) }}</span><small>云端 ZIP · SHA-256 {{ remote.packageSha256 || "未提供" }} · ID {{ remote.fsId }}</small></div><strong>{{ formatBytes(remote.size) }}</strong><div class="version-actions"><button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" title="下载本体包到本地" @click="downloadBody(remote)">下载</button><button class="icon-button danger-button" type="button" :disabled="busy || !!runtime" title="删除云端本体包" aria-label="删除云端本体包" @click="deleteRemoteBody(remote)"><Trash2 :size="15" /></button></div></div></div>
         </section>
       </div>
 

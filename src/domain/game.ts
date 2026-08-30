@@ -37,6 +37,13 @@ export interface GameBodyVersion {
   archivePath: string;
   fileCount: number;
   totalBytes: number;
+  packagePath?: string;
+  sha256?: string;
+  excludedItems: string[];
+  uploadStatus?: string;
+  remotePath?: string;
+  remoteFsId?: number;
+  remoteSize?: number;
 }
 
 export interface LaunchPrecheck {

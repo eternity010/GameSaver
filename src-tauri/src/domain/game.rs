@@ -94,6 +94,20 @@ pub struct GameBodyVersion {
     pub archive_path: String,
     pub file_count: usize,
     pub total_bytes: u64,
+    #[serde(default)]
+    pub package_path: Option<String>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub excluded_items: Vec<String>,
+    #[serde(default)]
+    pub upload_status: Option<String>,
+    #[serde(default)]
+    pub remote_path: Option<String>,
+    #[serde(default)]
+    pub remote_fs_id: Option<u64>,
+    #[serde(default)]
+    pub remote_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
