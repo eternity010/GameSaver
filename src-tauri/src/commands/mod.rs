@@ -7,3 +7,7 @@ pub mod save_version_commands;
 pub mod game_body_commands;
 pub mod baidu_commands;
 pub mod baidu_config_commands;
+pub mod diagnostics_commands;
+pub mod admin_commands;
+pub mod library_commands;
+pub mod cloud_account_commands;

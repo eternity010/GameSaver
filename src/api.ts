@@ -1,6 +1,40 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveLearningResult, SaveLearningSession, SaveProfile, SaveScope, SaveVersion } from "./domain/game";
 
+export interface FrontendErrorReport {
+  source: string;
+  message: string;
+  stack?: string;
+  url?: string;
+  line?: number;
+  column?: number;
+}
+
+function errorMessage(reason: unknown): string {
+  if (reason instanceof Error) return reason.message;
+  if (typeof reason === "string") return reason;
+  try {
+    return JSON.stringify(reason);
+  } catch {
+    return String(reason);
+  }
+}
+
+export function reportFrontendError(report: FrontendErrorReport): Promise<void> {
+  return invoke<void>("report_frontend_error", { error: report });
+}
+
+function invokeCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  return invoke<T>(command, args).catch((reason) => {
+    void reportFrontendError({
+      source: "tauri_command",
+      message: `${command}: ${errorMessage(reason)}`,
+      stack: reason instanceof Error ? reason.stack : undefined,
+    }).catch(() => undefined);
+    throw reason;
+  });
+}
+
 export interface AppTask {
   taskId: string;
   taskType: string;
@@ -27,6 +61,19 @@ export interface BaiduStatus {
   expiresAt?: number;
   expired: boolean;
   refreshError?: string;
+}
+
+export interface ElevationStatus {
+  isAdmin: boolean;
+  canRestartAsAdmin: boolean;
+}
+
+export function getElevationStatus(): Promise<ElevationStatus> {
+  return invokeCommand<ElevationStatus>("get_elevation_status");
+}
+
+export function restartAsAdmin(): Promise<void> {
+  return invokeCommand<void>("restart_as_admin");
 }
 
 export interface BaiduConfigView {
@@ -88,11 +135,11 @@ export interface CloudGameSummary {
 }
 
 export function listGames(): Promise<Game[]> {
-  return invoke<Game[]>("list_games");
+  return invokeCommand<Game[]>("list_games");
 }
 
 export function getGame(gameUid: string): Promise<Game | null> {
-  return invoke<Game | null>("get_game", { gameUid });
+  return invokeCommand<Game | null>("get_game", { gameUid });
 }
 
 export function startAddGameTask(input: {
@@ -100,143 +147,186 @@ export function startAddGameTask(input: {
   sourcePath: string;
   executablePath: string;
 }): Promise<string> {
-  return invoke<string>("start_add_game_task", input);
+  return invokeCommand<string>("start_add_game_task", input);
 }
 
 export function getTask(taskId: string): Promise<AppTask> {
-  return invoke<AppTask>("get_task", { taskId });
+  return invokeCommand<AppTask>("get_task", { taskId });
 }
 
 export function listTasks(): Promise<AppTask[]> {
-  return invoke<AppTask[]>("list_tasks");
+  return invokeCommand<AppTask[]>("list_tasks");
 }
 
 export function cancelTask(taskId: string): Promise<void> {
-  return invoke("cancel_task", { taskId });
+  return invokeCommand<void>("cancel_task", { taskId });
+}
+
+export interface LibrarySettings {
+  libraryRoot: string;
+  gamesPath: string;
+  bodyPackagesPath: string;
+  savesPath: string;
+  gamesBytes: number;
+  bodyPackagesBytes: number;
+  savesBytes: number;
+  totalBytes: number;
+  fileCount: number;
+  freeBytes: number;
+}
+
+export function getLibrarySettings(): Promise<LibrarySettings> {
+  return invokeCommand<LibrarySettings>("get_library_settings");
+}
+
+export function startSetLibraryRootTask(targetRoot: string): Promise<string> {
+  return invokeCommand<string>("start_set_library_root_task", { targetRoot });
 }
 
 export function startSaveLearningTask(gameUid: string): Promise<string> {
-  return invoke<string>("start_save_learning_task", { gameUid });
+  return invokeCommand<string>("start_save_learning_task", { gameUid });
 }
 
 export function startFinishSaveLearningTask(sessionId: string): Promise<string> {
-  return invoke<string>("start_finish_save_learning_task", { sessionId });
+  return invokeCommand<string>("start_finish_save_learning_task", { sessionId });
 }
 
 export function cancelSaveLearning(sessionId: string): Promise<void> {
-  return invoke("cancel_save_learning", { sessionId });
+  return invokeCommand<void>("cancel_save_learning", { sessionId });
 }
 
 export function confirmSaveProfile(gameUid: string, scopes: SaveScope[], confidence: number): Promise<SaveProfile> {
-  return invoke<SaveProfile>("confirm_save_profile", { gameUid, scopes, confidence });
+  return invokeCommand<SaveProfile>("confirm_save_profile", { gameUid, scopes, confidence });
 }
 
 export function discardPendingGame(gameUid: string): Promise<void> {
-  return invoke("discard_pending_game", { gameUid });
+  return invokeCommand<void>("discard_pending_game", { gameUid });
 }
 
 export function precheckGameLaunch(gameUid: string): Promise<LaunchPrecheck> {
-  return invoke<LaunchPrecheck>("precheck_game_launch", { gameUid });
+  return invokeCommand<LaunchPrecheck>("precheck_game_launch", { gameUid });
 }
 
 export function launchGame(gameUid: string): Promise<string> {
-  return invoke<string>("launch_game", { gameUid });
+  return invokeCommand<string>("launch_game", { gameUid });
 }
 
 export function getGameRuntime(gameUid: string): Promise<GameRuntime | null> {
-  return invoke<GameRuntime | null>("get_game_runtime", { gameUid });
+  return invokeCommand<GameRuntime | null>("get_game_runtime", { gameUid });
 }
 
 export function listSaveVersions(gameUid: string): Promise<SaveVersion[]> {
-  return invoke<SaveVersion[]>("list_save_versions", { gameUid });
+  return invokeCommand<SaveVersion[]>("list_save_versions", { gameUid });
 }
 
 export function restoreSaveVersion(gameUid: string, versionId: string): Promise<string> {
-  return invoke<string>("restore_save_version", { gameUid, versionId });
+  return invokeCommand<string>("restore_save_version", { gameUid, versionId });
 }
 
 export function deleteSaveVersion(gameUid: string, versionId: string): Promise<string> {
-  return invoke<string>("delete_save_version", { gameUid, versionId });
+  return invokeCommand<string>("delete_save_version", { gameUid, versionId });
 }
 
 export function pruneSaveVersions(gameUid: string, keepVersions: number): Promise<string> {
-  return invoke<string>("prune_save_versions", { gameUid, keepVersions });
+  return invokeCommand<string>("prune_save_versions", { gameUid, keepVersions });
 }
 
 export function listGameBodyVersions(gameUid: string): Promise<GameBodyVersion[]> {
-  return invoke<GameBodyVersion[]>("list_game_body_versions", { gameUid });
+  return invokeCommand<GameBodyVersion[]>("list_game_body_versions", { gameUid });
 }
 
 export function updateGameBody(gameUid: string, sourcePath: string): Promise<string> {
-  return invoke<string>("update_game_body", { gameUid, sourcePath });
+  return invokeCommand<string>("update_game_body", { gameUid, sourcePath });
 }
 
 export function packageGameBody(gameUid: string): Promise<string> {
-  return invoke<string>("package_game_body", { gameUid });
+  return invokeCommand<string>("package_game_body", { gameUid });
 }
 
 export function restoreGameBodyPackage(gameUid: string, versionId: string): Promise<string> {
-  return invoke<string>("restore_game_body_package", { gameUid, versionId });
+  return invokeCommand<string>("restore_game_body_package", { gameUid, versionId });
 }
 
 export function deleteGameBodyPackage(gameUid: string, versionId: string): Promise<string> {
-  return invoke<string>("delete_game_body_package", { gameUid, versionId });
+  return invokeCommand<string>("delete_game_body_package", { gameUid, versionId });
+}
+
+export function uninstallGameBody(gameUid: string): Promise<string> {
+  return invokeCommand<string>("uninstall_game_body", { gameUid });
 }
 
 export function getBaiduStatus(): Promise<BaiduStatus> {
-  return invoke<BaiduStatus>("get_baidu_status");
+  return invokeCommand<BaiduStatus>("get_baidu_status");
 }
 
 export function getBaiduConfig(): Promise<BaiduConfigView> {
-  return invoke<BaiduConfigView>("get_baidu_config");
+  return invokeCommand<BaiduConfigView>("get_baidu_config");
 }
 
 export function saveBaiduConfig(appKey: string, secretKey: string): Promise<BaiduConfigView> {
-  return invoke<BaiduConfigView>("save_baidu_config", { appKey, secretKey });
+  return invokeCommand<BaiduConfigView>("save_baidu_config", { appKey, secretKey });
 }
 
 export function setBaiduAutoUpload(enabled: boolean): Promise<BaiduConfigView> {
-  return invoke<BaiduConfigView>("set_baidu_auto_upload", { enabled });
+  return invokeCommand<BaiduConfigView>("set_baidu_auto_upload", { enabled });
 }
 
 export function buildBaiduAuthorizeUrl(): Promise<string> {
-  return invoke<string>("build_baidu_authorize_url");
+  return invokeCommand<string>("build_baidu_authorize_url");
 }
 
 export function exchangeBaiduCode(code: string): Promise<void> {
-  return invoke("exchange_baidu_code", { code });
+  return invokeCommand<void>("exchange_baidu_code", { code });
+}
+
+export interface CloudAccountStatus {
+  profileAvailable: boolean;
+  remoteSize?: number;
+  remoteUpdatedAt?: number;
+}
+
+export function getCloudAccountStatus(): Promise<CloudAccountStatus> {
+  return invokeCommand<CloudAccountStatus>("get_cloud_account_status");
+}
+
+export function startUploadCloudAccountTask(): Promise<string> {
+  return invokeCommand<string>("start_upload_cloud_account_task");
+}
+
+export function startDownloadCloudAccountTask(): Promise<string> {
+  return invokeCommand<string>("start_download_cloud_account_task");
 }
 
 export function getBaiduQuota(): Promise<BaiduQuota> {
-  return invoke<BaiduQuota>("get_baidu_quota");
+  return invokeCommand<BaiduQuota>("get_baidu_quota");
 }
 
 export function listCloudGames(): Promise<CloudGameSummary[]> {
-  return invoke<CloudGameSummary[]>("list_cloud_games");
+  return invokeCommand<CloudGameSummary[]>("list_cloud_games");
 }
 
 export function installCloudGame(gameUid: string, remotePath: string, remoteFsId?: number): Promise<string> {
-  return invoke<string>("install_cloud_game", { gameUid, remotePath, remoteFsId });
+  return invokeCommand<string>("install_cloud_game", { gameUid, remotePath, remoteFsId });
 }
 
 export function listRemoteBodyPackages(gameUid: string): Promise<RemoteBodyPackageList> {
-  return invoke<RemoteBodyPackageList>("list_remote_body_packages", { gameUid });
+  return invokeCommand<RemoteBodyPackageList>("list_remote_body_packages", { gameUid });
 }
 
 export function repairCloudBodyManifest(gameUid: string): Promise<string> {
-  return invoke<string>("repair_cloud_body_manifest", { gameUid });
+  return invokeCommand<string>("repair_cloud_body_manifest", { gameUid });
 }
 
 export function uploadGameBodyPackage(gameUid: string, versionId: string): Promise<string> {
-  return invoke<string>("upload_game_body_package", { gameUid, versionId });
+  return invokeCommand<string>("upload_game_body_package", { gameUid, versionId });
 }
 
 export function downloadGameBodyPackage(gameUid: string, remotePath: string, remoteFsId?: number): Promise<string> {
-  return invoke<string>("download_game_body_package", { gameUid, remotePath, remoteFsId });
+  return invokeCommand<string>("download_game_body_package", { gameUid, remotePath, remoteFsId });
 }
 
 export function deleteRemoteBodyPackage(gameUid: string, remotePath: string, remoteFsId?: number): Promise<string> {
-  return invoke<string>("delete_remote_body_package", { gameUid, remotePath, remoteFsId });
+  return invokeCommand<string>("delete_remote_body_package", { gameUid, remotePath, remoteFsId });
 }
 
 export type { SaveLearningResult, SaveLearningSession };

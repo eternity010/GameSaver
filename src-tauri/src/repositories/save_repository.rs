@@ -1,4 +1,4 @@
-use crate::domain::{Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope, SaveVersion};
+use crate::{app_state::AppState, domain::{Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope, SaveVersion}};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -591,7 +591,7 @@ fn read_stable_file(path: &Path) -> Result<(Vec<u8>, u64), String> {
 }
 
 fn repository_root(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app.path().app_data_dir().map_err(|err| format!("解析 GameSaver 数据目录失败：{err}"))?.join("saves").join(".gamesaver-repository"))
+    Ok(app.state::<AppState>().saves_root()?.join(".gamesaver-repository"))
 }
 
 fn same_entries(left: &[SaveFileEntry], right: &[SaveFileEntry]) -> bool {
@@ -632,7 +632,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 fn sha256_file(path: &Path) -> Result<String, String> {
     let mut file = fs::File::open(path).map_err(|err| format!("读取存档对象失败：{err}"))?;
     let mut digest = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
+    let mut buffer = vec![0u8; 1024 * 1024];
     loop {
         let read = file.read(&mut buffer).map_err(|err| format!("读取存档对象失败：{err}"))?;
         if read == 0 {

@@ -87,7 +87,16 @@ pub fn cancel_save_learning(state: State<AppState>, session_id: String) -> Resul
 #[tauri::command]
 pub fn confirm_save_profile(app: AppHandle, state: State<AppState>, game_uid: String, scopes: Vec<SaveScope>, confidence: u8) -> Result<SaveProfile, String> {
     let game_uid = game_uid.trim().to_string();
+    crate::logging::info(format!("开始确认存档保护：game_uid={game_uid} scopes={}", scopes.len()));
     if scopes.is_empty() { return Err("至少需要一个存档保护范围".to_string()); }
+    let operation_reserved = {
+        let mut operations = state.save_operations.lock().map_err(|_| "锁定存档确认状态失败".to_string())?;
+        if !operations.insert(format!("confirm:{game_uid}")) {
+            return Err("该游戏正在确认存档保护，请勿重复点击".to_string());
+        }
+        true
+    };
+    let _operation_guard = SaveProfileOperationGuard { state: &state, key: format!("confirm:{game_uid}"), active: operation_reserved };
     let game = {
         let store = state.store.lock().map_err(|_| "lock GameSaver store failed".to_string())?;
         let game = GameLibraryService::find(&store, &game_uid).ok_or_else(|| "游戏不存在".to_string())?;
@@ -95,18 +104,58 @@ pub fn confirm_save_profile(app: AppHandle, state: State<AppState>, game_uid: St
         game
     };
     for scope in &scopes { validate_scope(scope)?; }
-    let executable_path = Path::new(&game.managed_path).join(&game.launch.executable_relative_path);
-    let executable_hash = sha256_file(&executable_path)?;
+    crate::logging::info(format!("存档保护范围校验完成：game_uid={game_uid} scopes={}", scopes.len()));
+    let executable_path = managed_executable_path(&game).map_err(|error| {
+        crate::logging::error(format!("确认存档保护失败：启动程序路径无效：game_uid={game_uid} error={error}"));
+        error
+    })?;
+    let executable_metadata = fs::metadata(&executable_path).map_err(|error| {
+        let message = format!("读取启动程序信息失败：{}：{error}", executable_path.display());
+        crate::logging::error(format!("确认存档保护失败：game_uid={game_uid} error={message}"));
+        message
+    })?;
+    if !executable_metadata.is_file() {
+        return Err(format!("启动程序不是有效文件：{}", executable_path.display()));
+    }
+    crate::logging::info(format!("启动程序路径已确认：game_uid={game_uid} path={} size={}", executable_path.display(), executable_metadata.len()));
+    let executable_hash = sha256_file(&executable_path).map_err(|error| {
+        crate::logging::error(format!("确认存档保护失败：启动程序哈希失败：game_uid={game_uid} error={error}"));
+        error
+    })?;
+    crate::logging::info(format!("启动程序哈希完成：game_uid={game_uid}"));
     let profile = SaveProfile::new(game_uid.clone(), executable_hash, scopes, confidence.min(100), now_iso());
+    crate::logging::info(format!("存档保护配置已创建：game_uid={game_uid} profile_id={}", profile.profile_id));
     let mut store = state.store.lock().map_err(|_| "lock GameSaver store failed".to_string())?;
+    crate::logging::info(format!("开始准备存档保护持久化：game_uid={game_uid}"));
     let mut candidate = store.clone();
     candidate.save_profiles.retain(|item| item.game_uid != game_uid);
     candidate.save_profiles.push(profile.clone());
     let target = candidate.games.iter_mut().find(|item| item.game_uid == game_uid).ok_or_else(|| "游戏登记已不存在".to_string())?;
     target.activate(profile.profile_id.clone());
-    GameRepository::persist(&app, &candidate)?;
+    GameRepository::persist(&app, &candidate).map_err(|error| {
+        crate::logging::error(format!("确认存档保护失败：持久化失败：game_uid={game_uid} error={error}"));
+        error
+    })?;
+    crate::logging::info(format!("存档保护持久化完成：game_uid={game_uid}"));
     *store = candidate;
+    crate::logging::info(format!("存档保护确认完成：game_uid={game_uid} profile_id={}", profile.profile_id));
     Ok(profile)
+}
+
+struct SaveProfileOperationGuard<'a> {
+    state: &'a State<'a, AppState>,
+    key: String,
+    active: bool,
+}
+
+impl Drop for SaveProfileOperationGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            if let Ok(mut operations) = self.state.save_operations.lock() {
+                operations.remove(&self.key);
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -145,14 +194,44 @@ fn validate_scope(scope: &SaveScope) -> Result<(), String> {
     Ok(())
 }
 
+fn managed_executable_path(game: &crate::domain::Game) -> Result<PathBuf, String> {
+    let root = Path::new(&game.managed_path);
+    if !root.is_dir() {
+        return Err(format!("受管游戏目录不存在：{}", root.display()));
+    }
+    let relative = Path::new(&game.launch.executable_relative_path);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err("启动程序相对路径无效".to_string());
+    }
+    Ok(root.join(relative))
+}
+
 fn sha256_file(path: &Path) -> Result<String, String> {
     let mut file = fs::File::open(path).map_err(|err| format!("读取启动程序失败：{err}"))?;
     let mut digest = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
+    let mut buffer = vec![0u8; 1024 * 1024];
     loop { let read = file.read(&mut buffer).map_err(|err| format!("读取启动程序失败：{err}"))?; if read == 0 { break; } digest.update(&buffer[..read]); }
     Ok(hex::encode(digest.finalize()))
 }
 
 fn now_iso() -> String {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|value| value.as_secs().to_string()).unwrap_or_else(|_| "0".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sha256_file;
+    use std::fs;
+    use uuid::Uuid;
+
+    #[test]
+    fn hashes_executable_without_using_large_stack_buffer() {
+        let path = std::env::temp_dir().join(format!("gamesaver-hash-{}.bin", Uuid::new_v4()));
+        fs::write(&path, b"abc").expect("write test file");
+        assert_eq!(sha256_file(&path).expect("hash test file"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        fs::remove_file(path).expect("remove test file");
+    }
 }

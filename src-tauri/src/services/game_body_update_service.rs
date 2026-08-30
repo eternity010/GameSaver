@@ -240,6 +240,8 @@ fn cleanup_stale_update_artifacts(games_root: &Path) -> Result<(), String> {
             if games_root.join(base).is_dir() {
                 fs::remove_dir_all(&path).map_err(|err| format!("清理残留游戏更新目录失败：{err}"))?;
             }
+        } else if name.starts_with('.') && name.contains(".uninstalling-") {
+            fs::remove_dir_all(&path).map_err(|err| format!("清理残留游戏卸载目录失败：{err}"))?;
         }
     }
     Ok(())

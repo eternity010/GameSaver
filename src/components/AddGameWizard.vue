@@ -33,6 +33,7 @@ const progress = ref(0);
 const message = ref("");
 const error = ref("");
 const completedGame = ref<Game | null>(null);
+const confirming = ref(false);
 const newFileByScope = ref<Record<number, string>>({});
 const newPatternByScope = ref<Record<number, string>>({});
 let pollTimer: ReturnType<typeof setTimeout> | undefined;
@@ -198,8 +199,9 @@ async function addDirectoryScope() {
 }
 
 async function confirm() {
-  if (!completedGame.value || !canConfirm.value) return;
+  if (!completedGame.value || !canConfirm.value || confirming.value) return;
   error.value = "";
+  confirming.value = true;
   try {
     await confirmSaveProfile(completedGame.value.gameUid, reviewScopes.value, confidence.value);
     completedGame.value = await getGame(completedGame.value.gameUid);
@@ -207,6 +209,8 @@ async function confirm() {
     phase.value = "done";
   } catch (reason) {
     error.value = String(reason);
+  } finally {
+    confirming.value = false;
   }
 }
 
@@ -286,7 +290,7 @@ onUnmounted(stopPolling);
       <button class="secondary-button add-scope-button" type="button" @click="addDirectoryScope"><Plus :size="16" />手动添加存档目录</button>
       <div v-if="learningResult?.notes.length" class="notes-panel"><strong>识别说明</strong><p v-for="note in learningResult.notes" :key="note">{{ note }}</p></div>
       <p v-if="error" class="error-message" role="alert">{{ error }}</p>
-      <footer class="wizard-actions"><button class="secondary-button" type="button" @click="abandonPendingGame">放弃添加</button><button class="primary-button" type="button" :disabled="!canConfirm" @click="confirm"><Check :size="17" />确认并加入游戏库</button></footer>
+      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="confirming" @click="abandonPendingGame">放弃添加</button><button class="primary-button" type="button" :disabled="!canConfirm || confirming" @click="confirm"><LoaderCircle v-if="confirming" :size="17" class="spin" /><Check v-else :size="17" />{{ confirming ? "正在保存" : "确认并加入游戏库" }}</button></footer>
     </section>
 
     <div v-else class="wizard-success"><CheckCircle2 :size="34" /><div><h2>{{ completedGame?.displayName }} 已加入游戏库</h2><p>存档保护范围已确认，现在可以从游戏库启动它。</p></div><button class="primary-button" type="button" @click="emit('completed', completedGame!)">返回游戏库</button></div>

@@ -86,7 +86,9 @@ pub fn list_cloud_games(
         }) else {
             continue;
         };
-        let local = local_games.iter().find(|game| game.game_uid == game_uid);
+        let local = local_games.iter().find(|game| {
+            matches!(game.lifecycle, GameLifecycle::Active) && game.game_uid == game_uid
+        });
         let installed = local.is_some_and(|game| {
             Path::new(&game.managed_path)
                 .join(&game.launch.executable_relative_path)
@@ -959,7 +961,7 @@ fn install_cloud_game_task(
         .into_iter()
         .find(|package| package.path == remote.path && package.fs_id == remote.fs_id);
     let expected_sha256 = package.as_ref().and_then(|package| package.package_sha256.as_deref());
-    let games_root = app_data_dir.join("games");
+    let games_root = state.games_root()?;
     let managed_path = games_root.join(game_uid);
     let existing = state
         .store
@@ -980,7 +982,7 @@ fn install_cloud_game_task(
         .as_ref()
         .map(|package| package.version_id.clone())
         .unwrap_or_else(|| remote_file_name_without_extension(remote_path));
-    let cache_root = app_data_dir.join("body-packages");
+    let cache_root = state.body_packages_root()?;
     let package_path = BodyPackageService::package_path(&cache_root, game_uid, &version_id);
     if package_path.is_file() {
         let _ = std::fs::remove_file(&package_path);
@@ -1200,7 +1202,7 @@ fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn body_package_cache_root(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app_data_dir(app)?.join("body-packages"))
+    app.state::<AppState>().body_packages_root()
 }
 
 fn remote_body_dir(game_uid: &str) -> Result<String, String> {

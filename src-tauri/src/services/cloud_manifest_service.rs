@@ -460,11 +460,7 @@ fn validate(manifest: &CloudBodyManifest, remote_dir: &str) -> Result<(), String
     if manifest.format_version != MANIFEST_VERSION {
         return Err(format!("不支持的云端版本清单格式：{}", manifest.format_version));
     }
-    let expected_uid = remote_dir
-        .rsplit('/')
-        .next()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_default();
+    let expected_uid = game_uid_from_body_dir(remote_dir);
     if manifest.game_uid != expected_uid {
         return Err("云端版本清单不属于当前游戏".to_string());
     }
@@ -480,11 +476,7 @@ fn validate(manifest: &CloudBodyManifest, remote_dir: &str) -> Result<(), String
 }
 
 fn validate_catalog(catalog: &CloudGameCatalog, remote_dir: &str) -> Result<(), String> {
-    let expected_uid = remote_dir
-        .rsplit('/')
-        .nth(1)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_default();
+    let expected_uid = game_uid_from_body_dir(remote_dir);
     if catalog.format_version != MANIFEST_VERSION {
         return Err(format!("不支持的云端游戏信息格式：{}", catalog.format_version));
     }
@@ -495,6 +487,15 @@ fn validate_catalog(catalog: &CloudGameCatalog, remote_dir: &str) -> Result<(), 
         return Err("云端游戏信息缺少启动配置".to_string());
     }
     Ok(())
+}
+
+fn game_uid_from_body_dir(remote_dir: &str) -> &str {
+    remote_dir
+        .trim_end_matches('/')
+        .strip_suffix("/body")
+        .and_then(|parent| parent.rsplit('/').next())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
 }
 
 fn file_name_without_extension(path: &str) -> String {
@@ -514,7 +515,10 @@ fn now_iso() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CloudManifestService, CloudBodyManifest, CloudBodyManifestVersion};
+    use super::{
+        game_uid_from_body_dir, validate, CloudBodyManifest, CloudBodyManifestVersion,
+        CloudManifestService,
+    };
     use crate::{domain::GameBodyVersion, services::RemoteFile};
 
     fn version() -> GameBodyVersion {
@@ -545,6 +549,30 @@ mod tests {
         let manifest = CloudManifestService::build("game-1", &[local.clone(), not_uploaded], "2".to_string());
         assert_eq!(manifest.versions.len(), 1);
         assert_eq!(manifest.versions[0].package_size, 30);
+    }
+
+    #[test]
+    fn extracts_game_uid_from_body_directory() {
+        assert_eq!(
+            game_uid_from_body_dir("/apps/GameSaver/games/game-1/body"),
+            "game-1"
+        );
+        assert_eq!(
+            game_uid_from_body_dir("/apps/GameSaver/games/game-1/body/"),
+            "game-1"
+        );
+    }
+
+    #[test]
+    fn validates_manifest_against_game_uid_not_body_segment() {
+        let manifest = CloudBodyManifest {
+            format_version: 1,
+            game_uid: "game-1".to_string(),
+            updated_at: "2".to_string(),
+            versions: Vec::new(),
+        };
+        assert!(validate(&manifest, "/apps/GameSaver/games/game-1/body").is_ok());
+        assert!(validate(&manifest, "/apps/GameSaver/games/game-2/body").is_err());
     }
 
     #[test]

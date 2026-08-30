@@ -23,11 +23,7 @@ pub fn start_add_game_task(
     }
     let executable_relative_path = AddGameService::validate_source(&source, &executable)?;
     let source = source.canonicalize().map_err(|err| format!("解析游戏目录失败：{err}"))?;
-    let games_root = app
-        .path()
-        .app_data_dir()
-        .map_err(|err| format!("解析 GameSaver 数据目录失败：{err}"))?
-        .join("games");
+    let games_root = state.games_root()?;
     if paths_overlap(&source, &games_root) {
         return Err("原始游戏目录不能位于 GameSaver 受管游戏目录内，或包含该目录".to_string());
     }
@@ -43,6 +39,8 @@ pub fn start_add_game_task(
     let task_id = TaskService::create(&state, "add_game", Some(game_uid.clone()), "准备添加游戏")?;
     let app_handle = app.clone();
     let task_id_for_thread = task_id.clone();
+    let games_root_for_cleanup = games_root.clone();
+    let game_uid_for_cleanup = game_uid.clone();
     std::thread::spawn(move || {
         let result = (|| -> Result<(Game, String), String> {
             TaskService::update(&app_handle.state(), &task_id_for_thread, TaskStatus::Running, 1, "正在检查游戏目录", None);
@@ -72,6 +70,11 @@ pub fn start_add_game_task(
             *store = candidate;
             Ok((game, copied_message))
         })();
+        if result.is_err() {
+            if let Err(cleanup_error) = AddGameService::cleanup_copy_artifacts(&games_root_for_cleanup, &game_uid_for_cleanup) {
+                crate::logging::error(format!("添加游戏失败后的本体清理失败：{cleanup_error}"));
+            }
+        }
         match result {
             Ok((_, message)) => TaskService::update(&app_handle.state(), &task_id_for_thread, TaskStatus::Success, 100, message, None),
             Err(error) if error == "任务已取消" => TaskService::update(&app_handle.state(), &task_id_for_thread, TaskStatus::Cancelled, 100, "已取消添加游戏", None),

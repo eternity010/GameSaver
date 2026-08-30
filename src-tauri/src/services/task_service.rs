@@ -56,11 +56,19 @@ impl TaskService {
         result: Option<serde_json::Value>,
         error: Option<String>,
     ) {
+        let message = message.into();
+        if matches!(&status, TaskStatus::Failed) {
+            crate::logging::error(format!(
+                "后台任务失败：task_id={task_id} message={} error={}",
+                message,
+                error.clone().unwrap_or_default()
+            ));
+        }
         if let Ok(mut tasks) = state.tasks.lock() {
             if let Some(task) = tasks.get_mut(task_id) {
                 task.status = status;
                 task.progress = progress.min(100);
-                task.message = message.into();
+                task.message = message;
                 task.result = result;
                 task.error = error;
                 persist_locked(state, &tasks);
@@ -95,6 +103,7 @@ impl TaskService {
 
 fn persist_locked(state: &AppState, tasks: &std::collections::HashMap<String, AppTask>) {
     if let Err(error) = TaskRepository::persist(&state.tasks_path, tasks) {
+        crate::logging::error(format!("任务记录持久化失败：{error}"));
         eprintln!("GameSaver 任务记录持久化失败：{error}");
     }
 }

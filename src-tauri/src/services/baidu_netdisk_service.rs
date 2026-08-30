@@ -555,7 +555,7 @@ fn parse_value<T: for<'de> Deserialize<'de>>(value: serde_json::Value, operation
         let message = value.get("errmsg").and_then(serde_json::Value::as_str).or_else(|| value.get("error_msg").and_then(serde_json::Value::as_str)).unwrap_or("未知错误");
         return Err(format!("{operation}失败：{message} ({errno})"));
     }
-    if let Some(error_code) = value.get("error_code").and_then(serde_json::Value::as_i64) {
+    if let Some(error_code) = value.get("error_code").and_then(serde_json::Value::as_i64).filter(|value| *value != 0) {
         let message = value.get("error_description").and_then(serde_json::Value::as_str).or_else(|| value.get("error_msg").and_then(serde_json::Value::as_str)).unwrap_or("未知错误");
         return Err(format!("{operation}失败：{message} ({error_code})"));
     }

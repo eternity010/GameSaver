@@ -1,25 +1,34 @@
 mod app_state;
 mod commands;
 mod domain;
+mod logging;
 mod repositories;
 mod services;
 
 use app_state::AppState;
-use repositories::{GameRepository, TaskRepository};
+use repositories::{GameRepository, LibraryConfigRepository, TaskRepository};
 use services::{learning::cleanup_stale_captures, BodyPackageService, GameBodyUpdateService};
 use std::{collections::{HashMap, HashSet}, path::PathBuf};
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            cleanup_stale_captures(app.handle());
             let data_dir = app.path().app_data_dir()?;
-            let games_root = data_dir.join("games");
-            let body_package_root = data_dir.join("body-packages");
+            if let Err(error) = logging::init(&data_dir) {
+                eprintln!("GameSaver 日志系统初始化失败：{error}");
+            }
+            logging::install_panic_hook();
+            logging::info(format!("应用启动，数据目录：{}", data_dir.display()));
+            cleanup_stale_captures(app.handle());
+            let library_root = LibraryConfigRepository::resolve_root(&data_dir)
+                .map_err(|error| format!("解析游戏库根目录失败：{error}"))?;
+            let games_root = library_root.join("games");
+            let body_package_root = library_root.join("body-packages");
             if let Err(error) = BodyPackageService::cleanup_temporary_packages(&body_package_root) {
+                logging::error(format!("本体包临时文件清理失败：{error}"));
                 eprintln!("GameSaver 本体包临时文件清理失败：{error}");
             }
             let store = GameRepository::load(app.handle())?;
@@ -27,11 +36,13 @@ pub fn run() {
             let tasks = match TaskRepository::load(&tasks_path) {
                 Ok(tasks) => tasks,
                 Err(error) => {
+                    logging::error(format!("任务记录读取失败，将以空任务列表启动：{error}"));
                     eprintln!("GameSaver 任务记录读取失败，将以空任务列表启动：{error}");
                     HashMap::new()
                 }
             };
             if let Err(error) = TaskRepository::persist(&tasks_path, &tasks) {
+                logging::error(format!("任务恢复状态写入失败：{error}"));
                 eprintln!("GameSaver 任务恢复状态写入失败：{error}");
             }
             let committed_archives = store
@@ -48,9 +59,10 @@ pub fn run() {
             if let Err(error) =
                 GameBodyUpdateService::recover_pending_updates(&games_root, &committed_archives)
             {
+                logging::error(format!("游戏更新恢复失败：{error}"));
                 eprintln!("GameSaver 游戏更新恢复失败：{error}");
             }
-            app.manage(AppState::new(store, tasks, PathBuf::from(tasks_path)));
+            app.manage(AppState::new(store, library_root, tasks, PathBuf::from(tasks_path)));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -77,6 +89,7 @@ pub fn run() {
             commands::game_body_commands::package_game_body,
             commands::game_body_commands::restore_game_body_package,
             commands::game_body_commands::delete_game_body_package
+            ,commands::game_body_commands::uninstall_game_body
             ,commands::baidu_commands::get_baidu_status
             ,commands::baidu_commands::list_cloud_games
             ,commands::baidu_commands::install_cloud_game
@@ -91,7 +104,18 @@ pub fn run() {
             ,commands::baidu_config_commands::set_baidu_auto_upload
             ,commands::baidu_commands::get_baidu_quota
             ,commands::baidu_commands::delete_remote_body_package
+            ,commands::diagnostics_commands::report_frontend_error
+            ,commands::admin_commands::get_elevation_status
+            ,commands::admin_commands::restart_as_admin
+            ,commands::library_commands::get_library_settings
+            ,commands::library_commands::start_set_library_root_task
+            ,commands::cloud_account_commands::get_cloud_account_status
+            ,commands::cloud_account_commands::start_upload_cloud_account_task
+            ,commands::cloud_account_commands::start_download_cloud_account_task
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running GameSaver");
+        .run(tauri::generate_context!());
+    if let Err(error) = result {
+        logging::error(format!("Tauri 运行失败：{error}"));
+        eprintln!("GameSaver 运行失败：{error}");
+    }
 }

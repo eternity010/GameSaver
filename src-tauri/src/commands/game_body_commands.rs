@@ -41,11 +41,7 @@ pub fn update_game_body(
     let game_uid = game_uid.trim().to_string();
     let source_path = PathBuf::from(source_path.trim());
     let (game, profile, latest) = load_update_context(&state, &game_uid)?;
-    let games_root = app
-        .path()
-        .app_data_dir()
-        .map_err(|err| format!("解析 GameSaver 数据目录失败：{err}"))?
-        .join("games");
+    let games_root = state.games_root()?;
     if source_path.exists() && paths_overlap(&source_path, &games_root) {
         return Err("新版游戏目录不能位于 GameSaver 受管游戏库内".to_string());
     }
@@ -301,6 +297,190 @@ pub fn delete_game_body_package(
         }
     });
     Ok(task_id)
+}
+
+#[tauri::command]
+pub fn uninstall_game_body(
+    app: AppHandle,
+    state: State<AppState>,
+    game_uid: String,
+) -> Result<String, String> {
+    let game_uid = game_uid.trim().to_string();
+    let game = load_game_for_uninstall(&state, &game_uid)?;
+    let games_root = state.games_root()?;
+    validate_managed_game_path(&games_root, &game)?;
+    reserve_update(&state, &game_uid)?;
+    let task_id = match TaskService::create(
+        &state,
+        "uninstall_game_body",
+        Some(game_uid.clone()),
+        "准备卸载游戏本体",
+    ) {
+        Ok(task_id) => task_id,
+        Err(error) => {
+            release_update(&state, &game_uid);
+            return Err(error);
+        }
+    };
+    let app_handle = app.clone();
+    let task_id_for_thread = task_id.clone();
+    std::thread::spawn(move || {
+        let result = uninstall_game_body_task(&app_handle, &task_id_for_thread, &game, &games_root);
+        release_update(&app_handle.state(), &game_uid);
+        match result {
+            Ok(summary) => TaskService::finish(
+                &app_handle.state(),
+                &task_id_for_thread,
+                TaskStatus::Success,
+                100,
+                "游戏本体已卸载",
+                Some(summary),
+                None,
+            ),
+            Err(error) if error == "任务已取消" => TaskService::finish(
+                &app_handle.state(),
+                &task_id_for_thread,
+                TaskStatus::Cancelled,
+                100,
+                "已取消游戏本体卸载",
+                None,
+                None,
+            ),
+            Err(error) => TaskService::finish(
+                &app_handle.state(),
+                &task_id_for_thread,
+                TaskStatus::Failed,
+                100,
+                "游戏本体卸载失败",
+                None,
+                Some(error),
+            ),
+        }
+    });
+    Ok(task_id)
+}
+
+fn uninstall_game_body_task(
+    app: &AppHandle,
+    task_id: &str,
+    game: &crate::domain::Game,
+    games_root: &Path,
+) -> Result<serde_json::Value, String> {
+    let state = app.state::<AppState>();
+    let managed_path = Path::new(&game.managed_path);
+    validate_managed_game_path(games_root, game)?;
+    if !managed_path.exists() {
+        mark_game_uninstalled(app, &state, &game.game_uid)?;
+        return Ok(serde_json::json!({
+            "gameUid": game.game_uid,
+            "alreadyMissing": true,
+        }));
+    }
+    if !managed_path.is_dir() {
+        return Err("受管游戏路径不是文件夹，已停止卸载以避免误删文件".to_string());
+    }
+
+    TaskService::update(&state, task_id, TaskStatus::Running, 20, "正在移出受管游戏本体", None);
+    let quarantine = games_root.join(format!(".{}.uninstalling-{}", game.game_uid, Uuid::new_v4().simple()));
+    std::fs::rename(managed_path, &quarantine)
+        .map_err(|error| format!("无法暂存游戏本体，可能仍有文件被占用：{error}"))?;
+
+    if TaskService::is_cancelled(&state, task_id) {
+        return match std::fs::rename(&quarantine, managed_path) {
+            Ok(()) => Err("任务已取消".to_string()),
+            Err(error) => Err(format!("任务已取消，但恢复游戏本体失败：{error}")),
+        };
+    }
+    if let Err(error) = mark_game_uninstalled(app, &state, &game.game_uid) {
+        let rollback = std::fs::rename(&quarantine, managed_path);
+        return if let Err(rollback_error) = rollback {
+            Err(format!("保存卸载状态失败：{error}；恢复游戏本体失败：{rollback_error}"))
+        } else {
+            Err(format!("保存卸载状态失败，已恢复游戏本体：{error}"))
+        };
+    }
+
+    TaskService::update(&state, task_id, TaskStatus::Running, 80, "正在清理本体文件", None);
+    let removed_bytes = directory_size(&quarantine).unwrap_or(0);
+    if let Err(error) = std::fs::remove_dir_all(&quarantine) {
+        crate::logging::error(format!("游戏本体已卸载，但清理暂存目录失败：{}：{error}", quarantine.display()));
+        return Ok(serde_json::json!({
+            "gameUid": game.game_uid,
+            "alreadyMissing": false,
+            "removedBytes": removed_bytes,
+            "cleanupPending": true,
+            "cleanupPath": quarantine,
+        }));
+    }
+    Ok(serde_json::json!({
+        "gameUid": game.game_uid,
+        "alreadyMissing": false,
+        "removedBytes": removed_bytes,
+        "cleanupPending": false,
+    }))
+}
+
+fn load_game_for_uninstall(state: &AppState, game_uid: &str) -> Result<crate::domain::Game, String> {
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "lock GameSaver store failed".to_string())?;
+    GameLibraryService::find(&store, game_uid).ok_or_else(|| "游戏不存在".to_string())
+}
+
+fn validate_managed_game_path(games_root: &Path, game: &crate::domain::Game) -> Result<(), String> {
+    let managed_path = Path::new(&game.managed_path);
+    let expected = games_root.join(&game.game_uid);
+    if !same_normalized_path(managed_path, &expected)
+        || managed_path.file_name().and_then(|value| value.to_str()) != Some(game.game_uid.as_str())
+    {
+        return Err("受管游戏路径不在当前 GameSaver 游戏库中，已停止卸载".to_string());
+    }
+    Ok(())
+}
+
+fn same_normalized_path(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .eq_ignore_ascii_case(right.to_string_lossy().replace('/', "\\").trim_end_matches('\\'))
+}
+
+fn mark_game_uninstalled(app: &AppHandle, state: &AppState, game_uid: &str) -> Result<(), String> {
+    let mut candidate = state
+        .store
+        .lock()
+        .map_err(|_| "读取游戏记录失败".to_string())?
+        .clone();
+    let game = candidate
+        .games
+        .iter_mut()
+        .find(|game| game.game_uid == game_uid)
+        .ok_or_else(|| "游戏记录不存在".to_string())?;
+    game.lifecycle = GameLifecycle::NeedsRepair;
+    game.health = crate::domain::GameHealth::Broken;
+    GameRepository::persist(app, &candidate).map_err(|error| format!("保存卸载状态失败：{error}"))?;
+    *state
+        .store
+        .lock()
+        .map_err(|_| "更新游戏记录失败".to_string())? = candidate;
+    Ok(())
+}
+
+fn directory_size(root: &Path) -> Result<u64, String> {
+    let mut total = 0u64;
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry.map_err(|error| format!("读取待删除本体失败：{error}"))?;
+        if entry.file_type().is_file() {
+            total = total.saturating_add(
+                entry
+                    .metadata()
+                    .map_err(|error| format!("读取待删除本体大小失败：{error}"))?
+                    .len(),
+            );
+        }
+    }
+    Ok(total)
 }
 
 fn delete_game_body_package_task(
@@ -785,11 +965,7 @@ fn join_body_relative(base: &Path, relative: &str) -> Result<String, String> {
 }
 
 fn body_package_cache_root(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app
-        .path()
-        .app_data_dir()
-        .map_err(|err| format!("解析 GameSaver 数据目录失败：{err}"))?
-        .join("body-packages"))
+    app.state::<AppState>().body_packages_root()
 }
 
 fn auto_upload_enabled(app: &AppHandle) -> bool {

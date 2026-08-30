@@ -11,6 +11,17 @@ pub struct CopyResult {
 }
 
 impl AddGameService {
+    pub fn cleanup_copy_artifacts(games_root: &Path, game_uid: &str) -> Result<(), String> {
+        let managed_path = games_root.join(game_uid);
+        let staging_path = games_root.join(format!(".{game_uid}.copying"));
+        for path in [managed_path, staging_path] {
+            if path.exists() {
+                fs::remove_dir_all(&path).map_err(|err| format!("清理失败的游戏本体失败：{}：{err}", path.display()))?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_source(source: &Path, executable: &Path) -> Result<String, String> {
         if !source.is_dir() {
             return Err("游戏本体目录不存在或不可访问".to_string());
@@ -161,6 +172,22 @@ mod tests {
         assert!(result.is_err());
         assert!(!games_root.join("game-2").exists());
         assert!(!games_root.join(".game-2.copying").exists());
+        fs::remove_dir_all(root).expect("cleanup test directory");
+    }
+
+    #[test]
+    fn cleanup_removes_managed_and_staging_directories() {
+        let root = std::env::temp_dir().join(format!("gamesaver-next-cleanup-{}", Uuid::new_v4()));
+        let games_root = root.join("games");
+        fs::create_dir_all(games_root.join("game-3/bin")).expect("create managed directory");
+        fs::create_dir_all(games_root.join(".game-3.copying/bin")).expect("create staging directory");
+        fs::write(games_root.join("game-3/bin/game.exe"), b"exe").expect("write managed file");
+        fs::write(games_root.join(".game-3.copying/bin/game.exe"), b"exe").expect("write staging file");
+
+        AddGameService::cleanup_copy_artifacts(&games_root, "game-3").expect("cleanup artifacts");
+
+        assert!(!games_root.join("game-3").exists());
+        assert!(!games_root.join(".game-3.copying").exists());
         fs::remove_dir_all(root).expect("cleanup test directory");
     }
 }
