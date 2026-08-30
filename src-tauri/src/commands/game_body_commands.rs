@@ -137,9 +137,17 @@ pub fn package_game_body(
     game_uid: String,
 ) -> Result<String, String> {
     let game_uid = game_uid.trim().to_string();
+    if let Some(task_id) = active_body_package_task(&state, &game_uid) {
+        return Ok(task_id);
+    }
     let game = load_body_game(&state, &game_uid)?;
     let protected_paths = body_save_exclusion_paths(&state, &game)?;
-    reserve_update(&state, &game_uid)?;
+    if let Err(error) = reserve_update(&state, &game_uid) {
+        if let Some(task_id) = active_body_package_task(&state, &game_uid) {
+            return Ok(task_id);
+        }
+        return Err(error);
+    }
     let task_id = match TaskService::create(
         &state,
         "package_game_body",
@@ -1020,7 +1028,7 @@ fn reserve_update(state: &AppState, game_uid: &str) -> Result<(), String> {
         .lock()
         .map_err(|_| "lock save operation state failed".to_string())?;
     if operations.contains(game_uid) {
-        return Err("该游戏已有存档操作正在进行".to_string());
+        return Err("该游戏已有本体或存档操作正在进行".to_string());
     }
     if state
         .running_games
@@ -1032,6 +1040,19 @@ fn reserve_update(state: &AppState, game_uid: &str) -> Result<(), String> {
     }
     operations.insert(game_uid.to_string());
     Ok(())
+}
+
+fn active_body_package_task(state: &AppState, game_uid: &str) -> Option<String> {
+    state.tasks.lock().ok()?.values().find_map(|task| {
+        if task.game_uid.as_deref() == Some(game_uid)
+            && task.task_type == "package_game_body"
+            && matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+        {
+            Some(task.task_id.clone())
+        } else {
+            None
+        }
+    })
 }
 
 fn release_update(state: &AppState, game_uid: &str) {
