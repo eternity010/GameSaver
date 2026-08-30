@@ -1,7 +1,7 @@
 use std::{fs, path::{Path, PathBuf}};
 use walkdir::WalkDir;
 
-const LARGE_SOURCE_WARNING_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+const LARGE_SOURCE_WARNING_BYTES: u64 = 3_000_000_000;
 
 pub struct AddGameService;
 
@@ -78,7 +78,7 @@ impl AddGameService {
         if files.is_empty() {
             return Err("游戏目录中没有可复制的文件".to_string());
         }
-        if total_bytes > LARGE_SOURCE_WARNING_BYTES && !allow_large_source {
+        if needs_large_source_confirmation(total_bytes, allow_large_source) {
             return Err(format!(
                 "游戏本体大小为 {}，超过 3 GB。请确认游戏大小是否正常；确认后将继续复制。",
                 format_size(total_bytes)
@@ -150,7 +150,7 @@ fn ensure_available_space(target_root: &Path, required_bytes: u64) -> Result<(),
 
 #[cfg(test)]
 mod tests {
-    use super::AddGameService;
+    use super::{needs_large_source_confirmation, AddGameService};
     use std::fs;
     use uuid::Uuid;
 
@@ -199,6 +199,13 @@ mod tests {
         assert!(!games_root.join(".game-3.copying").exists());
         fs::remove_dir_all(root).expect("cleanup test directory");
     }
+
+    #[test]
+    fn large_source_warning_uses_decimal_three_gigabyte_boundary() {
+        assert!(!needs_large_source_confirmation(3_000_000_000, false));
+        assert!(needs_large_source_confirmation(3_000_000_001, false));
+        assert!(!needs_large_source_confirmation(3_000_000_001, true));
+    }
 }
 
 fn format_size(bytes: u64) -> String {
@@ -214,4 +221,8 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+fn needs_large_source_confirmation(total_bytes: u64, allow_large_source: bool) -> bool {
+    total_bytes > LARGE_SOURCE_WARNING_BYTES && !allow_large_source
 }
