@@ -117,6 +117,7 @@ mod tests {
             retry: Some(TaskRetry {
                 operation: "download_game_body_package".to_string(),
                 game_uid: "game-1".to_string(),
+                game_key: None,
                 version_id: None,
                 remote_path: Some("/apps/GameSaver/games/game-1/body/v.zip".to_string()),
                 remote_fs_id: Some(7),

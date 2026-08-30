@@ -12,20 +12,6 @@ use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
 const MANIFEST_PATH: &str = ".gamesaver/body-manifest.json";
 const PACKAGE_FORMAT_VERSION: u32 = 1;
-const DEFAULT_EXCLUDED_DIRECTORIES: &[&str] = &[
-    ".gamesaver",
-    "localization_work",
-    "logs",
-    "log",
-    "cache",
-    "caches",
-    "temp",
-    "tmp",
-    "crashdumps",
-    "crash-reports",
-];
-const DEFAULT_EXCLUDED_SUFFIXES: &[&str] = &[".log", ".tmp", ".dmp", ".crash"];
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BodyPackageFile {
@@ -74,6 +60,34 @@ impl BodyPackageService {
                 fs::remove_file(entry.path()).map_err(|err| format!("清理本体包临时文件失败（{}）：{err}", entry.path().display()))?;
                 removed += 1;
             }
+        }
+        Ok(removed)
+    }
+
+    pub fn cleanup_orphan_packages(
+        cache_root: &Path,
+        referenced_paths: &HashSet<String>,
+    ) -> Result<usize, String> {
+        if !cache_root.is_dir() {
+            return Ok(0);
+        }
+        let mut removed = 0;
+        for entry in WalkDir::new(cache_root).follow_links(false) {
+            let entry = entry.map_err(|err| format!("扫描孤立本体包失败：{err}"))?;
+            if !entry.file_type().is_file()
+                || entry
+                    .path()
+                    .extension()
+                    .is_none_or(|extension| !extension.eq_ignore_ascii_case("zip"))
+            {
+                continue;
+            }
+            if referenced_paths.contains(&path_key(entry.path())) {
+                continue;
+            }
+            fs::remove_file(entry.path())
+                .map_err(|err| format!("清理孤立本体包失败（{}）：{err}", entry.path().display()))?;
+            removed += 1;
         }
         Ok(removed)
     }
@@ -162,13 +176,9 @@ impl BodyPackageService {
                 version_id: version_id.to_string(),
                 file_count: manifest_files.len(),
                 total_bytes,
-                excluded_items: default_excluded_items()
-                    .into_iter()
-                    .chain(
-                        protected_paths
-                            .iter()
-                            .map(|path| format!("存档范围：{path}")),
-                    )
+                excluded_items: protected_paths
+                    .iter()
+                    .map(|path| format!("存档范围：{path}"))
                     .collect(),
                 files: manifest_files,
             };
@@ -238,6 +248,28 @@ impl BodyPackageService {
         validate_archive_entries(&archive, &manifest)?;
         validate_archive_contents(&mut archive, &manifest)?;
         Ok(manifest)
+    }
+
+    pub fn validate_package_for_upload(
+        package_path: &Path,
+        game_uid: &str,
+        executable_relative_path: &str,
+        expected_package_sha256: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(expected) = expected_package_sha256 {
+            let actual_hash = hash_file(package_path)?;
+            if actual_hash != expected {
+                return Err("本体 ZIP 哈希校验失败".to_string());
+            }
+            return Ok(());
+        }
+        Self::validate_package(
+            package_path,
+            game_uid,
+            executable_relative_path,
+            None,
+        )
+        .map(|_| ())
     }
 
     pub fn extract_package(
@@ -380,12 +412,7 @@ fn collect_files(root: &Path, protected_paths: &[String]) -> Result<Vec<String>,
             .path()
             .strip_prefix(root)
             .map_err(|err| format!("计算本体相对路径失败：{err}"))?;
-        if relative.components().any(|component| match component {
-            Component::Normal(value) => DEFAULT_EXCLUDED_DIRECTORIES
-                .iter()
-                .any(|item| value.to_string_lossy().eq_ignore_ascii_case(item)),
-            _ => false,
-        }) || is_protected_path(
+        if is_protected_path(
             &relative.to_string_lossy().replace('\\', "/"),
             protected_paths,
         ) {
@@ -395,20 +422,10 @@ fn collect_files(root: &Path, protected_paths: &[String]) -> Result<Vec<String>,
             continue;
         }
         let relative = normalize_relative(&relative.to_string_lossy())?;
-        if is_excluded_file(&relative) {
-            continue;
-        }
         files.push(relative);
     }
     files.sort();
     Ok(files)
-}
-
-fn is_excluded_file(relative: &str) -> bool {
-    let lower = relative.to_ascii_lowercase();
-    DEFAULT_EXCLUDED_SUFFIXES
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
 }
 
 fn is_protected_path(relative: &str, protected_paths: &[String]) -> bool {
@@ -420,18 +437,6 @@ fn is_protected_path(relative: &str, protected_paths: &[String]) -> bool {
                 .to_ascii_lowercase()
                 .starts_with(&(protected.to_ascii_lowercase() + "/"))
     })
-}
-
-fn default_excluded_items() -> Vec<String> {
-    DEFAULT_EXCLUDED_DIRECTORIES
-        .iter()
-        .map(|item| (*item).to_string())
-        .chain(
-            DEFAULT_EXCLUDED_SUFFIXES
-                .iter()
-                .map(|item| format!("*{item}")),
-        )
-        .collect()
 }
 
 fn normalize_relative(value: &str) -> Result<String, String> {
@@ -478,6 +483,13 @@ fn hash_file(path: &Path) -> Result<String, String> {
         hasher.update(&buffer[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
 }
 
 fn read_manifest<R: Read + Seek>(
@@ -552,12 +564,12 @@ use std::io::Seek;
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_relative, BodyPackageService};
-    use std::fs;
+    use super::{normalize_relative, path_key, BodyPackageService};
+    use std::{collections::HashSet, fs};
     use uuid::Uuid;
 
     #[test]
-    fn package_excludes_noise_and_keeps_unicode_files() {
+    fn package_keeps_game_files_without_name_or_suffix_filters() {
         let root = std::env::temp_dir().join(format!("gamesaver-body-package-{}", Uuid::new_v4()));
         let source = root.join("source");
         let cache = root.join("cache");
@@ -591,9 +603,10 @@ mod tests {
             || false,
         )
         .expect("extract package");
-        assert_eq!(manifest.file_count, 2);
+        assert_eq!(manifest.file_count, 4);
         assert!(staging.join("readme.txt").is_file());
-        assert!(!staging.join("debug.log").exists());
+        assert!(staging.join("debug.log").is_file());
+        assert!(staging.join("localization_work/draft.txt").is_file());
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -605,6 +618,27 @@ mod tests {
             normalize_relative("存档\\slot.dat").expect("normalize unicode path"),
             "存档/slot.dat"
         );
+    }
+
+    #[test]
+    fn orphan_packages_are_removed_but_referenced_packages_are_kept() {
+        let root = std::env::temp_dir()
+            .join(format!("gamesaver-body-package-orphans-{}", Uuid::new_v4()));
+        let cache = root.join("cache");
+        fs::create_dir_all(cache.join("game-1")).expect("create cache");
+        let kept = cache.join("game-1/kept.zip");
+        let orphan = cache.join("game-1/orphan.zip");
+        fs::write(&kept, b"kept").expect("write kept package");
+        fs::write(&orphan, b"orphan").expect("write orphan package");
+
+        let referenced = HashSet::from([path_key(&kept)]);
+        let removed = BodyPackageService::cleanup_orphan_packages(&cache, &referenced)
+            .expect("cleanup orphan packages");
+
+        assert_eq!(removed, 1);
+        assert!(kept.is_file());
+        assert!(!orphan.exists());
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

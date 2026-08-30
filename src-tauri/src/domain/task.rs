@@ -17,6 +17,8 @@ pub struct TaskRetry {
     pub operation: String,
     pub game_uid: String,
     #[serde(default)]
+    pub game_key: Option<String>,
+    #[serde(default)]
     pub version_id: Option<String>,
     #[serde(default)]
     pub remote_path: Option<String>,

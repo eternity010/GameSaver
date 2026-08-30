@@ -22,6 +22,7 @@ const emit = defineEmits<{ (event: "back"): void; (event: "completed", game: Gam
 
 const phase = ref<WizardPhase>("form");
 const displayName = ref("");
+const gameKey = ref("");
 const sourcePath = ref("");
 const executablePath = ref("");
 const taskId = ref("");
@@ -57,7 +58,14 @@ async function chooseSource() {
   const selected = await open({ directory: true, multiple: false });
   if (typeof selected !== "string") return;
   sourcePath.value = selected;
-  if (!displayName.value) displayName.value = selected.split(/[\\/]/).filter(Boolean).pop() || "";
+  if (!displayName.value) {
+    displayName.value = selected.split(/[\\/]/).filter(Boolean).pop() || "";
+    gameKey.value = normalizeGameKey(displayName.value);
+  }
+}
+
+function normalizeGameKey(value: string): string {
+  return value.trim().split(/\s+/).join(" ").toLocaleLowerCase();
 }
 
 async function chooseExecutable() {
@@ -77,7 +85,7 @@ function handleTaskFailure(task: AppTask, cancelledMessage: string, failedMessag
   phase.value = completedGame.value ? "ready" : "form";
 }
 
-async function watchTask(onSuccess: (task: AppTask) => Promise<void>, cancelledMessage: string, failedMessage: string) {
+async function watchTask(onSuccess: (task: AppTask) => Promise<void>, cancelledMessage: string, failedMessage: string, onFailure?: (task: AppTask) => Promise<void>) {
   const watchedTaskId = taskId.value;
   if (!watchedTaskId) return;
   try {
@@ -92,9 +100,10 @@ async function watchTask(onSuccess: (task: AppTask) => Promise<void>, cancelledM
     }
     if (task.status === "failed" || task.status === "cancelled") {
       handleTaskFailure(task, cancelledMessage, failedMessage);
+      if (onFailure) await onFailure(task);
       return;
     }
-    pollTimer = setTimeout(() => void watchTask(onSuccess, cancelledMessage, failedMessage), 350);
+    pollTimer = setTimeout(() => void watchTask(onSuccess, cancelledMessage, failedMessage, onFailure), 350);
   } catch (reason) {
     stopPolling();
     taskId.value = "";
@@ -103,24 +112,35 @@ async function watchTask(onSuccess: (task: AppTask) => Promise<void>, cancelledM
   }
 }
 
-async function start() {
+async function submitAdd(allowLargeSource: boolean) {
   if (!canStart.value) return;
   error.value = "";
   progress.value = 0;
   message.value = "准备复制游戏本体";
   phase.value = "copying";
   try {
-    taskId.value = await startAddGameTask({ displayName: displayName.value, sourcePath: sourcePath.value, executablePath: executablePath.value });
+    taskId.value = await startAddGameTask({ displayName: displayName.value, gameKey: normalizeGameKey(gameKey.value || displayName.value), sourcePath: sourcePath.value, executablePath: executablePath.value, allowLargeSource });
     await watchTask(async (task) => {
       completedGame.value = task.gameUid ? await getGame(task.gameUid) : null;
       if (!completedGame.value) throw new Error("游戏已复制，但没有找到待设置的游戏记录");
       phase.value = "ready";
       message.value = "游戏本体已准备好";
-    }, "已取消复制", "添加游戏失败");
+    }, "已取消复制", "添加游戏失败", async (task) => {
+      const warning = task.error || "";
+      if (!allowLargeSource && warning.includes("超过 3 GB")) {
+        error.value = "";
+        if (window.confirm(warning)) await submitAdd(true);
+        else error.value = warning;
+      }
+    });
   } catch (reason) {
     phase.value = "form";
     error.value = String(reason);
   }
+}
+
+async function start() {
+  await submitAdd(false);
 }
 
 async function beginLearning() {
@@ -257,7 +277,7 @@ onUnmounted(stopPolling);
     </div>
 
     <form v-if="phase === 'form' || phase === 'copying'" class="wizard-form" @submit.prevent="start">
-      <section class="wizard-section"><h2>游戏信息</h2><label class="field"><span>游戏名称</span><input v-model="displayName" :disabled="phase === 'copying'" type="text" placeholder="例如：Black Market" /></label></section>
+      <section class="wizard-section"><h2>游戏信息</h2><label class="field"><span>游戏名称</span><input v-model="displayName" :disabled="phase === 'copying'" type="text" placeholder="例如：Black Market" @input="!gameKey && (gameKey = normalizeGameKey(displayName))" /></label><label class="field"><span>游戏标识</span><input v-model="gameKey" :disabled="phase === 'copying'" type="text" placeholder="用于关联云端游戏" /><small class="field-note">默认由游戏名称生成，确认后不随显示名称变化。</small></label></section>
       <section class="wizard-section"><h2>游戏本体目录</h2><p class="field-note">GameSaver 会复制一份本体到自己的游戏库，原始目录不会被修改。</p><div class="path-row"><input v-model="sourcePath" :disabled="phase === 'copying'" type="text" placeholder="选择游戏所在文件夹" /><button type="button" :disabled="phase === 'copying'" title="选择游戏目录" @click="chooseSource"><FolderOpen :size="17" />选择</button></div></section>
       <section class="wizard-section"><h2>启动程序</h2><p class="field-note">启动程序必须位于游戏本体目录内。</p><div class="path-row"><input v-model="executablePath" :disabled="phase === 'copying'" type="text" placeholder="选择游戏 EXE" /><button type="button" :disabled="phase === 'copying'" title="选择启动程序" @click="chooseExecutable"><Gamepad2 :size="17" />选择</button></div></section>
       <div v-if="phase === 'copying'" class="task-progress"><div class="task-progress-heading"><span>{{ message || "正在处理" }}</span><strong>{{ progress }}%</strong></div><div class="progress-track"><span :style="{ width: `${progress}%` }"></span></div><button class="secondary-button" type="button" @click="cancelTaskOrLearning"><X :size="16" />取消复制</button></div>

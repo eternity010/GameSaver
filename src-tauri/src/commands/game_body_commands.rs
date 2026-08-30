@@ -4,15 +4,24 @@ use crate::{
     repositories::{BaiduConfigRepository, GameRepository, SaveRepository},
     services::{BodyPackageService, GameBodyUpdateService, GameLibraryService, TaskService},
 };
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameBodyVersionView {
+    #[serde(flatten)]
+    pub version: GameBodyVersion,
+    pub package_size: Option<u64>,
+}
 
 #[tauri::command]
 pub fn list_game_body_versions(
     state: State<AppState>,
     game_uid: String,
-) -> Result<Vec<GameBodyVersion>, String> {
+) -> Result<Vec<GameBodyVersionView>, String> {
     let game_uid = game_uid.trim();
     let store = state
         .store
@@ -24,11 +33,29 @@ pub fn list_game_body_versions(
     let mut versions = store
         .body_versions
         .iter()
-        .filter(|version| version.game_uid == game_uid)
+        .filter(|version| {
+            version.game_uid == game_uid
+                && (version
+                    .package_path
+                    .as_deref()
+                    .is_some_and(|path| Path::new(path).is_file())
+                    || (!version.archive_path.trim().is_empty()
+                        && Path::new(&version.archive_path).is_dir()))
+        })
         .cloned()
         .collect::<Vec<_>>();
     versions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
-    Ok(versions)
+    Ok(versions
+        .into_iter()
+        .map(|version| GameBodyVersionView {
+            package_size: version
+                .package_path
+                .as_deref()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|metadata| metadata.len()),
+            version,
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -156,81 +183,6 @@ pub fn package_game_body(
                 TaskStatus::Failed,
                 100,
                 "游戏本体包创建失败",
-                None,
-                Some(error),
-            ),
-        }
-    });
-    Ok(task_id)
-}
-
-#[tauri::command]
-pub fn restore_game_body_package(
-    app: AppHandle,
-    state: State<AppState>,
-    game_uid: String,
-    version_id: String,
-) -> Result<String, String> {
-    let game_uid = game_uid.trim().to_string();
-    let version_id = version_id.trim().to_string();
-    let (game, version, profile, latest) =
-        load_body_package_context(&state, &game_uid, &version_id)?;
-    let cache_root = body_package_cache_root(&app)?;
-    let package_path = BodyPackageService::package_path(&cache_root, &game_uid, &version_id);
-    if !package_path.is_file() {
-        return Err("本地本体 ZIP 不存在，请先重新生成或下载该版本".to_string());
-    }
-    reserve_update(&state, &game_uid)?;
-    let task_id = match TaskService::create(
-        &state,
-        "restore_game_body_package",
-        Some(game_uid.clone()),
-        "准备恢复游戏本体",
-    ) {
-        Ok(task_id) => task_id,
-        Err(error) => {
-            release_update(&state, &game_uid);
-            return Err(error);
-        }
-    };
-    let app_handle = app.clone();
-    let task_id_for_thread = task_id.clone();
-    std::thread::spawn(move || {
-        let result = restore_game_body_package_task(
-            &app_handle,
-            &task_id_for_thread,
-            &game,
-            &version,
-            profile.as_ref(),
-            latest.as_ref(),
-            package_path,
-        );
-        release_update(&app_handle.state(), &game_uid);
-        match result {
-            Ok(summary) => TaskService::finish(
-                &app_handle.state(),
-                &task_id_for_thread,
-                TaskStatus::Success,
-                100,
-                "游戏本体恢复完成",
-                Some(summary),
-                None,
-            ),
-            Err(error) if error == "任务已取消" => TaskService::finish(
-                &app_handle.state(),
-                &task_id_for_thread,
-                TaskStatus::Cancelled,
-                100,
-                "已取消游戏本体恢复",
-                None,
-                None,
-            ),
-            Err(error) => TaskService::finish(
-                &app_handle.state(),
-                &task_id_for_thread,
-                TaskStatus::Failed,
-                100,
-                "游戏本体恢复失败",
                 None,
                 Some(error),
             ),
@@ -611,219 +563,6 @@ fn package_game_body_task(
     }))
 }
 
-fn restore_game_body_package_task(
-    app: &AppHandle,
-    task_id: &str,
-    game: &crate::domain::Game,
-    version: &crate::domain::GameBodyVersion,
-    profile: Option<&SaveProfile>,
-    latest: Option<&SaveVersion>,
-    package_path: PathBuf,
-) -> Result<serde_json::Value, String> {
-    let state = app.state::<AppState>();
-    let games_root = Path::new(&game.managed_path)
-        .parent()
-        .ok_or_else(|| "解析游戏库目录失败".to_string())?
-        .to_path_buf();
-    let staging = games_root.join(format!(".{}.package-restoring", game.game_uid));
-    if staging.exists() {
-        return Err("已有未完成的本体恢复暂存目录，请重启应用后重试".to_string());
-    }
-    TaskService::update(
-        &state,
-        task_id,
-        TaskStatus::Running,
-        3,
-        "正在校验游戏本体包",
-        None,
-    );
-    let manifest = BodyPackageService::extract_package(
-        &package_path,
-        &staging,
-        &game.game_uid,
-        &game.launch.executable_relative_path,
-        version.sha256.as_deref(),
-        |progress, message| {
-            TaskService::update(
-                &state,
-                task_id,
-                TaskStatus::Running,
-                progress,
-                message,
-                None,
-            )
-        },
-        || TaskService::is_cancelled(&state, task_id),
-    )?;
-    if TaskService::is_cancelled(&state, task_id) {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err("任务已取消".to_string());
-    }
-    let protected = match profile {
-        Some(profile) => {
-            SaveRepository::commit(app, game, profile, latest, |progress, message| {
-                TaskService::update(
-                    &state,
-                    task_id,
-                    TaskStatus::Running,
-                    3 + progress / 10,
-                    message,
-                    None,
-                );
-            })?
-        }
-        None => None,
-    };
-    let pending_protected = protected.clone();
-    if TaskService::is_cancelled(&state, task_id) {
-        if let Some(version) = pending_protected.as_ref() {
-            crate::repositories::release_pending_objects(version);
-        }
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err("任务已取消".to_string());
-    }
-    let save_target = protected.as_ref().or(latest);
-    let managed = Path::new(&game.managed_path);
-    let archive_path = games_root
-        .join(".versions")
-        .join(&game.game_uid)
-        .join(format!("restore-{}", Uuid::new_v4()));
-    let journal_path = GameBodyUpdateService::journal_path(&games_root, &game.game_uid);
-    let swap = if managed.is_dir() {
-        if let Err(error) = GameBodyUpdateService::write_journal(
-            &games_root,
-            &game.game_uid,
-            managed,
-            &staging,
-            &archive_path,
-        ) {
-            if let Some(version) = pending_protected.as_ref() {
-                crate::repositories::release_pending_objects(version);
-            }
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(error);
-        }
-        match GameBodyUpdateService::swap(managed, &staging, &archive_path) {
-            Ok(swap) => Some(swap),
-            Err(error) => {
-                if let Some(version) = pending_protected.as_ref() {
-                    crate::repositories::release_pending_objects(version);
-                }
-                let _ = GameBodyUpdateService::clear_journal(&journal_path);
-                let _ = std::fs::remove_dir_all(&staging);
-                return Err(error);
-            }
-        }
-    } else {
-        if let Err(error) = std::fs::rename(&staging, managed) {
-            if let Some(version) = pending_protected.as_ref() {
-                crate::repositories::release_pending_objects(version);
-            }
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(format!("提交缺失游戏本体恢复失败：{error}"));
-        }
-        None
-    };
-    let receipt = match (profile, save_target) {
-        (Some(profile), Some(target)) => {
-            match SaveRepository::restore(app, game, profile, target, |progress, message| {
-                TaskService::update(
-                    &state,
-                    task_id,
-                    TaskStatus::Running,
-                    92 + progress / 20,
-                    message,
-                    None,
-                );
-            }) {
-                Ok(receipt) => Some(receipt),
-                Err(error) => {
-                    if let Some(swap) = swap.as_ref() {
-                        let _ = GameBodyUpdateService::rollback(managed, swap);
-                        let _ = GameBodyUpdateService::clear_journal(&journal_path);
-                    }
-                    if let Some(version) = pending_protected.as_ref() {
-                        crate::repositories::release_pending_objects(version);
-                    }
-                    return Err(format!("恢复受保护存档失败：{error}"));
-                }
-            }
-        }
-        _ => None,
-    };
-    let mut candidate = state
-        .store
-        .lock()
-        .map_err(|_| "读取游戏本体包记录失败".to_string())?
-        .clone();
-    if let Some(protected) = protected {
-        candidate.save_versions.push(protected.clone());
-        if let Some(game_record) = candidate
-            .games
-            .iter_mut()
-            .find(|item| item.game_uid == game.game_uid)
-        {
-            game_record.latest_save_version_id = Some(protected.version_id.clone());
-        }
-    }
-    let Some(record) = candidate
-        .body_versions
-        .iter_mut()
-        .find(|item| item.version_id == version.version_id)
-    else {
-        if let Some(receipt) = receipt {
-            let _ = SaveRepository::rollback_restore(receipt);
-        }
-        if let Some(swap) = swap.as_ref() {
-            let _ = GameBodyUpdateService::rollback(managed, swap);
-            let _ = GameBodyUpdateService::clear_journal(&journal_path);
-        }
-        if let Some(version) = pending_protected.as_ref() {
-            crate::repositories::release_pending_objects(version);
-        }
-        return Err("游戏本体包版本记录不存在".to_string());
-    };
-    if let Some(swap) = swap.as_ref() {
-        record.archive_path = swap.archive_path.to_string_lossy().to_string();
-    }
-    if let Err(error) = GameRepository::persist(app, &candidate) {
-        let save_rollback = receipt.map(SaveRepository::rollback_restore);
-        let body_rollback = swap
-            .as_ref()
-            .map(|swap| GameBodyUpdateService::rollback(managed, swap));
-        if body_rollback.as_ref().is_some_and(Result::is_ok) {
-            let _ = GameBodyUpdateService::clear_journal(&journal_path);
-        }
-        if let Some(version) = pending_protected.as_ref() {
-            crate::repositories::release_pending_objects(version);
-        }
-        let mut errors = vec![format!("保存本体恢复记录失败：{error}")];
-        if let Some(Err(save_error)) = save_rollback {
-            errors.push(format!("存档回滚失败：{save_error}"));
-        }
-        if let Some(Err(body_error)) = body_rollback {
-            errors.push(format!("游戏本体回滚失败：{body_error}"));
-        }
-        return Err(errors.join("；"));
-    }
-    *state
-        .store
-        .lock()
-        .map_err(|_| "更新游戏本体包记录失败".to_string())? = candidate;
-    if let Some(receipt) = receipt {
-        SaveRepository::finalize_restore(receipt);
-    }
-    if let Some(version) = pending_protected.as_ref() {
-        crate::repositories::release_pending_objects(version);
-    }
-    if swap.is_some() {
-        let _ = GameBodyUpdateService::clear_journal(&journal_path);
-    }
-    Ok(
-        serde_json::json!({ "versionId": version.version_id, "fileCount": manifest.file_count, "totalBytes": manifest.total_bytes }),
-    )
-}
-
 fn load_body_game(state: &AppState, game_uid: &str) -> Result<crate::domain::Game, String> {
     let store = state
         .store
@@ -1185,9 +924,31 @@ fn update_game_body_task(
     if let Some(version) = pending_protected.as_ref() {
         crate::repositories::release_pending_objects(version);
     }
-    let _ = GameBodyUpdateService::clear_journal(&journal_path);
+    let mut cleaned = state
+        .store
+        .lock()
+        .map_err(|_| "读取游戏更新清理记录失败".to_string())?
+        .clone();
+    let archive_cleanup = GameBodyUpdateService::cleanup_archived_body_versions(
+        &games_root,
+        &mut cleaned.body_versions,
+    );
+    let old_body_cleanup_pending = archive_cleanup.is_err();
+    if archive_cleanup.is_ok() {
+        if let Err(error) = GameRepository::persist(app, &cleaned) {
+            crate::logging::error(format!("旧游戏本体已清理，但更新记录清理失败：{error}"));
+        } else {
+            *state
+                .store
+                .lock()
+                .map_err(|_| "更新游戏清理记录失败".to_string())? = cleaned;
+        }
+        let _ = GameBodyUpdateService::clear_journal(&journal_path);
+    } else if let Err(error) = archive_cleanup {
+        crate::logging::error(error);
+    }
     Ok(
-        serde_json::json!({ "bodyVersionId": version_id, "fileCount": plan.file_count, "totalBytes": plan.total_bytes }),
+        serde_json::json!({ "fileCount": plan.file_count, "totalBytes": plan.total_bytes, "oldBodyCleanupPending": old_body_cleanup_pending }),
     )
 }
 

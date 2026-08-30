@@ -1,4 +1,4 @@
-use crate::domain::Game;
+use crate::domain::{Game, GameBodyVersion};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fs, path::{Path, PathBuf}};
 use uuid::Uuid;
@@ -81,6 +81,62 @@ impl GameBodyUpdateService {
             errors.push(error);
         }
         if errors.is_empty() { Ok(()) } else { Err(errors.join("；")) }
+    }
+
+    pub fn cleanup_removed_restore_archives(games_root: &Path) -> Result<Vec<PathBuf>, String> {
+        let versions_root = games_root.join(".versions");
+        if !versions_root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut removed = Vec::new();
+        for game_entry in fs::read_dir(&versions_root).map_err(|err| format!("读取历史本体目录失败：{err}"))? {
+            let game_path = game_entry.map_err(|err| format!("读取历史本体目录失败：{err}"))?.path();
+            if !game_path.is_dir() {
+                continue;
+            }
+            for archive_entry in fs::read_dir(&game_path).map_err(|err| format!("读取历史本体版本失败：{err}"))? {
+                let archive_path = archive_entry.map_err(|err| format!("读取历史本体版本失败：{err}"))?.path();
+                let Some(name) = archive_path.file_name().and_then(|value| value.to_str()) else { continue };
+                if name.starts_with("restore-") && archive_path.is_dir() {
+                    fs::remove_dir_all(&archive_path).map_err(|err| format!("清理历史本体恢复副本失败：{err}"))?;
+                    removed.push(archive_path);
+                }
+            }
+            if fs::read_dir(&game_path).map_err(|err| format!("检查历史本体目录失败：{err}"))?.next().is_none() {
+                fs::remove_dir(&game_path).map_err(|err| format!("清理空历史本体目录失败：{err}"))?;
+            }
+        }
+        Ok(removed)
+    }
+
+    pub fn cleanup_archived_body_versions(
+        games_root: &Path,
+        versions: &mut Vec<GameBodyVersion>,
+    ) -> Result<usize, String> {
+        let mut removed = 0;
+        for version in versions.iter_mut() {
+            if version.archive_path.trim().is_empty() {
+                continue;
+            }
+            let archive = PathBuf::from(&version.archive_path);
+            if !path_is_within(&archive, games_root) || archive == games_root {
+                return Err(format!("历史本体目录超出游戏库：{}", archive.display()));
+            }
+            if archive.is_dir() {
+                fs::remove_dir_all(&archive)
+                    .map_err(|err| format!("清理历史游戏本体失败：{err}"))?;
+                removed += 1;
+            } else if archive.is_file() {
+                fs::remove_file(&archive)
+                    .map_err(|err| format!("清理历史游戏本体文件失败：{err}"))?;
+                removed += 1;
+            }
+            version.archive_path.clear();
+        }
+        versions.retain(|version| {
+            version.package_path.is_some() || !version.archive_path.trim().is_empty()
+        });
+        Ok(removed)
     }
 
     pub fn validate_source(source: &Path, game: &Game) -> Result<UpdatePlan, String> {
@@ -305,7 +361,7 @@ fn ensure_available_space(target: &Path, required_bytes: u64) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::GameBodyUpdateService;
-    use crate::domain::Game;
+    use crate::domain::{Game, GameBodyVersion};
     use std::fs;
     use uuid::Uuid;
 
@@ -376,6 +432,38 @@ mod tests {
 
         assert_eq!(fs::read(managed.join("state.txt")).expect("read new"), b"new");
         assert!(!journal.exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn cleanup_archived_body_versions_removes_full_old_copy() {
+        let root = std::env::temp_dir().join(format!("gamesaver-cleanup-{}", Uuid::new_v4()));
+        let games_root = root.join("games");
+        let archive = games_root.join(".versions").join("game-1").join("version-1");
+        fs::create_dir_all(&archive).expect("create archive");
+        fs::write(archive.join("game.exe"), b"old body").expect("write archive");
+        let mut versions = vec![GameBodyVersion {
+            version_id: "version-1".to_string(),
+            game_uid: "game-1".to_string(),
+            created_at: "1".to_string(),
+            archive_path: archive.to_string_lossy().to_string(),
+            file_count: 1,
+            total_bytes: 8,
+            package_path: None,
+            sha256: None,
+            excluded_items: Vec::new(),
+            upload_status: None,
+            remote_path: None,
+            remote_fs_id: None,
+            remote_size: None,
+        }];
+
+        let removed = GameBodyUpdateService::cleanup_archived_body_versions(&games_root, &mut versions)
+            .expect("cleanup archived body version");
+
+        assert_eq!(removed, 1);
+        assert!(!archive.exists());
+        assert!(versions.is_empty());
         fs::remove_dir_all(root).expect("cleanup");
     }
 

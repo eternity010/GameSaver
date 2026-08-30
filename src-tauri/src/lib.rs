@@ -32,6 +32,49 @@ pub fn run() {
                 eprintln!("GameSaver 本体包临时文件清理失败：{error}");
             }
             let store = GameRepository::load(app.handle())?;
+            let removed_restore_archives = match GameBodyUpdateService::cleanup_removed_restore_archives(&games_root) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    logging::error(format!("清理已取消功能的本体恢复副本失败：{error}"));
+                    Vec::new()
+                }
+            };
+            let mut store = store;
+            if !removed_restore_archives.is_empty() {
+                let removed = removed_restore_archives
+                    .iter()
+                    .map(|path| path.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase())
+                    .collect::<HashSet<_>>();
+                let mut cleaned = store.clone();
+                for version in &mut cleaned.body_versions {
+                    let archive = version.archive_path.replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase();
+                    if removed.contains(&archive) {
+                        version.archive_path.clear();
+                    }
+                }
+                if let Err(error) = GameRepository::persist(app.handle(), &cleaned) {
+                    logging::error(format!("清理本体恢复副本记录失败：{error}"));
+                } else {
+                    store = cleaned;
+                }
+            }
+            let referenced_packages = store
+                .body_versions
+                .iter()
+                .filter_map(|version| version.package_path.as_deref())
+                .map(|path| {
+                    path.replace('\\', "/")
+                        .trim_end_matches('/')
+                        .to_ascii_lowercase()
+                })
+                .collect::<HashSet<_>>();
+            if let Err(error) = BodyPackageService::cleanup_orphan_packages(
+                &body_package_root,
+                &referenced_packages,
+            ) {
+                logging::error(format!("孤立本体包清理失败：{error}"));
+                eprintln!("GameSaver 孤立本体包清理失败：{error}");
+            }
             let tasks_path = TaskRepository::path(&data_dir);
             let tasks = match TaskRepository::load(&tasks_path) {
                 Ok(tasks) => tasks,
@@ -62,6 +105,16 @@ pub fn run() {
                 logging::error(format!("游戏更新恢复失败：{error}"));
                 eprintln!("GameSaver 游戏更新恢复失败：{error}");
             }
+            if let Err(error) =
+                GameBodyUpdateService::cleanup_archived_body_versions(&games_root, &mut store.body_versions)
+            {
+                logging::error(format!("清理历史游戏本体失败：{error}"));
+                eprintln!("GameSaver 清理历史游戏本体失败：{error}");
+            }
+            if let Err(error) = GameRepository::persist(app.handle(), &store) {
+                logging::error(format!("清理历史游戏本体记录失败：{error}"));
+                eprintln!("GameSaver 清理历史游戏本体记录失败：{error}");
+            }
             app.manage(AppState::new(store, library_root, tasks, PathBuf::from(tasks_path)));
             Ok(())
         })
@@ -72,6 +125,7 @@ pub fn run() {
             commands::task_commands::get_task,
             commands::task_commands::list_tasks,
             commands::task_commands::cancel_task,
+            commands::task_commands::delete_tasks,
             commands::save_commands::start_save_learning_task,
             commands::save_commands::start_finish_save_learning_task,
             commands::save_commands::cancel_save_learning,
@@ -87,7 +141,6 @@ pub fn run() {
             commands::game_body_commands::list_game_body_versions,
             commands::game_body_commands::update_game_body,
             commands::game_body_commands::package_game_body,
-            commands::game_body_commands::restore_game_body_package,
             commands::game_body_commands::delete_game_body_package
             ,commands::game_body_commands::uninstall_game_body
             ,commands::baidu_commands::get_baidu_status

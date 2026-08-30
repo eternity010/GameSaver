@@ -90,6 +90,33 @@ impl TaskService {
         Ok(())
     }
 
+    pub fn delete_many(state: &AppState, task_ids: &[String]) -> Result<usize, String> {
+        if task_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut tasks = state.tasks.lock().map_err(|_| "lock task state failed".to_string())?;
+        let mut unique_ids = std::collections::HashSet::<String>::new();
+        for task_id in task_ids {
+            if !unique_ids.insert(task_id.clone()) {
+                continue;
+            }
+            let task = tasks.get(task_id).ok_or_else(|| "task not found".to_string())?;
+            if matches!(task.status, TaskStatus::Pending | TaskStatus::Running) {
+                return Err("进行中的任务不能删除，请先取消任务".to_string());
+            }
+        }
+        let previous = tasks.clone();
+        let removed = unique_ids
+            .iter()
+            .filter(|task_id| tasks.remove(task_id.as_str()).is_some())
+            .count();
+        if let Err(error) = TaskRepository::persist(&state.tasks_path, &tasks) {
+            *tasks = previous;
+            return Err(error);
+        }
+        Ok(removed)
+    }
+
     pub fn get(state: &AppState, task_id: &str) -> Result<AppTask, String> {
         state.tasks.lock().map_err(|_| "lock task state failed".to_string())?.get(task_id).cloned().ok_or_else(|| "task not found".to_string())
     }

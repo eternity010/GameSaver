@@ -13,7 +13,7 @@ pub mod task_service;
 
 pub use add_game_service::AddGameService;
 pub use baidu_netdisk_service::{BaiduConnectionStatus, BaiduNetdiskClient, BaiduQuota, BaiduToken, RemoteFile};
-pub use cloud_manifest_service::{CloudGameSummary, CloudManifestService, RemoteBodyPackageList};
+pub use cloud_manifest_service::{CloudGamePage, CloudGameSummary, CloudManifestService, RemoteBodyPackageList};
 pub use cloud_account_service::{CloudAccountProfile, CloudAccountService};
 pub use game_body_package_service::BodyPackageService;
 pub use game_body_update_service::GameBodyUpdateService;

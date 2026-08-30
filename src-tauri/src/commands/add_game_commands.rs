@@ -14,12 +14,18 @@ pub fn start_add_game_task(
     source_path: String,
     executable_path: String,
     display_name: String,
+    game_key: String,
+    allow_large_source: bool,
 ) -> Result<String, String> {
     let source = PathBuf::from(source_path.trim());
     let executable = PathBuf::from(executable_path.trim());
     let display_name = display_name.trim().to_string();
     if display_name.is_empty() {
         return Err("游戏名称不能为空".to_string());
+    }
+    let game_key = Game::derive_game_key(&game_key);
+    if game_key.is_empty() || game_key.contains('/') || game_key.contains('\\') {
+        return Err("游戏标识不能为空，且不能包含路径分隔符".to_string());
     }
     let executable_relative_path = AddGameService::validate_source(&source, &executable)?;
     let source = source.canonicalize().map_err(|err| format!("解析游戏目录失败：{err}"))?;
@@ -32,7 +38,14 @@ pub fn start_add_game_task(
     let managed_path = games_root.join(&game_uid);
     {
         let store = state.store.lock().map_err(|_| "lock GameSaver store failed".to_string())?;
-        if store.games.iter().any(|game| game.managed_path == managed_path.to_string_lossy()) {
+        if store.games.iter().any(|game| game.game_key == game_key) {
+            return Err("游戏标识已存在，请使用游戏库中的现有记录".to_string());
+        }
+        if store
+            .games
+            .iter()
+            .any(|game| game.managed_path == managed_path.to_string_lossy())
+        {
             return Err("受管游戏目录已存在".to_string());
         }
     }
@@ -49,6 +62,7 @@ pub fn start_add_game_task(
                 &games_root,
                 &game_uid,
                 executable_relative_path,
+                allow_large_source,
                 |progress, message| TaskService::update(&app_handle.state(), &task_id_for_thread, TaskStatus::Running, progress, message, None),
                 || TaskService::is_cancelled(&app_handle.state(), &task_id_for_thread),
             )?;
@@ -58,6 +72,7 @@ pub fn start_add_game_task(
             }
             let mut game = Game::new_pending(display_name, copy_result.managed_path.to_string_lossy(), copy_result.executable_relative_path);
             game.game_uid = game_uid.clone();
+            game.game_key = game_key.clone();
             let copied_message = format!("游戏已加入，复制 {} 个文件（{} MB），等待存档设置", copy_result.file_count, copy_result.total_bytes / 1024 / 1024);
             let state: State<AppState> = app_handle.state();
             let mut store = state.store.lock().map_err(|_| "lock GameSaver store failed".to_string())?;

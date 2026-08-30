@@ -54,6 +54,12 @@ pub struct RemoteFile {
     pub server_mtime: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RemoteFilePage {
+    pub files: Vec<RemoteFile>,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BaiduQuota {
@@ -280,31 +286,62 @@ impl BaiduNetdiskClient {
     }
 
     pub fn list(&self, remote_dir: &str) -> Result<Vec<RemoteFile>, String> {
-        let url = format!("{API_BASE}/rest/2.0/xpan/file");
-        let token = self.token.access_token.clone();
         let mut start = 0usize;
         let mut result = Vec::new();
         loop {
-            let response = self.send_with_retry(|client| client.get(&url)
-                .query(&[("method", "list"), ("dir", remote_dir), ("order", "name"), ("start", &start.to_string()), ("limit", "1000"), ("web", "1"), ("folder", "0"), ("access_token", token.as_str())])
-                .send(), "请求百度网盘文件列表")?;
-            let body: FileListResponse = parse_json(response, "读取百度网盘文件列表")?;
-            let page = body.list.unwrap_or_default();
-            let page_len = page.len();
-            result.extend(page.into_iter().map(|item| RemoteFile {
-                path: item.path,
-                fs_id: item.fs_id,
-                size: item.size,
-                md5: item.md5,
-                is_dir: item.isdir != 0,
-                server_mtime: item.server_mtime,
-            }));
-            if page_len == 0 || body.has_more != Some(1) {
+            let page = self.list_page(remote_dir, start, 1000)?;
+            let page_len = page.files.len();
+            result.extend(page.files);
+            if page_len == 0 || !page.has_more {
                 break;
             }
             start = start.saturating_add(page_len);
         }
         Ok(result)
+    }
+
+    pub fn list_page(
+        &self,
+        remote_dir: &str,
+        start: usize,
+        limit: usize,
+    ) -> Result<RemoteFilePage, String> {
+        let url = format!("{API_BASE}/rest/2.0/xpan/file");
+        let token = self.token.access_token.clone();
+        let limit = limit.clamp(1, 1000);
+        let response = self
+            .send_with_retry(|client| {
+                client
+                    .get(&url)
+                    .query(&[
+                        ("method", "list"),
+                        ("dir", remote_dir),
+                        ("order", "name"),
+                        ("start", &start.to_string()),
+                        ("limit", &limit.to_string()),
+                        ("web", "1"),
+                        ("folder", "0"),
+                        ("access_token", token.as_str()),
+                    ])
+                    .send()
+            }, "请求百度网盘文件列表")?;
+        let body: FileListResponse = parse_json(response, "读取百度网盘文件列表")?;
+        Ok(RemoteFilePage {
+            files: body
+                .list
+                .unwrap_or_default()
+                .into_iter()
+                .map(|item| RemoteFile {
+                    path: item.path,
+                    fs_id: item.fs_id,
+                    size: item.size,
+                    md5: item.md5,
+                    is_dir: item.isdir != 0,
+                    server_mtime: item.server_mtime,
+                })
+                .collect(),
+            has_more: body.has_more == Some(1),
+        })
     }
 
     pub fn quota(&self) -> Result<BaiduQuota, String> {

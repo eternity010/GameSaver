@@ -1,6 +1,8 @@
 use std::{fs, path::{Path, PathBuf}};
 use walkdir::WalkDir;
 
+const LARGE_SOURCE_WARNING_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+
 pub struct AddGameService;
 
 pub struct CopyResult {
@@ -45,6 +47,7 @@ impl AddGameService {
         games_root: &Path,
         game_uid: &str,
         executable_relative_path: String,
+        allow_large_source: bool,
         on_progress: impl Fn(u8, &str),
         is_cancelled: impl Fn() -> bool,
     ) -> Result<CopyResult, String> {
@@ -74,6 +77,12 @@ impl AddGameService {
         }
         if files.is_empty() {
             return Err("游戏目录中没有可复制的文件".to_string());
+        }
+        if total_bytes > LARGE_SOURCE_WARNING_BYTES && !allow_large_source {
+            return Err(format!(
+                "游戏本体大小为 {}，超过 3 GB。请确认游戏大小是否正常；确认后将继续复制。",
+                format_size(total_bytes)
+            ));
         }
         ensure_available_space(games_root, total_bytes)?;
         on_progress(5, &format!("已扫描 {} 个文件", files.len()));
@@ -155,7 +164,7 @@ mod tests {
         fs::write(source.join("save.dat"), b"save").expect("write save");
 
         let relative = AddGameService::validate_source(&source, &source.join("bin/game.exe")).expect("validate source");
-        let result = AddGameService::copy_to_managed(&source, &games_root, "game-1", relative, |_, _| {}, || false).expect("copy game");
+        let result = AddGameService::copy_to_managed(&source, &games_root, "game-1", relative, false, |_, _| {}, || false).expect("copy game");
         assert_eq!(result.executable_relative_path, "bin/game.exe");
         assert_eq!(fs::read(result.managed_path.join("save.dat")).expect("read copied file"), b"save");
         fs::remove_dir_all(root).expect("cleanup test directory");
@@ -168,7 +177,7 @@ mod tests {
         let games_root = root.join("games");
         fs::create_dir_all(&source).expect("create source");
         fs::write(source.join("game.exe"), b"exe").expect("write exe");
-        let result = AddGameService::copy_to_managed(&source, &games_root, "game-2", "game.exe".to_string(), |_, _| {}, || true);
+        let result = AddGameService::copy_to_managed(&source, &games_root, "game-2", "game.exe".to_string(), false, |_, _| {}, || true);
         assert!(result.is_err());
         assert!(!games_root.join("game-2").exists());
         assert!(!games_root.join(".game-2.copying").exists());
@@ -189,5 +198,20 @@ mod tests {
         assert!(!games_root.join("game-3").exists());
         assert!(!games_root.join(".game-3.copying").exists());
         fs::remove_dir_all(root).expect("cleanup test directory");
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }

@@ -61,6 +61,8 @@ pub struct LaunchConfig {
 #[serde(rename_all = "camelCase")]
 pub struct Game {
     pub game_uid: String,
+    #[serde(default)]
+    pub game_key: String,
     pub display_name: String,
     pub managed_path: String,
     pub lifecycle: GameLifecycle,
@@ -119,14 +121,24 @@ pub enum GameRuntimeStatus {
 }
 
 impl Game {
+    pub fn derive_game_key(display_name: &str) -> String {
+        display_name
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    }
+
     pub fn new_pending(
         display_name: impl Into<String>,
         managed_path: impl Into<String>,
         executable_relative_path: impl Into<String>,
     ) -> Self {
+        let display_name = display_name.into();
         Self {
             game_uid: Uuid::new_v4().to_string(),
-            display_name: display_name.into(),
+            game_key: Self::derive_game_key(&display_name),
+            display_name,
             managed_path: managed_path.into(),
             lifecycle: GameLifecycle::PendingSetup,
             health: GameHealth::NeedsSetup,
@@ -163,5 +175,11 @@ mod tests {
         assert_eq!(game.lifecycle, GameLifecycle::Active);
         assert_eq!(game.health, GameHealth::Ready);
         assert_eq!(game.save_profile_id.as_deref(), Some("profile-1"));
+        assert_eq!(game.game_key, "test game");
+    }
+
+    #[test]
+    fn game_key_normalizes_whitespace_and_case() {
+        assert_eq!(Game::derive_game_key("  Monster   Black Market  "), "monster black market");
     }
 }

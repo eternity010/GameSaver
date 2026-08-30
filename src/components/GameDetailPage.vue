@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
-import { AlertTriangle, Archive, ArrowLeft, CheckCircle2, Clock3, Folder, FolderOpen, Gamepad2, HardDrive, LoaderCircle, Play, RefreshCw, RotateCcw, ShieldCheck, Trash2 } from "@lucide/vue";
-import { deleteGameBodyPackage, deleteRemoteBodyPackage, deleteSaveVersion, downloadGameBodyPackage, getBaiduConfig, getBaiduStatus, getGameRuntime, getTask, launchGame, listGameBodyVersions, listRemoteBodyPackages, listSaveVersions, packageGameBody, precheckGameLaunch, pruneSaveVersions, repairCloudBodyManifest, restoreGameBodyPackage, restoreSaveVersion, uninstallGameBody, updateGameBody, uploadGameBodyPackage } from "../api";
+import { AlertTriangle, Archive, ArrowLeft, CheckCircle2, Clock3, Folder, FolderOpen, Gamepad2, HardDrive, LoaderCircle, Play, RefreshCw, RotateCcw, ShieldCheck, Trash2, Upload } from "@lucide/vue";
+import { deleteGameBodyPackage, deleteRemoteBodyPackage, deleteSaveVersion, getBaiduConfig, getBaiduStatus, getGameRuntime, getTask, launchGame, listGameBodyVersions, listRemoteBodyPackages, listSaveVersions, packageGameBody, precheckGameLaunch, pruneSaveVersions, repairCloudBodyManifest, restoreSaveVersion, uninstallGameBody, updateGameBody, uploadGameBodyPackage } from "../api";
 import type { BaiduConfigView, BaiduStatus, RemoteBodyPackage } from "../api";
 import type { Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveVersion } from "../domain/game";
 
@@ -193,20 +193,6 @@ async function uninstallBody() {
   }
 }
 
-async function restoreBodyPackage(version: GameBodyVersion) {
-  if (busy.value || runtime.value || !version.packagePath) return;
-  if (!window.confirm("恢复本体包会替换当前受管游戏目录，当前目录会先保留为回滚版本，确定继续吗？")) return;
-  busy.value = true;
-  error.value = "";
-  message.value = "准备恢复游戏本体包";
-  try {
-    await watchTask(await restoreGameBodyPackage(props.game.gameUid, version.versionId));
-  } catch (reason) {
-    busy.value = false;
-    error.value = String(reason);
-  }
-}
-
 async function deleteBodyPackage(version: GameBodyVersion) {
   if (busy.value || runtime.value || !version.packagePath) return;
   if (!window.confirm(version.archivePath ? "删除本地 ZIP 后仍保留旧本体目录，确定继续吗？" : "删除本地 ZIP 后将无法从这个本体版本恢复，确定继续吗？")) return;
@@ -229,20 +215,6 @@ async function uploadBody(version: GameBodyVersion) {
   message.value = "准备上传游戏本体包";
   try {
     await watchTask(await uploadGameBodyPackage(props.game.gameUid, version.versionId));
-  } catch (reason) {
-    busy.value = false;
-    error.value = String(reason);
-  }
-}
-
-async function downloadBody(remote: RemoteBodyPackage) {
-  if (busy.value || runtime.value) return;
-  if (!window.confirm("下载此百度网盘本体 ZIP 到本地，完成后可在版本列表中恢复，确定继续吗？")) return;
-  busy.value = true;
-  error.value = "";
-  message.value = "准备下载游戏本体包";
-  try {
-    await watchTask(await downloadGameBodyPackage(props.game.gameUid, remote.path, remote.fsId));
   } catch (reason) {
     busy.value = false;
     error.value = String(reason);
@@ -386,8 +358,28 @@ onUnmounted(stopPolling);
           <div class="body-action-row"><button class="secondary-button" type="button" :disabled="busy || !!runtime" title="选择新版游戏文件夹并更新" @click="updateBody"><LoaderCircle v-if="busy && (message.includes('更新') || message.includes('新版'))" :size="16" class="spin" /><FolderOpen v-else :size="16" />更新游戏本体</button><button class="secondary-button" type="button" :disabled="busy || !!runtime" title="创建本体 ZIP 缓存" @click="packageBody"><LoaderCircle v-if="busy && message.includes('本体包')" :size="16" class="spin" /><Archive v-else :size="16" />创建本体包</button><button class="secondary-button danger-outline-button" type="button" :disabled="busy || !!runtime" title="删除 GameSaver 管理的本地游戏本体，保留配置和云端版本" @click="uninstallBody"><Trash2 :size="16" />卸载本体</button></div>
           <div class="cloud-summary"><span class="status-dot" :class="{ active: baiduReady() }"></span><strong>百度网盘</strong><span>{{ baiduLabel() }}</span><span v-if="baiduReady()">· {{ cloudManifestLabel() }}<template v-if="cloudManifestUpdatedAt"> · {{ formatDate(cloudManifestUpdatedAt) }}</template></span><button v-if="!baiduReady()" class="secondary-button compact-button" type="button" title="配置或授权百度网盘" @click="emit('settings')">{{ baiduActionLabel() }}</button><button v-else-if="cloudManifestStatus !== 'synced' || cloudWarnings.length" class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" title="扫描云端 ZIP 并重建版本清单" @click="repairCloudManifest"><RefreshCw :size="14" />修复清单</button></div>
           <div v-if="cloudWarnings.length" class="cloud-warnings"><p v-for="warning in cloudWarnings" :key="warning">{{ warning }}</p></div>
-          <div v-if="bodyVersions.length" class="body-version-list"><p class="timeline-caption">本体版本与本地包</p><div v-for="version in bodyVersions" :key="version.versionId" class="body-version-row"><div><span>{{ version.packagePath ? "ZIP 本体包" : "旧本体目录" }} · {{ formatDate(version.createdAt) }}</span><small v-if="version.packagePath">本地缓存 · {{ version.excludedItems.length }} 项排除 · {{ bodyUploadLabel(version) }}</small></div><strong>{{ version.fileCount }} 个文件 · {{ formatBytes(version.totalBytes) }}</strong><div v-if="version.packagePath" class="version-actions"><button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" title="校验并恢复本体包" @click="restoreBodyPackage(version)"><RotateCcw :size="15" />恢复</button><button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime || !baiduReady()" title="上传本体包到百度网盘" @click="uploadBody(version)">上传</button><button class="icon-button danger-button" type="button" :disabled="busy || !!runtime" title="删除本地本体包" aria-label="删除本地本体包" @click="deleteBodyPackage(version)"><Trash2 :size="15" /></button></div></div></div>
-          <div v-if="baiduReady() && remotePackages.length" class="body-version-list"><p class="timeline-caption">百度网盘本体包</p><div v-for="remote in remotePackages" :key="remote.fsId" class="body-version-row"><div><span>{{ remote.versionId }} · {{ remoteSyncLabel(remote) }}</span><small>云端 ZIP · SHA-256 {{ remote.packageSha256 || "未提供" }} · ID {{ remote.fsId }}</small></div><strong>{{ formatBytes(remote.size) }}</strong><div class="version-actions remote-version-actions"><button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" title="下载本体包到本地" @click="downloadBody(remote)">下载</button><button class="icon-button danger-button" type="button" :disabled="busy || !!runtime" title="删除云端本体包" aria-label="删除云端本体包" @click="deleteRemoteBody(remote)"><Trash2 :size="15" /></button></div></div></div>
+          <div v-if="bodyVersions.length" class="body-version-list">
+            <p class="timeline-caption">本体版本与本地包</p>
+            <article v-for="version in bodyVersions" :key="version.versionId" class="body-version-row">
+              <div class="body-version-info">
+                <div class="body-version-title"><strong>{{ version.packagePath ? "ZIP 本体包" : "旧本体目录" }}</strong><span>{{ formatDate(version.createdAt) }}</span></div>
+                <small v-if="version.packagePath">本地缓存 · {{ version.excludedItems.length }} 项排除 · {{ bodyUploadLabel(version) }}</small>
+              </div>
+              <div class="body-version-size"><strong>{{ version.fileCount }} 个文件</strong><span>原始 {{ formatBytes(version.totalBytes) }}<template v-if="version.packageSize"> · ZIP {{ formatBytes(version.packageSize) }}</template></span></div>
+              <div v-if="version.packagePath" class="version-actions body-version-actions">
+                <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime || !baiduReady()" title="上传本体包到百度网盘" @click="uploadBody(version)"><Upload :size="15" />上传</button>
+                <button class="icon-button danger-button" type="button" :disabled="busy || !!runtime" title="删除本地本体包" aria-label="删除本地本体包" @click="deleteBodyPackage(version)"><Trash2 :size="15" /></button>
+              </div>
+            </article>
+          </div>
+          <div v-if="baiduReady() && remotePackages.length" class="body-version-list">
+            <p class="timeline-caption">百度网盘本体包</p>
+            <article v-for="remote in remotePackages" :key="remote.fsId" class="body-version-row remote-body-version-row">
+              <div class="body-version-info"><div class="body-version-title"><strong>{{ remote.versionId }}</strong><span>{{ remoteSyncLabel(remote) }}</span></div><small>云端 ZIP · SHA-256 {{ remote.packageSha256 || "未提供" }} · ID {{ remote.fsId }}</small></div>
+              <div class="body-version-size"><strong>{{ formatBytes(remote.size) }}</strong><span>云端文件</span></div>
+              <div class="version-actions body-version-actions remote-version-actions"><span class="remote-download-hint">请前往游戏商店下载</span><button class="icon-button danger-button" type="button" :disabled="busy || !!runtime" title="删除云端本体包" aria-label="删除云端本体包" @click="deleteRemoteBody(remote)"><Trash2 :size="15" /></button></div>
+            </article>
+          </div>
         </section>
       </div>
 

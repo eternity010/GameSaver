@@ -4,8 +4,9 @@ use crate::{
     repositories::{BaiduConfigRepository, GameRepository},
     services::{BaiduNetdiskClient, CloudAccountProfile, CloudAccountService, TaskService},
 };
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 use tauri::{AppHandle, Manager, State};
+use uuid::Uuid;
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -119,19 +120,34 @@ fn merge_profile(
         .map_err(|_| "读取本地游戏库失败".to_string())?
         .clone();
     let mut imported_games = 0;
+    let mut cloud_uid_to_local_uid = HashMap::new();
+    let mut cloud_uid_to_game_key = HashMap::new();
     for cloud_game in &profile.games {
-        if let Some(local) = candidate.games.iter_mut().find(|game| game.game_uid == cloud_game.game_uid) {
+        let game_key = if cloud_game.game_key.trim().is_empty() {
+            Game::derive_game_key(&cloud_game.display_name)
+        } else {
+            Game::derive_game_key(&cloud_game.game_key)
+        };
+        let local_index = candidate.games.iter().position(|game| {
+            game.game_key == game_key || game.game_uid == cloud_game.game_uid
+        });
+        let local_uid = if let Some(index) = local_index {
+            let local = &mut candidate.games[index];
+            local.game_key = game_key.clone();
             local.display_name = cloud_game.display_name.clone();
             local.launch = cloud_game.launch.clone();
             local.last_played_at = cloud_game.last_played_at.clone();
             local.cloud_status = CloudStatus::Synced;
+            local.game_uid.clone()
         } else {
+            let local_uid = Uuid::new_v4().to_string();
             let mut game = Game::new_pending(
                 &cloud_game.display_name,
-                state.games_root()?.join(&cloud_game.game_uid).to_string_lossy(),
+                state.games_root()?.join(&local_uid).to_string_lossy(),
                 &cloud_game.launch.executable_relative_path,
             );
-            game.game_uid = cloud_game.game_uid.clone();
+            game.game_uid = local_uid.clone();
+            game.game_key = game_key.clone();
             game.launch = cloud_game.launch.clone();
             game.save_profile_id = cloud_game.save_profile_id.clone();
             game.last_played_at = cloud_game.last_played_at.clone();
@@ -140,20 +156,44 @@ fn merge_profile(
             game.cloud_status = CloudStatus::Synced;
             candidate.games.push(game);
             imported_games += 1;
-        }
+            local_uid
+        };
+        cloud_uid_to_local_uid.insert(cloud_game.game_uid.clone(), local_uid);
+        cloud_uid_to_game_key.insert(cloud_game.game_uid.clone(), game_key);
     }
     for cloud_profile in &profile.save_profiles {
-        let Some(game) = candidate.games.iter().find(|game| game.game_uid == cloud_profile.game_uid).cloned() else {
+        let local_uid = cloud_uid_to_local_uid
+            .get(&cloud_profile.game_uid)
+            .cloned()
+            .or_else(|| {
+                let game_key = if cloud_profile.game_key.trim().is_empty() {
+                    cloud_uid_to_game_key.get(&cloud_profile.game_uid).cloned()
+                } else {
+                    Some(Game::derive_game_key(&cloud_profile.game_key))
+                }?;
+                candidate
+                    .games
+                    .iter()
+                    .find(|game| game.game_key == game_key)
+                    .map(|game| game.game_uid.clone())
+            });
+        let Some(local_uid) = local_uid else {
             continue;
         };
-        let existing = candidate.save_profiles.iter().find(|item| item.profile_id == cloud_profile.profile_id || item.game_uid == cloud_profile.game_uid).cloned();
+        let game = candidate
+            .games
+            .iter()
+            .find(|game| game.game_uid == local_uid)
+            .cloned()
+            .ok_or_else(|| "云端存档配置对应的本地游戏不存在".to_string())?;
+        let existing = candidate.save_profiles.iter().find(|item| item.profile_id == cloud_profile.profile_id || item.game_uid == local_uid).cloned();
         let scopes = cloud_profile.scopes.iter().enumerate().map(|(index, scope)| {
             let fallback = existing.as_ref().and_then(|item| item.scopes.get(index)).map(|item| item.root_path.as_str());
             resolve_scope(app, &game, scope, fallback)
         }).collect::<Result<Vec<_>, _>>()?;
         let save_profile = SaveProfile {
             profile_id: cloud_profile.profile_id.clone(),
-            game_uid: cloud_profile.game_uid.clone(),
+            game_uid: local_uid.clone(),
             executable_hash: cloud_profile.executable_hash.clone(),
             scopes,
             detection_evidence: cloud_profile.detection_evidence.clone(),
@@ -164,7 +204,7 @@ fn merge_profile(
         };
         candidate.save_profiles.retain(|item| item.profile_id != save_profile.profile_id && item.game_uid != save_profile.game_uid);
         candidate.save_profiles.push(save_profile);
-        if let Some(local) = candidate.games.iter_mut().find(|item| item.game_uid == cloud_profile.game_uid) {
+        if let Some(local) = candidate.games.iter_mut().find(|item| item.game_uid == local_uid) {
             local.save_profile_id = Some(cloud_profile.profile_id.clone());
         }
     }

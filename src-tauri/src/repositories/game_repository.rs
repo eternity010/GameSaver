@@ -22,13 +22,17 @@ impl GameRepository {
         let raw = fs::read_to_string(&path).map_err(|err| format!("read GameSaver store failed: {err}"))?;
         let mut store = serde_json::from_str::<AppStore>(&raw)
             .map_err(|err| format!("parse GameSaver store failed: {err}"))?;
-        if store.schema_version != CURRENT_SCHEMA_VERSION {
+        if store.schema_version > CURRENT_SCHEMA_VERSION {
             return Err(format!(
                 "unsupported GameSaver store schema: {} (expected {})",
                 store.schema_version, CURRENT_SCHEMA_VERSION
             ));
         }
+        let needs_migration = store.schema_version < CURRENT_SCHEMA_VERSION;
         store.normalize();
+        if needs_migration {
+            Self::persist(app, &store)?;
+        }
         Ok(store)
     }
 

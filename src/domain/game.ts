@@ -11,6 +11,7 @@ export interface LaunchConfig {
 
 export interface Game {
   gameUid: string;
+  gameKey: string;
   displayName: string;
   managedPath: string;
   lifecycle: GameLifecycle;
@@ -38,6 +39,7 @@ export interface GameBodyVersion {
   fileCount: number;
   totalBytes: number;
   packagePath?: string;
+  packageSize?: number;
   sha256?: string;
   excludedItems: string[];
   uploadStatus?: string;

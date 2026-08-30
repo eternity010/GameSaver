@@ -19,6 +19,8 @@ const CATALOG_FILE_NAME: &str = "game.json";
 #[serde(rename_all = "camelCase")]
 pub struct CloudBodyManifest {
     pub format_version: u32,
+    #[serde(default)]
+    pub game_key: String,
     pub game_uid: String,
     pub updated_at: String,
     pub versions: Vec<CloudBodyManifestVersion>,
@@ -28,6 +30,8 @@ pub struct CloudBodyManifest {
 #[serde(rename_all = "camelCase")]
 pub struct CloudGameCatalog {
     pub format_version: u32,
+    #[serde(default)]
+    pub game_key: String,
     pub game_uid: String,
     pub display_name: String,
     pub executable_relative_path: String,
@@ -81,6 +85,7 @@ pub struct RemoteBodyPackageList {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudGameSummary {
+    pub game_key: String,
     pub game_uid: String,
     pub display_name: String,
     pub executable_relative_path: Option<String>,
@@ -95,6 +100,17 @@ pub struct CloudGameSummary {
     pub total_bytes: Option<u64>,
     pub created_at: Option<String>,
     pub installed: bool,
+    #[serde(default)]
+    pub versions: Vec<RemoteBodyPackage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudGamePage {
+    pub games: Vec<CloudGameSummary>,
+    pub page: usize,
+    pub page_size: usize,
+    pub has_more: bool,
 }
 
 pub struct CloudManifestService;
@@ -111,6 +127,7 @@ impl CloudManifestService {
     pub fn catalog_from_game(game: &Game) -> CloudGameCatalog {
         CloudGameCatalog {
             format_version: MANIFEST_VERSION,
+            game_key: game.game_key.clone(),
             game_uid: game.game_uid.clone(),
             display_name: game.display_name.clone(),
             executable_relative_path: game.launch.executable_relative_path.clone(),
@@ -175,6 +192,7 @@ impl CloudManifestService {
     }
 
     pub fn build(
+        game_key: &str,
         game_uid: &str,
         body_versions: &[GameBodyVersion],
         updated_at: String,
@@ -200,6 +218,7 @@ impl CloudManifestService {
         versions.sort_by(|left, right| left.version_id.cmp(&right.version_id));
         CloudBodyManifest {
             format_version: MANIFEST_VERSION,
+            game_key: game_key.to_string(),
             game_uid: game_uid.to_string(),
             updated_at,
             versions,
@@ -209,6 +228,7 @@ impl CloudManifestService {
     pub fn rebuild(
         client: &BaiduNetdiskClient,
         remote_dir: &str,
+        game_key: &str,
         game_uid: &str,
         remote_files: &[RemoteFile],
         local_versions: &[GameBodyVersion],
@@ -227,7 +247,7 @@ impl CloudManifestService {
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default();
-        let local_manifest = Self::build(game_uid, local_versions, now_iso());
+        let local_manifest = Self::build(game_key, game_uid, local_versions, now_iso());
         let local_by_path = local_manifest
             .versions
             .iter()
@@ -279,6 +299,7 @@ impl CloudManifestService {
         versions.sort_by(|left, right| left.version_id.cmp(&right.version_id));
         let manifest = CloudBodyManifest {
             format_version: MANIFEST_VERSION,
+            game_key: game_key.to_string(),
             game_uid: game_uid.to_string(),
             updated_at: now_iso(),
             versions,
@@ -372,19 +393,15 @@ impl CloudManifestService {
                 });
                 let package_sha256 = manifest_version.and_then(|item| item.package_sha256.clone());
                 let sync_state = if let Some(local) = local_version {
-                    if manifest_version.is_some_and(|item| {
-                        item.package_sha256.is_some()
-                            && local.sha256.as_deref() != item.package_sha256.as_deref()
-                    }) {
-                        "mismatch"
-                    } else if manifest_version.is_some_and(|item| item.package_sha256.is_some()) {
-                        "synced"
-                    } else if manifest_version.is_some() {
-                        "unverified"
-                    } else if manifest.is_some() {
-                        "manifest_pending"
-                    } else {
-                        "unverified"
+                    match (local.sha256.as_deref(), package_sha256.as_deref()) {
+                        (Some(local_hash), Some(remote_hash)) if local_hash != remote_hash => {
+                            "mismatch"
+                        }
+                        (Some(_), Some(_)) => "synced",
+                        (_, Some(_)) if manifest_version.is_some() => "unverified",
+                        (_, None) if manifest_version.is_some() => "unverified",
+                        (_, None) if manifest.is_some() => "manifest_pending",
+                        _ => "unverified",
                     }
                 } else {
                     "remote_only"
@@ -460,9 +477,12 @@ fn validate(manifest: &CloudBodyManifest, remote_dir: &str) -> Result<(), String
     if manifest.format_version != MANIFEST_VERSION {
         return Err(format!("不支持的云端版本清单格式：{}", manifest.format_version));
     }
-    let expected_uid = game_uid_from_body_dir(remote_dir);
-    if manifest.game_uid != expected_uid {
-        return Err("云端版本清单不属于当前游戏".to_string());
+    let expected_game_key = game_key_from_body_dir(remote_dir);
+    if manifest.game_key != expected_game_key
+        || manifest.game_key.trim().is_empty()
+        || !is_valid_game_uid(&manifest.game_uid)
+    {
+        return Err("云端版本清单缺少游戏标识".to_string());
     }
     if manifest.versions.iter().any(|version| {
         version.version_id.trim().is_empty()
@@ -476,26 +496,36 @@ fn validate(manifest: &CloudBodyManifest, remote_dir: &str) -> Result<(), String
 }
 
 fn validate_catalog(catalog: &CloudGameCatalog, remote_dir: &str) -> Result<(), String> {
-    let expected_uid = game_uid_from_body_dir(remote_dir);
+    let expected_game_key = game_key_from_body_dir(remote_dir);
     if catalog.format_version != MANIFEST_VERSION {
         return Err(format!("不支持的云端游戏信息格式：{}", catalog.format_version));
     }
-    if catalog.game_uid != expected_uid {
+    if catalog.game_key != expected_game_key || !is_valid_game_uid(&catalog.game_uid) {
         return Err("云端游戏信息不属于当前游戏".to_string());
     }
-    if catalog.display_name.trim().is_empty() || catalog.executable_relative_path.trim().is_empty() {
+    if catalog.game_key.trim().is_empty()
+        || catalog.display_name.trim().is_empty()
+        || catalog.executable_relative_path.trim().is_empty()
+    {
         return Err("云端游戏信息缺少启动配置".to_string());
     }
     Ok(())
 }
 
-fn game_uid_from_body_dir(remote_dir: &str) -> &str {
+fn game_key_from_body_dir(remote_dir: &str) -> &str {
     remote_dir
         .trim_end_matches('/')
         .strip_suffix("/body")
         .and_then(|parent| parent.rsplit('/').next())
         .filter(|value| !value.is_empty())
         .unwrap_or_default()
+}
+
+fn is_valid_game_uid(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 fn file_name_without_extension(path: &str) -> String {
@@ -516,7 +546,7 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        game_uid_from_body_dir, validate, CloudBodyManifest, CloudBodyManifestVersion,
+        game_key_from_body_dir, validate, CloudBodyManifest, CloudBodyManifestVersion,
         CloudManifestService,
     };
     use crate::{domain::GameBodyVersion, services::RemoteFile};
@@ -546,33 +576,34 @@ mod tests {
         not_uploaded.version_id = "v2".to_string();
         not_uploaded.remote_path = None;
         not_uploaded.remote_fs_id = None;
-        let manifest = CloudManifestService::build("game-1", &[local.clone(), not_uploaded], "2".to_string());
+        let manifest = CloudManifestService::build("game one", "game-1", &[local.clone(), not_uploaded], "2".to_string());
         assert_eq!(manifest.versions.len(), 1);
         assert_eq!(manifest.versions[0].package_size, 30);
     }
 
     #[test]
-    fn extracts_game_uid_from_body_directory() {
+    fn extracts_game_key_from_body_directory() {
         assert_eq!(
-            game_uid_from_body_dir("/apps/GameSaver/games/game-1/body"),
-            "game-1"
+            game_key_from_body_dir("/apps/GameSaver/games/game-one/body"),
+            "game-one"
         );
         assert_eq!(
-            game_uid_from_body_dir("/apps/GameSaver/games/game-1/body/"),
-            "game-1"
+            game_key_from_body_dir("/apps/GameSaver/games/game-one/body/"),
+            "game-one"
         );
     }
 
     #[test]
-    fn validates_manifest_against_game_uid_not_body_segment() {
+    fn validates_manifest_using_game_key_and_remote_uid() {
         let manifest = CloudBodyManifest {
             format_version: 1,
+            game_key: "game-one".to_string(),
             game_uid: "game-1".to_string(),
             updated_at: "2".to_string(),
             versions: Vec::new(),
         };
-        assert!(validate(&manifest, "/apps/GameSaver/games/game-1/body").is_ok());
-        assert!(validate(&manifest, "/apps/GameSaver/games/game-2/body").is_err());
+        assert!(validate(&manifest, "/apps/GameSaver/games/game-one/body").is_ok());
+        assert!(validate(&manifest, "/apps/GameSaver/games/other-game/body").is_err());
     }
 
     #[test]
@@ -580,6 +611,7 @@ mod tests {
         let local = version();
         let manifest = CloudBodyManifest {
             format_version: 1,
+            game_key: "game one".to_string(),
             game_uid: "game-1".to_string(),
             updated_at: "2".to_string(),
             versions: vec![CloudBodyManifestVersion {
@@ -617,5 +649,44 @@ mod tests {
         assert_eq!(result.packages[1].version_id, "v1");
         assert_eq!(result.packages[1].sync_state, "mismatch");
         assert!(result.warnings.iter().any(|warning| warning.contains("v1")));
+    }
+
+    #[test]
+    fn project_does_not_compare_remote_zip_with_local_directory_version() {
+        let remote_path = "/apps/GameSaver/games/game-1/body/directory-version.zip";
+        let mut local_directory = version();
+        local_directory.version_id = "directory-version".to_string();
+        local_directory.sha256 = None;
+        local_directory.package_path = None;
+        local_directory.archive_path = "E:/GameSaverGames/games/.versions/old".to_string();
+        local_directory.remote_path = Some(remote_path.to_string());
+        let remote = RemoteFile {
+            path: remote_path.to_string(),
+            fs_id: 12,
+            size: 30,
+            md5: None,
+            is_dir: false,
+            server_mtime: None,
+        };
+        let manifest = CloudBodyManifest {
+            format_version: 1,
+            game_key: "game one".to_string(),
+            game_uid: "game-1".to_string(),
+            updated_at: "2".to_string(),
+            versions: vec![CloudBodyManifestVersion {
+                version_id: "directory-version".to_string(),
+                created_at: "2".to_string(),
+                package_path: remote_path.to_string(),
+                package_fs_id: remote.fs_id,
+                package_size: remote.size,
+                package_sha256: Some("remote-zip-hash".to_string()),
+                file_count: 2,
+                total_bytes: 20,
+            }],
+        };
+
+        let result = CloudManifestService::project(&[remote], Some(&manifest), &[local_directory]);
+        assert_eq!(result.packages[0].sync_state, "unverified");
+        assert!(result.warnings.is_empty());
     }
 }

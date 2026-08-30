@@ -42,6 +42,7 @@ export interface AppTask {
   progress: number;
   message: string;
   gameUid?: string;
+  createdAt?: string;
   error?: string;
   result?: unknown;
   retry?: TaskRetry;
@@ -50,6 +51,7 @@ export interface AppTask {
 export interface TaskRetry {
   operation: string;
   gameUid: string;
+  gameKey?: string;
   versionId?: string;
   remotePath?: string;
   remoteFsId?: number;
@@ -118,6 +120,7 @@ export interface RemoteBodyPackageList {
 }
 
 export interface CloudGameSummary {
+  gameKey: string;
   gameUid: string;
   displayName: string;
   executableRelativePath?: string;
@@ -132,6 +135,20 @@ export interface CloudGameSummary {
   totalBytes?: number;
   createdAt?: string;
   installed: boolean;
+  versions: CloudGameVersion[];
+}
+
+export interface CloudGameVersion {
+  versionId: string;
+  path: string;
+  fsId: number;
+  size: number;
+  packageSha256?: string;
+  fileCount?: number;
+  totalBytes?: number;
+  createdAt?: string;
+  syncState: string;
+  manifestVerified: boolean;
 }
 
 export function listGames(): Promise<Game[]> {
@@ -144,8 +161,10 @@ export function getGame(gameUid: string): Promise<Game | null> {
 
 export function startAddGameTask(input: {
   displayName: string;
+  gameKey: string;
   sourcePath: string;
   executablePath: string;
+  allowLargeSource: boolean;
 }): Promise<string> {
   return invokeCommand<string>("start_add_game_task", input);
 }
@@ -160,6 +179,10 @@ export function listTasks(): Promise<AppTask[]> {
 
 export function cancelTask(taskId: string): Promise<void> {
   return invokeCommand<void>("cancel_task", { taskId });
+}
+
+export function deleteTasks(taskIds: string[]): Promise<number> {
+  return invokeCommand<number>("delete_tasks", { taskIds });
 }
 
 export interface LibrarySettings {
@@ -243,10 +266,6 @@ export function packageGameBody(gameUid: string): Promise<string> {
   return invokeCommand<string>("package_game_body", { gameUid });
 }
 
-export function restoreGameBodyPackage(gameUid: string, versionId: string): Promise<string> {
-  return invokeCommand<string>("restore_game_body_package", { gameUid, versionId });
-}
-
 export function deleteGameBodyPackage(gameUid: string, versionId: string): Promise<string> {
   return invokeCommand<string>("delete_game_body_package", { gameUid, versionId });
 }
@@ -301,12 +320,19 @@ export function getBaiduQuota(): Promise<BaiduQuota> {
   return invokeCommand<BaiduQuota>("get_baidu_quota");
 }
 
-export function listCloudGames(): Promise<CloudGameSummary[]> {
-  return invokeCommand<CloudGameSummary[]>("list_cloud_games");
+export interface CloudGamePage {
+  games: CloudGameSummary[];
+  page: number;
+  pageSize: number;
+  hasMore: boolean;
 }
 
-export function installCloudGame(gameUid: string, remotePath: string, remoteFsId?: number): Promise<string> {
-  return invokeCommand<string>("install_cloud_game", { gameUid, remotePath, remoteFsId });
+export function listCloudGames(page = 1, pageSize = 9): Promise<CloudGamePage> {
+  return invokeCommand<CloudGamePage>("list_cloud_games", { page, pageSize });
+}
+
+export function installCloudGame(gameUid: string, gameKey: string | undefined, remotePath: string, remoteFsId?: number): Promise<string> {
+  return invokeCommand<string>("install_cloud_game", { gameUid, gameKey, remotePath, remoteFsId });
 }
 
 export function listRemoteBodyPackages(gameUid: string): Promise<RemoteBodyPackageList> {

@@ -27,6 +27,8 @@ pub struct CloudAccountProfile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudGameRecord {
+    #[serde(default)]
+    pub game_key: String,
     pub game_uid: String,
     pub display_name: String,
     pub launch: LaunchConfig,
@@ -40,6 +42,8 @@ pub struct CloudGameRecord {
 #[serde(rename_all = "camelCase")]
 pub struct CloudSaveProfile {
     pub profile_id: String,
+    #[serde(default)]
+    pub game_key: String,
     pub game_uid: String,
     pub executable_hash: String,
     pub scopes: Vec<CloudSaveScope>,
@@ -67,6 +71,8 @@ pub struct CloudSaveScope {
 #[serde(rename_all = "camelCase")]
 pub struct CloudBodyVersionRecord {
     pub version_id: String,
+    #[serde(default)]
+    pub game_key: String,
     pub game_uid: String,
     pub created_at: String,
     pub file_count: usize,
@@ -108,6 +114,7 @@ impl CloudAccountService {
         let games = active_games
             .iter()
             .map(|game| CloudGameRecord {
+                game_key: game.game_key.clone(),
                 game_uid: game.game_uid.clone(),
                 display_name: game.display_name.clone(),
                 launch: game.launch.clone(),
@@ -121,6 +128,11 @@ impl CloudAccountService {
             .filter(|profile| active_ids.contains(profile.game_uid.as_str()) && profile.enabled)
             .map(|profile| CloudSaveProfile {
                 profile_id: profile.profile_id.clone(),
+                game_key: active_games
+                    .iter()
+                    .find(|game| game.game_uid == profile.game_uid)
+                    .map(|game| game.game_key.clone())
+                    .unwrap_or_default(),
                 game_uid: profile.game_uid.clone(),
                 executable_hash: profile.executable_hash.clone(),
                 scopes: profile.scopes.iter().map(cloud_scope).collect(),
@@ -137,10 +149,20 @@ impl CloudAccountService {
                     && version
                         .remote_path
                         .as_deref()
-                        .is_some_and(|path| is_valid_remote_body_path(&version.game_uid, path))
+                        .is_some_and(|path| {
+                            active_games
+                                .iter()
+                                .find(|game| game.game_uid == version.game_uid)
+                                .is_some_and(|game| is_valid_remote_body_path(&game.game_key, path))
+                        })
             })
             .map(|version| CloudBodyVersionRecord {
                 version_id: version.version_id.clone(),
+                game_key: active_games
+                    .iter()
+                    .find(|game| game.game_uid == version.game_uid)
+                    .map(|game| game.game_key.clone())
+                    .unwrap_or_default(),
                 game_uid: version.game_uid.clone(),
                 created_at: version.created_at.clone(),
                 file_count: version.file_count,
@@ -245,8 +267,11 @@ fn cloud_scope(scope: &SaveScope) -> CloudSaveScope {
     }
 }
 
-fn is_valid_remote_body_path(game_uid: &str, path: &str) -> bool {
-    let prefix = format!("/apps/GameSaver/games/{game_uid}/body/");
+fn is_valid_remote_body_path(game_key: &str, path: &str) -> bool {
+    if !is_valid_game_key(game_key) {
+        return false;
+    }
+    let prefix = format!("/apps/GameSaver/games/{game_key}/body/");
     let Some(name) = path.strip_prefix(&prefix) else {
         return false;
     };
@@ -256,6 +281,16 @@ fn is_valid_remote_body_path(game_uid: &str, path: &str) -> bool {
         && name != "."
         && name != ".."
         && name.to_ascii_lowercase().ends_with(".zip")
+}
+
+fn is_valid_game_key(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.chars().any(char::is_control)
 }
 
 fn is_valid_relative_path(value: &str) -> bool {
@@ -294,11 +329,14 @@ fn validate(profile: &CloudAccountProfile) -> Result<(), String> {
         ));
     }
     let mut game_ids = HashSet::new();
+    let mut game_keys = HashSet::new();
     for game in &profile.games {
         if !is_valid_game_id(game.game_uid.trim())
             || game.display_name.trim().is_empty()
             || game.launch.executable_relative_path.trim().is_empty()
             || !game_ids.insert(game.game_uid.as_str())
+            || !is_valid_game_key(&game.game_key)
+            || !game_keys.insert(game.game_key.as_str())
             || !is_valid_relative_path(&game.launch.executable_relative_path)
             || game
                 .launch
@@ -313,6 +351,13 @@ fn validate(profile: &CloudAccountProfile) -> Result<(), String> {
     for save_profile in &profile.save_profiles {
         if save_profile.profile_id.trim().is_empty()
             || !game_ids.contains(save_profile.game_uid.as_str())
+            || (!save_profile.game_key.trim().is_empty()
+                && (!game_keys.contains(save_profile.game_key.as_str())
+                    || profile
+                        .games
+                        .iter()
+                        .find(|game| game.game_uid == save_profile.game_uid)
+                        .is_none_or(|game| game.game_key != save_profile.game_key)))
             || !profile_ids.insert(save_profile.profile_id.as_str())
             || save_profile.scopes.is_empty()
         {
@@ -352,12 +397,25 @@ fn validate(profile: &CloudAccountProfile) -> Result<(), String> {
     for version in &profile.body_versions {
         if version.version_id.trim().is_empty()
             || !game_ids.contains(version.game_uid.as_str())
+            || (!version.game_key.trim().is_empty()
+                && (!game_keys.contains(version.game_key.as_str())
+                    || profile
+                        .games
+                        .iter()
+                        .find(|game| game.game_uid == version.game_uid)
+                        .is_none_or(|game| game.game_key != version.game_key)))
             || version.file_count == 0
             || !version_ids.insert((version.game_uid.as_str(), version.version_id.as_str()))
             || version
                 .remote_path
                 .as_deref()
-                .is_none_or(|path| !is_valid_remote_body_path(&version.game_uid, path))
+                .is_none_or(|path| {
+                    profile
+                        .games
+                        .iter()
+                        .find(|game| game.game_uid == version.game_uid)
+                        .is_none_or(|game| !is_valid_remote_body_path(&game.game_key, path))
+                })
         {
             return Err("云端账号清单包含无效本体版本".to_string());
         }
@@ -428,7 +486,7 @@ mod tests {
             excluded_items: Vec::new(),
             upload_status: Some("synced".to_string()),
             remote_path: Some(format!(
-                "/apps/GameSaver/games/{game_uid}/body/remote-v1.zip"
+                "/apps/GameSaver/games/test game/body/remote-v1.zip"
             )),
             remote_fs_id: Some(42),
             remote_size: Some(10),
@@ -437,6 +495,34 @@ mod tests {
         let profile = CloudAccountService::build(&store, false);
         assert_eq!(profile.body_versions.len(), 1);
         assert_eq!(profile.body_versions[0].version_id, "remote-v1");
+        assert_eq!(profile.body_versions[0].game_key, "test game");
+    }
+
+    #[test]
+    fn account_profile_carries_game_key_for_save_profile() {
+        let mut store = AppStore::default();
+        let game_uid = active_game(&mut store);
+        store.save_profiles.push(SaveProfile::new(
+            game_uid,
+            "hash".to_string(),
+            vec![SaveScope {
+                root_type: SaveRootType::ManagedGame,
+                root_path: "E:/GameSaverGames/games/game-1".to_string(),
+                confirmed_files: vec!["save.dat".to_string()],
+                include_directories: Vec::new(),
+                exclude_exact: Vec::new(),
+                exclude_patterns: Vec::new(),
+                exclude_directories: Vec::new(),
+                unknown_file_policy: UnknownFilePolicy::Protect,
+                max_file_bytes: Some(10),
+            }],
+            90,
+            "1".to_string(),
+        ));
+
+        let profile = CloudAccountService::build(&store, false);
+        assert_eq!(profile.save_profiles.len(), 1);
+        assert_eq!(profile.save_profiles[0].game_key, "test game");
     }
 
     #[test]
@@ -484,6 +570,7 @@ mod tests {
         profile = CloudAccountService::build(&store, false);
         profile.body_versions.push(super::CloudBodyVersionRecord {
             version_id: "bad".to_string(),
+            game_key: profile.games[0].game_key.clone(),
             game_uid,
             created_at: "1".to_string(),
             file_count: 1,

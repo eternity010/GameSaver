@@ -4,7 +4,7 @@ use crate::{
     repositories::{BaiduConfigRepository, GameRepository},
     services::{
         BaiduConnectionStatus, BaiduNetdiskClient, BaiduQuota, BodyPackageService,
-        CloudGameSummary, CloudManifestService, GameLibraryService, RemoteBodyPackageList, RemoteFile, TaskService,
+        CloudGamePage, CloudGameSummary, CloudManifestService, GameLibraryService, RemoteBodyPackageList, RemoteFile, TaskService,
     },
 };
 use std::path::{Path, PathBuf};
@@ -34,11 +34,23 @@ pub fn get_baidu_quota(app: AppHandle) -> Result<BaiduQuota, String> {
 pub fn list_cloud_games(
     app: AppHandle,
     state: State<AppState>,
-) -> Result<Vec<CloudGameSummary>, String> {
+    page: Option<usize>,
+    page_size: Option<usize>,
+) -> Result<CloudGamePage, String> {
     let client = load_baidu_client(&app)?;
-    let roots = match client.list(REMOTE_ROOT) {
+    let page = page.unwrap_or(1).max(1);
+    let page_size = page_size.unwrap_or(9).clamp(1, 24);
+    let start = page.saturating_sub(1).saturating_mul(page_size);
+    let root_page = match client.list_page(REMOTE_ROOT, start, page_size) {
         Ok(files) => files,
-        Err(error) if error.contains("(-9)") || error.contains("(-8)") => return Ok(Vec::new()),
+        Err(error) if error.contains("(-9)") || error.contains("(-8)") => {
+            return Ok(CloudGamePage {
+                games: Vec::new(),
+                page,
+                page_size,
+                has_more: false,
+            })
+        }
         Err(error) => return Err(error),
     };
     let local_games = state
@@ -49,13 +61,14 @@ pub fn list_cloud_games(
         .clone();
     let temporary_root = app_data_dir(&app)?.join("cloud-manifest-temp");
     let mut result = Vec::new();
-    for root in roots.into_iter().filter(|file| file.is_dir) {
-        let Some(game_uid) = root.path.strip_prefix(&format!("{REMOTE_ROOT}/"))
+    for root in root_page.files.into_iter().filter(|file| file.is_dir) {
+        let Some(remote_segment) = root.path.strip_prefix(&format!("{REMOTE_ROOT}/"))
             .filter(|value| !value.is_empty() && !value.contains('/'))
         else {
             continue;
         };
-        let Ok(directory) = remote_body_dir(game_uid) else {
+        let remote_game_key = Game::derive_game_key(remote_segment);
+        let Ok(directory) = remote_body_dir(&remote_game_key) else {
             continue;
         };
         let files = match client.list(&directory) {
@@ -69,38 +82,64 @@ pub fn list_cloud_games(
         let catalog = CloudManifestService::read_catalog(&client, &files, &directory, &temporary_root)
             .ok()
             .flatten();
+        let catalog_game_key = catalog
+            .as_ref()
+            .map(|value| value.game_key.trim())
+            .filter(|value| !value.is_empty());
+        let manifest_game_key = manifest
+            .as_ref()
+            .map(|value| value.game_key.trim())
+            .filter(|value| !value.is_empty());
+        if catalog.is_none() && manifest.is_none() {
+            continue;
+        }
+        if catalog_game_key.is_some_and(|key| key != remote_game_key)
+            || manifest_game_key.is_some_and(|key| key != remote_game_key)
+        {
+            continue;
+        }
+        let local = local_games
+            .iter()
+            .find(|game| {
+                matches!(game.lifecycle, GameLifecycle::Active)
+                    && game.game_key == remote_game_key
+            });
+        let remote_game_uid = catalog
+            .as_ref()
+            .map(|value| value.game_uid.clone())
+            .or_else(|| manifest.as_ref().map(|value| value.game_uid.clone()))
+            .or_else(|| local.map(|game| game.game_uid.clone()))
+            .unwrap_or_default();
         let local_versions = state
             .store
             .lock()
             .map_err(|_| "读取本体版本信息失败".to_string())?
             .body_versions
             .iter()
-            .filter(|version| version.game_uid == game_uid)
+            .filter(|version| local.is_some_and(|game| version.game_uid == game.game_uid))
             .cloned()
             .collect::<Vec<_>>();
         let packages = CloudManifestService::project(&files, manifest.as_ref(), &local_versions).packages;
-        let Some(package) = packages.into_iter().max_by(|left, right| {
+        let Some(package) = packages.iter().max_by(|left, right| {
             left.created_at
                 .cmp(&right.created_at)
                 .then_with(|| left.version_id.cmp(&right.version_id))
-        }) else {
+        }).cloned() else {
             continue;
         };
-        let local = local_games.iter().find(|game| {
-            matches!(game.lifecycle, GameLifecycle::Active) && game.game_uid == game_uid
-        });
         let installed = local.is_some_and(|game| {
             Path::new(&game.managed_path)
                 .join(&game.launch.executable_relative_path)
                 .is_file()
         });
         result.push(CloudGameSummary {
-            game_uid: game_uid.to_string(),
+            game_key: remote_game_key.clone(),
+            game_uid: remote_game_uid,
             display_name: catalog
                 .as_ref()
                 .map(|value| value.display_name.clone())
                 .or_else(|| local.map(|game| game.display_name.clone()))
-                .unwrap_or_else(|| game_uid.to_string()),
+                .unwrap_or_else(|| remote_game_key.clone()),
             executable_relative_path: catalog
                 .as_ref()
                 .map(|value| value.executable_relative_path.clone())
@@ -123,10 +162,16 @@ pub fn list_cloud_games(
             total_bytes: package.total_bytes,
             created_at: package.created_at,
             installed,
+            versions: packages,
         });
     }
     result.sort_by(|left, right| left.display_name.to_lowercase().cmp(&right.display_name.to_lowercase()));
-    Ok(result)
+    Ok(CloudGamePage {
+        games: result,
+        page,
+        page_size,
+        has_more: root_page.has_more,
+    })
 }
 
 #[tauri::command]
@@ -134,12 +179,19 @@ pub fn install_cloud_game(
     app: AppHandle,
     state: State<AppState>,
     game_uid: String,
+    game_key: Option<String>,
     remote_path: String,
     remote_fs_id: Option<u64>,
 ) -> Result<String, String> {
     let game_uid = game_uid.trim().to_string();
+    let game_key = game_key
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| Game::derive_game_key(&value));
     let remote_path = remote_path.trim().to_string();
-    let directory = remote_body_dir(&game_uid)?;
+    let remote_game_key = game_key
+        .as_deref()
+        .ok_or_else(|| "云端游戏缺少 gameKey，无法定位本体包".to_string())?;
+    let directory = remote_body_dir(remote_game_key)?;
     validate_remote_package_path(&directory, &remote_path)?;
     reserve_transfer(&state, &game_uid)?;
     let task_id = match TaskService::create(
@@ -160,6 +212,7 @@ pub fn install_cloud_game(
         TaskRetry {
             operation: "install_cloud_game".to_string(),
             game_uid: game_uid.clone(),
+            game_key: game_key.clone(),
             version_id: None,
             remote_path: Some(remote_path.clone()),
             remote_fs_id,
@@ -175,6 +228,7 @@ pub fn install_cloud_game(
             &app_handle,
             &task_id_for_thread,
             &game_uid,
+            game_key.as_deref(),
             &remote_path,
             remote_fs_id,
         );
@@ -223,7 +277,7 @@ pub fn delete_remote_body_package(
     let game_uid = game_uid.trim().to_string();
     let remote_path = remote_path.trim().to_string();
     let game = load_game(&state, &game_uid)?;
-    let directory = remote_body_dir(&game_uid)?;
+    let directory = remote_body_dir(&game.game_key)?;
     validate_remote_package_path(&directory, &remote_path)?;
     reserve_transfer(&state, &game_uid)?;
     let task_id = match TaskService::create(&state, "delete_remote_body_package", Some(game_uid.clone()), "准备删除云端本体包") {
@@ -236,6 +290,7 @@ pub fn delete_remote_body_package(
     if let Err(error) = TaskService::set_retry(&state, &task_id, TaskRetry {
         operation: "delete_remote_body_package".to_string(),
         game_uid: game_uid.clone(),
+        game_key: None,
         version_id: None,
         remote_path: Some(remote_path.clone()),
         remote_fs_id,
@@ -273,7 +328,8 @@ pub fn list_remote_body_packages(
     let game_uid = game_uid.trim().to_string();
     ensure_game(&state, &game_uid)?;
     let client = load_baidu_client(&app)?;
-    let directory = remote_body_dir(&game_uid)?;
+    let game = load_game(&state, &game_uid)?;
+    let directory = remote_body_dir(&game.game_key)?;
     let files = match client.list(&directory) {
         Ok(files) => files,
         Err(error) if error.contains("(-9)") || error.contains("(-8)") => {
@@ -326,7 +382,7 @@ pub fn repair_cloud_body_manifest(
 ) -> Result<String, String> {
     let game_uid = game_uid.trim().to_string();
     let game = load_game(&state, &game_uid)?;
-    let directory = remote_body_dir(&game_uid)?;
+    let directory = remote_body_dir(&game.game_key)?;
     reserve_transfer(&state, &game_uid)?;
     let task_id = match TaskService::create(
         &state,
@@ -346,6 +402,7 @@ pub fn repair_cloud_body_manifest(
         TaskRetry {
             operation: "repair_cloud_body_manifest".to_string(),
             game_uid: game_uid.clone(),
+            game_key: None,
             version_id: None,
             remote_path: None,
             remote_fs_id: None,
@@ -431,6 +488,7 @@ pub fn upload_game_body_package(
         TaskRetry {
             operation: "upload_game_body_package".to_string(),
             game_uid: game_uid.clone(),
+            game_key: None,
             version_id: Some(version_id.clone()),
             remote_path: None,
             remote_fs_id: None,
@@ -500,7 +558,7 @@ pub fn download_game_body_package(
     let game_uid = game_uid.trim().to_string();
     let remote_path = remote_path.trim().to_string();
     let game = load_game(&state, &game_uid)?;
-    let directory = remote_body_dir(&game_uid)?;
+    let directory = remote_body_dir(&game.game_key)?;
     validate_remote_package_path(&directory, &remote_path)?;
     reserve_transfer(&state, &game_uid)?;
     let task_id = match TaskService::create(
@@ -521,6 +579,7 @@ pub fn download_game_body_package(
         TaskRetry {
             operation: "download_game_body_package".to_string(),
             game_uid: game_uid.clone(),
+            game_key: None,
             version_id: None,
             remote_path: Some(remote_path.clone()),
             remote_fs_id,
@@ -590,6 +649,7 @@ fn upload_body_task(
     let package_size = std::fs::metadata(package_path)
         .map_err(|error| format!("读取本体 ZIP 大小失败：{error}"))?
         .len();
+    TaskService::update(&state, task_id, TaskStatus::Running, 2, "正在校验本体 ZIP", None);
     let quota = load_baidu_client(app)?.quota()?;
     if quota.free < package_size {
         return Err(format!(
@@ -598,14 +658,14 @@ fn upload_body_task(
             quota.free / 1024 / 1024
         ));
     }
-    BodyPackageService::validate_package(
+    BodyPackageService::validate_package_for_upload(
         package_path,
         &game.game_uid,
         &game.launch.executable_relative_path,
         version.sha256.as_deref(),
     )?;
     let client = load_baidu_client(app)?;
-    let directory = remote_body_dir(&game.game_uid)?;
+    let directory = remote_body_dir(&game.game_key)?;
     client.ensure_directory(&directory)?;
     TaskService::update(&state, task_id, TaskStatus::Running, 5, "正在连接百度网盘", None);
     let remote_path = format!("{directory}/{}.zip", version.version_id);
@@ -807,19 +867,26 @@ fn sync_cloud_manifest(
     client: &BaiduNetdiskClient,
     game_uid: &str,
 ) -> Result<(), String> {
-    let remote_dir = remote_body_dir(game_uid)?;
-    client.ensure_directory(&remote_dir)?;
-    let remote_files = client.list(&remote_dir)?;
-    let versions = state
+    let store = state
         .store
         .lock()
         .map_err(|_| "读取本体版本记录失败".to_string())?
-        .body_versions
         .clone();
+    let game_key = store
+        .games
+        .iter()
+        .find(|game| game.game_uid == game_uid)
+        .map(|game| game.game_key.clone())
+        .ok_or_else(|| "游戏不存在，无法生成云端版本清单".to_string())?;
+    let remote_dir = remote_body_dir(&game_key)?;
+    client.ensure_directory(&remote_dir)?;
+    let remote_files = client.list(&remote_dir)?;
+    let versions = store.body_versions;
     let temporary_root = app_data_dir(app)?.join("cloud-manifest-temp");
     CloudManifestService::rebuild(
         client,
         &remote_dir,
+        &game_key,
         game_uid,
         &remote_files,
         &versions,
@@ -877,6 +944,7 @@ fn repair_cloud_body_manifest_task(
     let manifest = CloudManifestService::rebuild(
         &client,
         directory,
+        &game.game_key,
         &game.game_uid,
         &remote_files,
         &local_versions,
@@ -923,6 +991,7 @@ fn install_cloud_game_task(
     app: &AppHandle,
     task_id: &str,
     game_uid: &str,
+    game_key: Option<&str>,
     remote_path: &str,
     remote_fs_id: Option<u64>,
 ) -> Result<serde_json::Value, String> {
@@ -930,7 +999,8 @@ fn install_cloud_game_task(
     let app_data_dir = app_data_dir(app)?;
     let client = load_baidu_client(app)?;
     TaskService::update(&state, task_id, TaskStatus::Running, 3, "正在读取云端游戏信息", None);
-    let directory = remote_body_dir(game_uid)?;
+    let remote_game_key = game_key.ok_or_else(|| "云端游戏缺少 gameKey，无法定位本体包".to_string())?;
+    let directory = remote_body_dir(remote_game_key)?;
     let remote_files = client.list(&directory)?;
     let remote = remote_files
         .iter()
@@ -947,13 +1017,28 @@ fn install_cloud_game_task(
     let manifest = CloudManifestService::read(&client, &remote_files, &directory, &temporary_root)
         .ok()
         .flatten();
+    let existing = state
+        .store
+        .lock()
+        .map_err(|_| "读取本地游戏信息失败".to_string())?
+        .games
+        .iter()
+        .find(|game| {
+            game_key.is_some_and(|key| game.game_key == key)
+                || game.game_uid == game_uid
+        })
+        .cloned();
+    let local_uid = existing
+        .as_ref()
+        .map(|game| game.game_uid.clone())
+        .unwrap_or_else(|| game_uid.to_string());
     let local_versions = state
         .store
         .lock()
         .map_err(|_| "读取本地本体版本信息失败".to_string())?
         .body_versions
         .iter()
-        .filter(|version| version.game_uid == game_uid)
+        .filter(|version| version.game_uid == local_uid)
         .cloned()
         .collect::<Vec<_>>();
     let package = CloudManifestService::project(&remote_files, manifest.as_ref(), &local_versions)
@@ -962,15 +1047,10 @@ fn install_cloud_game_task(
         .find(|package| package.path == remote.path && package.fs_id == remote.fs_id);
     let expected_sha256 = package.as_ref().and_then(|package| package.package_sha256.as_deref());
     let games_root = state.games_root()?;
-    let managed_path = games_root.join(game_uid);
-    let existing = state
-        .store
-        .lock()
-        .map_err(|_| "读取本地游戏信息失败".to_string())?
-        .games
-        .iter()
-        .find(|game| game.game_uid == game_uid)
-        .cloned();
+    let managed_path = existing
+        .as_ref()
+        .map(|game| PathBuf::from(&game.managed_path))
+        .unwrap_or_else(|| games_root.join(&local_uid));
     if existing.as_ref().is_some_and(|game| {
         Path::new(&game.managed_path)
             .join(&game.launch.executable_relative_path)
@@ -983,7 +1063,7 @@ fn install_cloud_game_task(
         .map(|package| package.version_id.clone())
         .unwrap_or_else(|| remote_file_name_without_extension(remote_path));
     let cache_root = state.body_packages_root()?;
-    let package_path = BodyPackageService::package_path(&cache_root, game_uid, &version_id);
+    let package_path = BodyPackageService::package_path(&cache_root, &local_uid, &version_id);
     if package_path.is_file() {
         let _ = std::fs::remove_file(&package_path);
     }
@@ -996,7 +1076,7 @@ fn install_cloud_game_task(
         let _ = std::fs::remove_file(&package_path);
         return Err("任务已取消".to_string());
     }
-    let staging = games_root.join(format!(".{game_uid}.cloud-installing"));
+    let staging = games_root.join(format!(".{local_uid}.cloud-installing"));
     if staging.exists() {
         return Err("已有未完成的云端游戏安装暂存目录，请重启应用后重试".to_string());
     }
@@ -1004,7 +1084,7 @@ fn install_cloud_game_task(
     let body_manifest = BodyPackageService::extract_package(
         &package_path,
         &staging,
-        game_uid,
+        &local_uid,
         &catalog.executable_relative_path,
         expected_sha256,
         |progress, message| TaskService::update(&state, task_id, TaskStatus::Running, 82 + progress / 6, message, None),
@@ -1026,9 +1106,12 @@ fn install_cloud_game_task(
         .clone();
     let mut game = existing.unwrap_or_else(|| {
         let mut game = Game::new_pending(&catalog.display_name, managed_path.to_string_lossy(), &catalog.executable_relative_path);
-        game.game_uid = game_uid.to_string();
+        game.game_uid = local_uid.to_string();
         game
     });
+    if game.game_key.trim().is_empty() {
+        game.game_key = Game::derive_game_key(&catalog.game_key);
+    }
     game.display_name = catalog.display_name;
     game.managed_path = managed_path.to_string_lossy().to_string();
     game.lifecycle = GameLifecycle::Active;
@@ -1039,15 +1122,15 @@ fn install_cloud_game_task(
         arguments: catalog.arguments,
         working_directory_relative_path: catalog.working_directory_relative_path,
     };
-    if let Some(existing_game) = candidate.games.iter_mut().find(|item| item.game_uid == game_uid) {
+    if let Some(existing_game) = candidate.games.iter_mut().find(|item| item.game_uid == local_uid) {
         *existing_game = game.clone();
     } else {
         GameLibraryService::register_pending(&mut candidate, game.clone())?;
     }
-    candidate.body_versions.retain(|version| !(version.game_uid == game_uid && version.version_id == version_id));
+    candidate.body_versions.retain(|version| !(version.game_uid == local_uid && version.version_id == version_id));
     candidate.body_versions.push(GameBodyVersion {
         version_id: version_id.clone(),
-        game_uid: game_uid.to_string(),
+        game_uid: local_uid.to_string(),
         created_at: package.as_ref().and_then(|package| package.created_at.clone()).unwrap_or_else(now_iso),
         archive_path: String::new(),
         file_count: body_manifest.file_count,
@@ -1066,7 +1149,7 @@ fn install_cloud_game_task(
     }
     *state.store.lock().map_err(|_| "更新游戏记录失败".to_string())? = candidate;
     Ok(serde_json::json!({
-        "gameUid": game_uid,
+        "gameUid": local_uid,
         "versionId": version_id,
         "managedPath": managed_path,
         "fileCount": body_manifest.file_count,
@@ -1205,11 +1288,18 @@ fn body_package_cache_root(app: &AppHandle) -> Result<PathBuf, String> {
     app.state::<AppState>().body_packages_root()
 }
 
-fn remote_body_dir(game_uid: &str) -> Result<String, String> {
-    if game_uid.is_empty() || !game_uid.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_') {
-        return Err("游戏标识包含不支持的远程路径字符".to_string());
+fn remote_body_dir(game_key: &str) -> Result<String, String> {
+    let game_key = game_key.trim();
+    if game_key.is_empty()
+        || game_key == "."
+        || game_key == ".."
+        || game_key.contains('/')
+        || game_key.contains('\\')
+        || game_key.chars().any(char::is_control)
+    {
+        return Err("gameKey 包含不支持的远程路径字符".to_string());
     }
-    Ok(format!("{REMOTE_ROOT}/{game_uid}/body"))
+    Ok(format!("{REMOTE_ROOT}/{game_key}/body"))
 }
 
 fn validate_remote_package_path(directory: &str, path: &str) -> Result<(), String> {
@@ -1245,4 +1335,43 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 
 fn now_iso() -> String {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|value| value.as_secs().to_string()).unwrap_or_else(|_| "0".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{remote_body_dir, validate_remote_package_path};
+
+    #[test]
+    fn remote_body_directory_uses_game_key_verbatim() {
+        assert_eq!(
+            remote_body_dir("monster black market").unwrap(),
+            "/apps/GameSaver/games/monster black market/body"
+        );
+        assert_eq!(
+            remote_body_dir("肉遊びver1.0.7").unwrap(),
+            "/apps/GameSaver/games/肉遊びver1.0.7/body"
+        );
+    }
+
+    #[test]
+    fn remote_body_directory_rejects_path_segments() {
+        for value in ["", ".", "..", "game/name", r"game\name", "game\nname"] {
+            assert!(remote_body_dir(value).is_err(), "accepted unsafe gameKey: {value:?}");
+        }
+    }
+
+    #[test]
+    fn remote_package_path_must_stay_in_game_key_directory() {
+        let directory = remote_body_dir("monster black market").unwrap();
+        assert!(validate_remote_package_path(
+            &directory,
+            "/apps/GameSaver/games/monster black market/body/v1.zip"
+        )
+        .is_ok());
+        assert!(validate_remote_package_path(
+            &directory,
+            "/apps/GameSaver/games/other game/body/v1.zip"
+        )
+        .is_err());
+    }
 }

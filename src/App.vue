@@ -27,6 +27,13 @@ const cloudInstallUid = ref("");
 const cloudInstallProgress = ref(0);
 const cloudInstallMessage = ref("");
 const cloudInstallError = ref("");
+const cloudInstallNotice = ref("");
+const storeLoading = ref(false);
+const storeError = ref("");
+const storeLoaded = ref(false);
+const storePage = ref(1);
+const storeHasMore = ref(false);
+const STORE_PAGE_SIZE = 9;
 const elevationStatus = ref<ElevationStatus | null>(null);
 const elevationLoading = ref(false);
 const elevationError = ref("");
@@ -52,11 +59,6 @@ async function loadGames() {
   error.value = "";
   try {
     games.value = await listGames();
-    try {
-      cloudGames.value = await listCloudGames();
-    } catch {
-      cloudGames.value = [];
-    }
     if (selectedGame.value) {
       selectedGame.value = games.value.find((game) => game.gameUid === selectedGame.value?.gameUid) || selectedGame.value;
     }
@@ -65,6 +67,36 @@ async function loadGames() {
   } finally {
     loading.value = false;
   }
+}
+
+async function loadStore(force = false, page = 1) {
+  if (storeLoading.value || (!force && storeLoaded.value && page === storePage.value)) return;
+  storeLoading.value = true;
+  storeError.value = "";
+  try {
+    const result = await listCloudGames(page, STORE_PAGE_SIZE);
+    cloudGames.value = result.games;
+    storePage.value = result.page;
+    storeHasMore.value = result.hasMore;
+    storeLoaded.value = true;
+  } catch (reason) {
+    if (page === 1) {
+      cloudGames.value = [];
+      storeHasMore.value = false;
+    }
+    storeError.value = String(reason);
+  } finally {
+    storeLoading.value = false;
+  }
+}
+
+function refreshStore() {
+  void loadStore(true, 1);
+}
+
+function changeStorePage(page: number) {
+  if (page < 1 || (page > storePage.value && !storeHasMore.value)) return;
+  void loadStore(true, page);
 }
 
 async function loadElevationStatus() {
@@ -98,6 +130,11 @@ function openAddGame() {
   activePage.value = "add";
 }
 
+function openStore() {
+  activePage.value = "store";
+  void loadStore();
+}
+
 function openGame(game: Game, detailError = "") {
   selectedGame.value = game;
   selectedGameError.value = detailError;
@@ -127,8 +164,9 @@ async function installAndLaunch(cloudGame: CloudGameSummary) {
   cloudInstallProgress.value = 0;
   cloudInstallMessage.value = "准备下载游戏本体";
   cloudInstallError.value = "";
+  cloudInstallNotice.value = "";
   try {
-    const taskId = await installCloudGame(cloudGame.gameUid, cloudGame.packagePath, cloudGame.packageFsId);
+    const taskId = await installCloudGame(cloudGame.gameUid, cloudGame.gameKey, cloudGame.packagePath, cloudGame.packageFsId);
     await watchCloudInstall(taskId, cloudGame);
   } catch (reason) {
     cloudInstallUid.value = "";
@@ -142,9 +180,9 @@ async function watchCloudInstall(taskId: string, cloudGame: CloudGameSummary) {
   cloudInstallMessage.value = task.message;
   if (task.status === "success") {
     cloudInstallUid.value = "";
+    cloudInstallNotice.value = "安装完成，游戏已加入游戏库。可以从游戏库手动启动。";
     await loadGames();
-    const installed = games.value.find((game) => game.gameUid === cloudGame.gameUid);
-    if (installed) await quickLaunch(installed);
+    await loadStore(true, storePage.value);
     return;
   }
   if (task.status === "failed" || task.status === "cancelled" || task.status === "interrupted") {
@@ -171,7 +209,7 @@ async function finishAddGame() {
       </div>
       <nav class="primary-nav" aria-label="主导航">
         <button class="nav-item" :class="{ active: activePage === 'library' }" type="button" @click="activePage = 'library'"><Library :size="18" /><span>游戏库</span></button>
-        <button class="nav-item" :class="{ active: activePage === 'store' }" type="button" @click="activePage = 'store'"><CloudDownload :size="18" /><span>游戏商店</span></button>
+        <button class="nav-item" :class="{ active: activePage === 'store' }" type="button" @click="openStore"><CloudDownload :size="18" /><span>游戏商店</span></button>
         <button class="nav-item" :class="{ active: activePage === 'add' }" type="button" @click="openAddGame"><Plus :size="18" /><span>添加游戏</span></button>
         <button class="nav-item" :class="{ active: activePage === 'transfers' }" type="button" @click="activePage = 'transfers'"><CloudUpload :size="18" /><span>传输中心</span></button>
       </nav>
@@ -211,7 +249,7 @@ async function finishAddGame() {
 
       <AddGameWizard v-if="activePage === 'add'" @back="activePage = 'library'" @completed="finishAddGame" />
       <GameDetailPage v-else-if="activePage === 'detail' && selectedGame" :game="selectedGame" :initial-error="selectedGameError" @back="activePage = 'library'" @settings="activePage = 'settings'" @refresh="loadGames" />
-      <GameStorePage v-else-if="activePage === 'store'" :games="cloudGames" :search="search" :install-uid="cloudInstallUid" :install-progress="cloudInstallProgress" :install-message="cloudInstallMessage" :install-error="cloudInstallError" @install="installAndLaunch" />
+      <GameStorePage v-else-if="activePage === 'store'" :games="cloudGames" :search="search" :loading="storeLoading" :load-error="storeError" :install-uid="cloudInstallUid" :install-progress="cloudInstallProgress" :install-message="cloudInstallMessage" :install-error="cloudInstallError" :install-notice="cloudInstallNotice" :page="storePage" :has-more="storeHasMore" @install="installAndLaunch" @retry="refreshStore" @refresh="refreshStore" @page-change="changeStorePage" />
       <TransferCenter v-else-if="activePage === 'transfers'" :games="games" :cloud-games="cloudGames" />
       <PlatformSettings v-else-if="activePage === 'settings'" />
 
