@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref } from "vue";
-import { ArrowLeft, Check, CheckCircle2, FolderOpen, Gamepad2, LoaderCircle, Plus, Trash2, X } from "@lucide/vue";
+import { AlertTriangle, ArrowLeft, Check, CheckCircle2, FolderOpen, Gamepad2, LoaderCircle, Plus, Trash2, X } from "@lucide/vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   cancelSaveLearning,
@@ -35,6 +35,8 @@ const message = ref("");
 const error = ref("");
 const completedGame = ref<Game | null>(null);
 const confirming = ref(false);
+const showLargeConfirmModal = ref(false);
+const largeConfirmMessage = ref("");
 const newFileByScope = ref<Record<number, string>>({});
 const newPatternByScope = ref<Record<number, string>>({});
 let pollTimer: ReturnType<typeof setTimeout> | undefined;
@@ -81,7 +83,9 @@ function stopPolling() {
 function handleTaskFailure(task: AppTask, cancelledMessage: string, failedMessage: string) {
   stopPolling();
   taskId.value = "";
-  error.value = task.error || (task.status === "cancelled" ? cancelledMessage : failedMessage);
+  const taskError = task.error || "";
+  const cleanError = taskError.replace(/^LARGE_SOURCE_REQUIRED:\s*/, "");
+  error.value = cleanError || (task.status === "cancelled" ? cancelledMessage : failedMessage);
   phase.value = completedGame.value ? "ready" : "form";
 }
 
@@ -127,16 +131,29 @@ async function submitAdd(allowLargeSource: boolean) {
       message.value = "游戏本体已准备好";
     }, "已取消复制", "添加游戏失败", async (task) => {
       const warning = task.error || "";
-      if (!allowLargeSource && warning.includes("超过 3 GB")) {
+      const isLargeSource = warning.startsWith("LARGE_SOURCE_REQUIRED:") || warning.includes("超过 3 GB");
+      if (!allowLargeSource && isLargeSource) {
         error.value = "";
-        if (window.confirm(warning)) await submitAdd(true);
-        else error.value = warning;
+        largeConfirmMessage.value = warning.replace(/^LARGE_SOURCE_REQUIRED:\s*/, "");
+        showLargeConfirmModal.value = true;
       }
     });
   } catch (reason) {
     phase.value = "form";
     error.value = String(reason);
   }
+}
+
+function handleConfirmLargeSource() {
+  showLargeConfirmModal.value = false;
+  largeConfirmMessage.value = "";
+  void submitAdd(true);
+}
+
+function handleCancelLargeSource() {
+  showLargeConfirmModal.value = false;
+  error.value = largeConfirmMessage.value;
+  largeConfirmMessage.value = "";
 }
 
 async function start() {
@@ -315,4 +332,26 @@ onUnmounted(stopPolling);
 
     <div v-else class="wizard-success"><CheckCircle2 :size="34" /><div><h2>{{ completedGame?.displayName }} 已加入游戏库</h2><p>存档保护范围已确认，现在可以从游戏库启动它。</p></div><button class="primary-button" type="button" @click="emit('completed', completedGame!)">返回游戏库</button></div>
   </section>
+
+  <Teleport to="body">
+    <div v-if="showLargeConfirmModal" class="cover-editor-overlay" @click.self="handleCancelLargeSource">
+      <section class="confirm-dialog" role="dialog" aria-modal="true" aria-label="游戏大小确认">
+        <header class="confirm-dialog-header">
+          <div class="confirm-dialog-title">
+            <AlertTriangle :size="20" class="warning-icon" />
+            <h2>游戏本体大小确认</h2>
+          </div>
+          <button class="icon-button" type="button" title="关闭" aria-label="关闭" @click="handleCancelLargeSource"><X :size="18" /></button>
+        </header>
+        <div class="confirm-dialog-content">
+          <p>{{ largeConfirmMessage }}</p>
+          <p class="field-note">如果此目录确实是游戏本体且大小正常，请点击「确认继续」；若误选了上级文件夹（如整个盘符或多游戏合集），请点击「取消」重新选择。</p>
+        </div>
+        <footer class="confirm-dialog-footer">
+          <button class="secondary-button" type="button" @click="handleCancelLargeSource">取消并重新选择</button>
+          <button class="primary-button" type="button" @click="handleConfirmLargeSource">确认继续复制</button>
+        </footer>
+      </section>
+    </div>
+  </Teleport>
 </template>

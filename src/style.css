@@ -271,8 +271,16 @@ h1 { margin-bottom: 0; font-size: 30px; letter-spacing: 0; }
 .cover-editor-controls label { display: grid; grid-template-columns: auto auto; gap: 7px 12px; align-items: center; color: var(--text-secondary); font-size: 12px; }
 .cover-editor-controls label strong { justify-self: end; color: var(--text-primary); font-size: 12px; }
 .cover-editor-controls input { grid-column: 1 / -1; width: 100%; accent-color: var(--brand); }
-.cover-editor-controls p { margin: 0; color: #8792a2; font-size: 12px; line-height: 1.5; }
 .cover-editor-footer { display: flex; justify-content: flex-end; gap: 10px; padding: 16px 24px; border-top: 1px solid #303948; background: #161b22; }
+.confirm-dialog { width: min(520px, 100%); border: 1px solid #3a4658; border-radius: 8px; background: #171c24; box-shadow: 0 24px 80px rgba(0, 0, 0, .48); overflow: hidden; }
+.confirm-dialog-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 20px; border-bottom: 1px solid #303948; }
+.confirm-dialog-title { display: flex; align-items: center; gap: 10px; }
+.confirm-dialog-title h2 { margin: 0; font-size: 17px; }
+.confirm-dialog-content { padding: 20px; }
+.confirm-dialog-content p { margin: 0 0 10px; color: var(--text-primary); font-size: 14px; line-height: 1.6; }
+.confirm-dialog-content .field-note { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
+.confirm-dialog-footer { display: flex; justify-content: flex-end; gap: 10px; padding: 14px 20px; border-top: 1px solid #303948; background: #161b22; }
+.warning-icon { color: #f5a623; }
 .detail-hero-copy { display: flex; align-items: flex-start; flex-direction: column; padding: 8px 0; }
 .detail-hero-copy .status-label { margin-bottom: 12px; }
 .detail-hero-copy h2 { margin-bottom: 8px; font-size: 24px; }

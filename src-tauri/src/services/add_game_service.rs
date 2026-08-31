@@ -1,7 +1,8 @@
 use std::{fs, path::{Path, PathBuf}};
 use walkdir::WalkDir;
 
-const LARGE_SOURCE_WARNING_BYTES: u64 = 3_000_000_000;
+pub const LARGE_SOURCE_WARNING_PREFIX: &str = "LARGE_SOURCE_REQUIRED:";
+pub const LARGE_SOURCE_WARNING_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 
 pub struct AddGameService;
 
@@ -80,7 +81,7 @@ impl AddGameService {
         }
         if needs_large_source_confirmation(total_bytes, allow_large_source) {
             return Err(format!(
-                "游戏本体大小为 {}，超过 3 GB。请确认游戏大小是否正常；确认后将继续复制。",
+                "{LARGE_SOURCE_WARNING_PREFIX}游戏本体大小为 {}，超过 3 GB。请确认游戏大小是否正常；确认后将继续复制。",
                 format_size(total_bytes)
             ));
         }
@@ -201,10 +202,11 @@ mod tests {
     }
 
     #[test]
-    fn large_source_warning_uses_decimal_three_gigabyte_boundary() {
-        assert!(!needs_large_source_confirmation(3_000_000_000, false));
-        assert!(needs_large_source_confirmation(3_000_000_001, false));
-        assert!(!needs_large_source_confirmation(3_000_000_001, true));
+    fn large_source_warning_uses_binary_three_gigabyte_boundary() {
+        let boundary = 3 * 1024 * 1024 * 1024;
+        assert!(!needs_large_source_confirmation(boundary, false));
+        assert!(needs_large_source_confirmation(boundary + 1, false));
+        assert!(!needs_large_source_confirmation(boundary + 1, true));
     }
 }
 
