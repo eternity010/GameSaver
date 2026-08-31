@@ -26,6 +26,14 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all"
+    "targets": "all",
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "bin/7z.exe",
+      "bin/7z.dll",
+      "bin/7z-license.txt"
+    ]
   }
 }
