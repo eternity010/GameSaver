@@ -113,6 +113,15 @@ pub struct CloudGamePage {
     pub has_more: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedEntry<T> {
+    pub fs_id: u64,
+    pub size: u64,
+    pub server_mtime: Option<u64>,
+    pub data: T,
+}
+
 pub struct CloudManifestService;
 
 impl CloudManifestService {
@@ -122,6 +131,95 @@ impl CloudManifestService {
 
     pub fn catalog_path(remote_dir: &str) -> String {
         format!("{remote_dir}/{CATALOG_FILE_NAME}")
+    }
+
+    pub fn cache_folder_name(remote_dir: &str) -> String {
+        remote_dir
+            .replace('/', "_")
+            .replace('\\', "_")
+            .replace(':', "_")
+            .trim_matches('_')
+            .to_string()
+    }
+
+    pub fn load_cached_catalog(
+        cache_root: &Path,
+        remote_dir: &str,
+        remote: &RemoteFile,
+    ) -> Option<CloudGameCatalog> {
+        let path = cache_root
+            .join(Self::cache_folder_name(remote_dir))
+            .join("catalog.cache.json");
+        let bytes = fs::read(path).ok()?;
+        let cached = serde_json::from_slice::<CachedEntry<CloudGameCatalog>>(&bytes).ok()?;
+        if cached.fs_id == remote.fs_id
+            && cached.size == remote.size
+            && cached.server_mtime == remote.server_mtime
+            && validate_catalog(&cached.data, remote_dir).is_ok()
+        {
+            Some(cached.data)
+        } else {
+            None
+        }
+    }
+
+    pub fn save_cached_catalog(
+        cache_root: &Path,
+        remote_dir: &str,
+        remote: &RemoteFile,
+        data: &CloudGameCatalog,
+    ) -> Result<(), String> {
+        let dir = cache_root.join(Self::cache_folder_name(remote_dir));
+        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let path = dir.join("catalog.cache.json");
+        let entry = CachedEntry {
+            fs_id: remote.fs_id,
+            size: remote.size,
+            server_mtime: remote.server_mtime,
+            data: data.clone(),
+        };
+        let bytes = serde_json::to_vec(&entry).map_err(|error| error.to_string())?;
+        fs::write(path, bytes).map_err(|error| error.to_string())
+    }
+
+    pub fn load_cached_manifest(
+        cache_root: &Path,
+        remote_dir: &str,
+        remote: &RemoteFile,
+    ) -> Option<CloudBodyManifest> {
+        let path = cache_root
+            .join(Self::cache_folder_name(remote_dir))
+            .join("manifest.cache.json");
+        let bytes = fs::read(path).ok()?;
+        let cached = serde_json::from_slice::<CachedEntry<CloudBodyManifest>>(&bytes).ok()?;
+        if cached.fs_id == remote.fs_id
+            && cached.size == remote.size
+            && cached.server_mtime == remote.server_mtime
+            && validate(&cached.data, remote_dir).is_ok()
+        {
+            Some(cached.data)
+        } else {
+            None
+        }
+    }
+
+    pub fn save_cached_manifest(
+        cache_root: &Path,
+        remote_dir: &str,
+        remote: &RemoteFile,
+        data: &CloudBodyManifest,
+    ) -> Result<(), String> {
+        let dir = cache_root.join(Self::cache_folder_name(remote_dir));
+        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let path = dir.join("manifest.cache.json");
+        let entry = CachedEntry {
+            fs_id: remote.fs_id,
+            size: remote.size,
+            server_mtime: remote.server_mtime,
+            data: data.clone(),
+        };
+        let bytes = serde_json::to_vec(&entry).map_err(|error| error.to_string())?;
+        fs::write(path, bytes).map_err(|error| error.to_string())
     }
 
     pub fn catalog_from_game(game: &Game) -> CloudGameCatalog {
@@ -166,6 +264,7 @@ impl CloudManifestService {
         remote_files: &[RemoteFile],
         remote_dir: &str,
         temporary_root: &Path,
+        cache_root: Option<&Path>,
     ) -> Result<Option<CloudGameCatalog>, String> {
         let catalog_path = Self::catalog_path(remote_dir);
         let Some(remote_catalog) = remote_files
@@ -174,6 +273,11 @@ impl CloudManifestService {
         else {
             return Ok(None);
         };
+        if let Some(cache_root) = cache_root {
+            if let Some(cached) = Self::load_cached_catalog(cache_root, remote_dir, remote_catalog) {
+                return Ok(Some(cached));
+            }
+        }
         fs::create_dir_all(temporary_root)
             .map_err(|error| format!("创建云端游戏信息下载目录失败：{error}"))?;
         let temporary = temporary_root.join(format!(".cloud-game-download-{}.json", Uuid::new_v4().simple()));
@@ -184,6 +288,9 @@ impl CloudManifestService {
             let catalog = serde_json::from_slice::<CloudGameCatalog>(&raw)
                 .map_err(|error| format!("解析云端游戏信息失败：{error}"))?;
             validate_catalog(&catalog, remote_dir)?;
+            if let Some(cache_root) = cache_root {
+                let _ = Self::save_cached_catalog(cache_root, remote_dir, remote_catalog, &catalog);
+            }
             Ok(catalog)
         })();
         let _ = fs::remove_file(&temporary);
@@ -234,7 +341,7 @@ impl CloudManifestService {
         local_versions: &[GameBodyVersion],
         temporary_root: &Path,
     ) -> Result<CloudBodyManifest, String> {
-        let existing = Self::read(client, remote_files, remote_dir, temporary_root)
+        let existing = Self::read(client, remote_files, remote_dir, temporary_root, None)
             .ok()
             .flatten();
         let existing_by_path = existing
@@ -342,6 +449,7 @@ impl CloudManifestService {
         remote_files: &[RemoteFile],
         remote_dir: &str,
         temporary_root: &Path,
+        cache_root: Option<&Path>,
     ) -> Result<Option<CloudBodyManifest>, String> {
         let manifest_path = Self::manifest_path(remote_dir);
         let Some(remote_manifest) = remote_files
@@ -350,6 +458,11 @@ impl CloudManifestService {
         else {
             return Ok(None);
         };
+        if let Some(cache_root) = cache_root {
+            if let Some(cached) = Self::load_cached_manifest(cache_root, remote_dir, remote_manifest) {
+                return Ok(Some(cached));
+            }
+        }
         fs::create_dir_all(temporary_root)
             .map_err(|error| format!("创建云端版本清单下载目录失败：{error}"))?;
         let temporary = temporary_root.join(format!(".cloud-manifest-download-{}.json", Uuid::new_v4().simple()));
@@ -360,6 +473,9 @@ impl CloudManifestService {
             let manifest = serde_json::from_slice::<CloudBodyManifest>(&raw)
                 .map_err(|error| format!("解析云端版本清单失败：{error}"))?;
             validate(&manifest, remote_dir)?;
+            if let Some(cache_root) = cache_root {
+                let _ = Self::save_cached_manifest(cache_root, remote_dir, remote_manifest, &manifest);
+            }
             Ok(manifest)
         })();
         let _ = fs::remove_file(&temporary);
@@ -547,9 +663,11 @@ fn now_iso() -> String {
 mod tests {
     use super::{
         game_key_from_body_dir, validate, CloudBodyManifest, CloudBodyManifestVersion,
-        CloudManifestService,
+        CloudGameCatalog, CloudManifestService,
     };
     use crate::{domain::GameBodyVersion, services::RemoteFile};
+    use std::fs;
+    use uuid::Uuid;
 
     fn version() -> GameBodyVersion {
         GameBodyVersion {
@@ -688,5 +806,42 @@ mod tests {
         let result = CloudManifestService::project(&[remote], Some(&manifest), &[local_directory]);
         assert_eq!(result.packages[0].sync_state, "unverified");
         assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn cache_roundtrip_loads_matching_catalog_and_manifest() {
+        let temp_dir = std::env::temp_dir().join(format!("cloud-manifest-cache-test-{}", Uuid::new_v4()));
+        let remote_dir = "/apps/GameSaver/games/game-test/body";
+        let remote_file = RemoteFile {
+            path: format!("{remote_dir}/game.json"),
+            fs_id: 101,
+            size: 200,
+            md5: None,
+            is_dir: false,
+            server_mtime: Some(1700000000),
+        };
+        let catalog = CloudGameCatalog {
+            format_version: 1,
+            game_key: "game-test".to_string(),
+            game_uid: "uid-1".to_string(),
+            display_name: "Test Game".to_string(),
+            executable_relative_path: "game.exe".to_string(),
+            arguments: vec!["--debug".to_string()],
+            working_directory_relative_path: None,
+        };
+
+        CloudManifestService::save_cached_catalog(&temp_dir, remote_dir, &remote_file, &catalog)
+            .expect("save cached catalog");
+
+        let loaded = CloudManifestService::load_cached_catalog(&temp_dir, remote_dir, &remote_file);
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().display_name, "Test Game");
+
+        // Mismatched fs_id should return None (cache miss)
+        let mut modified_remote = remote_file.clone();
+        modified_remote.fs_id = 102;
+        assert!(CloudManifestService::load_cached_catalog(&temp_dir, remote_dir, &modified_remote).is_none());
+
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }

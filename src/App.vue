@@ -161,6 +161,7 @@ async function restartWithAdmin() {
 onMounted(() => {
   void loadGames();
   void loadElevationStatus();
+  void loadStore();
 });
 onUnmounted(() => {
   if (cloudInstallTimer) clearTimeout(cloudInstallTimer);

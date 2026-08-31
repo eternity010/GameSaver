@@ -57,125 +57,152 @@ pub fn list_cloud_games(
         }
         Err(error) => return Err(error),
     };
-    let local_games = state
+    let local_store = state
         .store
         .lock()
         .map_err(|_| "读取本地游戏信息失败".to_string())?
-        .games
         .clone();
-    let temporary_root = app_data_dir(&app)?.join("cloud-manifest-temp");
-    let mut result = Vec::new();
-    for root in root_page.files.into_iter().filter(|file| file.is_dir) {
-        let Some(remote_segment) = root
-            .path
-            .strip_prefix(&format!("{REMOTE_ROOT}/"))
-            .filter(|value| !value.is_empty() && !value.contains('/'))
-        else {
-            continue;
-        };
-        let remote_game_key = Game::derive_game_key(remote_segment);
-        let Ok(directory) = remote_body_dir(&remote_game_key) else {
-            continue;
-        };
-        let files = match client.list(&directory) {
-            Ok(files) => files,
-            Err(error) if error.contains("(-9)") || error.contains("(-8)") => continue,
-            Err(error) => return Err(error),
-        };
-        let manifest = CloudManifestService::read(&client, &files, &directory, &temporary_root)
-            .ok()
-            .flatten();
-        let catalog =
-            CloudManifestService::read_catalog(&client, &files, &directory, &temporary_root)
+    let local_games = local_store.games;
+    let local_body_versions = local_store.body_versions;
+    let base_data_dir = app_data_dir(&app)?;
+    let temporary_root = base_data_dir.join("cloud-manifest-temp");
+    let cache_root = base_data_dir.join("cloud-manifest-cache");
+
+    let directories = root_page
+        .files
+        .into_iter()
+        .filter(|file| file.is_dir)
+        .filter_map(|root| {
+            let remote_segment = root
+                .path
+                .strip_prefix(&format!("{REMOTE_ROOT}/"))
+                .filter(|value| !value.is_empty() && !value.contains('/'))?;
+            let remote_game_key = Game::derive_game_key(remote_segment);
+            let directory = remote_body_dir(&remote_game_key).ok()?;
+            Some((remote_game_key, directory))
+        })
+        .collect::<Vec<_>>();
+
+    let summaries = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(directories.len());
+        for (remote_game_key, directory) in directories {
+            let client_ref = &client;
+            let temporary_root_ref = &temporary_root;
+            let cache_root_ref = &cache_root;
+            let local_games_ref = &local_games;
+            let local_body_versions_ref = &local_body_versions;
+
+            handles.push(scope.spawn(move || -> Option<CloudGameSummary> {
+                let files = match client_ref.list(&directory) {
+                    Ok(files) => files,
+                    Err(_) => return None,
+                };
+                let manifest = CloudManifestService::read(
+                    client_ref,
+                    &files,
+                    &directory,
+                    temporary_root_ref,
+                    Some(cache_root_ref),
+                )
                 .ok()
                 .flatten();
-        let catalog_game_key = catalog
-            .as_ref()
-            .map(|value| value.game_key.trim())
-            .filter(|value| !value.is_empty());
-        let manifest_game_key = manifest
-            .as_ref()
-            .map(|value| value.game_key.trim())
-            .filter(|value| !value.is_empty());
-        if catalog.is_none() && manifest.is_none() {
-            continue;
+                let catalog = CloudManifestService::read_catalog(
+                    client_ref,
+                    &files,
+                    &directory,
+                    temporary_root_ref,
+                    Some(cache_root_ref),
+                )
+                .ok()
+                .flatten();
+                let catalog_game_key = catalog
+                    .as_ref()
+                    .map(|value| value.game_key.trim())
+                    .filter(|value| !value.is_empty());
+                let manifest_game_key = manifest
+                    .as_ref()
+                    .map(|value| value.game_key.trim())
+                    .filter(|value| !value.is_empty());
+                if catalog.is_none() && manifest.is_none() {
+                    return None;
+                }
+                if catalog_game_key.is_some_and(|key| key != remote_game_key)
+                    || manifest_game_key.is_some_and(|key| key != remote_game_key)
+                {
+                    return None;
+                }
+                let local = local_games_ref.iter().find(|game| {
+                    matches!(game.lifecycle, GameLifecycle::Active) && game.game_key == remote_game_key
+                });
+                let remote_game_uid = catalog
+                    .as_ref()
+                    .map(|value| value.game_uid.clone())
+                    .or_else(|| manifest.as_ref().map(|value| value.game_uid.clone()))
+                    .or_else(|| local.map(|game| game.game_uid.clone()))
+                    .unwrap_or_default();
+                let local_versions = local_body_versions_ref
+                    .iter()
+                    .filter(|version| local.is_some_and(|game| version.game_uid == game.game_uid))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let packages =
+                    CloudManifestService::project(&files, manifest.as_ref(), &local_versions).packages;
+                let package = packages
+                    .iter()
+                    .max_by(|left, right| {
+                        left.created_at
+                            .cmp(&right.created_at)
+                            .then_with(|| left.version_id.cmp(&right.version_id))
+                    })
+                    .cloned()?;
+                let installed = local.is_some_and(|game| {
+                    Path::new(&game.managed_path)
+                        .join(&game.launch.executable_relative_path)
+                        .is_file()
+                });
+                Some(CloudGameSummary {
+                    game_key: remote_game_key.clone(),
+                    game_uid: remote_game_uid,
+                    display_name: catalog
+                        .as_ref()
+                        .map(|value| value.display_name.clone())
+                        .or_else(|| local.map(|game| game.display_name.clone()))
+                        .unwrap_or_else(|| remote_game_key.clone()),
+                    executable_relative_path: catalog
+                        .as_ref()
+                        .map(|value| value.executable_relative_path.clone())
+                        .or_else(|| local.map(|game| game.launch.executable_relative_path.clone())),
+                    arguments: catalog
+                        .as_ref()
+                        .map(|value| value.arguments.clone())
+                        .or_else(|| local.map(|game| game.launch.arguments.clone()))
+                        .unwrap_or_default(),
+                    working_directory_relative_path: catalog
+                        .as_ref()
+                        .and_then(|value| value.working_directory_relative_path.clone())
+                        .or_else(|| {
+                            local.and_then(|game| game.launch.working_directory_relative_path.clone())
+                        }),
+                    version_id: package.version_id,
+                    package_path: package.path,
+                    package_fs_id: package.fs_id,
+                    package_size: package.size,
+                    package_sha256: package.package_sha256,
+                    file_count: package.file_count,
+                    total_bytes: package.total_bytes,
+                    created_at: package.created_at,
+                    installed,
+                    versions: packages,
+                })
+            }));
         }
-        if catalog_game_key.is_some_and(|key| key != remote_game_key)
-            || manifest_game_key.is_some_and(|key| key != remote_game_key)
-        {
-            continue;
-        }
-        let local = local_games.iter().find(|game| {
-            matches!(game.lifecycle, GameLifecycle::Active) && game.game_key == remote_game_key
-        });
-        let remote_game_uid = catalog
-            .as_ref()
-            .map(|value| value.game_uid.clone())
-            .or_else(|| manifest.as_ref().map(|value| value.game_uid.clone()))
-            .or_else(|| local.map(|game| game.game_uid.clone()))
-            .unwrap_or_default();
-        let local_versions = state
-            .store
-            .lock()
-            .map_err(|_| "读取本体版本信息失败".to_string())?
-            .body_versions
-            .iter()
-            .filter(|version| local.is_some_and(|game| version.game_uid == game.game_uid))
-            .cloned()
-            .collect::<Vec<_>>();
-        let packages =
-            CloudManifestService::project(&files, manifest.as_ref(), &local_versions).packages;
-        let Some(package) = packages
-            .iter()
-            .max_by(|left, right| {
-                left.created_at
-                    .cmp(&right.created_at)
-                    .then_with(|| left.version_id.cmp(&right.version_id))
-            })
-            .cloned()
-        else {
-            continue;
-        };
-        let installed = local.is_some_and(|game| {
-            Path::new(&game.managed_path)
-                .join(&game.launch.executable_relative_path)
-                .is_file()
-        });
-        result.push(CloudGameSummary {
-            game_key: remote_game_key.clone(),
-            game_uid: remote_game_uid,
-            display_name: catalog
-                .as_ref()
-                .map(|value| value.display_name.clone())
-                .or_else(|| local.map(|game| game.display_name.clone()))
-                .unwrap_or_else(|| remote_game_key.clone()),
-            executable_relative_path: catalog
-                .as_ref()
-                .map(|value| value.executable_relative_path.clone())
-                .or_else(|| local.map(|game| game.launch.executable_relative_path.clone())),
-            arguments: catalog
-                .as_ref()
-                .map(|value| value.arguments.clone())
-                .or_else(|| local.map(|game| game.launch.arguments.clone()))
-                .unwrap_or_default(),
-            working_directory_relative_path: catalog
-                .as_ref()
-                .and_then(|value| value.working_directory_relative_path.clone())
-                .or_else(|| {
-                    local.and_then(|game| game.launch.working_directory_relative_path.clone())
-                }),
-            version_id: package.version_id,
-            package_path: package.path,
-            package_fs_id: package.fs_id,
-            package_size: package.size,
-            package_sha256: package.package_sha256,
-            file_count: package.file_count,
-            total_bytes: package.total_bytes,
-            created_at: package.created_at,
-            installed,
-            versions: packages,
-        });
-    }
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok().flatten())
+            .collect::<Vec<_>>()
+    });
+
+    let mut result = summaries;
     result.sort_by(|left, right| {
         left.display_name
             .to_lowercase()
@@ -413,9 +440,11 @@ pub fn list_remote_body_packages(
         }
         Err(error) => return Err(error),
     };
-    let temporary_root = app_data_dir(&app)?.join("cloud-manifest-temp");
+    let base_data_dir = app_data_dir(&app)?;
+    let temporary_root = base_data_dir.join("cloud-manifest-temp");
+    let cache_root = base_data_dir.join("cloud-manifest-cache");
     let mut warnings = Vec::new();
-    let manifest = match CloudManifestService::read(&client, &files, &directory, &temporary_root) {
+    let manifest = match CloudManifestService::read(&client, &files, &directory, &temporary_root, Some(&cache_root)) {
         Ok(manifest) => manifest,
         Err(error) => {
             warnings.push(format!("云端版本清单读取失败：{error}"));
@@ -808,11 +837,15 @@ fn download_body_task(
         })
         .cloned()
         .ok_or_else(|| "百度网盘中没有找到这个本体包，可能已被删除".to_string())?;
+    let base_data_dir = app_data_dir(app)?;
+    let temporary_root = base_data_dir.join("cloud-manifest-temp");
+    let manifest_cache_root = base_data_dir.join("cloud-manifest-cache");
     let cloud_manifest = CloudManifestService::read(
         &client,
         &remote_files,
         directory,
-        &app_data_dir(app)?.join("cloud-manifest-temp"),
+        &temporary_root,
+        Some(&manifest_cache_root),
     )
     .map_err(|error| format!("云端版本清单校验失败，已停止下载：{error}"))?;
     let cloud_entry = cloud_manifest.as_ref().and_then(|manifest| {
@@ -964,13 +997,15 @@ fn rebuild_remote_manifest(
     game_key: &str,
 ) -> Result<(), String> {
     let remote_files = client.list(directory)?;
-    let temporary_root = app_data_dir(app)?.join("cloud-manifest-temp");
-    let existing = CloudManifestService::read(client, &remote_files, directory, &temporary_root)?;
+    let base_data_dir = app_data_dir(app)?;
+    let temporary_root = base_data_dir.join("cloud-manifest-temp");
+    let cache_root = base_data_dir.join("cloud-manifest-cache");
+    let existing = CloudManifestService::read(client, &remote_files, directory, &temporary_root, Some(&cache_root))?;
     let game_uid = existing
         .as_ref()
         .map(|manifest| manifest.game_uid.clone())
         .or_else(|| {
-            CloudManifestService::read_catalog(client, &remote_files, directory, &temporary_root)
+            CloudManifestService::read_catalog(client, &remote_files, directory, &temporary_root, Some(&cache_root))
                 .ok()
                 .flatten()
                 .map(|catalog| catalog.game_uid)
@@ -1203,10 +1238,11 @@ fn install_cloud_game_task(
         .cloned()
         .ok_or_else(|| "百度网盘中没有找到这个游戏本体包，可能已被删除".to_string())?;
     let temporary_root = app_data_dir.join("cloud-manifest-temp");
+    let cache_root = app_data_dir.join("cloud-manifest-cache");
     let catalog =
-        CloudManifestService::read_catalog(&client, &remote_files, &directory, &temporary_root)?
+        CloudManifestService::read_catalog(&client, &remote_files, &directory, &temporary_root, Some(&cache_root))?
             .ok_or_else(|| "云端游戏缺少启动信息，请在本地重新上传一次游戏本体包".to_string())?;
-    let manifest = CloudManifestService::read(&client, &remote_files, &directory, &temporary_root)
+    let manifest = CloudManifestService::read(&client, &remote_files, &directory, &temporary_root, Some(&cache_root))
         .ok()
         .flatten();
     let existing = state
