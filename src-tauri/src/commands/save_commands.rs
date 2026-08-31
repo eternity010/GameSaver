@@ -79,6 +79,7 @@ pub fn cancel_save_learning(state: State<AppState>, session_id: String) -> Resul
         active.process_tracker_stop.store(true, std::sync::atomic::Ordering::Release);
         if let Some(capture) = active.etw_capture.as_ref() {
             let _ = stop_etw_capture(&capture.trace_name);
+            let _ = std::fs::remove_file(&capture.etl_path);
         }
     }
     Ok(())

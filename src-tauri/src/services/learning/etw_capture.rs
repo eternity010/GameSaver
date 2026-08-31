@@ -163,14 +163,25 @@ pub(crate) fn cleanup_stale_captures(app: &AppHandle) {
         if let Ok(entries) = std::fs::read_dir(directory) {
             for entry in entries.filter_map(Result::ok) {
                 let path = entry.path();
-                let is_csv_sidecar = path.extension().and_then(|value| value.to_str()) == Some("csv");
-                let old_enough = entry.metadata().ok().and_then(|metadata| metadata.modified().ok()).and_then(|modified| modified.elapsed().ok()).is_some_and(|age| age > std::time::Duration::from_secs(7 * 24 * 60 * 60));
-                if is_csv_sidecar && old_enough {
+                let is_trace = is_trace_artifact(&path);
+                let old_enough = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > std::time::Duration::from_secs(24 * 60 * 60));
+                if is_trace && old_enough {
                     let _ = std::fs::remove_file(path);
                 }
             }
         }
     }
+}
+
+pub(crate) fn is_trace_artifact(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("csv") || ext.eq_ignore_ascii_case("etl"))
 }
 
 pub(crate) fn is_running_as_admin() -> bool {
@@ -524,6 +535,7 @@ pub(crate) fn collect_related_files_by_trace(
         "性能：ETW 结果收集总计 {} ms",
         collection_started.elapsed().as_millis()
     ));
+    let _ = std::fs::remove_file(&csv_path);
     Ok(TraceCollectionResult {
         files,
         logs,
@@ -876,10 +888,11 @@ fn command_failure_detail(output: &std::process::Output, message: &str) -> Strin
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use super::{
         classify_file_operation, event_field_value, event_file_object_id, event_pid_value,
-        fast_csv_field, parse_csv_line, parse_trace_timestamp_ms, parse_u32, resolve_device_path,
-        should_skip_kernel_task, KERNEL_FILE_CAPTURE_KEYWORDS,
+        fast_csv_field, is_trace_artifact, parse_csv_line, parse_trace_timestamp_ms, parse_u32,
+        resolve_device_path, should_skip_kernel_task, KERNEL_FILE_CAPTURE_KEYWORDS,
     };
     use crate::services::learning::transactions::FileOperationKind;
 
@@ -985,5 +998,15 @@ mod tests {
             event_file_object_id(&row, Some(19)).as_deref(),
             Some("0XFFFF000000000002")
         );
+    }
+
+    #[test]
+    fn recognizes_trace_artifacts_for_cleanup() {
+        assert!(is_trace_artifact(Path::new("C:/appdata/events/trace.etl")));
+        assert!(is_trace_artifact(Path::new("C:/appdata/events/trace.ETL")));
+        assert!(is_trace_artifact(Path::new("C:/appdata/events/trace.etl.csv")));
+        assert!(is_trace_artifact(Path::new("C:/appdata/events/trace.CSV")));
+        assert!(!is_trace_artifact(Path::new("C:/appdata/events/store.json")));
+        assert!(!is_trace_artifact(Path::new("C:/appdata/events/game.exe")));
     }
 }

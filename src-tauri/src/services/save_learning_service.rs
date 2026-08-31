@@ -75,6 +75,7 @@ impl SaveLearningService {
         if is_cancelled() {
             if let Some(handle) = etw_capture.as_ref() {
                 let _ = stop_etw_capture(&handle.trace_name);
+                let _ = std::fs::remove_file(&handle.etl_path);
             }
             return Err("任务已取消".to_string());
         }
@@ -87,6 +88,7 @@ impl SaveLearningService {
             Err(err) => {
                 if let Some(handle) = etw_capture.as_ref() {
                     let _ = stop_etw_capture(&handle.trace_name);
+                    let _ = std::fs::remove_file(&handle.etl_path);
                 }
                 return Err(format!("启动游戏失败：{err}"));
             }
