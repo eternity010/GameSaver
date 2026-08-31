@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveLearningResult, SaveLearningSession, SaveProfile, SaveScope, SaveVersion } from "./domain/game";
+import type { CoverCrop, CoverPosition, Game, GameBodyVersion, GameCover, GameRuntime, LaunchPrecheck, SaveLearningResult, SaveLearningSession, SaveProfile, SaveScope, SaveVersion } from "./domain/game";
 
 export interface FrontendErrorReport {
   source: string;
@@ -157,6 +157,14 @@ export function listGames(): Promise<Game[]> {
 
 export function getGame(gameUid: string): Promise<Game | null> {
   return invokeCommand<Game | null>("get_game", { gameUid });
+}
+
+export function saveGameCover(gameUid: string, originalBytes: number[], displayBytes: number[], originalExtension: string, crop: CoverCrop, position: CoverPosition): Promise<GameCover> {
+  return invokeCommand<GameCover>("save_game_cover", { gameUid, originalBytes, displayBytes, originalExtension, crop, position });
+}
+
+export function getGameCover(gameUid: string): Promise<number[] | null> {
+  return invokeCommand<number[] | null>("get_game_cover", { gameUid });
 }
 
 export function startAddGameTask(input: {
@@ -351,8 +359,8 @@ export function downloadGameBodyPackage(gameUid: string, remotePath: string, rem
   return invokeCommand<string>("download_game_body_package", { gameUid, remotePath, remoteFsId });
 }
 
-export function deleteRemoteBodyPackage(gameUid: string, remotePath: string, remoteFsId?: number): Promise<string> {
-  return invokeCommand<string>("delete_remote_body_package", { gameUid, remotePath, remoteFsId });
+export function deleteRemoteBodyPackage(gameUid: string, gameKey: string, remotePath: string, remoteFsId?: number): Promise<string> {
+  return invokeCommand<string>("delete_remote_body_package", { gameUid, gameKey, remotePath, remoteFsId });
 }
 
 export type { SaveLearningResult, SaveLearningSession };

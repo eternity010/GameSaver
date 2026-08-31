@@ -9,6 +9,26 @@ export interface LaunchConfig {
   workingDirectoryRelativePath?: string;
 }
 
+export interface CoverCrop {
+  aspectWidth: number;
+  aspectHeight: number;
+  outputWidth: number;
+  outputHeight: number;
+}
+
+export interface CoverPosition {
+  offsetXMilli: number;
+  offsetYMilli: number;
+  zoomMilli: number;
+}
+
+export interface GameCover {
+  originalPath: string;
+  displayPath: string;
+  crop: CoverCrop;
+  position: CoverPosition;
+}
+
 export interface Game {
   gameUid: string;
   gameKey: string;
@@ -18,6 +38,7 @@ export interface Game {
   health: GameHealth;
   cloudStatus: CloudStatus;
   launch: LaunchConfig;
+  cover?: GameCover;
   saveProfileId?: string;
   lastPlayedAt?: string;
   latestSaveVersionId?: string;

@@ -5,7 +5,7 @@ pub mod learning;
 pub mod save_profile;
 pub mod save_version;
 
-pub use game::{Game, GameBodyVersion, GameHealth, GameLifecycle, GameRuntime, GameRuntimeStatus};
+pub use game::{CoverCrop, CoverPosition, Game, GameBodyVersion, GameCover, GameHealth, GameLifecycle, GameRuntime, GameRuntimeStatus};
 pub use store::AppStore;
 pub use task::{AppTask, TaskRetry, TaskStatus};
 pub use learning::{ActiveLearningSession, EtwCaptureHandle, FileFingerprint, LearningSessionView, LearningStatus, SaveLearningResult, SaveScopeDraft, SaveTransactionSummary, ScanRoot};

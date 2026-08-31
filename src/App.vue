@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { AlertTriangle, CloudDownload, CloudUpload, Gamepad2, Library, Plus, Settings, Search, ShieldCheck } from "@lucide/vue";
-import { getElevationStatus, getTask, installCloudGame, launchGame, listCloudGames, listGames, restartAsAdmin } from "./api";
+import { deleteRemoteBodyPackage, getElevationStatus, getGameCover, getTask, installCloudGame, launchGame, listCloudGames, listGames, restartAsAdmin } from "./api";
 import type { ElevationStatus } from "./api";
-import type { CloudGameSummary } from "./api";
+import type { CloudGameSummary, CloudGameVersion } from "./api";
 import { gameStatusLabel, type Game } from "./domain/game";
 import AddGameWizard from "./components/AddGameWizard.vue";
 import GameDetailPage from "./components/GameDetailPage.vue";
@@ -16,6 +16,7 @@ type AppPage = "library" | "store" | "add" | "detail" | "transfers" | "settings"
 
 const games = ref<Game[]>([]);
 const cloudGames = ref<CloudGameSummary[]>([]);
+const coverUrls = ref<Record<string, string>>({});
 const activePage = ref<AppPage>("library");
 const activeView = ref<LibraryView>("all");
 const search = ref("");
@@ -54,14 +55,53 @@ const filteredGames = computed(() => {
 
 const pageTitle = computed(() => activeView.value === "all" ? "游戏库" : activeView.value === "recent" ? "最近游玩" : activeView.value === "favorites" ? "收藏" : "需要处理");
 
+async function loadGameCovers(list: Game[]) {
+  const currentUids = new Set(list.map((game) => game.gameUid));
+
+  for (const [uid, url] of Object.entries(coverUrls.value)) {
+    if (!currentUids.has(uid)) {
+      URL.revokeObjectURL(url);
+      delete coverUrls.value[uid];
+    }
+  }
+
+  await Promise.all(
+    list.map(async (game) => {
+      if (!game.cover) {
+        if (coverUrls.value[game.gameUid]) {
+          URL.revokeObjectURL(coverUrls.value[game.gameUid]);
+          delete coverUrls.value[game.gameUid];
+        }
+        return;
+      }
+      try {
+        const bytes = await getGameCover(game.gameUid);
+        if (bytes && bytes.length > 0) {
+          const oldUrl = coverUrls.value[game.gameUid];
+          const newUrl = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: "image/jpeg" }));
+          coverUrls.value[game.gameUid] = newUrl;
+          if (oldUrl) URL.revokeObjectURL(oldUrl);
+        } else if (coverUrls.value[game.gameUid]) {
+          URL.revokeObjectURL(coverUrls.value[game.gameUid]);
+          delete coverUrls.value[game.gameUid];
+        }
+      } catch {
+        // Retain fallback placeholder if loading fails
+      }
+    })
+  );
+}
+
 async function loadGames() {
   loading.value = true;
   error.value = "";
   try {
-    games.value = await listGames();
+    const loaded = await listGames();
+    games.value = loaded;
     if (selectedGame.value) {
-      selectedGame.value = games.value.find((game) => game.gameUid === selectedGame.value?.gameUid) || selectedGame.value;
+      selectedGame.value = loaded.find((game) => game.gameUid === selectedGame.value?.gameUid) || selectedGame.value;
     }
+    void loadGameCovers(loaded);
   } catch (reason) {
     error.value = String(reason);
   } finally {
@@ -124,6 +164,10 @@ onMounted(() => {
 });
 onUnmounted(() => {
   if (cloudInstallTimer) clearTimeout(cloudInstallTimer);
+  for (const url of Object.values(coverUrls.value)) {
+    URL.revokeObjectURL(url);
+  }
+  coverUrls.value = {};
 });
 
 function openAddGame() {
@@ -154,7 +198,7 @@ async function quickLaunch(game: Game) {
   }
 }
 
-async function installAndLaunch(cloudGame: CloudGameSummary) {
+async function installAndLaunch(cloudGame: CloudGameSummary, version: CloudGameVersion) {
   if (cloudInstallUid.value) return;
   if (!cloudGame.executableRelativePath) {
     cloudInstallError.value = "这个云端游戏缺少启动信息，请重新上传游戏本体包。";
@@ -166,12 +210,55 @@ async function installAndLaunch(cloudGame: CloudGameSummary) {
   cloudInstallError.value = "";
   cloudInstallNotice.value = "";
   try {
-    const taskId = await installCloudGame(cloudGame.gameUid, cloudGame.gameKey, cloudGame.packagePath, cloudGame.packageFsId);
+    const taskId = await installCloudGame(cloudGame.gameUid, cloudGame.gameKey, version.path, version.fsId);
     await watchCloudInstall(taskId, cloudGame);
   } catch (reason) {
     cloudInstallUid.value = "";
     cloudInstallError.value = String(reason);
   }
+}
+
+async function deleteCloudVersion(cloudGame: CloudGameSummary, version: CloudGameVersion) {
+  if (cloudInstallUid.value) return;
+  const warning = `将永久删除百度网盘中的“${cloudGame.displayName}”版本 ${version.versionId}（${formatBytes(version.size)}）。此操作无法撤销，确定继续吗？`;
+  if (!window.confirm(warning) || !window.confirm("请再次确认：仅云端版本会被删除，本地游戏本体不会受影响。")) return;
+  cloudInstallUid.value = cloudGame.gameUid;
+  cloudInstallProgress.value = 0;
+  cloudInstallMessage.value = "准备删除云端版本";
+  cloudInstallError.value = "";
+  cloudInstallNotice.value = "";
+  try {
+    const taskId = await deleteRemoteBodyPackage(cloudGame.gameUid, cloudGame.gameKey, version.path, version.fsId);
+    await watchCloudDeletion(taskId);
+  } catch (reason) {
+    cloudInstallUid.value = "";
+    cloudInstallError.value = String(reason);
+  }
+}
+
+async function watchCloudDeletion(taskId: string) {
+  const task = await getTask(taskId);
+  cloudInstallProgress.value = task.progress;
+  cloudInstallMessage.value = task.message;
+  if (task.status === "success") {
+    cloudInstallUid.value = "";
+    cloudInstallNotice.value = "云端版本已删除。";
+    await loadStore(true, storePage.value);
+    return;
+  }
+  if (task.status === "failed" || task.status === "cancelled" || task.status === "interrupted") {
+    cloudInstallUid.value = "";
+    cloudInstallError.value = task.error || task.message;
+    return;
+  }
+  if (cloudInstallTimer) clearTimeout(cloudInstallTimer);
+  cloudInstallTimer = setTimeout(() => void watchCloudDeletion(taskId), 700);
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 async function watchCloudInstall(taskId: string, cloudGame: CloudGameSummary) {
@@ -248,8 +335,8 @@ async function finishAddGame() {
       </header>
 
       <AddGameWizard v-if="activePage === 'add'" @back="activePage = 'library'" @completed="finishAddGame" />
-      <GameDetailPage v-else-if="activePage === 'detail' && selectedGame" :game="selectedGame" :initial-error="selectedGameError" @back="activePage = 'library'" @settings="activePage = 'settings'" @refresh="loadGames" />
-      <GameStorePage v-else-if="activePage === 'store'" :games="cloudGames" :search="search" :loading="storeLoading" :load-error="storeError" :install-uid="cloudInstallUid" :install-progress="cloudInstallProgress" :install-message="cloudInstallMessage" :install-error="cloudInstallError" :install-notice="cloudInstallNotice" :page="storePage" :has-more="storeHasMore" @install="installAndLaunch" @retry="refreshStore" @refresh="refreshStore" @page-change="changeStorePage" />
+      <GameDetailPage v-else-if="activePage === 'detail' && selectedGame" :game="selectedGame" :cover-url="selectedGame ? coverUrls[selectedGame.gameUid] : ''" :initial-error="selectedGameError" @back="activePage = 'library'" @settings="activePage = 'settings'" @refresh="loadGames" />
+      <GameStorePage v-else-if="activePage === 'store'" :games="cloudGames" :search="search" :loading="storeLoading" :load-error="storeError" :install-uid="cloudInstallUid" :install-progress="cloudInstallProgress" :install-message="cloudInstallMessage" :install-error="cloudInstallError" :install-notice="cloudInstallNotice" :page="storePage" :has-more="storeHasMore" @install="installAndLaunch" @delete-version="deleteCloudVersion" @retry="refreshStore" @refresh="refreshStore" @page-change="changeStorePage" />
       <TransferCenter v-else-if="activePage === 'transfers'" :games="games" :cloud-games="cloudGames" />
       <PlatformSettings v-else-if="activePage === 'settings'" />
 
@@ -264,7 +351,10 @@ async function finishAddGame() {
       <div v-else-if="!filteredGames.length" class="state-panel empty-state"><div class="empty-icon"><Gamepad2 :size="28" /></div><strong>{{ games.length ? "没有匹配的游戏" : "还没有加入游戏" }}</strong><p>{{ games.length ? "调整搜索或筛选条件。" : "添加游戏本体后，它会出现在这里。" }}</p><button class="primary-button" type="button" @click="openAddGame"><Plus :size="17" /> 添加游戏</button></div>
       <div v-else class="game-grid">
         <article v-for="game in filteredGames" :key="game.gameUid" class="game-card" tabindex="0" @click="openGame(game)" @keyup.enter="openGame(game)">
-          <div class="cover-placeholder"><Gamepad2 :size="34" /></div>
+          <div class="game-card-cover">
+            <img v-if="coverUrls[game.gameUid]" :src="coverUrls[game.gameUid]" :alt="`${game.displayName} 封面`" loading="lazy" />
+            <div v-else class="cover-placeholder"><Gamepad2 :size="34" /></div>
+          </div>
           <div class="game-card-body"><div><h2>{{ game.displayName }}</h2><span class="status-label">{{ gameStatusLabel(game) }}</span></div><button class="launch-button" type="button" :disabled="game.lifecycle !== 'active'" @click.stop="quickLaunch(game)">启动</button></div>
         </article>
       </div>

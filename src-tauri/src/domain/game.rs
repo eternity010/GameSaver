@@ -59,6 +59,32 @@ pub struct LaunchConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct CoverCrop {
+    pub aspect_width: u32,
+    pub aspect_height: u32,
+    pub output_width: u32,
+    pub output_height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverPosition {
+    pub offset_x_milli: i32,
+    pub offset_y_milli: i32,
+    pub zoom_milli: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GameCover {
+    pub original_path: String,
+    pub display_path: String,
+    pub crop: CoverCrop,
+    pub position: CoverPosition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct Game {
     pub game_uid: String,
     #[serde(default)]
@@ -69,6 +95,8 @@ pub struct Game {
     pub health: GameHealth,
     pub cloud_status: CloudStatus,
     pub launch: LaunchConfig,
+    #[serde(default)]
+    pub cover: Option<GameCover>,
     #[serde(default)]
     pub save_profile_id: Option<String>,
     #[serde(default)]
@@ -147,6 +175,7 @@ impl Game {
                 executable_relative_path: executable_relative_path.into(),
                 ..LaunchConfig::default()
             },
+            cover: None,
             save_profile_id: None,
             last_played_at: None,
             latest_save_version_id: None,
