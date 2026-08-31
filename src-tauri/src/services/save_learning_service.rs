@@ -200,7 +200,13 @@ impl SaveLearningService {
         on_progress(92, "正在按文件夹整理存档候选");
         let (changed_files, scope_drafts, mut inference_notes) = infer_scope_drafts(active, &final_snapshot, baseline, &etw_files);
         notes.append(&mut inference_notes);
-        let confidence = if scope_drafts.is_empty() { 0 } else { 70 };
+        let transaction_summary = (!etw_operations.is_empty() || active.etw_capture.is_some())
+            .then(|| crate::services::learning::analyze_save_transactions(etw_operations));
+        let confidence = calculate_learning_confidence(
+            &scope_drafts,
+            &event_capture_mode,
+            transaction_summary.as_ref(),
+        );
         Ok(SaveLearningResult {
             session_id: active.view.session_id.clone(),
             changed_files,
@@ -208,8 +214,7 @@ impl SaveLearningService {
             confidence,
             notes,
             event_capture_mode,
-            transaction_summary: (!etw_operations.is_empty() || active.etw_capture.is_some())
-                .then(|| crate::services::learning::analyze_save_transactions(etw_operations)),
+            transaction_summary,
         })
     }
 }
@@ -493,6 +498,40 @@ fn infer_scope_drafts(active: &ActiveLearningSession, final_snapshot: &HashMap<S
     (changed, drafts, notes)
 }
 
+fn calculate_learning_confidence(
+    scope_drafts: &[SaveScopeDraft],
+    event_capture_mode: &str,
+    transaction_summary: Option<&crate::domain::SaveTransactionSummary>,
+) -> u8 {
+    if scope_drafts.is_empty() {
+        return 0;
+    }
+
+    let max_draft_confidence = scope_drafts
+        .iter()
+        .map(|draft| draft.confidence)
+        .max()
+        .unwrap_or(65);
+
+    let has_named_save_container = scope_drafts.iter().any(|draft| {
+        is_save_container_directory(Path::new(&draft.scope.root_path))
+    });
+    let container_bonus = if has_named_save_container { 5 } else { 0 };
+
+    let mode_adjustment: i16 = match (event_capture_mode, transaction_summary) {
+        ("etw", Some(txn)) if txn.status == "completed" => {
+            let txn_ratio = (txn.confidence as f32 / 100.0).clamp(0.0, 1.0);
+            10 + (txn_ratio * 5.0).round() as i16
+        }
+        ("etw", Some(txn)) if txn.status == "candidate" => 5,
+        ("etw", _) => 2,
+        _ => 0,
+    };
+
+    let total = (max_draft_confidence as i16) + (container_bonus as i16) + mode_adjustment;
+    total.clamp(30, 95) as u8
+}
+
 fn collect_targeted_snapshot(
     roots: &[crate::domain::ScanRoot],
     etw_files: &HashSet<String>,
@@ -592,11 +631,11 @@ mod tests {
     use std::{fs, path::Path};
 
     use super::{
-        directory_matches_hint, discover_save_container_files, is_etw_candidate,
-        is_save_container_directory, path_is_within_root, snapshot_analysis_progress,
-        MAX_CANDIDATE_FILE_BYTES,
+        calculate_learning_confidence, directory_matches_hint, discover_save_container_files,
+        is_etw_candidate, is_save_container_directory, path_is_within_root,
+        snapshot_analysis_progress, MAX_CANDIDATE_FILE_BYTES,
     };
-    use crate::domain::{ScanRoot, SaveRootType};
+    use crate::domain::{SaveRootType, SaveScope, SaveScopeDraft, SaveTransactionSummary, ScanRoot, UnknownFilePolicy};
 
     #[test]
     fn snapshot_progress_does_not_overflow_at_completion() {
@@ -680,5 +719,79 @@ mod tests {
         );
         let deserialized: SaveRootType = serde_json::from_str("\"saved_games\"").unwrap();
         assert_eq!(deserialized, SaveRootType::SavedGames);
+    }
+
+    #[test]
+    fn learning_confidence_returns_zero_when_no_drafts() {
+        assert_eq!(calculate_learning_confidence(&[], "etw", None), 0);
+        assert_eq!(calculate_learning_confidence(&[], "snapshot", None), 0);
+    }
+
+    #[test]
+    fn learning_confidence_scales_with_evidence_and_transactions() {
+        let dummy_scope = SaveScope {
+            root_type: SaveRootType::AppData,
+            root_path: r"C:\Users\Player\AppData\LocalLow\GameStudio".to_string(),
+            confirmed_files: vec!["profile.sav".to_string()],
+            include_directories: vec![],
+            exclude_exact: vec![],
+            exclude_patterns: vec![],
+            exclude_directories: vec![],
+            unknown_file_policy: UnknownFilePolicy::Protect,
+            max_file_bytes: Some(10_000_000),
+        };
+        let single_file_draft = SaveScopeDraft {
+            scope: dummy_scope.clone(),
+            changed_files: vec!["profile.sav".to_string()],
+            confidence: 65,
+        };
+        // 纯快照单文件 -> 65%
+        assert_eq!(
+            calculate_learning_confidence(&[single_file_draft.clone()], "snapshot", None),
+            65
+        );
+
+        let container_scope = SaveScope {
+            root_type: SaveRootType::SavedGames,
+            root_path: r"C:\Users\Player\Saved Games\MyGame\SaveData".to_string(),
+            confirmed_files: vec!["slot1.sav".to_string(), "slot2.sav".to_string()],
+            include_directories: vec![".".to_string()],
+            exclude_exact: vec![],
+            exclude_patterns: vec![],
+            exclude_directories: vec![],
+            unknown_file_policy: UnknownFilePolicy::Protect,
+            max_file_bytes: Some(10_000_000),
+        };
+        let container_draft = SaveScopeDraft {
+            scope: container_scope,
+            changed_files: vec!["slot1.sav".to_string(), "slot2.sav".to_string()],
+            confidence: 80,
+        };
+        // 快照模式多文件 + SaveData 容器命名奖励 -> 85%
+        assert_eq!(
+            calculate_learning_confidence(&[container_draft.clone()], "snapshot", None),
+            85
+        );
+
+        let completed_txn = SaveTransactionSummary {
+            status: "completed".to_string(),
+            confidence: 90,
+            transaction_count: 1,
+            affected_files: vec!["slot1.sav".to_string()],
+            affected_directories: vec!["SaveData".to_string()],
+            started_at: Some("1000".to_string()),
+            ended_at: Some("1500".to_string()),
+            operation_count: 3,
+            notes: vec![],
+        };
+        // ETW 完整事务 + 命名容器 -> 95% (顶格封顶)
+        assert_eq!(
+            calculate_learning_confidence(
+                &[container_draft],
+                "etw",
+                Some(&completed_txn)
+            ),
+            95
+        );
     }
 }
