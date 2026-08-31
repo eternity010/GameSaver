@@ -7,6 +7,7 @@ pub enum SaveRootType {
     ManagedGame,
     AppData,
     LocalAppData,
+    LocalLow,
     Documents,
     SavedGames,
     UserProfile,

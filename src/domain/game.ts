@@ -107,7 +107,7 @@ export interface SaveProfile {
   updatedAt: string;
 }
 
-export type SaveRootType = "managed_game" | "app_data" | "local_app_data" | "documents" | "saved_games" | "user_profile" | "custom";
+export type SaveRootType = "managed_game" | "app_data" | "local_app_data" | "local_low" | "documents" | "saved_games" | "user_profile" | "custom";
 export type UnknownFilePolicy = "protect" | "ignore";
 
 export interface SaveScope {

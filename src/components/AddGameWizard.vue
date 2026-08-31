@@ -51,6 +51,7 @@ const rootTypeLabel: Record<SaveRootType, string> = {
   managed_game: "游戏目录",
   app_data: "AppData",
   local_app_data: "LocalAppData",
+  local_low: "LocalLow",
   documents: "文档",
   saved_games: "Saved Games",
   user_profile: "用户目录",

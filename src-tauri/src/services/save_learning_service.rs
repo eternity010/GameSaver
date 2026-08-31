@@ -289,7 +289,7 @@ fn discover_scan_roots(game: &Game) -> Result<Vec<crate::domain::ScanRoot>, Stri
         let local_low = profile_root.join("AppData").join("LocalLow");
         if local_low.is_dir() {
             for path in find_candidate_directories(&local_low, &hints) {
-                roots.push(crate::domain::ScanRoot { root_type: SaveRootType::LocalAppData, physical_path: path });
+                roots.push(crate::domain::ScanRoot { root_type: SaveRootType::LocalLow, physical_path: path });
             }
         }
     }
@@ -721,6 +721,16 @@ mod tests {
         );
         let deserialized: SaveRootType = serde_json::from_str("\"saved_games\"").unwrap();
         assert_eq!(deserialized, SaveRootType::SavedGames);
+    }
+
+    #[test]
+    fn local_low_root_type_serializes_and_matches() {
+        assert_eq!(
+            serde_json::to_string(&SaveRootType::LocalLow).unwrap(),
+            "\"local_low\""
+        );
+        let deserialized: SaveRootType = serde_json::from_str("\"local_low\"").unwrap();
+        assert_eq!(deserialized, SaveRootType::LocalLow);
     }
 
     #[test]
