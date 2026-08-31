@@ -94,8 +94,9 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--focus-ring)
 .store-game-card { position: relative; width: 220px; aspect-ratio: 1 / 1; overflow: hidden; border: 1px solid #2d323b; border-radius: 8px; background: var(--surface-panel); cursor: pointer; transition: border-color .16s ease, transform .16s ease, background .16s ease; }
 .store-game-card:hover { border-color: #61799f; background: #222832; transform: translateY(-2px); }
 .store-game-card:focus-visible { outline: 2px solid #80adf5; outline-offset: 3px; }
-.store-cover { position: absolute; inset: 0; display: grid; place-items: center; color: #87a8dc; background: #202a38; }
+.store-cover { position: absolute; inset: 0; display: grid; place-items: center; overflow: hidden; color: #87a8dc; background: #202a38; }
 .store-cover::after { position: absolute; inset: 0; border: 1px solid rgba(255,255,255,.04); content: ""; pointer-events: none; }
+.store-cover-image { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; }
 .store-cover-type, .store-cover-size { position: absolute; z-index: 1; padding: 5px 7px; border-radius: 4px; color: #d9e4f7; background: rgba(20, 25, 34, .78); font-size: 10px; }
 .store-cover-type { top: 10px; left: 10px; }
 .store-cover-size { top: 10px; right: 10px; bottom: auto; color: var(--text-primary); font-size: 11px; font-weight: 600; }
@@ -122,8 +123,9 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--focus-ring)
 .store-detail-header .eyebrow { margin-bottom: 5px; }
 .store-detail-header h2 { margin: 0; overflow-wrap: anywhere; font-size: 21px; }
 .store-detail-content { min-height: 0; overflow: auto; padding: 24px; }
-.store-detail-overview { display: grid; grid-template-columns: 168px minmax(0, 1fr); gap: 20px; align-items: center; }
-.store-detail-cover { display: grid; place-items: center; align-content: center; gap: 8px; aspect-ratio: 1 / 1; border: 1px solid #3a4558; border-radius: 7px; color: #8faee0; background: #202a38; }
+.store-detail-overview { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 20px; align-items: center; }
+.store-detail-cover { position: relative; display: grid; place-items: center; align-content: center; gap: 8px; aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid #3a4558; border-radius: 7px; color: #8faee0; background: #202a38; }
+.store-detail-cover-image { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; }
 .store-detail-cover span { color: #cbd7e8; font-size: 11px; font-weight: 700; }
 .store-detail-summary { display: grid; gap: 12px; min-width: 0; }
 .store-detail-summary p { margin: 0; color: var(--text-secondary); font-size: 13px; line-height: 1.6; }

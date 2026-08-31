@@ -35,6 +35,33 @@ pub fn get_baidu_quota(app: AppHandle) -> Result<BaiduQuota, String> {
 }
 
 #[tauri::command]
+pub fn get_cloud_game_cover(
+    app: AppHandle,
+    game_key: String,
+) -> Result<Option<Vec<u8>>, String> {
+    let game_key = game_key.trim();
+    if game_key.is_empty() {
+        return Ok(None);
+    }
+    let remote_dir = match remote_body_dir(game_key) {
+        Ok(dir) => dir,
+        Err(_) => return Ok(None),
+    };
+    let base_data_dir = app_data_dir(&app)?;
+    let cache_root = base_data_dir.join("cloud-manifest-cache");
+    let cover_file = cache_root
+        .join(CloudManifestService::cache_folder_name(&remote_dir))
+        .join("cover.jpg");
+    if cover_file.is_file() {
+        std::fs::read(cover_file)
+            .map(Some)
+            .map_err(|error| format!("读取云端封面缓存失败：{error}"))
+    } else {
+        Ok(None)
+    }
+}
+
+#[tauri::command]
 pub fn list_cloud_games(
     app: AppHandle,
     state: State<AppState>,
@@ -131,6 +158,16 @@ pub fn list_cloud_games(
                 {
                     return None;
                 }
+                let has_cover = CloudManifestService::read_cover(
+                    client_ref,
+                    &files,
+                    &directory,
+                    temporary_root_ref,
+                    Some(cache_root_ref),
+                )
+                .ok()
+                .flatten()
+                .is_some();
                 let local = local_games_ref.iter().find(|game| {
                     matches!(game.lifecycle, GameLifecycle::Active) && game.game_key == remote_game_key
                 });
@@ -193,6 +230,7 @@ pub fn list_cloud_games(
                     created_at: package.created_at,
                     installed,
                     versions: packages,
+                    has_cover,
                 })
             }));
         }
@@ -1197,12 +1235,32 @@ fn sync_cloud_catalog(
         .find(|game| game.game_uid == game_uid)
         .cloned()
         .ok_or_else(|| "游戏不存在，无法同步云端游戏信息".to_string())?;
+    let base_data_dir = app_data_dir(app)?;
+    let temporary_root = base_data_dir.join("cloud-manifest-temp");
+    let cache_root = base_data_dir.join("cloud-manifest-cache");
     CloudManifestService::write_catalog(
         client,
         remote_dir,
         &CloudManifestService::catalog_from_game(&game),
-        &app_data_dir(app)?.join("cloud-manifest-temp"),
-    )
+        &temporary_root,
+    )?;
+    if let Some(cover) = &game.cover {
+        if let Ok(root) = state.library_root_path() {
+            let display_path = root.join(&cover.display_path);
+            if display_path.is_file() {
+                if let Ok(bytes) = std::fs::read(&display_path) {
+                    let _ = CloudManifestService::write_cover(
+                        client,
+                        remote_dir,
+                        &bytes,
+                        &temporary_root,
+                        Some(&cache_root),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn install_cloud_game_task(
@@ -1384,6 +1442,40 @@ fn install_cloud_game_task(
         arguments: catalog.arguments,
         working_directory_relative_path: catalog.working_directory_relative_path,
     };
+    if game.cover.is_none() {
+        let manifest_cache_root = app_data_dir.join("cloud-manifest-cache");
+        if let Ok(Some(cover_bytes)) = CloudManifestService::read_cover(
+            &client,
+            &remote_files,
+            &directory,
+            &temporary_root,
+            Some(&manifest_cache_root),
+        ) {
+            if let Ok(library_root) = state.library_root_path() {
+                let cover_id = Uuid::new_v4().simple().to_string();
+                let cover_dir = library_root.join("covers").join(&local_uid).join(&cover_id);
+                if std::fs::create_dir_all(&cover_dir).is_ok() {
+                    let _ = std::fs::write(cover_dir.join("display.jpg"), &cover_bytes);
+                    let _ = std::fs::write(cover_dir.join("original.jpg"), &cover_bytes);
+                    game.cover = Some(crate::domain::game::GameCover {
+                        original_path: format!("covers/{local_uid}/{cover_id}/original.jpg"),
+                        display_path: format!("covers/{local_uid}/{cover_id}/display.jpg"),
+                        crop: crate::domain::game::CoverCrop {
+                            aspect_width: 16,
+                            aspect_height: 9,
+                            output_width: 1280,
+                            output_height: 720,
+                        },
+                        position: crate::domain::game::CoverPosition {
+                            zoom_milli: 1000,
+                            offset_x_milli: 0,
+                            offset_y_milli: 0,
+                        },
+                    });
+                }
+            }
+        }
+    }
     if let Some(existing_game) = candidate
         .games
         .iter_mut()
@@ -1572,7 +1664,7 @@ fn release_transfer(state: &AppState, game_uid: &str) {
     }
 }
 
-fn load_baidu_client(app: &AppHandle) -> Result<BaiduNetdiskClient, String> {
+pub(crate) fn load_baidu_client(app: &AppHandle) -> Result<BaiduNetdiskClient, String> {
     let app_data_dir = app_data_dir(app)?;
     let config = BaiduConfigRepository::load(&app_data_dir)?;
     match config {
@@ -1585,7 +1677,7 @@ fn load_baidu_client(app: &AppHandle) -> Result<BaiduNetdiskClient, String> {
     }
 }
 
-fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
         .map_err(|err| format!("解析 GameSaver 数据目录失败：{err}"))
@@ -1595,7 +1687,7 @@ fn body_package_cache_root(app: &AppHandle) -> Result<PathBuf, String> {
     app.state::<AppState>().body_packages_root()
 }
 
-fn remote_body_dir(game_key: &str) -> Result<String, String> {
+pub(crate) fn remote_body_dir(game_key: &str) -> Result<String, String> {
     let game_key = game_key.trim();
     if game_key.is_empty()
         || game_key == "."

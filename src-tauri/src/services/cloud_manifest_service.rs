@@ -14,6 +14,7 @@ use uuid::Uuid;
 const MANIFEST_VERSION: u32 = 1;
 const MANIFEST_FILE_NAME: &str = "manifest.json";
 const CATALOG_FILE_NAME: &str = "game.json";
+const COVER_FILE_NAME: &str = "cover.jpg";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +40,8 @@ pub struct CloudGameCatalog {
     pub arguments: Vec<String>,
     #[serde(default)]
     pub working_directory_relative_path: Option<String>,
+    #[serde(default)]
+    pub has_cover: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +105,8 @@ pub struct CloudGameSummary {
     pub installed: bool,
     #[serde(default)]
     pub versions: Vec<RemoteBodyPackage>,
+    #[serde(default)]
+    pub has_cover: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -131,6 +136,10 @@ impl CloudManifestService {
 
     pub fn catalog_path(remote_dir: &str) -> String {
         format!("{remote_dir}/{CATALOG_FILE_NAME}")
+    }
+
+    pub fn cover_path(remote_dir: &str) -> String {
+        format!("{remote_dir}/{COVER_FILE_NAME}")
     }
 
     pub fn cache_folder_name(remote_dir: &str) -> String {
@@ -222,6 +231,113 @@ impl CloudManifestService {
         fs::write(path, bytes).map_err(|error| error.to_string())
     }
 
+    pub fn load_cached_cover(
+        cache_root: &Path,
+        remote_dir: &str,
+        remote: &RemoteFile,
+    ) -> Option<Vec<u8>> {
+        let dir = cache_root.join(Self::cache_folder_name(remote_dir));
+        let meta_path = dir.join("cover.cache.json");
+        let image_path = dir.join("cover.jpg");
+        let meta_bytes = fs::read(meta_path).ok()?;
+        let cached = serde_json::from_slice::<CachedEntry<()>>(&meta_bytes).ok()?;
+        if cached.fs_id == remote.fs_id
+            && cached.size == remote.size
+            && cached.server_mtime == remote.server_mtime
+            && image_path.is_file()
+        {
+            fs::read(image_path).ok()
+        } else {
+            None
+        }
+    }
+
+    pub fn save_cached_cover(
+        cache_root: &Path,
+        remote_dir: &str,
+        remote: &RemoteFile,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let dir = cache_root.join(Self::cache_folder_name(remote_dir));
+        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let meta_path = dir.join("cover.cache.json");
+        let image_path = dir.join("cover.jpg");
+        let entry = CachedEntry {
+            fs_id: remote.fs_id,
+            size: remote.size,
+            server_mtime: remote.server_mtime,
+            data: (),
+        };
+        let meta_bytes = serde_json::to_vec(&entry).map_err(|error| error.to_string())?;
+        fs::write(meta_path, meta_bytes).map_err(|error| error.to_string())?;
+        fs::write(image_path, bytes).map_err(|error| error.to_string())
+    }
+
+    pub fn read_cover(
+        client: &BaiduNetdiskClient,
+        remote_files: &[RemoteFile],
+        remote_dir: &str,
+        temporary_root: &Path,
+        cache_root: Option<&Path>,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let cover_path = Self::cover_path(remote_dir);
+        let Some(remote_cover) = remote_files
+            .iter()
+            .find(|file| file.path == cover_path && !file.is_dir)
+        else {
+            return Ok(None);
+        };
+        if let Some(cache_root) = cache_root {
+            if let Some(cached) = Self::load_cached_cover(cache_root, remote_dir, remote_cover) {
+                return Ok(Some(cached));
+            }
+        }
+        fs::create_dir_all(temporary_root)
+            .map_err(|error| format!("创建云端封面下载目录失败：{error}"))?;
+        let temporary = temporary_root.join(format!(".cloud-cover-download-{}.jpg", Uuid::new_v4().simple()));
+        let result = (|| -> Result<Vec<u8>, String> {
+            client.download_file(remote_cover, &temporary, |_, _| true)?;
+            let raw = fs::read(&temporary)
+                .map_err(|error| format!("读取云端封面失败：{error}"))?;
+            if let Some(cache_root) = cache_root {
+                let _ = Self::save_cached_cover(cache_root, remote_dir, remote_cover, &raw);
+            }
+            Ok(raw)
+        })();
+        let _ = fs::remove_file(&temporary);
+        let _ = fs::remove_file(temporary.with_extension("download.tmp"));
+        result.map(Some)
+    }
+
+    pub fn write_cover(
+        client: &BaiduNetdiskClient,
+        remote_dir: &str,
+        cover_bytes: &[u8],
+        temporary_root: &Path,
+        cache_root: Option<&Path>,
+    ) -> Result<(), String> {
+        fs::create_dir_all(temporary_root)
+            .map_err(|error| format!("创建云端封面临时目录失败：{error}"))?;
+        let temporary = temporary_root.join(format!(".cloud-cover-{}.jpg", Uuid::new_v4().simple()));
+        let result = (|| -> Result<(), String> {
+            let mut file = fs::File::create(&temporary)
+                .map_err(|error| format!("创建云端封面临时文件失败：{error}"))?;
+            file.write_all(cover_bytes)
+                .map_err(|error| format!("写入云端封面临时文件失败：{error}"))?;
+            file.sync_all()
+                .map_err(|error| format!("刷新云端封面临时文件失败：{error}"))?;
+            client.upload_file(&temporary, &Self::cover_path(remote_dir), |_, _| true)?;
+            Ok(())
+        })();
+        let _ = fs::remove_file(&temporary);
+        if let Some(cache_root) = cache_root {
+            let dir = cache_root.join(Self::cache_folder_name(remote_dir));
+            let _ = fs::create_dir_all(&dir);
+            let _ = fs::write(dir.join("cover.jpg"), cover_bytes);
+        }
+        result
+    }
+
     pub fn catalog_from_game(game: &Game) -> CloudGameCatalog {
         CloudGameCatalog {
             format_version: MANIFEST_VERSION,
@@ -231,6 +347,7 @@ impl CloudManifestService {
             executable_relative_path: game.launch.executable_relative_path.clone(),
             arguments: game.launch.arguments.clone(),
             working_directory_relative_path: game.launch.working_directory_relative_path.clone(),
+            has_cover: game.cover.is_some(),
         }
     }
 
@@ -828,6 +945,7 @@ mod tests {
             executable_relative_path: "game.exe".to_string(),
             arguments: vec!["--debug".to_string()],
             working_directory_relative_path: None,
+            has_cover: true,
         };
 
         CloudManifestService::save_cached_catalog(&temp_dir, remote_dir, &remote_file, &catalog)
@@ -841,6 +959,21 @@ mod tests {
         let mut modified_remote = remote_file.clone();
         modified_remote.fs_id = 102;
         assert!(CloudManifestService::load_cached_catalog(&temp_dir, remote_dir, &modified_remote).is_none());
+
+        // Cover cache test
+        let cover_remote = RemoteFile {
+            path: format!("{remote_dir}/cover.jpg"),
+            fs_id: 201,
+            size: 50,
+            md5: None,
+            is_dir: false,
+            server_mtime: Some(1700000000),
+        };
+        let cover_bytes = b"fake-jpeg-content";
+        CloudManifestService::save_cached_cover(&temp_dir, remote_dir, &cover_remote, cover_bytes)
+            .expect("save cached cover");
+        let loaded_cover = CloudManifestService::load_cached_cover(&temp_dir, remote_dir, &cover_remote);
+        assert_eq!(loaded_cover, Some(cover_bytes.to_vec()));
 
         let _ = fs::remove_dir_all(temp_dir);
     }

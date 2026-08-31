@@ -108,16 +108,57 @@ fn save_game_cover_files(
         };
         let game = candidate.games.iter_mut().find(|game| game.game_uid == game_uid).ok_or_else(|| "游戏不存在".to_string())?;
         game.cover = Some(cover.clone());
+        let game_key = game.game_key.clone();
         if let Err(error) = GameRepository::persist(app, &candidate) {
             let _ = fs::remove_dir_all(&final_dir);
             return Err(format!("保存游戏封面记录失败：{error}"));
         }
         *state.store.lock().map_err(|_| "更新游戏封面记录失败".to_string())? = candidate;
         cleanup_old_cover(&root, game_uid, old_cover.as_ref(), &cover);
+        maybe_sync_cover_to_cloud_async(app.clone(), game_key, display_bytes.to_vec());
         Ok(cover)
     })();
     let _ = fs::remove_dir_all(&staging);
     result
+}
+
+fn maybe_sync_cover_to_cloud_async(
+    app: AppHandle,
+    game_key: String,
+    display_bytes: Vec<u8>,
+) {
+    if game_key.trim().is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let Ok(client) = crate::commands::baidu_commands::load_baidu_client(&app) else {
+            return;
+        };
+        let Ok(remote_dir) = crate::commands::baidu_commands::remote_body_dir(&game_key) else {
+            return;
+        };
+        let Ok(remote_files) = client.list(&remote_dir) else {
+            return;
+        };
+        let has_cloud_game = remote_files.iter().any(|file| {
+            file.path.ends_with("/manifest.json") || file.path.ends_with("/game.json")
+        });
+        if !has_cloud_game {
+            return;
+        }
+        let Ok(base_data_dir) = crate::commands::baidu_commands::app_data_dir(&app) else {
+            return;
+        };
+        let temporary_root = base_data_dir.join("cloud-manifest-temp");
+        let cache_root = base_data_dir.join("cloud-manifest-cache");
+        let _ = crate::services::CloudManifestService::write_cover(
+            &client,
+            &remote_dir,
+            &display_bytes,
+            &temporary_root,
+            Some(&cache_root),
+        );
+    });
 }
 
 fn validate_cover_input(

@@ -136,6 +136,7 @@ export interface CloudGameSummary {
   createdAt?: string;
   installed: boolean;
   versions: CloudGameVersion[];
+  hasCover?: boolean;
 }
 
 export interface CloudGameVersion {
@@ -337,6 +338,10 @@ export interface CloudGamePage {
 
 export function listCloudGames(page = 1, pageSize = 9): Promise<CloudGamePage> {
   return invokeCommand<CloudGamePage>("list_cloud_games", { page, pageSize });
+}
+
+export function getCloudGameCover(gameKey: string): Promise<number[] | null> {
+  return invokeCommand<number[] | null>("get_cloud_game_cover", { gameKey });
 }
 
 export function installCloudGame(gameUid: string, gameKey: string | undefined, remotePath: string, remoteFsId?: number): Promise<string> {

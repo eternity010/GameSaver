@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { ChevronLeft, ChevronRight, CloudDownload, CloudUpload, Gamepad2, RefreshCw, Trash2, X } from "@lucide/vue";
-import type { CloudGameSummary, CloudGameVersion } from "../api";
+import { getCloudGameCover, type CloudGameSummary, type CloudGameVersion } from "../api";
 
 const props = defineProps<{
   games: CloudGameSummary[];
@@ -34,6 +34,33 @@ const visibleGames = computed(() => {
 
 const selectedGame = ref<CloudGameSummary | null>(null);
 const selectedVersion = ref<CloudGameVersion | null>(null);
+const storeCoverUrls = ref<Record<string, string>>({});
+
+async function loadStoreCovers(games: CloudGameSummary[]) {
+  const currentKeySet = new Set(games.map((game) => game.gameKey || game.gameUid));
+  for (const [key, url] of Object.entries(storeCoverUrls.value)) {
+    if (!currentKeySet.has(key)) {
+      URL.revokeObjectURL(url);
+      delete storeCoverUrls.value[key];
+    }
+  }
+
+  await Promise.all(
+    games
+      .filter((game) => game.hasCover && !storeCoverUrls.value[game.gameKey || game.gameUid])
+      .map(async (game) => {
+        const key = game.gameKey || game.gameUid;
+        try {
+          const bytes = await getCloudGameCover(key);
+          if (!bytes || !bytes.length) return;
+          const blob = new Blob([new Uint8Array(bytes)], { type: "image/jpeg" });
+          storeCoverUrls.value[key] = URL.createObjectURL(blob);
+        } catch {
+          // Fall back gracefully to placeholder
+        }
+      })
+  );
+}
 
 function cloudGameKey(game: CloudGameSummary): string {
   return game.gameKey || game.gameUid;
@@ -92,6 +119,7 @@ function handleKeydown(event: KeyboardEvent) {
 watch(
   () => props.games,
   (games) => {
+    void loadStoreCovers(games);
     const openedGame = selectedGame.value;
     if (!openedGame) return;
 
@@ -107,10 +135,17 @@ watch(
       ? refreshedGame.versions.find((version) => version.fsId === openedVersion.fsId) || latestVersion(refreshedGame)
       : latestVersion(refreshedGame);
   },
+  { immediate: true },
 );
 
 onMounted(() => window.addEventListener("keydown", handleKeydown));
-onUnmounted(() => window.removeEventListener("keydown", handleKeydown));
+onUnmounted(() => {
+  window.removeEventListener("keydown", handleKeydown);
+  for (const url of Object.values(storeCoverUrls.value)) {
+    URL.revokeObjectURL(url);
+  }
+  storeCoverUrls.value = {};
+});
 </script>
 
 <template>
@@ -134,7 +169,19 @@ onUnmounted(() => window.removeEventListener("keydown", handleKeydown));
 
     <div v-else class="store-grid">
       <article v-for="game in visibleGames" :key="game.gameKey || game.gameUid" class="store-game-card" role="button" tabindex="0" :aria-label="`查看 ${game.displayName} 的云端详情`" @click="openDetail(game)" @keydown.enter.prevent="openDetail(game)" @keydown.space.prevent="openDetail(game)">
-        <div class="store-cover"><Gamepad2 :size="38" /><span class="store-cover-type">ZIP 本体包</span><span class="store-cover-size">{{ packageSize(game.packageSize) }}</span></div>
+        <div class="store-cover">
+          <img
+            v-if="storeCoverUrls[game.gameKey || game.gameUid]"
+            :src="storeCoverUrls[game.gameKey || game.gameUid]"
+            :alt="`${game.displayName} 封面`"
+            class="store-cover-image"
+          />
+          <template v-else>
+            <Gamepad2 :size="38" />
+          </template>
+          <span class="store-cover-type">ZIP 本体包</span>
+          <span class="store-cover-size">{{ packageSize(game.packageSize) }}</span>
+        </div>
         <div class="store-game-body">
           <div class="store-game-heading"><div><h2>{{ game.displayName }}</h2><p>{{ game.versions.length }} 个云端版本</p></div><span class="store-status-label" :class="{ installed: game.installed }">{{ game.installed ? "已在游戏库" : "可下载" }}</span></div>
           <div class="store-game-meta"><span>{{ game.fileCount?.toLocaleString() || "未知" }} 个文件</span><span>安装后 {{ game.totalBytes ? packageSize(game.totalBytes) : "未知" }}</span></div>
@@ -162,7 +209,18 @@ onUnmounted(() => window.removeEventListener("keydown", handleKeydown));
 
         <div class="store-detail-content">
           <div class="store-detail-overview">
-            <div class="store-detail-cover"><Gamepad2 :size="46" /><span>ZIP 本体包</span></div>
+            <div class="store-detail-cover">
+              <img
+                v-if="storeCoverUrls[selectedGame.gameKey || selectedGame.gameUid]"
+                :src="storeCoverUrls[selectedGame.gameKey || selectedGame.gameUid]"
+                :alt="`${selectedGame.displayName} 封面`"
+                class="store-detail-cover-image"
+              />
+              <template v-else>
+                <Gamepad2 :size="46" />
+                <span>ZIP 本体包</span>
+              </template>
+            </div>
             <div class="store-detail-summary">
               <span class="store-status-label" :class="{ installed: selectedGame.installed }">{{ selectedGame.installed ? "已在游戏库" : "可下载" }}</span>
               <p>{{ selectedGame.installed ? "本地游戏仍由游戏库管理；云端版本可在此查看或删除。" : "选择一个云端版本后下载并安装到游戏库。" }}</p>

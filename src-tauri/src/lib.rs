@@ -147,6 +147,7 @@ pub fn run() {
             ,commands::game_body_commands::uninstall_game_body
             ,commands::baidu_commands::get_baidu_status
             ,commands::baidu_commands::list_cloud_games
+            ,commands::baidu_commands::get_cloud_game_cover
             ,commands::baidu_commands::install_cloud_game
             ,commands::baidu_commands::list_remote_body_packages
             ,commands::baidu_commands::repair_cloud_body_manifest
