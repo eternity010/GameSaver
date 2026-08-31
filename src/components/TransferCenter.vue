@@ -86,7 +86,8 @@ async function retry(task: AppTask) {
     } else if (retryInfo.operation === "download_game_body_package" && retryInfo.remotePath) {
       await downloadGameBodyPackage(retryInfo.gameUid, retryInfo.remotePath, retryInfo.remoteFsId);
     } else if (retryInfo.operation === "delete_remote_body_package" && retryInfo.remotePath) {
-      await deleteRemoteBodyPackage(retryInfo.gameUid, retryInfo.remotePath, retryInfo.remoteFsId);
+      if (!retryInfo.gameKey) throw new Error("该删除任务缺少云端游戏标识，无法重试");
+      await deleteRemoteBodyPackage(retryInfo.gameUid, retryInfo.gameKey, retryInfo.remotePath, retryInfo.remoteFsId);
     } else if (retryInfo.operation === "repair_cloud_body_manifest") {
       await repairCloudBodyManifest(retryInfo.gameUid);
     } else {

@@ -1,10 +1,14 @@
 use crate::{
     app_state::AppState,
-    domain::{game::{CloudStatus, LaunchConfig}, Game, GameBodyVersion, GameHealth, GameLifecycle, TaskRetry, TaskStatus},
+    domain::{
+        game::{CloudStatus, LaunchConfig},
+        Game, GameBodyVersion, GameHealth, GameLifecycle, TaskRetry, TaskStatus,
+    },
     repositories::{BaiduConfigRepository, GameRepository},
     services::{
-        BaiduConnectionStatus, BaiduNetdiskClient, BaiduQuota, BodyPackageService,
-        CloudGamePage, CloudGameSummary, CloudManifestService, GameLibraryService, RemoteBodyPackageList, RemoteFile, TaskService,
+        BaiduConnectionStatus, BaiduNetdiskClient, BaiduQuota, BodyPackageService, CloudGamePage,
+        CloudGameSummary, CloudManifestService, GameLibraryService, RemoteBodyPackageList,
+        RemoteFile, TaskService,
     },
 };
 use std::path::{Path, PathBuf};
@@ -62,7 +66,9 @@ pub fn list_cloud_games(
     let temporary_root = app_data_dir(&app)?.join("cloud-manifest-temp");
     let mut result = Vec::new();
     for root in root_page.files.into_iter().filter(|file| file.is_dir) {
-        let Some(remote_segment) = root.path.strip_prefix(&format!("{REMOTE_ROOT}/"))
+        let Some(remote_segment) = root
+            .path
+            .strip_prefix(&format!("{REMOTE_ROOT}/"))
             .filter(|value| !value.is_empty() && !value.contains('/'))
         else {
             continue;
@@ -79,9 +85,10 @@ pub fn list_cloud_games(
         let manifest = CloudManifestService::read(&client, &files, &directory, &temporary_root)
             .ok()
             .flatten();
-        let catalog = CloudManifestService::read_catalog(&client, &files, &directory, &temporary_root)
-            .ok()
-            .flatten();
+        let catalog =
+            CloudManifestService::read_catalog(&client, &files, &directory, &temporary_root)
+                .ok()
+                .flatten();
         let catalog_game_key = catalog
             .as_ref()
             .map(|value| value.game_key.trim())
@@ -98,12 +105,9 @@ pub fn list_cloud_games(
         {
             continue;
         }
-        let local = local_games
-            .iter()
-            .find(|game| {
-                matches!(game.lifecycle, GameLifecycle::Active)
-                    && game.game_key == remote_game_key
-            });
+        let local = local_games.iter().find(|game| {
+            matches!(game.lifecycle, GameLifecycle::Active) && game.game_key == remote_game_key
+        });
         let remote_game_uid = catalog
             .as_ref()
             .map(|value| value.game_uid.clone())
@@ -119,12 +123,17 @@ pub fn list_cloud_games(
             .filter(|version| local.is_some_and(|game| version.game_uid == game.game_uid))
             .cloned()
             .collect::<Vec<_>>();
-        let packages = CloudManifestService::project(&files, manifest.as_ref(), &local_versions).packages;
-        let Some(package) = packages.iter().max_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| left.version_id.cmp(&right.version_id))
-        }).cloned() else {
+        let packages =
+            CloudManifestService::project(&files, manifest.as_ref(), &local_versions).packages;
+        let Some(package) = packages
+            .iter()
+            .max_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.version_id.cmp(&right.version_id))
+            })
+            .cloned()
+        else {
             continue;
         };
         let installed = local.is_some_and(|game| {
@@ -152,7 +161,9 @@ pub fn list_cloud_games(
             working_directory_relative_path: catalog
                 .as_ref()
                 .and_then(|value| value.working_directory_relative_path.clone())
-                .or_else(|| local.and_then(|game| game.launch.working_directory_relative_path.clone())),
+                .or_else(|| {
+                    local.and_then(|game| game.launch.working_directory_relative_path.clone())
+                }),
             version_id: package.version_id,
             package_path: package.path,
             package_fs_id: package.fs_id,
@@ -165,7 +176,11 @@ pub fn list_cloud_games(
             versions: packages,
         });
     }
-    result.sort_by(|left, right| left.display_name.to_lowercase().cmp(&right.display_name.to_lowercase()));
+    result.sort_by(|left, right| {
+        left.display_name
+            .to_lowercase()
+            .cmp(&right.display_name.to_lowercase())
+    });
     Ok(CloudGamePage {
         games: result,
         page,
@@ -271,49 +286,102 @@ pub fn delete_remote_body_package(
     app: AppHandle,
     state: State<AppState>,
     game_uid: String,
+    game_key: Option<String>,
     remote_path: String,
     remote_fs_id: Option<u64>,
 ) -> Result<String, String> {
     let game_uid = game_uid.trim().to_string();
+    let game_key = game_key
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| Game::derive_game_key(&value));
     let remote_path = remote_path.trim().to_string();
-    let game = load_game(&state, &game_uid)?;
-    let directory = remote_body_dir(&game.game_key)?;
+    let local_game = state
+        .store
+        .lock()
+        .map_err(|_| "读取本地游戏信息失败".to_string())?
+        .games
+        .iter()
+        .find(|game| game.game_uid == game_uid)
+        .cloned();
+    let remote_game_key = game_key
+        .or_else(|| local_game.as_ref().map(|game| game.game_key.clone()))
+        .ok_or_else(|| "云端游戏缺少 gameKey，无法定位本体包".to_string())?;
+    let directory = remote_body_dir(&remote_game_key)?;
     validate_remote_package_path(&directory, &remote_path)?;
-    reserve_transfer(&state, &game_uid)?;
-    let task_id = match TaskService::create(&state, "delete_remote_body_package", Some(game_uid.clone()), "准备删除云端本体包") {
+    let transfer_key = local_game
+        .as_ref()
+        .map(|game| game.game_uid.clone())
+        .unwrap_or_else(|| format!("remote:{remote_game_key}"));
+    reserve_transfer(&state, &transfer_key)?;
+    let task_id = match TaskService::create(
+        &state,
+        "delete_remote_body_package",
+        Some(game_uid.clone()),
+        "准备删除云端本体包",
+    ) {
         Ok(task_id) => task_id,
         Err(error) => {
-            release_transfer(&state, &game_uid);
+            release_transfer(&state, &transfer_key);
             return Err(error);
         }
     };
-    if let Err(error) = TaskService::set_retry(&state, &task_id, TaskRetry {
-        operation: "delete_remote_body_package".to_string(),
-        game_uid: game_uid.clone(),
-        game_key: None,
-        version_id: None,
-        remote_path: Some(remote_path.clone()),
-        remote_fs_id,
-    }) {
-        release_transfer(&state, &game_uid);
+    if let Err(error) = TaskService::set_retry(
+        &state,
+        &task_id,
+        TaskRetry {
+            operation: "delete_remote_body_package".to_string(),
+            game_uid: game_uid.clone(),
+            game_key: Some(remote_game_key.clone()),
+            version_id: None,
+            remote_path: Some(remote_path.clone()),
+            remote_fs_id,
+        },
+    ) {
+        release_transfer(&state, &transfer_key);
         return Err(error);
     }
     let app_handle = app.clone();
     let task_id_for_thread = task_id.clone();
+    let transfer_key_for_thread = transfer_key.clone();
     std::thread::spawn(move || {
         let result = delete_remote_body_task(
             &app_handle,
             &task_id_for_thread,
-            &game,
+            local_game.as_ref(),
+            &remote_game_key,
             &directory,
             &remote_path,
             remote_fs_id,
         );
-        release_transfer(&app_handle.state(), &game_uid);
+        release_transfer(&app_handle.state(), &transfer_key_for_thread);
         match result {
-            Ok(summary) => TaskService::finish(&app_handle.state(), &task_id_for_thread, TaskStatus::Success, 100, "云端本体包已删除", Some(summary), None),
-            Err(error) if error == "任务已取消" => TaskService::finish(&app_handle.state(), &task_id_for_thread, TaskStatus::Cancelled, 100, "已取消云端本体包删除", None, None),
-            Err(error) => TaskService::finish(&app_handle.state(), &task_id_for_thread, TaskStatus::Failed, 100, "云端本体包删除失败", None, Some(error)),
+            Ok(summary) => TaskService::finish(
+                &app_handle.state(),
+                &task_id_for_thread,
+                TaskStatus::Success,
+                100,
+                "云端本体包已删除",
+                Some(summary),
+                None,
+            ),
+            Err(error) if error == "任务已取消" => TaskService::finish(
+                &app_handle.state(),
+                &task_id_for_thread,
+                TaskStatus::Cancelled,
+                100,
+                "已取消云端本体包删除",
+                None,
+                None,
+            ),
+            Err(error) => TaskService::finish(
+                &app_handle.state(),
+                &task_id_for_thread,
+                TaskStatus::Failed,
+                100,
+                "云端本体包删除失败",
+                None,
+                Some(error),
+            ),
         }
     });
     Ok(task_id)
@@ -347,12 +415,7 @@ pub fn list_remote_body_packages(
     };
     let temporary_root = app_data_dir(&app)?.join("cloud-manifest-temp");
     let mut warnings = Vec::new();
-    let manifest = match CloudManifestService::read(
-        &client,
-        &files,
-        &directory,
-        &temporary_root,
-    ) {
+    let manifest = match CloudManifestService::read(&client, &files, &directory, &temporary_root) {
         Ok(manifest) => manifest,
         Err(error) => {
             warnings.push(format!("云端版本清单读取失败：{error}"));
@@ -414,12 +477,8 @@ pub fn repair_cloud_body_manifest(
     let app_handle = app.clone();
     let task_id_for_thread = task_id.clone();
     std::thread::spawn(move || {
-        let result = repair_cloud_body_manifest_task(
-            &app_handle,
-            &task_id_for_thread,
-            &game,
-            &directory,
-        );
+        let result =
+            repair_cloud_body_manifest_task(&app_handle, &task_id_for_thread, &game, &directory);
         release_transfer(&app_handle.state(), &game_uid);
         match result {
             Ok(summary) => TaskService::finish(
@@ -519,7 +578,13 @@ pub fn upload_game_body_package(
                 None,
             ),
             Err(error) if error == "任务已取消" => {
-                let _ = update_upload_record(&app_handle, &game_uid, &version.version_id, "local_only", None);
+                let _ = update_upload_record(
+                    &app_handle,
+                    &game_uid,
+                    &version.version_id,
+                    "local_only",
+                    None,
+                );
                 TaskService::finish(
                     &app_handle.state(),
                     &task_id_for_thread,
@@ -529,9 +594,15 @@ pub fn upload_game_body_package(
                     None,
                     None,
                 )
-            },
+            }
             Err(error) => {
-                let _ = update_upload_record(&app_handle, &game_uid, &version.version_id, "failed", None);
+                let _ = update_upload_record(
+                    &app_handle,
+                    &game_uid,
+                    &version.version_id,
+                    "failed",
+                    None,
+                );
                 TaskService::finish(
                     &app_handle.state(),
                     &task_id_for_thread,
@@ -642,14 +713,22 @@ fn upload_body_task(
 ) -> Result<serde_json::Value, String> {
     let state = app.state::<AppState>();
     update_upload_record(app, &game.game_uid, &version.version_id, "syncing", None)?;
-    let package_path = package_path.ok_or_else(|| "该本体版本没有本地 ZIP，无法上传".to_string())?;
+    let package_path =
+        package_path.ok_or_else(|| "该本体版本没有本地 ZIP，无法上传".to_string())?;
     if !package_path.is_file() {
         return Err("本地本体 ZIP 不存在，请先创建或下载本体包".to_string());
     }
     let package_size = std::fs::metadata(package_path)
         .map_err(|error| format!("读取本体 ZIP 大小失败：{error}"))?
         .len();
-    TaskService::update(&state, task_id, TaskStatus::Running, 2, "正在校验本体 ZIP", None);
+    TaskService::update(
+        &state,
+        task_id,
+        TaskStatus::Running,
+        2,
+        "正在校验本体 ZIP",
+        None,
+    );
     let quota = load_baidu_client(app)?.quota()?;
     if quota.free < package_size {
         return Err(format!(
@@ -667,13 +746,33 @@ fn upload_body_task(
     let client = load_baidu_client(app)?;
     let directory = remote_body_dir(&game.game_key)?;
     client.ensure_directory(&directory)?;
-    TaskService::update(&state, task_id, TaskStatus::Running, 5, "正在连接百度网盘", None);
+    TaskService::update(
+        &state,
+        task_id,
+        TaskStatus::Running,
+        5,
+        "正在连接百度网盘",
+        None,
+    );
     let remote_path = format!("{directory}/{}.zip", version.version_id);
     let remote = client.upload_file(package_path, &remote_path, |progress, message| {
-        TaskService::update(&state, task_id, TaskStatus::Running, progress, message, None);
+        TaskService::update(
+            &state,
+            task_id,
+            TaskStatus::Running,
+            progress,
+            message,
+            None,
+        );
         !TaskService::is_cancelled(&state, task_id)
     })?;
-    update_upload_record(app, &game.game_uid, &version.version_id, "synced", Some(&remote))?;
+    update_upload_record(
+        app,
+        &game.game_uid,
+        &version.version_id,
+        "synced",
+        Some(&remote),
+    )?;
     sync_cloud_manifest(app, &state, &client, &game.game_uid)?;
     Ok(serde_json::json!({
         "versionId": version.version_id,
@@ -693,11 +792,20 @@ fn download_body_task(
 ) -> Result<serde_json::Value, String> {
     let state = app.state::<AppState>();
     let client = load_baidu_client(app)?;
-    TaskService::update(&state, task_id, TaskStatus::Running, 3, "正在读取百度网盘本体版本", None);
+    TaskService::update(
+        &state,
+        task_id,
+        TaskStatus::Running,
+        3,
+        "正在读取百度网盘本体版本",
+        None,
+    );
     let remote_files = client.list(directory)?;
     let remote = remote_files
         .iter()
-        .find(|file| file.path == remote_path && remote_fs_id.is_none_or(|fs_id| fs_id == file.fs_id))
+        .find(|file| {
+            file.path == remote_path && remote_fs_id.is_none_or(|fs_id| fs_id == file.fs_id)
+        })
         .cloned()
         .ok_or_else(|| "百度网盘中没有找到这个本体包，可能已被删除".to_string())?;
     let cloud_manifest = CloudManifestService::read(
@@ -717,9 +825,20 @@ fn download_body_task(
     }
     let temporary_version_id = Uuid::new_v4().to_string();
     let cache_root = body_package_cache_root(app)?;
-    let temporary_path = BodyPackageService::package_path(&cache_root, &game.game_uid, &format!(".download-{temporary_version_id}"));
+    let temporary_path = BodyPackageService::package_path(
+        &cache_root,
+        &game.game_uid,
+        &format!(".download-{temporary_version_id}"),
+    );
     client.download_file(&remote, &temporary_path, |progress, message| {
-        TaskService::update(&state, task_id, TaskStatus::Running, progress, message, None);
+        TaskService::update(
+            &state,
+            task_id,
+            TaskStatus::Running,
+            progress,
+            message,
+            None,
+        );
         !TaskService::is_cancelled(&state, task_id)
     })?;
     let manifest = match BodyPackageService::validate_package(
@@ -739,7 +858,12 @@ fn download_body_task(
         let _ = std::fs::remove_file(&temporary_path);
         return Err("下载的本体包版本与云端版本清单不一致".to_string());
     }
-    if version_id.trim().is_empty() || version_id.contains('/') || version_id.contains('\\') || version_id == "." || version_id == ".." {
+    if version_id.trim().is_empty()
+        || version_id.contains('/')
+        || version_id.contains('\\')
+        || version_id == "."
+        || version_id == ".."
+    {
         let _ = std::fs::remove_file(&temporary_path);
         return Err("下载的本体包版本标识无效".to_string());
     }
@@ -773,7 +897,9 @@ fn download_body_task(
         .lock()
         .map_err(|_| "读取本体版本记录失败".to_string())?
         .clone();
-    candidate.body_versions.retain(|item| !(item.game_uid == game.game_uid && item.version_id == version_id));
+    candidate
+        .body_versions
+        .retain(|item| !(item.game_uid == game.game_uid && item.version_id == version_id));
     candidate.body_versions.push(body_version);
     if let Err(error) = GameRepository::persist(app, &candidate) {
         let _ = std::fs::remove_file(&package_path);
@@ -783,19 +909,29 @@ fn download_body_task(
         .store
         .lock()
         .map_err(|_| "更新本体版本记录失败".to_string())? = candidate;
-    Ok(serde_json::json!({ "versionId": version_id, "remotePath": remote_path, "fileCount": manifest.file_count }))
+    Ok(
+        serde_json::json!({ "versionId": version_id, "remotePath": remote_path, "fileCount": manifest.file_count }),
+    )
 }
 
 fn delete_remote_body_task(
     app: &AppHandle,
     task_id: &str,
-    game: &Game,
+    local_game: Option<&Game>,
+    game_key: &str,
     directory: &str,
     remote_path: &str,
     remote_fs_id: Option<u64>,
 ) -> Result<serde_json::Value, String> {
     let state = app.state::<AppState>();
-    TaskService::update(&state, task_id, TaskStatus::Running, 10, "正在删除云端本体包", None);
+    TaskService::update(
+        &state,
+        task_id,
+        TaskStatus::Running,
+        10,
+        "正在删除云端本体包",
+        None,
+    );
     if TaskService::is_cancelled(&state, task_id) {
         return Err("任务已取消".to_string());
     }
@@ -810,22 +946,75 @@ fn delete_remote_body_task(
         })
         .ok_or_else(|| "百度网盘中没有找到这个本体包，可能已被删除".to_string())?;
     client.delete_file(&remote.path)?;
-    clear_upload_record(app, &game.game_uid, &remote.path, remote.fs_id)?;
-    sync_cloud_manifest(app, &state, &client, &game.game_uid)?;
-    Ok(serde_json::json!({ "remotePath": remote.path, "remoteFsId": remote.fs_id, "size": remote.size }))
+    if let Some(game) = local_game {
+        clear_upload_record(app, &game.game_uid, &remote.path, remote.fs_id)?;
+        sync_cloud_manifest(app, &state, &client, &game.game_uid)?;
+    } else {
+        rebuild_remote_manifest(app, &client, directory, game_key)?;
+    }
+    Ok(
+        serde_json::json!({ "remotePath": remote.path, "remoteFsId": remote.fs_id, "size": remote.size }),
+    )
 }
 
-fn clear_upload_record(app: &AppHandle, game_uid: &str, remote_path: &str, remote_fs_id: u64) -> Result<(), String> {
+fn rebuild_remote_manifest(
+    app: &AppHandle,
+    client: &BaiduNetdiskClient,
+    directory: &str,
+    game_key: &str,
+) -> Result<(), String> {
+    let remote_files = client.list(directory)?;
+    let temporary_root = app_data_dir(app)?.join("cloud-manifest-temp");
+    let existing = CloudManifestService::read(client, &remote_files, directory, &temporary_root)?;
+    let game_uid = existing
+        .as_ref()
+        .map(|manifest| manifest.game_uid.clone())
+        .or_else(|| {
+            CloudManifestService::read_catalog(client, &remote_files, directory, &temporary_root)
+                .ok()
+                .flatten()
+                .map(|catalog| catalog.game_uid)
+        })
+        .ok_or_else(|| "云端游戏缺少可用的版本清单，无法更新删除结果".to_string())?;
+    CloudManifestService::rebuild(
+        client,
+        directory,
+        game_key,
+        &game_uid,
+        &remote_files,
+        &[],
+        &temporary_root,
+    )?;
+    Ok(())
+}
+
+fn clear_upload_record(
+    app: &AppHandle,
+    game_uid: &str,
+    remote_path: &str,
+    remote_fs_id: u64,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut candidate = state.store.lock().map_err(|_| "读取本体版本记录失败".to_string())?.clone();
-    for version in candidate.body_versions.iter_mut().filter(|version| version.game_uid == game_uid && version.remote_path.as_deref() == Some(remote_path) && version.remote_fs_id == Some(remote_fs_id)) {
+    let mut candidate = state
+        .store
+        .lock()
+        .map_err(|_| "读取本体版本记录失败".to_string())?
+        .clone();
+    for version in candidate.body_versions.iter_mut().filter(|version| {
+        version.game_uid == game_uid
+            && version.remote_path.as_deref() == Some(remote_path)
+            && version.remote_fs_id == Some(remote_fs_id)
+    }) {
         version.upload_status = Some("local_only".to_string());
         version.remote_path = None;
         version.remote_fs_id = None;
         version.remote_size = None;
     }
     GameRepository::persist(app, &candidate)?;
-    *state.store.lock().map_err(|_| "更新本体版本记录失败".to_string())? = candidate;
+    *state
+        .store
+        .lock()
+        .map_err(|_| "更新本体版本记录失败".to_string())? = candidate;
     Ok(())
 }
 
@@ -950,13 +1139,7 @@ fn repair_cloud_body_manifest_task(
         &local_versions,
         &app_data_dir(app)?.join("cloud-manifest-temp"),
     )?;
-    sync_cloud_catalog(
-        app,
-        &state,
-        &client,
-        &game.game_uid,
-        directory,
-    )?;
+    sync_cloud_catalog(app, &state, &client, &game.game_uid, directory)?;
     Ok(serde_json::json!({
         "versionCount": manifest.versions.len(),
         "remoteFileCount": remote_files.len(),
@@ -998,8 +1181,16 @@ fn install_cloud_game_task(
     let state = app.state::<AppState>();
     let app_data_dir = app_data_dir(app)?;
     let client = load_baidu_client(app)?;
-    TaskService::update(&state, task_id, TaskStatus::Running, 3, "正在读取云端游戏信息", None);
-    let remote_game_key = game_key.ok_or_else(|| "云端游戏缺少 gameKey，无法定位本体包".to_string())?;
+    TaskService::update(
+        &state,
+        task_id,
+        TaskStatus::Running,
+        3,
+        "正在读取云端游戏信息",
+        None,
+    );
+    let remote_game_key =
+        game_key.ok_or_else(|| "云端游戏缺少 gameKey，无法定位本体包".to_string())?;
     let directory = remote_body_dir(remote_game_key)?;
     let remote_files = client.list(&directory)?;
     let remote = remote_files
@@ -1012,8 +1203,9 @@ fn install_cloud_game_task(
         .cloned()
         .ok_or_else(|| "百度网盘中没有找到这个游戏本体包，可能已被删除".to_string())?;
     let temporary_root = app_data_dir.join("cloud-manifest-temp");
-    let catalog = CloudManifestService::read_catalog(&client, &remote_files, &directory, &temporary_root)?
-        .ok_or_else(|| "云端游戏缺少启动信息，请在本地重新上传一次游戏本体包".to_string())?;
+    let catalog =
+        CloudManifestService::read_catalog(&client, &remote_files, &directory, &temporary_root)?
+            .ok_or_else(|| "云端游戏缺少启动信息，请在本地重新上传一次游戏本体包".to_string())?;
     let manifest = CloudManifestService::read(&client, &remote_files, &directory, &temporary_root)
         .ok()
         .flatten();
@@ -1023,10 +1215,7 @@ fn install_cloud_game_task(
         .map_err(|_| "读取本地游戏信息失败".to_string())?
         .games
         .iter()
-        .find(|game| {
-            game_key.is_some_and(|key| game.game_key == key)
-                || game.game_uid == game_uid
-        })
+        .find(|game| game_key.is_some_and(|key| game.game_key == key) || game.game_uid == game_uid)
         .cloned();
     let local_uid = existing
         .as_ref()
@@ -1045,7 +1234,9 @@ fn install_cloud_game_task(
         .packages
         .into_iter()
         .find(|package| package.path == remote.path && package.fs_id == remote.fs_id);
-    let expected_sha256 = package.as_ref().and_then(|package| package.package_sha256.as_deref());
+    let expected_sha256 = package
+        .as_ref()
+        .and_then(|package| package.package_sha256.as_deref());
     let games_root = state.games_root()?;
     let managed_path = existing
         .as_ref()
@@ -1067,9 +1258,23 @@ fn install_cloud_game_task(
     if package_path.is_file() {
         let _ = std::fs::remove_file(&package_path);
     }
-    TaskService::update(&state, task_id, TaskStatus::Running, 5, "正在下载游戏本体", None);
+    TaskService::update(
+        &state,
+        task_id,
+        TaskStatus::Running,
+        5,
+        "正在下载游戏本体",
+        None,
+    );
     client.download_file(&remote, &package_path, |progress, message| {
-        TaskService::update(&state, task_id, TaskStatus::Running, 5 + progress.saturating_mul(3) / 4, message, None);
+        TaskService::update(
+            &state,
+            task_id,
+            TaskStatus::Running,
+            5 + progress.saturating_mul(3) / 4,
+            message,
+            None,
+        );
         !TaskService::is_cancelled(&state, task_id)
     })?;
     if TaskService::is_cancelled(&state, task_id) {
@@ -1080,14 +1285,30 @@ fn install_cloud_game_task(
     if staging.exists() {
         return Err("已有未完成的云端游戏安装暂存目录，请重启应用后重试".to_string());
     }
-    TaskService::update(&state, task_id, TaskStatus::Running, 82, "正在校验并安装游戏本体", None);
+    TaskService::update(
+        &state,
+        task_id,
+        TaskStatus::Running,
+        82,
+        "正在校验并安装游戏本体",
+        None,
+    );
     let body_manifest = BodyPackageService::extract_package(
         &package_path,
         &staging,
         &local_uid,
         &catalog.executable_relative_path,
         expected_sha256,
-        |progress, message| TaskService::update(&state, task_id, TaskStatus::Running, 82 + progress / 6, message, None),
+        |progress, message| {
+            TaskService::update(
+                &state,
+                task_id,
+                TaskStatus::Running,
+                82 + progress / 6,
+                message,
+                None,
+            )
+        },
         || TaskService::is_cancelled(&state, task_id),
     )?;
     if TaskService::is_cancelled(&state, task_id) {
@@ -1098,14 +1319,19 @@ fn install_cloud_game_task(
     if managed_path.exists() {
         return Err("游戏受管目录已存在，未覆盖现有文件".to_string());
     }
-    std::fs::rename(&staging, &managed_path).map_err(|error| format!("提交云端游戏安装失败：{error}"))?;
+    std::fs::rename(&staging, &managed_path)
+        .map_err(|error| format!("提交云端游戏安装失败：{error}"))?;
     let mut candidate = state
         .store
         .lock()
         .map_err(|_| "读取游戏记录失败".to_string())?
         .clone();
     let mut game = existing.unwrap_or_else(|| {
-        let mut game = Game::new_pending(&catalog.display_name, managed_path.to_string_lossy(), &catalog.executable_relative_path);
+        let mut game = Game::new_pending(
+            &catalog.display_name,
+            managed_path.to_string_lossy(),
+            &catalog.executable_relative_path,
+        );
         game.game_uid = local_uid.to_string();
         game
     });
@@ -1122,16 +1348,25 @@ fn install_cloud_game_task(
         arguments: catalog.arguments,
         working_directory_relative_path: catalog.working_directory_relative_path,
     };
-    if let Some(existing_game) = candidate.games.iter_mut().find(|item| item.game_uid == local_uid) {
+    if let Some(existing_game) = candidate
+        .games
+        .iter_mut()
+        .find(|item| item.game_uid == local_uid)
+    {
         *existing_game = game.clone();
     } else {
         GameLibraryService::register_pending(&mut candidate, game.clone())?;
     }
-    candidate.body_versions.retain(|version| !(version.game_uid == local_uid && version.version_id == version_id));
+    candidate
+        .body_versions
+        .retain(|version| !(version.game_uid == local_uid && version.version_id == version_id));
     candidate.body_versions.push(GameBodyVersion {
         version_id: version_id.clone(),
         game_uid: local_uid.to_string(),
-        created_at: package.as_ref().and_then(|package| package.created_at.clone()).unwrap_or_else(now_iso),
+        created_at: package
+            .as_ref()
+            .and_then(|package| package.created_at.clone())
+            .unwrap_or_else(now_iso),
         archive_path: String::new(),
         file_count: body_manifest.file_count,
         total_bytes: body_manifest.total_bytes,
@@ -1147,7 +1382,10 @@ fn install_cloud_game_task(
         let _ = std::fs::remove_dir_all(&managed_path);
         return Err(format!("保存已安装游戏记录失败：{error}"));
     }
-    *state.store.lock().map_err(|_| "更新游戏记录失败".to_string())? = candidate;
+    *state
+        .store
+        .lock()
+        .map_err(|_| "更新游戏记录失败".to_string())? = candidate;
     Ok(serde_json::json!({
         "gameUid": local_uid,
         "versionId": version_id,
@@ -1202,7 +1440,9 @@ fn reconcile_local_body_versions(
                     changed = true;
                 }
             }
-            None if version.remote_path.is_some() || version.upload_status.as_deref() == Some("synced") => {
+            None if version.remote_path.is_some()
+                || version.upload_status.as_deref() == Some("synced") =>
+            {
                 version.upload_status = Some("local_only".to_string());
                 version.remote_path = None;
                 version.remote_fs_id = None;
@@ -1228,17 +1468,38 @@ fn load_body_version(
     game_uid: &str,
     version_id: &str,
 ) -> Result<(Game, GameBodyVersion), String> {
-    let store = state.store.lock().map_err(|_| "lock GameSaver store failed".to_string())?;
-    let game = store.games.iter().find(|game| game.game_uid == game_uid).cloned().ok_or_else(|| "游戏不存在".to_string())?;
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "lock GameSaver store failed".to_string())?;
+    let game = store
+        .games
+        .iter()
+        .find(|game| game.game_uid == game_uid)
+        .cloned()
+        .ok_or_else(|| "游戏不存在".to_string())?;
     if !matches!(game.lifecycle, crate::domain::GameLifecycle::Active) {
         return Err("游戏尚未完成设置，不能传输本体包".to_string());
     }
-    let version = store.body_versions.iter().find(|version| version.game_uid == game_uid && version.version_id == version_id).cloned().ok_or_else(|| "本体版本不存在".to_string())?;
+    let version = store
+        .body_versions
+        .iter()
+        .find(|version| version.game_uid == game_uid && version.version_id == version_id)
+        .cloned()
+        .ok_or_else(|| "本体版本不存在".to_string())?;
     Ok((game, version))
 }
 
 fn load_game(state: &AppState, game_uid: &str) -> Result<Game, String> {
-    let game = state.store.lock().map_err(|_| "lock GameSaver store failed".to_string())?.games.iter().find(|game| game.game_uid == game_uid).cloned().ok_or_else(|| "游戏不存在".to_string())?;
+    let game = state
+        .store
+        .lock()
+        .map_err(|_| "lock GameSaver store failed".to_string())?
+        .games
+        .iter()
+        .find(|game| game.game_uid == game_uid)
+        .cloned()
+        .ok_or_else(|| "游戏不存在".to_string())?;
     if !matches!(game.lifecycle, crate::domain::GameLifecycle::Active) {
         return Err("游戏尚未完成设置，不能传输本体包".to_string());
     }
@@ -1250,11 +1511,19 @@ fn ensure_game(state: &AppState, game_uid: &str) -> Result<(), String> {
 }
 
 fn reserve_transfer(state: &AppState, game_uid: &str) -> Result<(), String> {
-    let mut operations = state.save_operations.lock().map_err(|_| "lock save operation state failed".to_string())?;
+    let mut operations = state
+        .save_operations
+        .lock()
+        .map_err(|_| "lock save operation state failed".to_string())?;
     if operations.contains(game_uid) {
         return Err("该游戏已有本体或存档操作正在进行".to_string());
     }
-    if state.running_games.lock().map_err(|_| "lock running game state failed".to_string())?.contains_key(game_uid) {
+    if state
+        .running_games
+        .lock()
+        .map_err(|_| "lock running game state failed".to_string())?
+        .contains_key(game_uid)
+    {
         return Err("游戏运行中，暂时不能传输游戏本体".to_string());
     }
     operations.insert(game_uid.to_string());
@@ -1281,7 +1550,9 @@ fn load_baidu_client(app: &AppHandle) -> Result<BaiduNetdiskClient, String> {
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path().app_data_dir().map_err(|err| format!("解析 GameSaver 数据目录失败：{err}"))
+    app.path()
+        .app_data_dir()
+        .map_err(|err| format!("解析 GameSaver 数据目录失败：{err}"))
 }
 
 fn body_package_cache_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1304,8 +1575,16 @@ fn remote_body_dir(game_key: &str) -> Result<String, String> {
 
 fn validate_remote_package_path(directory: &str, path: &str) -> Result<(), String> {
     let prefix = format!("{directory}/");
-    let name = path.strip_prefix(&prefix).ok_or_else(|| "远程本体包路径不属于当前游戏".to_string())?;
-    if name.is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".." || !name.to_ascii_lowercase().ends_with(".zip") {
+    let name = path
+        .strip_prefix(&prefix)
+        .ok_or_else(|| "远程本体包路径不属于当前游戏".to_string())?;
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name == "."
+        || name == ".."
+        || !name.to_ascii_lowercase().ends_with(".zip")
+    {
         return Err("远程本体包路径无效".to_string());
     }
     Ok(())
@@ -1326,15 +1605,21 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
-        let read = std::io::Read::read(&mut file, &mut buffer).map_err(|err| format!("计算本体包哈希失败：{err}"))?;
-        if read == 0 { break; }
+        let read = std::io::Read::read(&mut file, &mut buffer)
+            .map_err(|err| format!("计算本体包哈希失败：{err}"))?;
+        if read == 0 {
+            break;
+        }
         hasher.update(&buffer[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
 }
 
 fn now_iso() -> String {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|value| value.as_secs().to_string()).unwrap_or_else(|_| "0".to_string())
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 #[cfg(test)]
@@ -1356,7 +1641,10 @@ mod tests {
     #[test]
     fn remote_body_directory_rejects_path_segments() {
         for value in ["", ".", "..", "game/name", r"game\name", "game\nname"] {
-            assert!(remote_body_dir(value).is_err(), "accepted unsafe gameKey: {value:?}");
+            assert!(
+                remote_body_dir(value).is_err(),
+                "accepted unsafe gameKey: {value:?}"
+            );
         }
     }
 
