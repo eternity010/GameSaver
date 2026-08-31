@@ -439,16 +439,21 @@ fn infer_scope_drafts(active: &ActiveLearningSession, final_snapshot: &HashMap<S
         for (path, fingerprint) in final_snapshot {
             if baseline.get(path) != Some(fingerprint) { changed.push(path.clone()); }
         }
+        for path in baseline.keys() {
+            if !final_snapshot.contains_key(path) { changed.push(path.clone()); }
+        }
     } else {
         for path in etw_files {
             if final_snapshot.contains_key(path) { changed.push(path.clone()); }
         }
     }
     changed.sort();
+    changed.dedup();
     let mut groups: BTreeMap<String, (usize, Vec<String>, SaveRootType)> = BTreeMap::new();
     for path in &changed {
         if !etw_files.is_empty() && !etw_files.contains(path) { continue; }
-        let Some(fingerprint) = final_snapshot.get(path) else { continue; };
+        let fingerprint = final_snapshot.get(path).or_else(|| baseline.and_then(|b| b.get(path)));
+        let Some(fingerprint) = fingerprint else { continue; };
         let candidate_by_etw = !etw_files.is_empty() && is_etw_candidate(path);
         let candidate_by_snapshot = etw_files.is_empty() && is_save_candidate(path);
         if fingerprint.size > MAX_CANDIDATE_FILE_BYTES || (!candidate_by_etw && !candidate_by_snapshot) { continue; }
@@ -467,13 +472,18 @@ fn infer_scope_drafts(active: &ActiveLearningSession, final_snapshot: &HashMap<S
         let Some(relative) = relative else { continue; };
         let entry = groups.entry(key).or_insert((0, Vec::new(), scan_root.root_type));
         entry.0 += 1;
-        entry.1.push(relative);
+        if final_snapshot.contains_key(path) {
+            entry.1.push(relative);
+        }
     }
     let mut drafts = Vec::new();
     for (physical_root, (count, mut files, root_type)) in groups {
         files.sort();
         files.dedup();
         let protects_container = is_save_container_directory(Path::new(&physical_root));
+        if files.is_empty() && !protects_container {
+            continue;
+        }
         drafts.push(SaveScopeDraft {
             scope: SaveScope {
                 root_type,
@@ -634,10 +644,16 @@ mod tests {
 
     use super::{
         calculate_learning_confidence, directory_matches_hint, discover_save_container_files,
-        is_etw_candidate, is_save_container_directory, path_is_within_root,
+        infer_scope_drafts, is_etw_candidate, is_save_container_directory, path_is_within_root,
         snapshot_analysis_progress, MAX_CANDIDATE_FILE_BYTES,
     };
-    use crate::domain::{SaveRootType, SaveScope, SaveScopeDraft, SaveTransactionSummary, ScanRoot, UnknownFilePolicy};
+    use crate::domain::{
+        ActiveLearningSession, FileFingerprint, LearningSessionView, LearningStatus, SaveRootType,
+        SaveScope, SaveScopeDraft, SaveTransactionSummary, ScanRoot, UnknownFilePolicy,
+    };
+    use std::collections::{HashMap, HashSet};
+    use std::path::PathBuf;
+    use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
     #[test]
     fn snapshot_progress_does_not_overflow_at_completion() {
@@ -805,5 +821,48 @@ mod tests {
             ),
             95
         );
+    }
+
+    #[test]
+    fn bidirectional_diff_captures_deleted_and_created_files() {
+        let active = ActiveLearningSession {
+            view: LearningSessionView {
+                session_id: "test-sess".to_string(),
+                game_uid: "game-1".to_string(),
+                root_pid: 100,
+                started_at: "0".to_string(),
+                status: LearningStatus::Capturing,
+            },
+            roots: vec![ScanRoot {
+                root_type: SaveRootType::SavedGames,
+                physical_path: PathBuf::from(r"c:\users\player\saved games\mygame"),
+            }],
+            baseline: None,
+            tracked_pids: Arc::new(Mutex::new(vec![100])),
+            process_tracker_stop: Arc::new(AtomicBool::new(false)),
+            etw_capture: None,
+            etw_start_error: None,
+        };
+
+        let old_save = r"c:\users\player\saved games\mygame\save_old.sav".to_string();
+        let new_save = r"c:\users\player\saved games\mygame\save_new.sav".to_string();
+
+        let mut baseline = HashMap::new();
+        baseline.insert(old_save.clone(), FileFingerprint { size: 1024, modified_unix: 100 });
+
+        let mut final_snapshot = HashMap::new();
+        final_snapshot.insert(new_save.clone(), FileFingerprint { size: 2048, modified_unix: 200 });
+
+        let etw_empty = HashSet::new();
+        let (changed, drafts, _) = infer_scope_drafts(&active, &final_snapshot, Some(&baseline), &etw_empty);
+
+        // 双向 diff 必须同时捕获被删除的 old_save 和新建的 new_save
+        assert_eq!(changed.len(), 2);
+        assert!(changed.contains(&old_save));
+        assert!(changed.contains(&new_save));
+
+        // 生成的 scope draft confirmed_files 只包含当前实际存活的 new_save
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].scope.confirmed_files, vec!["save_new.sav".to_string()]);
     }
 }
