@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch } from "vue";
+import { nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
-import { AlertTriangle, Archive, ArrowLeft, CheckCircle2, Clock3, Folder, FolderOpen, Gamepad2, HardDrive, ImagePlus, LoaderCircle, Play, RefreshCw, RotateCcw, ShieldCheck, Trash2, Upload, X } from "@lucide/vue";
-import { deleteGameBodyPackage, deleteSaveVersion, getBaiduConfig, getBaiduStatus, getGameCover, getGameRuntime, getTask, launchGame, listGameBodyVersions, listSaveVersions, packageGameBody, precheckGameLaunch, pruneSaveVersions, restoreSaveVersion, saveGameCover, uninstallGameBody, updateGameBody, uploadGameBodyPackage } from "../api";
+import { AlertTriangle, Archive, ArrowLeft, Check, CheckCircle2, Clock3, Folder, FolderOpen, Gamepad2, HardDrive, ImagePlus, LoaderCircle, Pencil, Play, RefreshCw, RotateCcw, ShieldCheck, Trash2, Upload, X } from "@lucide/vue";
+import { deleteGameBodyPackage, deleteSaveVersion, getBaiduConfig, getBaiduStatus, getGameCover, getGameRuntime, getTask, launchGame, listGameBodyVersions, listSaveVersions, packageGameBody, precheckGameLaunch, pruneSaveVersions, renameGame, restoreSaveVersion, saveGameCover, uninstallGameBody, updateGameBody, uploadGameBodyPackage } from "../api";
 import type { BaiduConfigView, BaiduStatus } from "../api";
 import type { CoverCrop, CoverPosition, Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveVersion } from "../domain/game";
 
@@ -40,6 +40,51 @@ let coverPointerY = 0;
 const COVER_STAGE_WIDTH = 640;
 const COVER_STAGE_HEIGHT = 360;
 let pollTimer: ReturnType<typeof setTimeout> | undefined;
+
+const renaming = ref(false);
+const editingName = ref("");
+const renameSaving = ref(false);
+const renameError = ref("");
+const nameInputRef = ref<HTMLInputElement | null>(null);
+
+function startRename() {
+  editingName.value = props.game.displayName;
+  renameError.value = "";
+  renaming.value = true;
+  void nextTick(() => {
+    nameInputRef.value?.focus();
+    nameInputRef.value?.select();
+  });
+}
+
+function cancelRename() {
+  renaming.value = false;
+  renameError.value = "";
+}
+
+async function submitRename() {
+  const trimmed = editingName.value.trim();
+  if (!trimmed) {
+    renameError.value = "游戏名称不能为空";
+    return;
+  }
+  if (trimmed === props.game.displayName) {
+    renaming.value = false;
+    return;
+  }
+  renameSaving.value = true;
+  renameError.value = "";
+  try {
+    const updated = await renameGame(props.game.gameUid, trimmed);
+    props.game.displayName = updated.displayName;
+    renaming.value = false;
+    emit("refresh");
+  } catch (reason) {
+    renameError.value = String(reason);
+  } finally {
+    renameSaving.value = false;
+  }
+}
 
 async function refresh() {
   loading.value = true;
@@ -477,7 +522,57 @@ onUnmounted(() => {
   <section class="game-detail-page page-enter">
     <header class="detail-header">
       <button class="icon-button" type="button" title="返回游戏库" aria-label="返回游戏库" @click="emit('back')"><ArrowLeft :size="18" /></button>
-      <div class="detail-heading"><p class="eyebrow">游戏详情</p><h1>{{ game.displayName }}</h1><p>管理本体、启动和存档保护。</p></div>
+      <div class="detail-heading">
+        <p class="eyebrow">游戏详情</p>
+        <div v-if="renaming" class="detail-rename-form">
+          <input
+            ref="nameInputRef"
+            v-model="editingName"
+            type="text"
+            class="detail-rename-input"
+            maxlength="100"
+            placeholder="输入游戏名称"
+            :disabled="renameSaving"
+            @keydown.enter.prevent="submitRename"
+            @keydown.escape.prevent="cancelRename"
+          />
+          <button
+            class="icon-button detail-rename-action confirm"
+            type="button"
+            title="保存名称 (Enter)"
+            aria-label="保存名称"
+            :disabled="renameSaving"
+            @click="submitRename"
+          >
+            <Check :size="16" />
+          </button>
+          <button
+            class="icon-button detail-rename-action cancel"
+            type="button"
+            title="取消 (Esc)"
+            aria-label="取消修改"
+            :disabled="renameSaving"
+            @click="cancelRename"
+          >
+            <X :size="16" />
+          </button>
+        </div>
+        <div v-else class="detail-title-row">
+          <h1 :title="`游戏名称：${game.displayName}`">{{ game.displayName }}</h1>
+          <button
+            class="icon-button inline-rename-button"
+            type="button"
+            title="修改游戏名称"
+            aria-label="修改游戏名称"
+            :disabled="busy || !!runtime"
+            @click="startRename"
+          >
+            <Pencil :size="16" />
+          </button>
+        </div>
+        <p v-if="renameError" class="detail-rename-error">{{ renameError }}</p>
+        <p v-else>管理本体、启动和存档保护。</p>
+      </div>
       <button class="icon-button detail-refresh" type="button" title="刷新游戏状态" aria-label="刷新游戏状态" :disabled="loading || busy" @click="refresh"><RefreshCw :size="17" /></button>
     </header>
 

@@ -8,6 +8,7 @@ use std::{fs, io::Write, path::{Component, Path, PathBuf}};
 use tauri::{AppHandle, State};
 use uuid::Uuid;
 
+
 #[tauri::command]
 pub fn list_games(state: State<AppState>) -> Result<Vec<crate::domain::Game>, String> {
     let store = state.store.lock().map_err(|_| "lock GameSaver store failed".to_string())?;
@@ -18,6 +19,95 @@ pub fn list_games(state: State<AppState>) -> Result<Vec<crate::domain::Game>, St
 pub fn get_game(state: State<AppState>, game_uid: String) -> Result<Option<crate::domain::Game>, String> {
     let store = state.store.lock().map_err(|_| "lock GameSaver store failed".to_string())?;
     Ok(GameLibraryService::find(&store, game_uid.trim()))
+}
+
+pub fn validate_game_display_name(new_display_name: &str) -> Result<String, String> {
+    let new_name = new_display_name.trim();
+    if new_name.is_empty() {
+        return Err("游戏名称不能为空".to_string());
+    }
+    if new_name.chars().count() > 100 {
+        return Err("游戏名称不能超过 100 个字符".to_string());
+    }
+    if new_name.chars().any(char::is_control) {
+        return Err("游戏名称包含非法控制字符".to_string());
+    }
+    Ok(new_name.to_string())
+}
+
+#[tauri::command]
+pub fn rename_game(
+    app: AppHandle,
+    state: State<AppState>,
+    game_uid: String,
+    new_display_name: String,
+) -> Result<crate::domain::Game, String> {
+    let game_uid = game_uid.trim().to_string();
+    let new_name = validate_game_display_name(&new_display_name)?;
+
+    let mut candidate = state
+        .store
+        .lock()
+        .map_err(|_| "读取游戏记录失败".to_string())?
+        .clone();
+    let game = candidate
+        .games
+        .iter_mut()
+        .find(|game| game.game_uid == game_uid)
+        .ok_or_else(|| "游戏不存在".to_string())?;
+
+    game.display_name = new_name.to_string();
+    let updated_game = game.clone();
+
+    GameRepository::persist(&app, &candidate)?;
+    *state.store.lock().map_err(|_| "更新游戏记录失败".to_string())? = candidate;
+
+    maybe_sync_catalog_to_cloud_async(app, updated_game.clone());
+
+    Ok(updated_game)
+}
+
+fn maybe_sync_catalog_to_cloud_async(app: AppHandle, game: crate::domain::Game) {
+    if game.game_key.trim().is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let Ok(client) = crate::commands::baidu_commands::load_baidu_client(&app) else {
+            return;
+        };
+        let Ok(remote_dir) = crate::commands::baidu_commands::remote_body_dir(&game.game_key) else {
+            return;
+        };
+        let Ok(remote_files) = client.list(&remote_dir) else {
+            return;
+        };
+        let has_cloud_game = remote_files.iter().any(|file| {
+            file.path.ends_with("/manifest.json") || file.path.ends_with("/game.json")
+        });
+        if !has_cloud_game {
+            return;
+        }
+        let Ok(base_data_dir) = crate::commands::baidu_commands::app_data_dir(&app) else {
+            return;
+        };
+        let temporary_root = base_data_dir.join("cloud-manifest-temp");
+        let cache_root = base_data_dir.join("cloud-manifest-cache");
+        let catalog = crate::services::CloudManifestService::catalog_from_game(&game);
+        let _ = crate::services::CloudManifestService::write_catalog(
+            &client,
+            &remote_dir,
+            &catalog,
+            &temporary_root,
+        );
+        if let Some(remote_catalog) = remote_files.iter().find(|file| file.path == crate::services::CloudManifestService::catalog_path(&remote_dir)) {
+            let _ = crate::services::CloudManifestService::save_cached_catalog(
+                &cache_root,
+                &remote_dir,
+                remote_catalog,
+                &catalog,
+            );
+        }
+    });
 }
 
 const MAX_ORIGINAL_COVER_BYTES: usize = 32 * 1024 * 1024;
@@ -262,5 +352,41 @@ fn reserve_cover_operation(state: &AppState, game_uid: &str) -> Result<(), Strin
 fn release_cover_operation(state: &AppState, game_uid: &str) {
     if let Ok(mut operations) = state.save_operations.lock() {
         operations.remove(game_uid);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_game_display_name;
+
+    #[test]
+    fn validates_valid_game_display_name() {
+        assert_eq!(
+            validate_game_display_name("  Cyberpunk 2077  ").unwrap(),
+            "Cyberpunk 2077"
+        );
+        assert_eq!(
+            validate_game_display_name("小猫的金币大冒险").unwrap(),
+            "小猫的金币大冒险"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_or_whitespace_game_display_name() {
+        assert!(validate_game_display_name("").is_err());
+        assert!(validate_game_display_name("   \t  ").is_err());
+    }
+
+    #[test]
+    fn rejects_overly_long_game_display_name() {
+        let long_name = "a".repeat(101);
+        assert!(validate_game_display_name(&long_name).is_err());
+    }
+
+    #[test]
+    fn rejects_control_characters_in_game_display_name() {
+        assert!(validate_game_display_name("Game\nName").is_err());
+        assert!(validate_game_display_name("Game\r\nName").is_err());
+        assert!(validate_game_display_name("Game\0Name").is_err());
     }
 }

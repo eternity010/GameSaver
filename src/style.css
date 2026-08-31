@@ -233,8 +233,20 @@ h1 { margin-bottom: 0; font-size: 30px; letter-spacing: 0; }
 .state-panel button { padding: 9px 14px; color: var(--text-primary); background: var(--surface-raised); }
 .game-detail-page { max-width: 1120px; margin: 0 auto; }
 .detail-header { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 24px; }
-.detail-heading { flex: 1; }
-.detail-heading h1 { margin-bottom: 7px; }
+.detail-heading { flex: 1; min-width: 0; }
+.detail-heading h1 { margin-bottom: 0; font-size: 24px; line-height: 1.25; word-break: break-word; }
+.detail-title-row { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+.inline-rename-button { display: inline-grid; place-items: center; width: 28px; height: 28px; color: var(--text-secondary); border-radius: 4px; }
+.inline-rename-button:hover { color: var(--text-primary); background: #2b3543; }
+.detail-rename-form { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+.detail-rename-input { min-width: 240px; max-width: min(480px, 100%); padding: 5px 10px; border: 1px solid #485c7b; border-radius: 5px; color: var(--text-primary); background: #171d26; font-size: 18px; font-weight: 700; outline: none; }
+.detail-rename-input:focus { border-color: #80adf5; box-shadow: 0 0 0 2px rgba(128, 173, 245, .2); }
+.detail-rename-action { display: inline-grid; place-items: center; width: 32px; height: 32px; border-radius: 4px; }
+.detail-rename-action.confirm { color: #5edb99; background: #1f382a; }
+.detail-rename-action.confirm:hover { background: #294c39; }
+.detail-rename-action.cancel { color: #adb5bd; background: #28303d; }
+.detail-rename-action.cancel:hover { background: #343e4f; }
+.detail-rename-error { margin-top: 4px; margin-bottom: 0; color: #f77272; font-size: 12px; }
 .detail-heading p:last-child { margin-bottom: 0; color: var(--text-secondary); }
 .detail-refresh { margin-left: auto; }
 .detail-hero { display: flex; gap: 24px; min-height: 250px; margin-bottom: 18px; padding: 24px; border: 1px solid #2d323b; border-radius: 8px; background: #222832; }

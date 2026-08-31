@@ -160,6 +160,10 @@ export function getGame(gameUid: string): Promise<Game | null> {
   return invokeCommand<Game | null>("get_game", { gameUid });
 }
 
+export function renameGame(gameUid: string, newDisplayName: string): Promise<Game> {
+  return invokeCommand<Game>("rename_game", { gameUid, newDisplayName });
+}
+
 export function saveGameCover(gameUid: string, originalBytes: number[], displayBytes: number[], originalExtension: string, crop: CoverCrop, position: CoverPosition): Promise<GameCover> {
   return invokeCommand<GameCover>("save_game_cover", { gameUid, originalBytes, displayBytes, originalExtension, crop, position });
 }
