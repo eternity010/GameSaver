@@ -223,6 +223,7 @@ fn resolve_scope(
         crate::domain::SaveRootType::AppData => std::env::var("APPDATA").ok(),
         crate::domain::SaveRootType::LocalAppData => std::env::var("LOCALAPPDATA").ok(),
         crate::domain::SaveRootType::Documents => std::env::var("USERPROFILE").ok().map(|path| PathBuf::from(path).join("Documents").to_string_lossy().to_string()),
+        crate::domain::SaveRootType::SavedGames => std::env::var("USERPROFILE").ok().map(|path| PathBuf::from(path).join("Saved Games").to_string_lossy().to_string()),
         crate::domain::SaveRootType::UserProfile => std::env::var("USERPROFILE").ok(),
         crate::domain::SaveRootType::Custom => scope.custom_root_path.clone(),
     }

@@ -276,7 +276,7 @@ fn discover_scan_roots(game: &Game) -> Result<Vec<crate::domain::ScanRoot>, Stri
         let saved_games = profile_root.join("Saved Games");
         if saved_games.is_dir() {
             for path in find_candidate_directories(&saved_games, &hints) {
-                roots.push(crate::domain::ScanRoot { root_type: SaveRootType::Documents, physical_path: path });
+                roots.push(crate::domain::ScanRoot { root_type: SaveRootType::SavedGames, physical_path: path });
             }
         }
         let local_low = profile_root.join("AppData").join("LocalLow");
@@ -670,5 +670,15 @@ mod tests {
             r"c:\users\player\gamesaver-old\save.dat",
             Path::new(r"C:\Users\Player\GameSaver")
         ));
+    }
+
+    #[test]
+    fn saved_games_root_type_serializes_and_matches() {
+        assert_eq!(
+            serde_json::to_string(&SaveRootType::SavedGames).unwrap(),
+            "\"saved_games\""
+        );
+        let deserialized: SaveRootType = serde_json::from_str("\"saved_games\"").unwrap();
+        assert_eq!(deserialized, SaveRootType::SavedGames);
     }
 }

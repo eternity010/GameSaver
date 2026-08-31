@@ -8,6 +8,7 @@ pub enum SaveRootType {
     AppData,
     LocalAppData,
     Documents,
+    SavedGames,
     UserProfile,
     Custom,
 }
