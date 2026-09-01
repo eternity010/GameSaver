@@ -31,6 +31,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--focus-ring)
 .nav-item { display: flex; align-items: center; gap: 12px; width: 100%; padding: 11px 12px; border: 0; border-radius: 6px; color: var(--text-secondary); background: transparent; text-align: left; }
 .nav-item:hover, .nav-item.active { color: var(--text-primary); background: var(--surface-raised); }
 .nav-item.active { box-shadow: inset 3px 0 var(--brand); }
+.nav-badge { margin-left: auto; padding: 2px 7px; border-radius: 999px; color: #162033; background: var(--brand); font-size: 11px; font-weight: 700; line-height: 1.2; }
 .disabled-nav { cursor: not-allowed; opacity: .45; }
 .local-status { padding: 0 12px; color: #7f8897; font-size: 12px; }
 .local-status i { display: inline-block; width: 7px; height: 7px; margin-right: 5px; border-radius: 50%; background: var(--success); }

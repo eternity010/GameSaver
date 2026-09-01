@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { AlertTriangle, CloudDownload, CloudUpload, Gamepad2, Library, Plus, Settings, Search, ShieldCheck } from "@lucide/vue";
-import { deleteRemoteBodyPackage, getElevationStatus, getGameCover, getTask, installCloudGame, launchGame, listCloudGames, listGames, restartAsAdmin } from "./api";
-import type { ElevationStatus } from "./api";
+import { deleteRemoteBodyPackage, getElevationStatus, getGameCover, getTask, installCloudGame, launchGame, listCloudGames, listGames, listTasks, restartAsAdmin } from "./api";
+import type { AppTask, ElevationStatus } from "./api";
 import type { CloudGameSummary, CloudGameVersion } from "./api";
 import { gameStatusLabel, type Game } from "./domain/game";
 import AddGameWizard from "./components/AddGameWizard.vue";
@@ -38,7 +38,9 @@ const STORE_PAGE_SIZE = 9;
 const elevationStatus = ref<ElevationStatus | null>(null);
 const elevationLoading = ref(false);
 const elevationError = ref("");
+const activeTransferCount = ref(0);
 let cloudInstallTimer: ReturnType<typeof setTimeout> | undefined;
+let transferCountTimer: ReturnType<typeof setTimeout> | undefined;
 
 const filteredGames = computed(() => {
   const keyword = search.value.trim().toLocaleLowerCase();
@@ -158,13 +160,34 @@ async function restartWithAdmin() {
   }
 }
 
+async function updateTransferCount() {
+  try {
+    const tasks = await listTasks();
+    const isTransfer = (task: AppTask) =>
+      task.taskType === "upload_game_body_package" ||
+      task.taskType === "download_game_body_package" ||
+      task.taskType === "install_cloud_game" ||
+      task.taskType === "delete_remote_body_package" ||
+      task.taskType === "repair_cloud_body_manifest";
+    const active = tasks.filter((task) => isTransfer(task) && (task.status === "pending" || task.status === "running")).length;
+    activeTransferCount.value = active;
+    if (transferCountTimer) clearTimeout(transferCountTimer);
+    transferCountTimer = setTimeout(() => void updateTransferCount(), active > 0 ? 1000 : 3500);
+  } catch {
+    if (transferCountTimer) clearTimeout(transferCountTimer);
+    transferCountTimer = setTimeout(() => void updateTransferCount(), 5000);
+  }
+}
+
 onMounted(() => {
   void loadGames();
   void loadElevationStatus();
   void loadStore();
+  void updateTransferCount();
 });
 onUnmounted(() => {
   if (cloudInstallTimer) clearTimeout(cloudInstallTimer);
+  if (transferCountTimer) clearTimeout(transferCountTimer);
   for (const url of Object.values(coverUrls.value)) {
     URL.revokeObjectURL(url);
   }
@@ -299,7 +322,11 @@ async function finishAddGame() {
         <button class="nav-item" :class="{ active: activePage === 'library' }" type="button" @click="activePage = 'library'"><Library :size="18" /><span>游戏库</span></button>
         <button class="nav-item" :class="{ active: activePage === 'store' }" type="button" @click="openStore"><CloudDownload :size="18" /><span>游戏商店</span></button>
         <button class="nav-item" :class="{ active: activePage === 'add' }" type="button" @click="openAddGame"><Plus :size="18" /><span>添加游戏</span></button>
-        <button class="nav-item" :class="{ active: activePage === 'transfers' }" type="button" @click="activePage = 'transfers'"><CloudUpload :size="18" /><span>传输中心</span></button>
+        <button class="nav-item" :class="{ active: activePage === 'transfers' }" type="button" @click="activePage = 'transfers'">
+          <CloudUpload :size="18" />
+          <span>传输中心</span>
+          <span v-if="activeTransferCount > 0" class="nav-badge">{{ activeTransferCount }}</span>
+        </button>
       </nav>
       <div class="sidebar-bottom">
         <button class="nav-item" :class="{ active: activePage === 'settings' }" type="button" @click="activePage = 'settings'"><Settings :size="18" /><span>GameSaver 设置</span></button>

@@ -104,8 +104,8 @@ async function watchTask(onSuccess: (task: AppTask) => Promise<void>, cancelledM
       await onSuccess(task);
       return;
     }
-    if (task.status === "failed" || task.status === "cancelled") {
-      handleTaskFailure(task, cancelledMessage, failedMessage);
+    if (task.status === "failed" || task.status === "cancelled" || task.status === "interrupted") {
+      handleTaskFailure(task, cancelledMessage, task.status === "interrupted" ? "任务异常中断，请重试" : failedMessage);
       if (onFailure) await onFailure(task);
       return;
     }

@@ -126,6 +126,7 @@ async function start() {
 }
 
 async function watchTask(taskId: string) {
+  stopPolling();
   try {
     const task = await getTask(taskId);
     runtime.value = await getGameRuntime(props.game.gameUid);
@@ -137,9 +138,9 @@ async function watchTask(taskId: string) {
       emit("refresh");
       return;
     }
-    if (task.status === "failed" || task.status === "cancelled") {
+    if (task.status === "failed" || task.status === "cancelled" || task.status === "interrupted") {
       busy.value = false;
-      const failure = task.error || task.message;
+      const failure = task.error || task.message || (task.status === "interrupted" ? "任务异常中断" : "操作失败");
       await refresh();
       error.value = failure;
       return;
@@ -503,6 +504,15 @@ async function loadCover() {
 
 watch(() => props.coverUrl, (value) => {
   if (!coverOwnedUrl) coverDisplayUrl.value = value || "";
+});
+
+watch(() => props.initialError, (value) => {
+  if (value) error.value = value;
+});
+
+watch(() => props.game.gameUid, () => {
+  void refresh();
+  void loadCover();
 });
 
 watch(coverZoom, clampCoverPosition);
