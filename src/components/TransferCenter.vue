@@ -79,19 +79,23 @@ async function retry(task: AppTask) {
   retrying.value = task.taskId;
   error.value = "";
   try {
+    let newTaskId = "";
     if (retryInfo.operation === "upload_game_body_package" && retryInfo.versionId) {
-      await uploadGameBodyPackage(retryInfo.gameUid, retryInfo.versionId);
+      newTaskId = await uploadGameBodyPackage(retryInfo.gameUid, retryInfo.versionId);
     } else if (retryInfo.operation === "install_cloud_game" && retryInfo.remotePath) {
-      await installCloudGame(retryInfo.gameUid, retryInfo.gameKey, retryInfo.remotePath, retryInfo.remoteFsId);
+      newTaskId = await installCloudGame(retryInfo.gameUid, retryInfo.gameKey, retryInfo.remotePath, retryInfo.remoteFsId);
     } else if (retryInfo.operation === "download_game_body_package" && retryInfo.remotePath) {
-      await downloadGameBodyPackage(retryInfo.gameUid, retryInfo.remotePath, retryInfo.remoteFsId);
+      newTaskId = await downloadGameBodyPackage(retryInfo.gameUid, retryInfo.remotePath, retryInfo.remoteFsId);
     } else if (retryInfo.operation === "delete_remote_body_package" && retryInfo.remotePath) {
       if (!retryInfo.gameKey) throw new Error("该删除任务缺少云端游戏标识，无法重试");
-      await deleteRemoteBodyPackage(retryInfo.gameUid, retryInfo.gameKey, retryInfo.remotePath, retryInfo.remoteFsId);
+      newTaskId = await deleteRemoteBodyPackage(retryInfo.gameUid, retryInfo.gameKey, retryInfo.remotePath, retryInfo.remoteFsId);
     } else if (retryInfo.operation === "repair_cloud_body_manifest") {
-      await repairCloudBodyManifest(retryInfo.gameUid);
+      newTaskId = await repairCloudBodyManifest(retryInfo.gameUid);
     } else {
       throw new Error("该任务缺少可重试参数");
+    }
+    if (newTaskId && newTaskId !== task.taskId) {
+      await deleteTasks([task.taskId]);
     }
     await refresh();
   } catch (reason) {
