@@ -12,6 +12,20 @@ pub struct BaiduConfig {
     pub secret_key: String,
     #[serde(default)]
     pub auto_upload_body: bool,
+    #[serde(default = "default_true")]
+    pub auto_sync_save: bool,
+    #[serde(default = "default_true")]
+    pub check_cloud_save_on_launch: bool,
+    #[serde(default = "default_save_keep_limit")]
+    pub cloud_save_keep_limit: usize,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_save_keep_limit() -> usize {
+    10
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -28,6 +42,9 @@ pub struct BaiduConfigView {
     pub app_key: Option<String>,
     pub secret_key_configured: bool,
     pub auto_upload_body: bool,
+    pub auto_sync_save: bool,
+    pub check_cloud_save_on_launch: bool,
+    pub cloud_save_keep_limit: usize,
 }
 
 pub struct BaiduConfigRepository;
@@ -64,6 +81,9 @@ impl BaiduConfigRepository {
             app_key: config.as_ref().map(|value| value.app_key.clone()),
             secret_key_configured: config.as_ref().is_some_and(|value| !value.secret_key.is_empty()),
             auto_upload_body: config.as_ref().is_some_and(|value| value.auto_upload_body),
+            auto_sync_save: config.as_ref().map(|value| value.auto_sync_save).unwrap_or(true),
+            check_cloud_save_on_launch: config.as_ref().map(|value| value.check_cloud_save_on_launch).unwrap_or(true),
+            cloud_save_keep_limit: config.as_ref().map(|value| value.cloud_save_keep_limit).unwrap_or(10),
         })
     }
 
@@ -168,7 +188,17 @@ mod tests {
 
     #[test]
     fn rejects_empty_credentials() {
-        let result = BaiduConfigRepository::save(std::path::Path::new("target/test-config"), BaiduConfig { app_key: String::new(), secret_key: "secret".to_string(), auto_upload_body: false });
+        let result = BaiduConfigRepository::save(
+            std::path::Path::new("target/test-config"),
+            BaiduConfig {
+                app_key: String::new(),
+                secret_key: "secret".to_string(),
+                auto_upload_body: false,
+                auto_sync_save: true,
+                check_cloud_save_on_launch: true,
+                cloud_save_keep_limit: 10,
+            },
+        );
         assert!(result.is_err());
     }
 }

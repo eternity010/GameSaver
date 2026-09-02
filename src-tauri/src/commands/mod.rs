@@ -11,3 +11,4 @@ pub mod diagnostics_commands;
 pub mod admin_commands;
 pub mod library_commands;
 pub mod cloud_account_commands;
+pub mod cloud_save_commands;

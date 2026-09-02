@@ -184,6 +184,28 @@ impl SaveRepository {
         Ok(removed)
     }
 
+    pub fn write_object(app: &AppHandle, hash: &str, bytes: &[u8]) -> Result<(), String> {
+        let lock = REPOSITORY_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().map_err(|_| "存档仓库锁定失败".to_string())?;
+        Self::write_object_locked(app, hash, bytes)
+    }
+
+    pub fn read_object(app: &AppHandle, hash: &str) -> Result<Vec<u8>, String> {
+        let path = object_path(app, hash)?;
+        if !path.is_file() {
+            return Err(format!("存档对象不存在：{hash}"));
+        }
+        let bytes = fs::read(&path).map_err(|err| format!("读取存档对象失败：{err}"))?;
+        if sha256_bytes(&bytes) != hash.to_ascii_lowercase() {
+            return Err(format!("存档对象完整性校验失败：{hash}"));
+        }
+        Ok(bytes)
+    }
+
+    pub fn object_path(app: &AppHandle, hash: &str) -> Result<PathBuf, String> {
+        object_path(app, hash)
+    }
+
     fn write_object_locked(app: &AppHandle, hash: &str, bytes: &[u8]) -> Result<(), String> {
         let root = Self::list_objects_root(app)?;
         let directory = root.join(&hash[..2]);

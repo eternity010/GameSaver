@@ -158,6 +158,29 @@ export interface SaveTransactionSummary {
   notes: string[];
 }
 
+export interface CloudSaveManifestVersion {
+  versionId: string;
+  createdAt: string;
+  packagePath: string;
+  packageFsId: number;
+  packageSize: number;
+  packageSha256?: string;
+  fileCount: number;
+  totalBytes: number;
+  deviceName?: string;
+}
+
+export interface CloudSaveSyncStatusView {
+  autoSyncSave: boolean;
+  localVersionCount: number;
+  cloudVersionCount: number;
+  latestLocalCreatedAt?: string;
+  latestCloudCreatedAt?: string;
+  latestCloudVersionId?: string;
+  syncState: "synced" | "local_ahead" | "cloud_ahead" | "no_cloud_saves" | "offline" | string;
+  warnings: string[];
+}
+
 export function gameStatusLabel(game: Game): string {
   if (game.lifecycle === "pending_setup") return "需要设置";
   if (game.lifecycle === "needs_repair" || game.health === "broken" || game.health === "needs_attention") {

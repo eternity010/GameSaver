@@ -22,8 +22,19 @@ pub fn get_baidu_config(app: AppHandle) -> Result<BaiduConfigView, String> {
 #[tauri::command]
 pub fn save_baidu_config(app: AppHandle, app_key: String, secret_key: String) -> Result<BaiduConfigView, String> {
     let app_data_dir = app_data_dir(&app)?;
-    let auto_upload_body = BaiduConfigRepository::load(&app_data_dir)?.is_some_and(|config| config.auto_upload_body);
-    let config = BaiduConfig { app_key: app_key.trim().to_string(), secret_key: secret_key.trim().to_string(), auto_upload_body };
+    let existing = BaiduConfigRepository::load(&app_data_dir)?;
+    let auto_upload_body = existing.as_ref().is_some_and(|config| config.auto_upload_body);
+    let auto_sync_save = existing.as_ref().map(|config| config.auto_sync_save).unwrap_or(true);
+    let check_cloud_save_on_launch = existing.as_ref().map(|config| config.check_cloud_save_on_launch).unwrap_or(true);
+    let cloud_save_keep_limit = existing.as_ref().map(|config| config.cloud_save_keep_limit).unwrap_or(10);
+    let config = BaiduConfig {
+        app_key: app_key.trim().to_string(),
+        secret_key: secret_key.trim().to_string(),
+        auto_upload_body,
+        auto_sync_save,
+        check_cloud_save_on_launch,
+        cloud_save_keep_limit,
+    };
     BaiduConfigRepository::save(&app_data_dir, config)?;
     BaiduConfigRepository::view(&app_data_dir)
 }
@@ -34,6 +45,23 @@ pub fn set_baidu_auto_upload(app: AppHandle, enabled: bool) -> Result<BaiduConfi
     let mut config = BaiduConfigRepository::load(&app_data_dir)?
         .ok_or_else(|| "请先在平台设置中保存百度 AppKey 和 SecretKey".to_string())?;
     config.auto_upload_body = enabled;
+    BaiduConfigRepository::save(&app_data_dir, config)?;
+    BaiduConfigRepository::view(&app_data_dir)
+}
+
+#[tauri::command]
+pub fn update_baidu_save_sync_settings(
+    app: AppHandle,
+    auto_sync_save: bool,
+    check_cloud_save_on_launch: bool,
+    cloud_save_keep_limit: usize,
+) -> Result<BaiduConfigView, String> {
+    let app_data_dir = app_data_dir(&app)?;
+    let mut config = BaiduConfigRepository::load(&app_data_dir)?
+        .ok_or_else(|| "请先在平台设置中保存百度 AppKey 和 SecretKey".to_string())?;
+    config.auto_sync_save = auto_sync_save;
+    config.check_cloud_save_on_launch = check_cloud_save_on_launch;
+    config.cloud_save_keep_limit = cloud_save_keep_limit.clamp(1, 100);
     BaiduConfigRepository::save(&app_data_dir, config)?;
     BaiduConfigRepository::view(&app_data_dir)
 }

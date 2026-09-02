@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
-import { AlertTriangle, Archive, ArrowLeft, Check, CheckCircle2, Clock3, Folder, FolderOpen, Gamepad2, HardDrive, ImagePlus, LoaderCircle, Pencil, Play, RefreshCw, RotateCcw, ShieldCheck, Trash2, Upload, X } from "@lucide/vue";
-import { deleteGameBodyPackage, deleteSaveVersion, getBaiduConfig, getBaiduStatus, getGameCover, getGameRuntime, getTask, launchGame, listGameBodyVersions, listSaveVersions, packageGameBody, precheckGameLaunch, pruneSaveVersions, renameGame, restoreSaveVersion, saveGameCover, uninstallGameBody, updateGameBody, uploadGameBodyPackage } from "../api";
+import { AlertTriangle, Archive, ArrowLeft, Check, CheckCircle2, Clock3, Cloud, CloudDownload, CloudUpload, Folder, FolderOpen, Gamepad2, HardDrive, ImagePlus, LoaderCircle, Pencil, Play, RefreshCw, RotateCcw, ShieldCheck, Trash2, Upload, X } from "@lucide/vue";
+import { deleteCloudSaveVersion, deleteGameBodyPackage, deleteSaveVersion, getBaiduConfig, getBaiduStatus, getCloudSaveStatus, getGameCover, getGameRuntime, getTask, launchGame, listCloudSaveVersions, listGameBodyVersions, listSaveVersions, packageGameBody, precheckGameLaunch, pruneSaveVersions, renameGame, restoreSaveVersion, saveGameCover, startRestoreCloudSaveTask, startUploadSaveVersionTask, uninstallGameBody, updateGameBody, uploadGameBodyPackage } from "../api";
 import type { BaiduConfigView, BaiduStatus } from "../api";
-import type { CoverCrop, CoverPosition, Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveVersion } from "../domain/game";
+import type { CloudSaveManifestVersion, CloudSaveSyncStatusView, CoverCrop, CoverPosition, Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveVersion } from "../domain/game";
 
 const props = defineProps<{ game: Game; initialError?: string; coverUrl?: string }>();
 const emit = defineEmits<{ back: []; refresh: []; settings: [] }>();
@@ -13,6 +13,10 @@ const precheck = ref<LaunchPrecheck | null>(null);
 const runtime = ref<GameRuntime | null>(null);
 const versions = ref<SaveVersion[]>([]);
 const bodyVersions = ref<GameBodyVersion[]>([]);
+const cloudSaveStatus = ref<CloudSaveSyncStatusView | null>(null);
+const cloudSaveVersions = ref<CloudSaveManifestVersion[]>([]);
+const cloudSaveDrawerOpen = ref(false);
+const cloudSaveLoading = ref(false);
 const baiduStatus = ref<BaiduStatus | null>(null);
 const baiduConfig = ref<BaiduConfigView | null>(null);
 const loading = ref(true);
@@ -104,10 +108,135 @@ async function refresh() {
     bodyVersions.value = nextBodyVersions;
     baiduStatus.value = nextBaiduStatus;
     baiduConfig.value = nextBaiduConfig;
+
+    if (baiduReady()) {
+      try {
+        const [status, cloudVers] = await Promise.all([
+          getCloudSaveStatus(props.game.gameUid),
+          listCloudSaveVersions(props.game.gameUid),
+        ]);
+        cloudSaveStatus.value = status;
+        cloudSaveVersions.value = cloudVers;
+      } catch {
+        cloudSaveStatus.value = null;
+        cloudSaveVersions.value = [];
+      }
+    } else {
+      cloudSaveStatus.value = null;
+      cloudSaveVersions.value = [];
+    }
   } catch (reason) {
     error.value = String(reason);
   } finally {
     loading.value = false;
+  }
+}
+
+async function uploadSave(version: SaveVersion) {
+  if (busy.value || runtime.value || !baiduReady()) return;
+  busy.value = true;
+  error.value = "";
+  message.value = "准备上传存档到百度网盘";
+  try {
+    await watchTask(await startUploadSaveVersionTask(props.game.gameUid, version.versionId));
+  } catch (reason) {
+    busy.value = false;
+    error.value = String(reason);
+  }
+}
+
+async function openCloudSaveDrawer() {
+  cloudSaveDrawerOpen.value = true;
+  if (!baiduReady()) return;
+  cloudSaveLoading.value = true;
+  try {
+    cloudSaveVersions.value = await listCloudSaveVersions(props.game.gameUid);
+    cloudSaveStatus.value = await getCloudSaveStatus(props.game.gameUid);
+  } catch (reason) {
+    error.value = String(reason);
+  } finally {
+    cloudSaveLoading.value = false;
+  }
+}
+
+async function restoreCloudSave(cloudVersion: CloudSaveManifestVersion) {
+  if (busy.value || runtime.value) return;
+  if (!window.confirm(`从百度网盘还原 ${formatDate(cloudVersion.createdAt)} 的存档。\n还原前会先保护当前本地存档，确定继续吗？`)) return;
+  busy.value = true;
+  error.value = "";
+  message.value = "正在从云端还原存档";
+  try {
+    await watchTask(await startRestoreCloudSaveTask(props.game.gameUid, cloudVersion.versionId));
+  } catch (reason) {
+    busy.value = false;
+    error.value = String(reason);
+  }
+}
+
+async function deleteCloudSave(cloudVersion: CloudSaveManifestVersion) {
+  if (busy.value || runtime.value) return;
+  if (!window.confirm(`确定从百度网盘中删除 ${formatDate(cloudVersion.createdAt)} 的云端存档吗？`)) return;
+  busy.value = true;
+  error.value = "";
+  message.value = "正在删除云端存档";
+  try {
+    cloudSaveVersions.value = await deleteCloudSaveVersion(props.game.gameUid, cloudVersion.versionId);
+    cloudSaveStatus.value = await getCloudSaveStatus(props.game.gameUid);
+    message.value = "云端存档已删除";
+  } catch (reason) {
+    error.value = String(reason);
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function syncLatestSave() {
+  if (busy.value || runtime.value || !baiduReady()) return;
+  if (!cloudSaveStatus.value) return;
+  if (cloudSaveStatus.value.syncState === "local_ahead" || cloudSaveStatus.value.syncState === "no_cloud_saves") {
+    const latest = versions.value[0];
+    if (latest) await uploadSave(latest);
+  } else if (cloudSaveStatus.value.syncState === "cloud_ahead") {
+    const latestCloud = cloudSaveVersions.value[0];
+    if (latestCloud) await restoreCloudSave(latestCloud);
+  } else {
+    await refresh();
+  }
+}
+
+function cloudSaveStatusText(): string {
+  if (!baiduReady()) return "网盘未连接";
+  if (!cloudSaveStatus.value) return "查询中...";
+  switch (cloudSaveStatus.value.syncState) {
+    case "synced":
+      return "已与云端同步";
+    case "local_ahead":
+      return "本地有待同步新存档";
+    case "cloud_ahead":
+      return "云端有更新的存档进度";
+    case "no_cloud_saves":
+      return "云端暂无存档";
+    case "offline":
+      return "离线 / 未连接";
+    default:
+      return "状态正常";
+  }
+}
+
+function cloudSaveStatusBadgeClass(): string {
+  if (!baiduReady()) return "badge-offline";
+  if (!cloudSaveStatus.value) return "";
+  switch (cloudSaveStatus.value.syncState) {
+    case "synced":
+      return "badge-synced";
+    case "local_ahead":
+      return "badge-ahead";
+    case "cloud_ahead":
+      return "badge-cloud";
+    case "no_cloud_saves":
+      return "badge-empty";
+    default:
+      return "";
   }
 }
 
@@ -640,6 +769,31 @@ onUnmounted(() => {
             <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime || versions.length <= keepVersions" title="清理旧保存版本" @click="pruneVersions"><Trash2 :size="15" />清理</button>
           </div>
         </header>
+
+        <div class="cloud-save-banner">
+          <div class="cloud-save-main">
+            <div class="cloud-save-icon"><Cloud :size="18" /></div>
+            <div class="cloud-save-info">
+              <div class="cloud-save-status-row">
+                <strong>存档云同步</strong>
+                <span class="cloud-badge" :class="cloudSaveStatusBadgeClass()">{{ cloudSaveStatusText() }}</span>
+              </div>
+              <small v-if="baiduReady() && cloudSaveStatus">
+                本地 {{ cloudSaveStatus.localVersionCount }} 个版本 · 云端 {{ cloudSaveStatus.cloudVersionCount }} 个版本
+                <template v-if="cloudSaveStatus.latestCloudCreatedAt"> · 云端最新：{{ formatDate(cloudSaveStatus.latestCloudCreatedAt) }}</template>
+              </small>
+              <small v-else-if="!baiduReady()">请先在【平台设置】中完成百度网盘授权，以启用云端跨设备同步。</small>
+            </div>
+          </div>
+          <div v-if="baiduReady()" class="cloud-save-actions">
+            <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" title="立即与云端同步" @click="syncLatestSave"><RefreshCw :size="14" />同步最新</button>
+            <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" title="查看百度网盘上的所有历史存档" @click="openCloudSaveDrawer"><FolderOpen :size="14" />云端存档 ({{ cloudSaveVersions.length }})</button>
+          </div>
+          <div v-else class="cloud-save-actions">
+            <button class="secondary-button compact-button" type="button" @click="emit('settings')">配置网盘</button>
+          </div>
+        </div>
+
         <p class="timeline-caption">游戏退出后自动提交，恢复前会先保护当前存档</p>
         <div v-if="!versions.length" class="timeline-empty"><ShieldCheck :size="22" /><p>还没有保存版本。启动游戏并正常退出一次后，GameSaver 会在这里记录版本。</p></div>
         <div v-else class="version-list">
@@ -648,6 +802,7 @@ onUnmounted(() => {
             <div class="version-copy"><strong>{{ index === 0 ? "最近一次保存" : "保存版本" }}</strong><span>{{ formatDate(version.createdAt) }}</span></div>
             <div class="version-meta"><strong>{{ version.files.length }} 个文件</strong><span>{{ formatBytes(version.totalBytes) }}</span></div>
             <div class="version-actions">
+              <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime || !baiduReady()" title="上传这个保存版本到百度网盘" @click="uploadSave(version)"><CloudUpload :size="15" />上传云端</button>
               <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" title="恢复这个保存版本" @click="restoreVersion(version)"><RotateCcw :size="15" />恢复</button>
               <button class="icon-button danger-button" type="button" :disabled="busy || !!runtime" title="删除这个保存版本" :aria-label="`删除 ${formatDate(version.createdAt)} 保存版本`" @click="deleteVersion(version)"><Trash2 :size="15" /></button>
             </div>
@@ -658,6 +813,32 @@ onUnmounted(() => {
   </section>
 
   <Teleport to="body">
+    <div v-if="cloudSaveDrawerOpen" class="cover-editor-overlay" @click.self="cloudSaveDrawerOpen = false">
+      <section class="cloud-save-dialog" role="dialog" aria-modal="true" aria-label="百度网盘云端存档">
+        <header class="cloud-save-header">
+          <div><p class="eyebrow">云端存档管理</p><h2>百度网盘云端存档</h2></div>
+          <button class="icon-button" type="button" title="关闭" aria-label="关闭" @click="cloudSaveDrawerOpen = false"><X :size="18" /></button>
+        </header>
+        <div class="cloud-save-body">
+          <div v-if="cloudSaveLoading" class="state-panel"><span class="loader"></span><strong>正在加载云端存档列表...</strong></div>
+          <div v-else-if="!cloudSaveVersions.length" class="cloud-save-empty">
+            <Cloud :size="32" />
+            <p>百度网盘上暂无此游戏的云端存档</p>
+          </div>
+          <article v-for="cVer in cloudSaveVersions" :key="cVer.versionId" class="cloud-save-row">
+            <div class="cloud-save-meta">
+              <strong>{{ formatDate(cVer.createdAt) }}</strong>
+              <span>{{ cVer.fileCount }} 个文件 · {{ formatBytes(cVer.packageSize) }}<template v-if="cVer.deviceName"> · 来自 {{ cVer.deviceName }}</template></span>
+            </div>
+            <div class="cloud-save-btns">
+              <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" title="从百度网盘拉取并还原该版本" @click="restoreCloudSave(cVer)"><CloudDownload :size="14" />还原至本机</button>
+              <button class="icon-button danger-button" type="button" :disabled="busy || !!runtime" title="从网盘删除" :aria-label="`删除 ${formatDate(cVer.createdAt)} 云端存档`" @click="deleteCloudSave(cVer)"><Trash2 :size="14" /></button>
+            </div>
+          </article>
+        </div>
+      </section>
+    </div>
+
     <div v-if="coverEditorOpen && coverImage" class="cover-editor-overlay" @click.self="closeCoverEditor">
       <section class="cover-editor-dialog" role="dialog" aria-modal="true" aria-label="调整游戏封面">
         <header class="cover-editor-header">

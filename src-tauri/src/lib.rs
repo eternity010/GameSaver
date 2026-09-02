@@ -169,6 +169,12 @@ pub fn run() {
             ,commands::cloud_account_commands::get_cloud_account_status
             ,commands::cloud_account_commands::start_upload_cloud_account_task
             ,commands::cloud_account_commands::start_download_cloud_account_task
+            ,commands::baidu_config_commands::update_baidu_save_sync_settings
+            ,commands::cloud_save_commands::get_cloud_save_status
+            ,commands::cloud_save_commands::list_cloud_save_versions
+            ,commands::cloud_save_commands::start_upload_save_version_task
+            ,commands::cloud_save_commands::start_restore_cloud_save_task
+            ,commands::cloud_save_commands::delete_cloud_save_version
         ])
         .run(tauri::generate_context!());
     if let Err(error) = result {

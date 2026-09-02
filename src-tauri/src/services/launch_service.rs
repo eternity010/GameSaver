@@ -138,7 +138,23 @@ impl LaunchService {
                 running.remove(&game.game_uid);
             }
             match result {
-                Ok(summary) => TaskService::finish(&state, &task_id_for_thread, TaskStatus::Success, 100, summary.0, Some(summary.1), None),
+                Ok(summary) => {
+                    TaskService::finish(&state, &task_id_for_thread, TaskStatus::Success, 100, summary.0, Some(summary.1.clone()), None);
+                    if summary.1.get("created").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        if let Some(version_id) = summary.1.get("versionId").and_then(|v| v.as_str()) {
+                            let app_data_dir = app_handle.path().app_data_dir().ok();
+                            let config = app_data_dir.as_deref().and_then(|dir| crate::repositories::BaiduConfigRepository::load(dir).ok().flatten());
+                            if config.map(|c| c.auto_sync_save).unwrap_or(true) {
+                                let _ = crate::commands::cloud_save_commands::start_upload_save_version_task(
+                                    app_handle.clone(),
+                                    app_handle.state::<AppState>(),
+                                    game.game_uid.clone(),
+                                    version_id.to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
                 Err(error) => TaskService::finish(&state, &task_id_for_thread, TaskStatus::Failed, 100, "游戏会话结束，但存档版本提交失败", None, Some(error)),
             }
         });

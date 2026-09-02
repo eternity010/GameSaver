@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from "vue";
 import { CheckCircle2, CloudDownload, CloudUpload, ExternalLink, FolderOpen, HardDrive, KeyRound, RefreshCw, Save, ShieldCheck, XCircle } from "@lucide/vue";
-import { buildBaiduAuthorizeUrl, exchangeBaiduCode, getBaiduConfig, getBaiduQuota, getBaiduStatus, getCloudAccountStatus, getLibrarySettings, getTask, saveBaiduConfig, setBaiduAutoUpload, startDownloadCloudAccountTask, startSetLibraryRootTask, startUploadCloudAccountTask } from "../api";
+import { buildBaiduAuthorizeUrl, exchangeBaiduCode, getBaiduConfig, getBaiduQuota, getBaiduStatus, getCloudAccountStatus, getLibrarySettings, getTask, saveBaiduConfig, setBaiduAutoUpload, startDownloadCloudAccountTask, startSetLibraryRootTask, startUploadCloudAccountTask, updateBaiduSaveSyncSettings } from "../api";
 import type { BaiduConfigView, BaiduQuota, BaiduStatus, CloudAccountStatus, LibrarySettings } from "../api";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -162,6 +162,24 @@ async function toggleAutoUpload() {
   }
 }
 
+async function updateSaveSyncSettings(field: "autoSyncSave" | "checkCloudSaveOnLaunch" | "cloudSaveKeepLimit", value: boolean | number) {
+  if (!config.value?.configured) return;
+  saving.value = true;
+  error.value = "";
+  message.value = "";
+  try {
+    const autoSyncSave = field === "autoSyncSave" ? Boolean(value) : config.value.autoSyncSave;
+    const checkCloudSaveOnLaunch = field === "checkCloudSaveOnLaunch" ? Boolean(value) : config.value.checkCloudSaveOnLaunch;
+    const cloudSaveKeepLimit = field === "cloudSaveKeepLimit" ? Number(value) : config.value.cloudSaveKeepLimit;
+    config.value = await updateBaiduSaveSyncSettings(autoSyncSave, checkCloudSaveOnLaunch, cloudSaveKeepLimit);
+    message.value = "存档云同步设置已更新";
+  } catch (reason) {
+    error.value = String(reason);
+  } finally {
+    saving.value = false;
+  }
+}
+
 async function prepareAuthorization() {
   authorizing.value = true;
   error.value = "";
@@ -250,6 +268,18 @@ onUnmounted(() => {
           <p class="settings-hint"><ShieldCheck :size="15" />SecretKey 使用 Windows 本机加密保存，不会显示在日志、迁移包或云端。</p>
           <button class="primary-button" type="button" :disabled="saving || !appKey.trim() || !secretKey.trim()" @click="save"><Save :size="16" />{{ saving ? "保存中" : "保存凭证" }}</button>
           <button class="settings-toggle" type="button" :disabled="saving || !config?.configured" @click="toggleAutoUpload"><span class="toggle-track" :class="{ enabled: config?.autoUploadBody }"><i></i></span><span><strong>自动上传游戏本体</strong><small>本地 ZIP 成功创建后，自动加入上传队列；失败不会影响本地游戏。</small></span></button>
+          <button class="settings-toggle" type="button" :disabled="saving || !config?.configured" @click="updateSaveSyncSettings('autoSyncSave', !config?.autoSyncSave)"><span class="toggle-track" :class="{ enabled: config?.autoSyncSave }"><i></i></span><span><strong>游戏退出后自动同步存档</strong><small>每次正常退出游戏且产生新存档后，自动增量压缩并同步至百度网盘。</small></span></button>
+          <button class="settings-toggle" type="button" :disabled="saving || !config?.configured" @click="updateSaveSyncSettings('checkCloudSaveOnLaunch', !config?.checkCloudSaveOnLaunch)"><span class="toggle-track" :class="{ enabled: config?.checkCloudSaveOnLaunch }"><i></i></span><span><strong>启动游戏前检查云端存档</strong><small>启动游戏前比对本地与云端进度，发现跨设备新存档时智能提醒。</small></span></button>
+          <div class="settings-select-row" v-if="config?.configured">
+            <span>云端存档历史版本保留数量</span>
+            <select :value="config?.cloudSaveKeepLimit || 10" :disabled="saving" @change="updateSaveSyncSettings('cloudSaveKeepLimit', Number(($event.target as HTMLSelectElement).value))">
+              <option :value="1">保留 1 个最新版本</option>
+              <option :value="3">保留 3 个历史版本</option>
+              <option :value="5">保留 5 个历史版本</option>
+              <option :value="10">保留 10 个历史版本</option>
+              <option :value="20">保留 20 个历史版本</option>
+            </select>
+          </div>
           <p v-if="status?.refreshError" class="settings-hint settings-hint-warning"><XCircle :size="15" />{{ status.refreshError }}。请重新完成百度授权。</p>
         </div>
       </section>

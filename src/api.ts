@@ -83,6 +83,9 @@ export interface BaiduConfigView {
   appKey?: string;
   secretKeyConfigured: boolean;
   autoUploadBody: boolean;
+  autoSyncSave: boolean;
+  checkCloudSaveOnLaunch: boolean;
+  cloudSaveKeepLimit: number;
 }
 
 export interface BaiduQuota {
@@ -370,6 +373,38 @@ export function downloadGameBodyPackage(gameUid: string, remotePath: string, rem
 
 export function deleteRemoteBodyPackage(gameUid: string, gameKey: string, remotePath: string, remoteFsId?: number): Promise<string> {
   return invokeCommand<string>("delete_remote_body_package", { gameUid, gameKey, remotePath, remoteFsId });
+}
+
+export function updateBaiduSaveSyncSettings(
+  autoSyncSave: boolean,
+  checkCloudSaveOnLaunch: boolean,
+  cloudSaveKeepLimit: number,
+): Promise<BaiduConfigView> {
+  return invokeCommand<BaiduConfigView>("update_baidu_save_sync_settings", {
+    autoSyncSave,
+    checkCloudSaveOnLaunch,
+    cloudSaveKeepLimit,
+  });
+}
+
+export function getCloudSaveStatus(gameUid: string): Promise<import("./domain/game").CloudSaveSyncStatusView> {
+  return invokeCommand<import("./domain/game").CloudSaveSyncStatusView>("get_cloud_save_status", { gameUid });
+}
+
+export function listCloudSaveVersions(gameUid: string): Promise<import("./domain/game").CloudSaveManifestVersion[]> {
+  return invokeCommand<import("./domain/game").CloudSaveManifestVersion[]>("list_cloud_save_versions", { gameUid });
+}
+
+export function startUploadSaveVersionTask(gameUid: string, versionId: string): Promise<string> {
+  return invokeCommand<string>("start_upload_save_version_task", { gameUid, versionId });
+}
+
+export function startRestoreCloudSaveTask(gameUid: string, versionId: string): Promise<string> {
+  return invokeCommand<string>("start_restore_cloud_save_task", { gameUid, versionId });
+}
+
+export function deleteCloudSaveVersion(gameUid: string, versionId: string): Promise<import("./domain/game").CloudSaveManifestVersion[]> {
+  return invokeCommand<import("./domain/game").CloudSaveManifestVersion[]>("delete_cloud_save_version", { gameUid, versionId });
 }
 
 export type { SaveLearningResult, SaveLearningSession };
