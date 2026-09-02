@@ -52,6 +52,10 @@ fn default_max_file_bytes() -> Option<u64> {
     Some(10 * 1024 * 1024)
 }
 
+fn default_keep_versions() -> usize {
+    5
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveProfile {
@@ -62,6 +66,8 @@ pub struct SaveProfile {
     pub detection_evidence: Vec<String>,
     pub confidence: u8,
     pub enabled: bool,
+    #[serde(default = "default_keep_versions")]
+    pub keep_versions: usize,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -76,6 +82,7 @@ impl SaveProfile {
             detection_evidence: vec!["snapshot_diff".to_string(), "folder_grouping".to_string()],
             confidence,
             enabled: true,
+            keep_versions: 5,
             created_at: now.clone(),
             updated_at: now,
         }

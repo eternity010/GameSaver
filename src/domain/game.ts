@@ -103,6 +103,7 @@ export interface SaveProfile {
   detectionEvidence: string[];
   confidence: number;
   enabled: boolean;
+  keepVersions?: number;
   createdAt: string;
   updatedAt: string;
 }

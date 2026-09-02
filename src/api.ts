@@ -238,6 +238,14 @@ export function confirmSaveProfile(gameUid: string, scopes: SaveScope[], confide
   return invokeCommand<SaveProfile>("confirm_save_profile", { gameUid, scopes, confidence });
 }
 
+export function getSaveProfile(gameUid: string): Promise<SaveProfile | null> {
+  return invokeCommand<SaveProfile | null>("get_save_profile", { gameUid });
+}
+
+export function updateSaveProfileKeepVersions(gameUid: string, keepVersions: number): Promise<SaveProfile> {
+  return invokeCommand<SaveProfile>("update_save_profile_keep_versions", { gameUid, keepVersions });
+}
+
 export function discardPendingGame(gameUid: string): Promise<void> {
   return invokeCommand<void>("discard_pending_game", { gameUid });
 }

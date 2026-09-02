@@ -123,6 +123,27 @@ fn restore_version_task(
         };
         let protected_id = protected.version_id.clone();
         candidate.save_versions.push(protected);
+
+        let keep_versions = profile.keep_versions;
+        if keep_versions > 0 {
+            let mut game_versions: Vec<_> = candidate
+                .save_versions
+                .iter()
+                .filter(|v| v.game_uid == game.game_uid)
+                .cloned()
+                .collect();
+            game_versions.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.version_id.cmp(&a.version_id)));
+            if game_versions.len() > keep_versions {
+                let to_remove: std::collections::HashSet<String> = game_versions
+                    .into_iter()
+                    .skip(keep_versions)
+                    .map(|v| v.version_id)
+                    .collect();
+                candidate.save_versions.retain(|v| !(v.game_uid == game.game_uid && to_remove.contains(&v.version_id)));
+                let _ = SaveRepository::collect_garbage(app, &candidate.save_versions);
+            }
+        }
+
         let Some(game_record) = candidate.games.iter_mut().find(|item| item.game_uid == game.game_uid) else {
             if let Some(version) = pending_protected.as_ref() { crate::repositories::release_pending_objects(version); }
             return Err("游戏记录不存在".to_string());

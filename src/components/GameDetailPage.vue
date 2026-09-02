@@ -2,7 +2,7 @@
 import { nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { AlertTriangle, Archive, ArrowLeft, Check, CheckCircle2, Clock3, Cloud, CloudDownload, CloudUpload, Folder, FolderOpen, Gamepad2, HardDrive, ImagePlus, LoaderCircle, Pencil, Play, RefreshCw, RotateCcw, ShieldCheck, Trash2, Upload, X } from "@lucide/vue";
-import { deleteCloudSaveVersion, deleteGameBodyPackage, deleteSaveVersion, getBaiduConfig, getBaiduStatus, getCloudSaveStatus, getGameCover, getGameRuntime, getTask, launchGame, listCloudSaveVersions, listGameBodyVersions, listSaveVersions, packageGameBody, precheckGameLaunch, pruneSaveVersions, renameGame, restoreSaveVersion, saveGameCover, startRestoreCloudSaveTask, startUploadSaveVersionTask, uninstallGameBody, updateGameBody, uploadGameBodyPackage } from "../api";
+import { deleteCloudSaveVersion, deleteGameBodyPackage, deleteSaveVersion, getBaiduConfig, getBaiduStatus, getCloudSaveStatus, getGameCover, getGameRuntime, getSaveProfile, getTask, launchGame, listCloudSaveVersions, listGameBodyVersions, listSaveVersions, packageGameBody, precheckGameLaunch, pruneSaveVersions, renameGame, restoreSaveVersion, saveGameCover, startRestoreCloudSaveTask, startUploadSaveVersionTask, uninstallGameBody, updateGameBody, uploadGameBodyPackage, updateSaveProfileKeepVersions } from "../api";
 import type { BaiduConfigView, BaiduStatus } from "../api";
 import type { CloudSaveManifestVersion, CloudSaveSyncStatusView, CoverCrop, CoverPosition, Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveVersion } from "../domain/game";
 
@@ -94,13 +94,14 @@ async function refresh() {
   loading.value = true;
   error.value = "";
   try {
-    const [nextPrecheck, nextVersions, nextRuntime, nextBodyVersions, nextBaiduStatus, nextBaiduConfig] = await Promise.all([
+    const [nextPrecheck, nextVersions, nextRuntime, nextBodyVersions, nextBaiduStatus, nextBaiduConfig, profile] = await Promise.all([
       precheckGameLaunch(props.game.gameUid),
       listSaveVersions(props.game.gameUid),
       getGameRuntime(props.game.gameUid),
       listGameBodyVersions(props.game.gameUid),
       getBaiduStatus(),
       getBaiduConfig(),
+      getSaveProfile(props.game.gameUid),
     ]);
     precheck.value = nextPrecheck;
     versions.value = nextVersions;
@@ -108,6 +109,9 @@ async function refresh() {
     bodyVersions.value = nextBodyVersions;
     baiduStatus.value = nextBaiduStatus;
     baiduConfig.value = nextBaiduConfig;
+    if (profile?.keepVersions) {
+      keepVersions.value = profile.keepVersions;
+    }
 
     if (baiduReady()) {
       try {
@@ -319,6 +323,16 @@ async function pruneVersions() {
     await watchTask(await pruneSaveVersions(props.game.gameUid, keepVersions.value));
   } catch (reason) {
     busy.value = false;
+    error.value = String(reason);
+  }
+}
+
+async function changeKeepVersions(newLimit: number) {
+  keepVersions.value = newLimit;
+  try {
+    await updateSaveProfileKeepVersions(props.game.gameUid, newLimit);
+    await refresh();
+  } catch (reason) {
     error.value = String(reason);
   }
 }
@@ -762,8 +776,8 @@ onUnmounted(() => {
           <div><p class="eyebrow">存档保护</p><h2>保存版本</h2></div>
           <div class="version-tools">
             <label>保留
-              <select v-model.number="keepVersions" :disabled="busy || !!runtime" aria-label="保留保存版本数量">
-                <option :value="1">1 个</option><option :value="3">3 个</option><option :value="5">5 个</option><option :value="10">10 个</option>
+              <select :value="keepVersions" :disabled="busy || !!runtime" aria-label="保留保存版本数量" @change="changeKeepVersions(Number(($event.target as HTMLSelectElement).value))">
+                <option :value="1">1 个</option><option :value="3">3 个</option><option :value="5">5 个</option><option :value="10">10 个</option><option :value="20">20 个</option>
               </select>
             </label>
             <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime || versions.length <= keepVersions" title="清理旧保存版本" @click="pruneVersions"><Trash2 :size="15" />清理</button>

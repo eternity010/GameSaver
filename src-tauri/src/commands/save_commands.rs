@@ -1,7 +1,7 @@
 use crate::{
     app_state::AppState,
     domain::{GameLifecycle, SaveProfile, SaveScope, TaskStatus},
-    repositories::GameRepository,
+    repositories::{GameRepository, SaveRepository},
     services::{learning::stop_etw_capture, GameLibraryService, SaveLearningService, TaskService},
 };
 use sha2::{Digest, Sha256};
@@ -218,6 +218,62 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(hex::encode(digest.finalize()))
 }
 
+#[tauri::command]
+pub fn get_save_profile(state: State<AppState>, game_uid: String) -> Result<Option<SaveProfile>, String> {
+    let game_uid = game_uid.trim();
+    let store = state.store.lock().map_err(|_| "lock GameSaver store failed".to_string())?;
+    let game = GameLibraryService::find(&store, game_uid).ok_or_else(|| "游戏不存在".to_string())?;
+    let profile = store
+        .save_profiles
+        .iter()
+        .find(|p| p.game_uid == game_uid && game.save_profile_id.as_deref() == Some(p.profile_id.as_str()) && p.enabled)
+        .cloned();
+    Ok(profile)
+}
+
+#[tauri::command]
+pub fn update_save_profile_keep_versions(
+    app: AppHandle,
+    state: State<AppState>,
+    game_uid: String,
+    keep_versions: usize,
+) -> Result<SaveProfile, String> {
+    let game_uid = game_uid.trim();
+    let keep_versions = keep_versions.clamp(1, 100);
+    let mut store = state.store.lock().map_err(|_| "lock GameSaver store failed".to_string())?;
+    let game = GameLibraryService::find(&store, game_uid).ok_or_else(|| "游戏不存在".to_string())?;
+    let mut candidate = store.clone();
+    let profile = candidate
+        .save_profiles
+        .iter_mut()
+        .find(|p| p.game_uid == game_uid && game.save_profile_id.as_deref() == Some(p.profile_id.as_str()) && p.enabled)
+        .ok_or_else(|| "未找到存档保护配置".to_string())?;
+    profile.keep_versions = keep_versions;
+    profile.updated_at = now_iso();
+    let updated_profile = profile.clone();
+
+    let mut game_versions: Vec<_> = candidate
+        .save_versions
+        .iter()
+        .filter(|v| v.game_uid == game_uid)
+        .cloned()
+        .collect();
+    game_versions.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.version_id.cmp(&a.version_id)));
+    if game_versions.len() > keep_versions {
+        let to_remove: std::collections::HashSet<String> = game_versions
+            .into_iter()
+            .skip(keep_versions)
+            .map(|v| v.version_id)
+            .collect();
+        candidate.save_versions.retain(|v| !(v.game_uid == game_uid && to_remove.contains(&v.version_id)));
+        let _ = SaveRepository::collect_garbage(&app, &candidate.save_versions);
+    }
+
+    GameRepository::persist(&app, &candidate)?;
+    *store = candidate;
+    Ok(updated_profile)
+}
+
 fn now_iso() -> String {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|value| value.as_secs().to_string()).unwrap_or_else(|_| "0".to_string())
 }
@@ -234,5 +290,22 @@ mod tests {
         fs::write(&path, b"abc").expect("write test file");
         assert_eq!(sha256_file(&path).expect("hash test file"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
         fs::remove_file(path).expect("remove test file");
+    }
+
+    #[test]
+    fn save_profile_prune_logic_selects_oldest_to_remove() {
+        use crate::domain::SaveVersion;
+        let mut versions = (1..=6).map(|i| SaveVersion {
+            version_id: format!("v{i}"),
+            game_uid: "game1".to_string(),
+            created_at: format!("170000000{i}"),
+            files: Vec::new(),
+            total_bytes: 100,
+        }).collect::<Vec<_>>();
+        versions.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.version_id.cmp(&a.version_id)));
+        let keep_versions = 5;
+        let to_remove: std::collections::HashSet<String> = versions.into_iter().skip(keep_versions).map(|v| v.version_id).collect();
+        assert_eq!(to_remove.len(), 1);
+        assert!(to_remove.contains("v1"));
     }
 }

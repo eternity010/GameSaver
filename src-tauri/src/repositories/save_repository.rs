@@ -728,6 +728,7 @@ mod tests {
             detection_evidence: Vec::new(),
             confidence: 100,
             enabled: true,
+            keep_versions: 5,
             created_at: "0".to_string(),
             updated_at: "0".to_string(),
         };
@@ -763,6 +764,7 @@ mod tests {
             detection_evidence: Vec::new(),
             confidence: 100,
             enabled: true,
+            keep_versions: 5,
             created_at: "0".to_string(),
             updated_at: "0".to_string(),
         };

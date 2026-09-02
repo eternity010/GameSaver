@@ -199,6 +199,7 @@ fn merge_profile(
             detection_evidence: cloud_profile.detection_evidence.clone(),
             confidence: cloud_profile.confidence,
             enabled: true,
+            keep_versions: existing.as_ref().map(|item| item.keep_versions).unwrap_or(5),
             created_at: existing.as_ref().map(|item| item.created_at.clone()).unwrap_or_else(|| cloud_profile.updated_at.clone()),
             updated_at: cloud_profile.updated_at.clone(),
         };
