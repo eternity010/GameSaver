@@ -29,6 +29,23 @@ const NAME_HINTS: [&str; 7] = ["save", "slot", "profile", "userdata", "autosave"
 const SAVE_DIRECTORY_HINTS: [&str; 8] = [
     "save", "savedata", "saves", "savegame", "savegames", "profile", "profiles", "userdata",
 ];
+const DEFAULT_EXCLUDE_PATTERNS: [&str; 8] = [
+    "*.tmp",
+    "*.temp",
+    "*.log",
+    "*.dmp",
+    "*.bak",
+    "*.etl",
+    "*.csv",
+    "*.cache",
+];
+const DEFAULT_EXCLUDE_DIRECTORIES: [&str; 5] = [
+    "logs",
+    "crashdumps",
+    "cache",
+    "shadercache",
+    "webcache",
+];
 
 pub struct SaveLearningService;
 
@@ -433,30 +450,98 @@ fn collect_snapshot(
     Ok(files)
 }
 
-fn infer_scope_drafts(active: &ActiveLearningSession, final_snapshot: &HashMap<String, FileFingerprint>, baseline: Option<&HashMap<String, FileFingerprint>>, etw_files: &HashSet<String>) -> (Vec<String>, Vec<SaveScopeDraft>, Vec<String>) {
+fn resolve_scope_root_and_relative(
+    file_path: &Path,
+    scan_root_path: &Path,
+) -> Option<(PathBuf, String)> {
+    let parent = file_path.parent()?;
+    let mut current = parent;
+    let mut chosen_root = None;
+    let scan_root_norm = normalize_path(scan_root_path);
+
+    loop {
+        if is_save_container_directory(current) {
+            chosen_root = Some(current.to_path_buf());
+        }
+        let current_norm = normalize_path(current);
+        if current_norm == scan_root_norm || !current_norm.starts_with(&scan_root_norm) {
+            break;
+        }
+        match current.parent() {
+            Some(p) => current = p,
+            None => break,
+        }
+    }
+
+    let root = chosen_root.unwrap_or_else(|| parent.to_path_buf());
+    let root_norm = normalize_path(&root);
+    let file_norm = normalize_path(file_path);
+
+    let relative = if file_norm.starts_with(&root_norm) {
+        let remainder = file_norm[root_norm.len()..].trim_start_matches('\\');
+        remainder.replace('\\', "/")
+    } else {
+        file_path.file_name()?.to_string_lossy().replace('\\', "/")
+    };
+
+    Some((root, relative))
+}
+
+fn infer_scope_drafts(
+    active: &ActiveLearningSession,
+    final_snapshot: &HashMap<String, FileFingerprint>,
+    baseline: Option<&HashMap<String, FileFingerprint>>,
+    etw_files: &HashSet<String>,
+) -> (Vec<String>, Vec<SaveScopeDraft>, Vec<String>) {
     let mut changed = Vec::new();
     if let Some(baseline) = baseline {
         for (path, fingerprint) in final_snapshot {
-            if baseline.get(path) != Some(fingerprint) { changed.push(path.clone()); }
+            if baseline.get(path) != Some(fingerprint) {
+                changed.push(path.clone());
+            }
         }
         for path in baseline.keys() {
-            if !final_snapshot.contains_key(path) { changed.push(path.clone()); }
+            if !final_snapshot.contains_key(path) {
+                changed.push(path.clone());
+            }
         }
     } else {
         for path in etw_files {
-            if final_snapshot.contains_key(path) { changed.push(path.clone()); }
+            if final_snapshot.contains_key(path) {
+                changed.push(path.clone());
+            }
         }
     }
     changed.sort();
     changed.dedup();
-    let mut groups: BTreeMap<String, (usize, Vec<String>, SaveRootType)> = BTreeMap::new();
+
+    struct ScopeGroup {
+        physical_path: PathBuf,
+        count: usize,
+        files: Vec<String>,
+        noise_exact: Vec<String>,
+        root_type: SaveRootType,
+    }
+
+    let mut groups: BTreeMap<String, ScopeGroup> = BTreeMap::new();
+    let mut unhandled_noise: Vec<(String, &FileFingerprint)> = Vec::new();
+
     for path in &changed {
-        if !etw_files.is_empty() && !etw_files.contains(path) { continue; }
-        let fingerprint = final_snapshot.get(path).or_else(|| baseline.and_then(|b| b.get(path)));
-        let Some(fingerprint) = fingerprint else { continue; };
+        if !etw_files.is_empty() && !etw_files.contains(path) {
+            continue;
+        }
+        let fingerprint = final_snapshot
+            .get(path)
+            .or_else(|| baseline.and_then(|b| b.get(path)));
+        let Some(fingerprint) = fingerprint else {
+            continue;
+        };
+
         let candidate_by_etw = !etw_files.is_empty() && is_etw_candidate(path);
         let candidate_by_snapshot = etw_files.is_empty() && is_save_candidate(path);
-        if fingerprint.size > MAX_CANDIDATE_FILE_BYTES || (!candidate_by_etw && !candidate_by_snapshot) { continue; }
+        let is_candidate = fingerprint.size <= MAX_CANDIDATE_FILE_BYTES
+            && (candidate_by_etw || candidate_by_snapshot);
+
         let Some(scan_root) = active
             .roots
             .iter()
@@ -465,48 +550,124 @@ fn infer_scope_drafts(active: &ActiveLearningSession, final_snapshot: &HashMap<S
         else {
             continue;
         };
+
         let file_path = Path::new(path);
-        let Some(parent) = file_path.parent() else { continue; };
-        let key = normalize_path(parent);
-        let relative = file_path.file_name().map(|name| name.to_string_lossy().replace('\\', "/"));
-        let Some(relative) = relative else { continue; };
-        let entry = groups.entry(key).or_insert((0, Vec::new(), scan_root.root_type));
-        entry.0 += 1;
-        if final_snapshot.contains_key(path) {
-            entry.1.push(relative);
+        let Some((scope_root, relative)) =
+            resolve_scope_root_and_relative(file_path, &scan_root.physical_path)
+        else {
+            continue;
+        };
+
+        if is_candidate {
+            let key = normalize_path(&scope_root);
+            let entry = groups.entry(key).or_insert_with(|| ScopeGroup {
+                physical_path: scope_root,
+                count: 0,
+                files: Vec::new(),
+                noise_exact: Vec::new(),
+                root_type: scan_root.root_type,
+            });
+            entry.count += 1;
+            if final_snapshot.contains_key(path) {
+                entry.files.push(relative);
+            }
+        } else {
+            unhandled_noise.push((path.clone(), fingerprint));
         }
     }
+
+    for (noise_path_str, _) in unhandled_noise {
+        let noise_path = Path::new(&noise_path_str);
+        let noise_norm = normalize_path(noise_path);
+        for group in groups.values_mut() {
+            let group_norm = normalize_path(&group.physical_path);
+            if noise_norm.starts_with(&group_norm) {
+                let rel = noise_norm[group_norm.len()..].trim_start_matches('\\').replace('\\', "/");
+                if !rel.is_empty() && !group.files.contains(&rel) {
+                    group.noise_exact.push(rel);
+                }
+            }
+        }
+    }
+
     let mut drafts = Vec::new();
-    for (physical_root, (count, mut files, root_type)) in groups {
-        files.sort();
-        files.dedup();
-        let protects_container = is_save_container_directory(Path::new(&physical_root));
-        if files.is_empty() && !protects_container {
+    for (_, mut group) in groups {
+        group.files.sort();
+        group.files.dedup();
+        group.noise_exact.sort();
+        group.noise_exact.dedup();
+
+        let protects_container = is_save_container_directory(&group.physical_path);
+        if group.files.is_empty() && !protects_container {
             continue;
         }
+
+        let mut exclude_patterns: Vec<String> = DEFAULT_EXCLUDE_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut exclude_directories: Vec<String> = DEFAULT_EXCLUDE_DIRECTORIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut exclude_exact: Vec<String> = Vec::new();
+
+        for noise in group.noise_exact {
+            if group.files.contains(&noise) {
+                continue;
+            }
+            if let Some((dir, _)) = noise.split_once('/') {
+                let dir_norm = dir.to_ascii_lowercase();
+                if !exclude_directories.iter().any(|d| d.to_ascii_lowercase() == dir_norm) {
+                    exclude_directories.push(dir.to_string());
+                }
+            }
+            if let Some(ext) = Path::new(&noise).extension().and_then(|e| e.to_str()) {
+                let ext_pattern = format!("*.{}", ext.to_ascii_lowercase());
+                if !exclude_patterns.contains(&ext_pattern) {
+                    exclude_patterns.push(ext_pattern);
+                }
+            }
+            if !exclude_exact.contains(&noise) {
+                exclude_exact.push(noise);
+            }
+        }
+
+        let unknown_file_policy = if protects_container || group.root_type == SaveRootType::SavedGames {
+            UnknownFilePolicy::Protect
+        } else {
+            UnknownFilePolicy::Ignore
+        };
+
+        let physical_root_str = group.physical_path.to_string_lossy().replace('/', "\\");
+
         drafts.push(SaveScopeDraft {
             scope: SaveScope {
-                root_type,
-                root_path: physical_root,
-                confirmed_files: files.clone(),
+                root_type: group.root_type,
+                root_path: physical_root_str,
+                confirmed_files: group.files.clone(),
                 include_directories: protects_container.then(|| ".".to_string()).into_iter().collect(),
-                exclude_exact: Vec::new(),
-                exclude_patterns: Vec::new(),
-                exclude_directories: Vec::new(),
-                unknown_file_policy: UnknownFilePolicy::Protect,
+                exclude_exact,
+                exclude_patterns,
+                exclude_directories,
+                unknown_file_policy,
                 max_file_bytes: Some(MAX_CANDIDATE_FILE_BYTES),
             },
-            changed_files: files,
-            confidence: if count >= 2 { 80 } else { 65 },
+            changed_files: group.files,
+            confidence: if group.count >= 2 { 80 } else { 65 },
         });
     }
+
     let mut notes = vec![(if etw_files.is_empty() {
-        "当前使用快照差异按文件夹归类，候选范围保存前仍可编辑。"
+        "当前使用快照差异按文件夹归类，已自动注入标准排除规则与伴生噪音过滤。"
     } else {
-        "当前优先使用 ETW 写入证据按文件夹归类，候选范围保存前仍可编辑。"
+        "当前优先使用 ETW 写入证据按文件夹归类，已自动注入标准排除规则与伴生噪音过滤。"
     }).to_string()];
-    if drafts.is_empty() { notes.push("没有发现符合存档特征的变化，请确认游戏内完成了一次保存，或手动添加存档目录。".to_string()); }
-    else { notes.push("默认只保护 10 MB 以内的存档候选，大文件和游戏资源不会自动加入。".to_string()); }
+    if drafts.is_empty() {
+        notes.push("没有发现符合存档特征的变化，请确认游戏内完成了一次保存，或手动添加存档目录。".to_string());
+    } else {
+        notes.push("默认只保护 10 MB 以内的存档候选，大文件、日志与噪音缓存已自动排除。".to_string());
+    }
     (changed, drafts, notes)
 }
 
@@ -580,10 +741,23 @@ fn collect_targeted_snapshot(
 }
 
 fn is_save_candidate(path: &str) -> bool {
+    let path_obj = Path::new(path);
+    if is_noise_path(path_obj) {
+        return false;
+    }
     let path_lower = path.to_ascii_lowercase();
-    let extension = Path::new(path).extension().and_then(|value| value.to_str()).unwrap_or_default();
-    if RESOURCE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()) { return false; }
-    SAVE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()) || NAME_HINTS.iter().any(|hint| Path::new(path).file_stem().and_then(|value| value.to_str()).unwrap_or_default().to_ascii_lowercase().contains(hint)) || path_lower.contains("\\savedata\\") || path_lower.contains("/savedata/")
+    if path_lower.contains("\\analytics\\") || path_lower.contains("/analytics/") {
+        return false;
+    }
+    let extension = path_obj.extension().and_then(|value| value.to_str()).unwrap_or_default();
+    let ext_lower = extension.to_ascii_lowercase();
+    if ext_lower == "log" || ext_lower == "tmp" || ext_lower == "dmp" || RESOURCE_EXTENSIONS.contains(&ext_lower.as_str()) {
+        return false;
+    }
+    SAVE_EXTENSIONS.contains(&ext_lower.as_str())
+        || NAME_HINTS.iter().any(|hint| path_obj.file_stem().and_then(|value| value.to_str()).unwrap_or_default().to_ascii_lowercase().contains(hint))
+        || path_lower.contains("\\savedata\\")
+        || path_lower.contains("/savedata/")
 }
 
 fn is_etw_candidate(path: &str) -> bool {
@@ -644,8 +818,8 @@ mod tests {
 
     use super::{
         calculate_learning_confidence, directory_matches_hint, discover_save_container_files,
-        infer_scope_drafts, is_etw_candidate, is_save_container_directory, path_is_within_root,
-        snapshot_analysis_progress, MAX_CANDIDATE_FILE_BYTES,
+        infer_scope_drafts, is_etw_candidate, is_save_container_directory, normalize_path,
+        path_is_within_root, snapshot_analysis_progress, MAX_CANDIDATE_FILE_BYTES,
     };
     use crate::domain::{
         ActiveLearningSession, FileFingerprint, LearningSessionView, LearningStatus, SaveRootType,
@@ -864,5 +1038,57 @@ mod tests {
         // 生成的 scope draft confirmed_files 只包含当前实际存活的 new_save
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].scope.confirmed_files, vec!["save_new.sav".to_string()]);
+        // 自动注入了标准排除规则
+        assert!(drafts[0].scope.exclude_patterns.contains(&"*.log".to_string()));
+        assert!(drafts[0].scope.exclude_patterns.contains(&"*.tmp".to_string()));
+        assert!(drafts[0].scope.exclude_directories.contains(&"logs".to_string()));
+    }
+
+    #[test]
+    fn smart_container_lift_clusters_nested_slots_and_injects_preset_exclusions() {
+        let active = ActiveLearningSession {
+            view: LearningSessionView {
+                session_id: "test-sess-lift".to_string(),
+                game_uid: "game-lift".to_string(),
+                root_pid: 100,
+                started_at: "0".to_string(),
+                status: LearningStatus::Capturing,
+            },
+            roots: vec![ScanRoot {
+                root_type: SaveRootType::LocalLow,
+                physical_path: PathBuf::from(r"C:\Users\Player\AppData\LocalLow\Company\MyGame"),
+            }],
+            baseline: None,
+            tracked_pids: Arc::new(Mutex::new(vec![100])),
+            process_tracker_stop: Arc::new(AtomicBool::new(false)),
+            etw_capture: None,
+            etw_start_error: None,
+        };
+
+        let slot1 = r"c:\users\player\appdata\locallow\company\mygame\savedata\slot1\save.dat".to_string();
+        let slot2 = r"c:\users\player\appdata\locallow\company\mygame\savedata\slot2\save.dat".to_string();
+        let log_file = r"c:\users\player\appdata\locallow\company\mygame\savedata\player.log".to_string();
+
+        let mut final_snapshot = HashMap::new();
+        final_snapshot.insert(slot1.clone(), FileFingerprint { size: 1024, modified_unix: 200 });
+        final_snapshot.insert(slot2.clone(), FileFingerprint { size: 1024, modified_unix: 200 });
+        final_snapshot.insert(log_file.clone(), FileFingerprint { size: 512, modified_unix: 200 });
+
+        let etw_empty = HashSet::new();
+        let (_, drafts, _) = infer_scope_drafts(&active, &final_snapshot, Some(&HashMap::new()), &etw_empty);
+
+        // 两个槽位必须自动聚类提升至同一个 SaveData 顶层容器
+        assert_eq!(drafts.len(), 1);
+        let draft = &drafts[0];
+        assert_eq!(normalize_path(Path::new(&draft.scope.root_path)), r"c:\users\player\appdata\locallow\company\mygame\savedata");
+        assert_eq!(draft.scope.confirmed_files, vec!["slot1/save.dat".to_string(), "slot2/save.dat".to_string()]);
+        assert_eq!(draft.scope.include_directories, vec![".".to_string()]);
+        assert_eq!(draft.scope.unknown_file_policy, UnknownFilePolicy::Protect);
+
+        // 同目录发现的 Player.log 伴生噪音必须自动转为精确排除
+        assert!(draft.scope.exclude_exact.contains(&"player.log".to_string()));
+        // 必须自动带有通用排除模式
+        assert!(draft.scope.exclude_patterns.contains(&"*.tmp".to_string()));
+        assert!(draft.scope.exclude_patterns.contains(&"*.log".to_string()));
     }
 }

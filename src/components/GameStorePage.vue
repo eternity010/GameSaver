@@ -80,12 +80,27 @@ function selectVersion(version: CloudGameVersion) {
   selectedVersion.value = version;
 }
 
+function sortedVersions(game: CloudGameSummary): CloudGameVersion[] {
+  return [...game.versions].sort((a, b) => {
+    const timeA = a.createdAt ? Number(a.createdAt) : 0;
+    const timeB = b.createdAt ? Number(b.createdAt) : 0;
+    if (timeA !== timeB) return timeB - timeA;
+    return (b.fsId || 0) - (a.fsId || 0);
+  });
+}
+
 function latestVersion(game: CloudGameSummary): CloudGameVersion | null {
-  return game.versions.find((version) => version.path === game.packagePath && version.fsId === game.packageFsId) || game.versions[0] || null;
+  const sorted = sortedVersions(game);
+  return sorted.find((version) => version.path === game.packagePath && version.fsId === game.packageFsId) || sorted[0] || null;
 }
 
 function versionSelected(version: CloudGameVersion): boolean {
   return selectedVersion.value?.fsId === version.fsId;
+}
+
+function isLatestVersion(game: CloudGameSummary, version: CloudGameVersion): boolean {
+  const sorted = sortedVersions(game);
+  return sorted[0]?.fsId === version.fsId || sorted[0]?.versionId === version.versionId;
 }
 
 function packageSize(bytes: number): string {
@@ -108,8 +123,17 @@ function versionStatus(version: CloudGameVersion): string {
 function createdLabel(value?: string): string {
   if (!value) return "时间未知";
   const timestamp = Number(value);
-  if (!Number.isFinite(timestamp)) return value;
-  return new Date(timestamp).toLocaleDateString("zh-CN");
+  const ms = Number.isFinite(timestamp)
+    ? (timestamp < 1e11 ? timestamp * 1000 : timestamp)
+    : Date.parse(value);
+  const date = new Date(ms);
+  if (isNaN(date.getTime())) return value;
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${year}/${month}/${day} ${hours}:${minutes}`;
 }
 
 function handleKeydown(event: KeyboardEvent) {
@@ -234,9 +258,16 @@ onUnmounted(() => {
 
           <section class="store-detail-versions" aria-label="云端版本">
             <div class="store-detail-section-heading"><div><h3>云端版本</h3><p>选择要下载的版本；删除只影响百度网盘中的本体包。</p></div><span>{{ selectedGame.versions.length }} 个</span></div>
-            <article v-for="version in selectedGame.versions" :key="version.fsId" class="store-version-option" :class="{ selected: versionSelected(version) }" role="button" tabindex="0" :aria-label="`选择云端版本 ${version.versionId}`" @click="selectVersion(version)" @keydown.enter.prevent="selectVersion(version)" @keydown.space.prevent="selectVersion(version)">
-              <div class="store-version-copy"><strong>{{ version.versionId }}</strong><span>{{ createdLabel(version.createdAt) }} · {{ packageSize(version.size) }}</span></div>
-              <div class="store-version-meta"><span>{{ version.fileCount?.toLocaleString() || "未知" }} 个文件</span><strong>{{ versionStatus(version) }}</strong></div>
+            <article v-for="(version, vIdx) in sortedVersions(selectedGame)" :key="version.fsId" class="store-version-option" :class="{ selected: versionSelected(version) }" role="button" tabindex="0" :aria-label="`选择云端版本 ${version.versionId}`" @click="selectVersion(version)" @keydown.enter.prevent="selectVersion(version)" @keydown.space.prevent="selectVersion(version)">
+              <div class="store-version-copy">
+                <div class="store-version-title-row">
+                  <strong>{{ version.versionId }}</strong>
+                  <span v-if="vIdx === 0" class="version-badge latest-badge">最新版本</span>
+                  <span v-if="version.syncState === 'synced'" class="version-badge synced-badge">本地已同步</span>
+                </div>
+                <span>{{ createdLabel(version.createdAt) }} · {{ packageSize(version.size) }}</span>
+              </div>
+              <div class="store-version-meta"><span>{{ version.fileCount?.toLocaleString() || "未知" }} 个文件</span><strong :class="{ 'status-synced': version.syncState === 'synced' }">{{ versionStatus(version) }}</strong></div>
               <button class="icon-button danger-button" type="button" :disabled="!!installUid" title="删除这个云端版本" :aria-label="`删除云端版本 ${version.versionId}`" @click.stop="emit('deleteVersion', selectedGame, version)"><Trash2 :size="16" /></button>
             </article>
           </section>

@@ -652,13 +652,21 @@ impl CloudManifestService {
                     package_sha256,
                     file_count: manifest_version.map(|item| item.file_count),
                     total_bytes: manifest_version.map(|item| item.total_bytes),
-                    created_at: manifest_version.map(|item| item.created_at.clone()),
+                    created_at: manifest_version
+                        .map(|item| item.created_at.clone())
+                        .or_else(|| file.server_mtime.map(|time| time.to_string())),
                     sync_state: sync_state.to_string(),
                     manifest_verified: manifest_version.is_some_and(|item| item.package_sha256.is_some()),
                 }
             })
             .collect::<Vec<_>>();
-        packages.sort_by(|left, right| right.path.cmp(&left.path));
+        packages.sort_by(|left, right| {
+            let left_time = left.created_at.as_deref().unwrap_or_default();
+            let right_time = right.created_at.as_deref().unwrap_or_default();
+            right_time
+                .cmp(left_time)
+                .then_with(|| right.path.cmp(&left.path))
+        });
         let mut warnings = Vec::new();
         let manifest_present = remote_files
             .iter()
@@ -875,7 +883,7 @@ mod tests {
                 size: 40,
                 md5: None,
                 is_dir: false,
-                server_mtime: None,
+                server_mtime: Some(2),
             },
         ];
         let result = CloudManifestService::project(&remote_files, Some(&manifest), &[local]);
