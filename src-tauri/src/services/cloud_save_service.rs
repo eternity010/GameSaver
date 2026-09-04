@@ -1,5 +1,5 @@
 use crate::{
-    domain::{Game, SaveFileEntry, SaveProfile, SaveRootType, SaveVersion},
+    domain::{Game, SaveFileEntry, SaveProfile, SaveVersion},
     repositories::{BaiduConfigRepository, GameRepository, SaveRepository},
     services::{BaiduNetdiskClient, RemoteFile},
 };
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{Read, Write},
+    io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -95,7 +95,8 @@ impl CloudSaveService {
         let zip_path = temp_dir.join(format!("gamesaver-save-pkg-{}.zip", Uuid::new_v4().simple()));
         let file = fs::File::create(&zip_path)
             .map_err(|err| format!("创建临时存档压缩文件失败：{err}"))?;
-        let mut zip = ZipWriter::new(file);
+        let writer = BufWriter::with_capacity(512 * 1024, file);
+        let mut zip = ZipWriter::new(writer);
         let options = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
 
@@ -131,13 +132,16 @@ impl CloudSaveService {
                 .map_err(|err| format!("写入存档文件内容失败：{err}"))?;
         }
 
-        zip.finish()
+        let mut finished_writer = zip.finish()
             .map_err(|err| format!("完成存档压缩包打包失败：{err}"))?;
+        finished_writer.flush()
+            .map_err(|err| format!("刷新存档压缩包缓冲区失败：{err}"))?;
+        drop(finished_writer);
 
-        let zip_bytes = fs::read(&zip_path)
-            .map_err(|err| format!("读取生成的存档压缩包失败：{err}"))?;
-        let sha256 = sha256_hex(&zip_bytes);
-        let size = zip_bytes.len() as u64;
+        let size = fs::metadata(&zip_path)
+            .map_err(|err| format!("获取存档压缩包大小失败：{err}"))?
+            .len();
+        let sha256 = sha256_file(&zip_path)?;
 
         Ok((zip_path, sha256, size))
     }
@@ -149,7 +153,7 @@ impl CloudSaveService {
         profile: &SaveProfile,
         version: &SaveVersion,
         keep_limit: usize,
-        on_progress: impl Fn(u8, &str) -> bool,
+        on_progress: impl Fn(u8, &str) -> bool + Sync,
     ) -> Result<CloudSaveManifestVersion, String> {
         on_progress(10, "正在打包本地存档");
         let (zip_path, sha256, size) = Self::package_save_version(app, game, profile, version)?;
@@ -237,15 +241,26 @@ impl CloudSaveService {
             on_progress(15 + (pct as f32 * 0.5) as u8, msg)
         });
 
-        if let Err(err) = dl_result {
-            let _ = fs::remove_file(&target_zip);
-            return Err(err);
+        let downloaded_sha256 = match dl_result {
+            Ok(hash) => hash,
+            Err(err) => {
+                let _ = fs::remove_file(&target_zip);
+                return Err(err);
+            }
+        };
+
+        if let Some(expected_hash) = remote_version.package_sha256.as_deref() {
+            if !expected_hash.is_empty() && downloaded_sha256 != expected_hash {
+                let _ = fs::remove_file(&target_zip);
+                return Err("下载的存档压缩包完整性校验失败（SHA-256 不匹配）".to_string());
+            }
         }
 
         on_progress(70, "正在校验并解压存档");
         let file = fs::File::open(&target_zip)
             .map_err(|err| format!("打开下载的存档压缩包失败：{err}"))?;
-        let mut archive = ZipArchive::new(file)
+        let reader = BufReader::with_capacity(512 * 1024, file);
+        let mut archive = ZipArchive::new(reader)
             .map_err(|err| format!("解析下载的存档压缩包失败：{err}"))?;
 
         let meta = {
@@ -480,11 +495,7 @@ impl CloudSaveService {
 fn read_file_from_scope(game: &Game, profile: &SaveProfile, entry: &SaveFileEntry) -> Result<Vec<u8>, String> {
     let scope = profile.scopes.iter().find(|s| s.root_type == entry.root_type)
         .ok_or_else(|| format!("未找到匹配的作用域：{:?}", entry.root_type))?;
-    let root = if matches!(scope.root_type, SaveRootType::ManagedGame) {
-        PathBuf::from(&game.managed_path)
-    } else {
-        PathBuf::from(&scope.root_path)
-    };
+    let root = crate::repositories::save_repository::scope_root(game, scope);
     let file_path = root.join(&entry.relative_path);
     fs::read(&file_path).map_err(|err| format!("读取物理存档文件失败：{} ({err})", file_path.display()))
 }
@@ -493,6 +504,20 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|err| format!("读取存档压缩包失败：{err}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 512 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|err| format!("计算存档压缩包哈希失败：{err}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn hostname() -> String {

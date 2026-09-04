@@ -159,6 +159,40 @@ pub fn get_game_cover(state: State<AppState>, game_uid: String) -> Result<Option
     fs::read(path).map(Some).map_err(|error| format!("读取游戏封面失败：{error}"))
 }
 
+#[tauri::command]
+pub fn get_game_cover_path(state: State<AppState>, game_uid: String) -> Result<Option<String>, String> {
+    let game_uid = game_uid.trim();
+    validate_component(game_uid, "游戏标识")?;
+    let cover = {
+        let store = state.store.lock().map_err(|_| "读取游戏封面记录失败".to_string())?;
+        GameLibraryService::find(&store, game_uid).and_then(|game| game.cover)
+    };
+    let Some(cover) = cover else { return Ok(None); };
+    let root = state.library_root_path()?;
+    let path = safe_cover_path(&root, game_uid, &cover.display_path)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+pub fn get_game_cover_paths(state: State<AppState>) -> Result<std::collections::HashMap<String, String>, String> {
+    let store = state.store.lock().map_err(|_| "读取游戏库失败".to_string())?;
+    let root = state.library_root_path()?;
+    let mut paths = std::collections::HashMap::new();
+    for game in GameLibraryService::list(&store) {
+        if let Some(cover) = game.cover {
+            if let Ok(path) = safe_cover_path(&root, &game.game_uid, &cover.display_path) {
+                if path.is_file() {
+                    paths.insert(game.game_uid, path.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    Ok(paths)
+}
+
 fn save_game_cover_files(
     app: &AppHandle,
     state: &AppState,

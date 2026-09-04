@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { ChevronLeft, ChevronRight, CloudDownload, CloudUpload, Gamepad2, RefreshCw, Trash2, X } from "@lucide/vue";
-import { getCloudGameCover, type CloudGameSummary, type CloudGameVersion } from "../api";
+import { getCloudGameCoverUrl, type CloudGameSummary, type CloudGameVersion } from "../api";
 
 const props = defineProps<{
   games: CloudGameSummary[];
@@ -36,30 +36,15 @@ const selectedGame = ref<CloudGameSummary | null>(null);
 const selectedVersion = ref<CloudGameVersion | null>(null);
 const storeCoverUrls = ref<Record<string, string>>({});
 
-async function loadStoreCovers(games: CloudGameSummary[]) {
-  const currentKeySet = new Set(games.map((game) => game.gameKey || game.gameUid));
-  for (const [key, url] of Object.entries(storeCoverUrls.value)) {
-    if (!currentKeySet.has(key)) {
-      URL.revokeObjectURL(url);
-      delete storeCoverUrls.value[key];
+function loadStoreCovers(games: CloudGameSummary[]) {
+  const nextUrls: Record<string, string> = {};
+  for (const game of games) {
+    if (game.hasCover) {
+      const key = game.gameKey || game.gameUid;
+      nextUrls[key] = getCloudGameCoverUrl(key);
     }
   }
-
-  await Promise.all(
-    games
-      .filter((game) => game.hasCover && !storeCoverUrls.value[game.gameKey || game.gameUid])
-      .map(async (game) => {
-        const key = game.gameKey || game.gameUid;
-        try {
-          const bytes = await getCloudGameCover(key);
-          if (!bytes || !bytes.length) return;
-          const blob = new Blob([new Uint8Array(bytes)], { type: "image/jpeg" });
-          storeCoverUrls.value[key] = URL.createObjectURL(blob);
-        } catch {
-          // Fall back gracefully to placeholder
-        }
-      })
-  );
+  storeCoverUrls.value = nextUrls;
 }
 
 function cloudGameKey(game: CloudGameSummary): string {
@@ -165,9 +150,6 @@ watch(
 onMounted(() => window.addEventListener("keydown", handleKeydown));
 onUnmounted(() => {
   window.removeEventListener("keydown", handleKeydown);
-  for (const url of Object.values(storeCoverUrls.value)) {
-    URL.revokeObjectURL(url);
-  }
   storeCoverUrls.value = {};
 });
 </script>
@@ -199,6 +181,7 @@ onUnmounted(() => {
             :src="storeCoverUrls[game.gameKey || game.gameUid]"
             :alt="`${game.displayName} 封面`"
             class="store-cover-image"
+            @error="delete storeCoverUrls[game.gameKey || game.gameUid]"
           />
           <template v-else>
             <Gamepad2 :size="38" />

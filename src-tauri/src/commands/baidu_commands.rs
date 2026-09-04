@@ -62,6 +62,77 @@ pub fn get_cloud_game_cover(
 }
 
 #[tauri::command]
+pub fn get_cloud_game_cover_path(
+    app: AppHandle,
+    game_key: String,
+) -> Result<Option<String>, String> {
+    let game_key = game_key.trim();
+    if game_key.is_empty() {
+        return Ok(None);
+    }
+    let remote_dir = match remote_body_dir(game_key) {
+        Ok(dir) => dir,
+        Err(_) => return Ok(None),
+    };
+    let base_data_dir = app_data_dir(&app)?;
+    let cache_root = base_data_dir.join("cloud-manifest-cache");
+    let cover_file = cache_root
+        .join(CloudManifestService::cache_folder_name(&remote_dir))
+        .join("cover.jpg");
+    if cover_file.is_file() {
+        Ok(Some(cover_file.to_string_lossy().to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+pub fn get_cloud_game_cover_paths(
+    app: AppHandle,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let base_data_dir = app_data_dir(&app)?;
+    let cache_root = base_data_dir.join("cloud-manifest-cache");
+    let mut map = std::collections::HashMap::new();
+    if !cache_root.is_dir() {
+        return Ok(map);
+    }
+    let Ok(entries) = std::fs::read_dir(&cache_root) else {
+        return Ok(map);
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let cover_file = dir.join("cover.jpg");
+        if !cover_file.is_file() {
+            continue;
+        }
+        let catalog_file = dir.join("game.json");
+        let manifest_file = dir.join("manifest.json");
+        let mut game_key = None;
+        if catalog_file.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&catalog_file) {
+                if let Ok(catalog) = serde_json::from_str::<serde_json::Value>(&content) {
+                    game_key = catalog.get("gameKey").and_then(|v| v.as_str()).map(ToString::to_string);
+                }
+            }
+        }
+        if game_key.is_none() && manifest_file.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&manifest_file) {
+                if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) {
+                    game_key = manifest.get("gameKey").and_then(|v| v.as_str()).map(ToString::to_string);
+                }
+            }
+        }
+        if let Some(key) = game_key {
+            map.insert(key, cover_file.to_string_lossy().to_string());
+        }
+    }
+    Ok(map)
+}
+
+#[tauri::command]
 pub fn list_cloud_games(
     app: AppHandle,
     state: State<AppState>,
@@ -901,7 +972,7 @@ fn download_body_task(
         &game.game_uid,
         &format!(".download-{temporary_version_id}"),
     );
-    client.download_file(&remote, &temporary_path, |progress, message| {
+    let downloaded_sha256 = client.download_file(&remote, &temporary_path, |progress, message| {
         TaskService::update(
             &state,
             task_id,
@@ -912,11 +983,12 @@ fn download_body_task(
         );
         !TaskService::is_cancelled(&state, task_id)
     })?;
-    let manifest = match BodyPackageService::validate_package(
+    let manifest = match BodyPackageService::validate_package_with_known_hash(
         &temporary_path,
         &game.game_uid,
         &game.launch.executable_relative_path,
         cloud_entry.and_then(|entry| entry.package_sha256.as_deref()),
+        Some(&downloaded_sha256),
     ) {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -947,7 +1019,7 @@ fn download_body_task(
         let _ = std::fs::remove_file(&temporary_path);
         format!("提交下载的本体包失败：{err}")
     })?;
-    let package_sha256 = sha256_file(&package_path)?;
+    let package_sha256 = downloaded_sha256;
     let body_version = GameBodyVersion {
         version_id: version_id.clone(),
         game_uid: game.game_uid.clone(),
@@ -1360,7 +1432,7 @@ fn install_cloud_game_task(
         "正在下载游戏本体",
         None,
     );
-    client.download_file(&remote, &package_path, |progress, message| {
+    let downloaded_sha256 = client.download_file(&remote, &package_path, |progress, message| {
         TaskService::update(
             &state,
             task_id,
@@ -1387,12 +1459,13 @@ fn install_cloud_game_task(
         "正在校验并安装游戏本体",
         None,
     );
-    let body_manifest = BodyPackageService::extract_package(
+    let body_manifest = BodyPackageService::extract_package_with_known_hash(
         &package_path,
         &staging,
         &local_uid,
         &catalog.executable_relative_path,
         expected_sha256,
+        Some(&downloaded_sha256),
         |progress, message| {
             TaskService::update(
                 &state,
@@ -1499,7 +1572,7 @@ fn install_cloud_game_task(
         file_count: body_manifest.file_count,
         total_bytes: body_manifest.total_bytes,
         package_path: Some(package_path.to_string_lossy().to_string()),
-        sha256: Some(sha256_file(&package_path)?),
+        sha256: Some(downloaded_sha256),
         excluded_items: body_manifest.excluded_items,
         upload_status: Some("synced".to_string()),
         remote_path: Some(remote.path.clone()),
@@ -1727,21 +1800,6 @@ fn remote_file_name_without_extension(path: &str) -> String {
         .to_string()
 }
 
-fn sha256_file(path: &Path) -> Result<String, String> {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path).map_err(|err| format!("读取本体包失败：{err}"))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 1024 * 1024];
-    loop {
-        let read = std::io::Read::read(&mut file, &mut buffer)
-            .map_err(|err| format!("计算本体包哈希失败：{err}"))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
 
 fn now_iso() -> String {
     std::time::SystemTime::now()

@@ -217,14 +217,11 @@ fn score_group(
     if has_write {
         score += 30;
     }
-    if has_write && has_close {
-        score += 20;
+    if has_close {
+        score += 30;
     }
     if has_rename {
         score += 30;
-    }
-    if has_close {
-        score += 20;
     }
     if group.operations.len() > 1 {
         score += 10;

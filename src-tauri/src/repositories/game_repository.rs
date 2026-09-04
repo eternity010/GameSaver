@@ -1,7 +1,15 @@
 use crate::domain::{store::CURRENT_SCHEMA_VERSION, AppStore};
-use std::{fs, io::Write, path::{Path, PathBuf}};
+use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
+
+static LAST_PERSISTED_HASH: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
 pub struct GameRepository;
 
@@ -19,8 +27,8 @@ impl GameRepository {
         if !path.exists() {
             return Ok(AppStore::default());
         }
-        let raw = fs::read_to_string(&path).map_err(|err| format!("read GameSaver store failed: {err}"))?;
-        let mut store = serde_json::from_str::<AppStore>(&raw)
+        let bytes = fs::read(&path).map_err(|err| format!("read GameSaver store failed: {err}"))?;
+        let mut store = serde_json::from_slice::<AppStore>(&bytes)
             .map_err(|err| format!("parse GameSaver store failed: {err}"))?;
         if store.schema_version > CURRENT_SCHEMA_VERSION {
             return Err(format!(
@@ -32,6 +40,12 @@ impl GameRepository {
         store.normalize();
         if needs_migration {
             Self::persist(app, &store)?;
+        } else {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            if let Ok(mut guard) = LAST_PERSISTED_HASH.lock() {
+                *guard = Some(hasher.finalize().into());
+            }
         }
         Ok(store)
     }
@@ -44,6 +58,20 @@ impl GameRepository {
         candidate.normalize();
         let bytes = serde_json::to_vec_pretty(&candidate)
             .map_err(|err| format!("serialize GameSaver store failed: {err}"))?;
+
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let hash: [u8; 32] = hasher.finalize().into();
+
+        if let Ok(mut guard) = LAST_PERSISTED_HASH.lock() {
+            if guard.as_ref() == Some(&hash) && path.exists() {
+                return Ok(());
+            }
+            atomic_replace(&path, &bytes)?;
+            *guard = Some(hash);
+            return Ok(());
+        }
+
         atomic_replace(&path, &bytes)
     }
 }
@@ -55,6 +83,7 @@ fn atomic_replace(target: &Path, bytes: &[u8]) -> Result<(), String> {
         let mut file = fs::File::create(&temp).map_err(|err| format!("create store temporary file failed: {err}"))?;
         file.write_all(bytes).map_err(|err| format!("write store temporary file failed: {err}"))?;
         file.sync_all().map_err(|err| format!("flush store temporary file failed: {err}"))?;
+        drop(file);
         let had_target = target.exists();
         if had_target {
             fs::rename(target, &backup).map_err(|err| format!("stage existing store failed: {err}"))?;
@@ -72,4 +101,24 @@ fn atomic_replace(target: &Path, bytes: &[u8]) -> Result<(), String> {
     })();
     let _ = fs::remove_file(&temp);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_replace_creates_and_overwrites() {
+        let dir = std::env::temp_dir().join(format!("gamesaver-test-{}", Uuid::new_v4().simple()));
+        let _ = fs::create_dir_all(&dir);
+        let file = dir.join("test_store.json");
+
+        atomic_replace(&file, b"{\"test\": 1}").expect("initial create");
+        assert_eq!(fs::read_to_string(&file).expect("read 1"), "{\"test\": 1}");
+
+        atomic_replace(&file, b"{\"test\": 2}").expect("overwrite");
+        assert_eq!(fs::read_to_string(&file).expect("read 2"), "{\"test\": 2}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

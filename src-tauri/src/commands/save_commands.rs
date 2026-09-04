@@ -19,6 +19,16 @@ pub fn start_save_learning_task(app: AppHandle, state: State<AppState>, game_uid
         }
         game
     };
+    if let Ok(sessions) = state.learning_sessions.lock() {
+        if sessions.values().any(|s| s.view.game_uid == game_uid) {
+            return Err("该游戏已有正在进行的存档识别会话".to_string());
+        }
+    }
+    if let Ok(running) = state.running_games.lock() {
+        if running.contains_key(&game_uid) {
+            return Err("游戏当前正在运行中，请先关闭游戏后再进行存档识别".to_string());
+        }
+    }
     let task_id = TaskService::create(&state, "learn_saves", Some(game_uid), "准备识别存档范围")?;
     let app_handle = app.clone();
     let task_id_for_thread = task_id.clone();
@@ -85,8 +95,23 @@ pub fn cancel_save_learning(state: State<AppState>, session_id: String) -> Resul
     Ok(())
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefaultSaveExclusions {
+    pub exclude_patterns: Vec<String>,
+    pub exclude_directories: Vec<String>,
+}
+
 #[tauri::command]
-pub fn confirm_save_profile(app: AppHandle, state: State<AppState>, game_uid: String, scopes: Vec<SaveScope>, confidence: u8) -> Result<SaveProfile, String> {
+pub fn get_default_save_exclusions() -> DefaultSaveExclusions {
+    DefaultSaveExclusions {
+        exclude_patterns: crate::domain::DEFAULT_EXCLUDE_PATTERNS.iter().map(|s| s.to_string()).collect(),
+        exclude_directories: crate::domain::DEFAULT_EXCLUDE_DIRECTORIES.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+#[tauri::command]
+pub fn confirm_save_profile(app: AppHandle, state: State<AppState>, game_uid: String, mut scopes: Vec<SaveScope>, confidence: u8) -> Result<SaveProfile, String> {
     let game_uid = game_uid.trim().to_string();
     crate::logging::info(format!("开始确认存档保护：game_uid={game_uid} scopes={}", scopes.len()));
     if scopes.is_empty() { return Err("至少需要一个存档保护范围".to_string()); }
@@ -104,7 +129,10 @@ pub fn confirm_save_profile(app: AppHandle, state: State<AppState>, game_uid: St
         if !matches!(game.lifecycle, GameLifecycle::PendingSetup) { return Err("该游戏已经完成设置".to_string()); }
         game
     };
-    for scope in &scopes { validate_scope(scope)?; }
+    for scope in &mut scopes {
+        scope.ensure_default_exclusions_if_empty();
+        validate_scope(scope)?;
+    }
     crate::logging::info(format!("存档保护范围校验完成：game_uid={game_uid} scopes={}", scopes.len()));
     let executable_path = managed_executable_path(&game).map_err(|error| {
         crate::logging::error(format!("确认存档保护失败：启动程序路径无效：game_uid={game_uid} error={error}"));
@@ -274,6 +302,107 @@ pub fn update_save_profile_keep_versions(
     Ok(updated_profile)
 }
 
+#[tauri::command]
+pub fn update_save_profile_scopes(
+    app: AppHandle,
+    state: State<AppState>,
+    game_uid: String,
+    mut scopes: Vec<SaveScope>,
+) -> Result<SaveProfile, String> {
+    let game_uid = game_uid.trim();
+    if scopes.is_empty() {
+        return Err("存档保护范围不能为空".to_string());
+    }
+    for scope in &mut scopes {
+        scope.ensure_default_exclusions_if_empty();
+        validate_scope(scope)?;
+    }
+
+    let mut store = state.store.lock().map_err(|_| "lock GameSaver store failed".to_string())?;
+    let game = GameLibraryService::find(&store, game_uid).ok_or_else(|| "游戏不存在".to_string())?;
+    let mut candidate = store.clone();
+    let profile = candidate
+        .save_profiles
+        .iter_mut()
+        .find(|p| p.game_uid == game_uid && game.save_profile_id.as_deref() == Some(p.profile_id.as_str()) && p.enabled)
+        .ok_or_else(|| "未找到存档保护配置".to_string())?;
+
+    profile.scopes = scopes;
+    profile.updated_at = now_iso();
+    let updated_profile = profile.clone();
+
+    GameRepository::persist(&app, &candidate)?;
+    *store = candidate;
+    crate::logging::info(format!("存档保护范围已更新：game_uid={game_uid} profile_id={}", updated_profile.profile_id));
+    Ok(updated_profile)
+}
+
+#[tauri::command]
+pub fn open_path_in_explorer(path: String) -> Result<(), String> {
+    let clean_path = path.trim();
+    if clean_path.is_empty() {
+        return Err("路径不能为空".to_string());
+    }
+    let p = Path::new(clean_path);
+    if !p.exists() {
+        let mut parent = p.parent();
+        while let Some(par) = parent {
+            if par.exists() {
+                return open_system_explorer(par);
+            }
+            parent = par.parent();
+        }
+        return Err(format!("路径不存在：{clean_path}"));
+    }
+    open_system_explorer(p)
+}
+
+fn open_system_explorer(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        let mut command = Command::new("explorer");
+        if path.is_file() {
+            command.arg(format!("/select,{}", path.display()));
+        } else {
+            command.arg(path.as_os_str());
+        }
+        command.spawn().map_err(|err| format!("打开文件资源管理器失败：{err}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        let mut command = Command::new("open");
+        if path.is_file() {
+            command.args(["-R", &path.to_string_lossy()]);
+        } else {
+            command.arg(path.as_os_str());
+        }
+        command.spawn().map_err(|err| format!("打开访达失败：{err}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Command;
+        let target = if path.is_file() {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+        Command::new("xdg-open")
+            .arg(target.as_os_str())
+            .spawn()
+            .map_err(|err| format!("打开文件管理器失败：{err}"))?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = path;
+        Err("当前操作系统不支持打开文件管理器".to_string())
+    }
+}
+
 fn now_iso() -> String {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|value| value.as_secs().to_string()).unwrap_or_else(|_| "0".to_string())
 }
@@ -307,5 +436,12 @@ mod tests {
         let to_remove: std::collections::HashSet<String> = versions.into_iter().skip(keep_versions).map(|v| v.version_id).collect();
         assert_eq!(to_remove.len(), 1);
         assert!(to_remove.contains("v1"));
+    }
+
+    #[test]
+    fn open_path_in_explorer_validates_path() {
+        assert!(super::open_path_in_explorer("".to_string()).is_err());
+        assert!(super::open_path_in_explorer("   ".to_string()).is_err());
+        assert!(super::open_path_in_explorer(r"Z:\non_existent_drive_12345\not_real".to_string()).is_err());
     }
 }

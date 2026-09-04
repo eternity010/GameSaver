@@ -110,7 +110,7 @@ fn download_account(app: &AppHandle, task_id: &str) -> Result<(), String> {
 }
 
 fn merge_profile(
-    app: &AppHandle,
+    _app: &AppHandle,
     state: &AppState,
     profile: CloudAccountProfile,
 ) -> Result<(crate::domain::AppStore, usize), String> {
@@ -189,7 +189,7 @@ fn merge_profile(
         let existing = candidate.save_profiles.iter().find(|item| item.profile_id == cloud_profile.profile_id || item.game_uid == local_uid).cloned();
         let scopes = cloud_profile.scopes.iter().enumerate().map(|(index, scope)| {
             let fallback = existing.as_ref().and_then(|item| item.scopes.get(index)).map(|item| item.root_path.as_str());
-            resolve_scope(app, &game, scope, fallback)
+            resolve_scope(&game, scope, fallback)
         }).collect::<Result<Vec<_>, _>>()?;
         let save_profile = SaveProfile {
             profile_id: cloud_profile.profile_id.clone(),
@@ -213,25 +213,37 @@ fn merge_profile(
     Ok((candidate, imported_games))
 }
 
-fn resolve_scope(
-    app: &AppHandle,
+pub(crate) fn resolve_scope(
     game: &Game,
     scope: &crate::services::cloud_account_service::CloudSaveScope,
     fallback: Option<&str>,
 ) -> Result<SaveScope, String> {
-    let root_path = match scope.root_type {
-        crate::domain::SaveRootType::ManagedGame => Some(game.managed_path.clone()),
-        crate::domain::SaveRootType::AppData => std::env::var("APPDATA").ok(),
-        crate::domain::SaveRootType::LocalAppData => std::env::var("LOCALAPPDATA").ok(),
-        crate::domain::SaveRootType::LocalLow => std::env::var("USERPROFILE").ok().map(|path| PathBuf::from(path).join("AppData").join("LocalLow").to_string_lossy().to_string()),
-        crate::domain::SaveRootType::Documents => std::env::var("USERPROFILE").ok().map(|path| PathBuf::from(path).join("Documents").to_string_lossy().to_string()),
-        crate::domain::SaveRootType::SavedGames => std::env::var("USERPROFILE").ok().map(|path| PathBuf::from(path).join("Saved Games").to_string_lossy().to_string()),
-        crate::domain::SaveRootType::UserProfile => std::env::var("USERPROFILE").ok(),
-        crate::domain::SaveRootType::Custom => scope.custom_root_path.clone(),
-    }
-    .or_else(|| fallback.map(str::to_string))
-    .ok_or_else(|| format!("无法解析云端存档范围：{:?}", scope.root_type))?;
-    let _ = app;
+    let base_path = match scope.root_type {
+        crate::domain::SaveRootType::ManagedGame => Some(PathBuf::from(&game.managed_path)),
+        crate::domain::SaveRootType::AppData => std::env::var_os("APPDATA").map(PathBuf::from),
+        crate::domain::SaveRootType::LocalAppData => std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        crate::domain::SaveRootType::LocalLow => std::env::var_os("USERPROFILE").map(|path| PathBuf::from(path).join("AppData").join("LocalLow")),
+        crate::domain::SaveRootType::Documents => std::env::var_os("USERPROFILE").map(|path| PathBuf::from(path).join("Documents")),
+        crate::domain::SaveRootType::SavedGames => std::env::var_os("USERPROFILE").map(|path| PathBuf::from(path).join("Saved Games")),
+        crate::domain::SaveRootType::UserProfile => std::env::var_os("USERPROFILE").map(PathBuf::from),
+        crate::domain::SaveRootType::Custom => scope.custom_root_path.as_ref().map(PathBuf::from),
+    };
+
+    let root_path = if let Some(base) = base_path {
+        if let Some(sub) = scope.sub_path.as_deref().filter(|s| !s.trim().is_empty()) {
+            let normalized_sub = sub.replace('/', "\\");
+            base.join(normalized_sub).to_string_lossy().to_string()
+        } else if let Some(fallback_path) = fallback {
+            fallback_path.to_string()
+        } else {
+            base.to_string_lossy().to_string()
+        }
+    } else if let Some(fallback_path) = fallback {
+        fallback_path.to_string()
+    } else {
+        return Err(format!("无法解析云端存档范围：{:?}", scope.root_type));
+    };
+
     Ok(SaveScope {
         root_type: scope.root_type,
         root_path,
@@ -294,4 +306,69 @@ fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn load_auto_upload_setting(app: &AppHandle) -> bool {
     app_data_dir(app).ok().and_then(|path| BaiduConfigRepository::load(&path).ok().flatten()).is_some_and(|config| config.auto_upload_body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Game, SaveRootType, UnknownFilePolicy};
+    use crate::services::cloud_account_service::CloudSaveScope;
+
+    #[test]
+    fn resolve_scope_joins_sub_path_for_locallow() {
+        let game = Game::new_pending("Game1", r"E:\Games\Game1", "game.exe");
+        let cloud_scope = CloudSaveScope {
+            root_type: SaveRootType::LocalLow,
+            custom_root_path: None,
+            sub_path: Some("miHoYo/GenshinImpact".to_string()),
+            confirmed_files: vec!["save.dat".to_string()],
+            include_directories: Vec::new(),
+            exclude_exact: Vec::new(),
+            exclude_patterns: Vec::new(),
+            exclude_directories: Vec::new(),
+            unknown_file_policy: UnknownFilePolicy::Protect,
+            max_file_bytes: None,
+        };
+        let resolved = resolve_scope(&game, &cloud_scope, None).expect("should resolve");
+        assert!(resolved.root_path.ends_with(r"AppData\LocalLow\miHoYo\GenshinImpact"));
+    }
+
+    #[test]
+    fn resolve_scope_joins_sub_path_for_managed_game() {
+        let game = Game::new_pending("Game1", r"E:\Games\Game1", "game.exe");
+        let cloud_scope = CloudSaveScope {
+            root_type: SaveRootType::ManagedGame,
+            custom_root_path: None,
+            sub_path: Some("SaveData/Slot1".to_string()),
+            confirmed_files: vec!["save.dat".to_string()],
+            include_directories: Vec::new(),
+            exclude_exact: Vec::new(),
+            exclude_patterns: Vec::new(),
+            exclude_directories: Vec::new(),
+            unknown_file_policy: UnknownFilePolicy::Protect,
+            max_file_bytes: None,
+        };
+        let resolved = resolve_scope(&game, &cloud_scope, None).expect("should resolve");
+        assert_eq!(resolved.root_path, r"E:\Games\Game1\SaveData\Slot1");
+    }
+
+    #[test]
+    fn resolve_scope_uses_fallback_when_sub_path_is_none() {
+        let game = Game::new_pending("Game1", r"E:\Games\Game1", "game.exe");
+        let cloud_scope = CloudSaveScope {
+            root_type: SaveRootType::LocalLow,
+            custom_root_path: None,
+            sub_path: None,
+            confirmed_files: vec!["save.dat".to_string()],
+            include_directories: Vec::new(),
+            exclude_exact: Vec::new(),
+            exclude_patterns: Vec::new(),
+            exclude_directories: Vec::new(),
+            unknown_file_policy: UnknownFilePolicy::Protect,
+            max_file_bytes: None,
+        };
+        let fallback = r"C:\Users\Bob\AppData\LocalLow\CustomFolder";
+        let resolved = resolve_scope(&game, &cloud_scope, Some(fallback)).expect("should resolve");
+        assert_eq!(resolved.root_path, fallback);
+    }
 }

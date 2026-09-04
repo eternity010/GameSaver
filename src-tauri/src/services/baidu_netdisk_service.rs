@@ -1,17 +1,22 @@
 use reqwest::blocking::{Client, multipart};
 use reqwest::blocking::Response;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{Read, Write},
+    io::{BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Mutex, OnceLock,
+    },
     time::Duration,
 };
 
 const API_BASE: &str = "https://pan.baidu.com";
 const UPLOAD_API_BASE: &str = "https://d.pcs.baidu.com";
 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+const UPLOAD_CONCURRENCY: usize = 3;
 const MAX_REQUEST_ATTEMPTS: usize = 3;
 const TOKEN_REFRESH_LEEWAY_MS: u64 = 5 * 60 * 1000;
 const TOKEN_FILE_NAME: &str = "baidu-netdisk-token.json";
@@ -391,7 +396,7 @@ impl BaiduNetdiskClient {
         Ok(())
     }
 
-    pub fn upload_file(&self, local_path: &Path, remote_path: &str, on_progress: impl Fn(u8, &str) -> bool) -> Result<RemoteFile, String> {
+    pub fn upload_file(&self, local_path: &Path, remote_path: &str, on_progress: impl Fn(u8, &str) -> bool + Send) -> Result<RemoteFile, String> {
         let metadata = fs::metadata(local_path).map_err(|err| format!("读取待上传本体包失败：{err}"))?;
         let total_size = metadata.len();
         if total_size == 0 { return Err("不能上传空的本体包".to_string()); }
@@ -411,24 +416,105 @@ impl BaiduNetdiskClient {
             .send(), "定位百度上传服务器")?, "定位百度上传服务器")?;
         let host = located.servers.unwrap_or_default().into_iter().chain(located.bak_servers.unwrap_or_default()).find_map(|item| item.server).or(located.host).ok_or_else(|| "百度未返回可用上传服务器".to_string())?;
         let host = if host.starts_with("http") { host } else { format!("https://{host}") };
-        let mut file = fs::File::open(local_path).map_err(|err| format!("打开待上传本体包失败：{err}"))?;
         let chunk_count = block_md5.len();
-        for index in 0..chunk_count {
-            let length = (total_size.saturating_sub(index as u64 * CHUNK_SIZE)).min(CHUNK_SIZE) as usize;
-            let mut bytes = vec![0u8; length];
-            file.read_exact(&mut bytes).map_err(|err| format!("读取本体包分片失败：{err}"))?;
-            let upload_url = format!("{host}/rest/2.0/pcs/superfile2");
-            let token = self.token.access_token.clone();
-            let response = self.send_with_retry(|client| {
-                let form = multipart::Form::new().part("file", multipart::Part::bytes(bytes.clone()).file_name("package.zip"));
-                client.post(&upload_url)
-                    .query(&[("method", "upload"), ("access_token", token.as_str()), ("type", "tmpfile"), ("path", remote_path), ("uploadid", upload_id.as_str()), ("upload_version", "2.0"), ("partseq", &index.to_string())])
-                    .multipart(form).send()
-            }, &format!("上传百度本体包分片 {}/{}", index + 1, chunk_count))?;
-            let _: serde_json::Value = parse_json(response, "上传百度本体包分片")?;
-            if !on_progress(10 + (((index + 1) * 80) / chunk_count.max(1)) as u8, &format!("正在上传本体包分片 {}/{}", index + 1, chunk_count)) {
-                return Err("任务已取消".to_string());
+        let concurrency = UPLOAD_CONCURRENCY.min(chunk_count);
+        let next_chunk = AtomicUsize::new(0);
+        let completed_count = AtomicUsize::new(0);
+        let aborted = AtomicBool::new(false);
+        let first_error = Mutex::new(None::<String>);
+        let progress_callback = Mutex::new(on_progress);
+
+        std::thread::scope(|s| {
+            for _ in 0..concurrency {
+                s.spawn(|| {
+                    let mut file = match fs::File::open(local_path) {
+                        Ok(f) => f,
+                        Err(err) => {
+                            aborted.store(true, Ordering::Relaxed);
+                            let mut err_guard = first_error.lock().unwrap();
+                            if err_guard.is_none() {
+                                *err_guard = Some(format!("打开待上传本体包失败：{err}"));
+                            }
+                            return;
+                        }
+                    };
+                    while !aborted.load(Ordering::Relaxed) {
+                        let index = next_chunk.fetch_add(1, Ordering::SeqCst);
+                        if index >= chunk_count {
+                            break;
+                        }
+                        let offset = index as u64 * CHUNK_SIZE;
+                        let length = (total_size.saturating_sub(offset)).min(CHUNK_SIZE) as usize;
+                        if let Err(err) = file.seek(std::io::SeekFrom::Start(offset)) {
+                            aborted.store(true, Ordering::Relaxed);
+                            let mut err_guard = first_error.lock().unwrap();
+                            if err_guard.is_none() {
+                                *err_guard = Some(format!("定位本体包分片偏移失败：{err}"));
+                            }
+                            break;
+                        }
+                        let mut bytes = vec![0u8; length];
+                        if let Err(err) = file.read_exact(&mut bytes) {
+                            aborted.store(true, Ordering::Relaxed);
+                            let mut err_guard = first_error.lock().unwrap();
+                            if err_guard.is_none() {
+                                *err_guard = Some(format!("读取本体包分片失败：{err}"));
+                            }
+                            break;
+                        }
+
+                        let upload_url = format!("{host}/rest/2.0/pcs/superfile2");
+                        let token = self.token.access_token.clone();
+                        let upload_result = self.send_with_retry(|client| {
+                            let form = multipart::Form::new().part("file", multipart::Part::bytes(bytes.clone()).file_name("package.zip"));
+                            client.post(&upload_url)
+                                .query(&[("method", "upload"), ("access_token", token.as_str()), ("type", "tmpfile"), ("path", remote_path), ("uploadid", upload_id.as_str()), ("upload_version", "2.0"), ("partseq", &index.to_string())])
+                                .multipart(form).send()
+                        }, &format!("上传百度本体包分片 {}/{}", index + 1, chunk_count));
+
+                        let response = match upload_result {
+                            Ok(res) => res,
+                            Err(err) => {
+                                aborted.store(true, Ordering::Relaxed);
+                                let mut err_guard = first_error.lock().unwrap();
+                                if err_guard.is_none() {
+                                    *err_guard = Some(err);
+                                }
+                                break;
+                            }
+                        };
+
+                        if let Err(err) = parse_json::<serde_json::Value>(response, "上传百度本体包分片") {
+                            aborted.store(true, Ordering::Relaxed);
+                            let mut err_guard = first_error.lock().unwrap();
+                            if err_guard.is_none() {
+                                *err_guard = Some(err);
+                            }
+                            break;
+                        }
+
+                        let finished = completed_count.fetch_add(1, Ordering::SeqCst) + 1;
+                        let progress_pct = 10 + ((finished * 80) / chunk_count.max(1)) as u8;
+                        let progress_msg = format!("正在上传本体包分片 {}/{}", finished, chunk_count);
+                        let keep_going = match progress_callback.lock() {
+                            Ok(cb) => cb(progress_pct, &progress_msg),
+                            Err(_) => false,
+                        };
+                        if !keep_going {
+                            aborted.store(true, Ordering::Relaxed);
+                            let mut err_guard = first_error.lock().unwrap();
+                            if err_guard.is_none() {
+                                *err_guard = Some("任务已取消".to_string());
+                            }
+                            break;
+                        }
+                    }
+                });
             }
+        });
+
+        if let Some(err) = first_error.into_inner().unwrap() {
+            return Err(err);
         }
         let url = format!("{API_BASE}/rest/2.0/xpan/file");
         let token = self.token.access_token.clone();
@@ -436,11 +522,13 @@ impl BaiduNetdiskClient {
             .query(&[("method", "create"), ("access_token", token.as_str())])
             .form(&[("path", remote_path), ("size", &total_size.to_string()), ("isdir", "0"), ("uploadid", upload_id.as_str()), ("block_list", &block_list), ("rtype", "3"), ("is_revision", "1")])
             .send(), "提交百度本体包")?, "提交百度本体包")?;
-        on_progress(100, "本体包上传完成");
+        if let Ok(cb) = progress_callback.lock() {
+            cb(100, "本体包上传完成");
+        }
         Ok(RemoteFile { path: remote_path.to_string(), fs_id: created.fs_id, size: created.size.max(total_size), md5: created.md5, is_dir: false, server_mtime: None })
     }
 
-    pub fn download_file(&self, remote: &RemoteFile, target_path: &Path, on_progress: impl Fn(u8, &str) -> bool) -> Result<(), String> {
+    pub fn download_file(&self, remote: &RemoteFile, target_path: &Path, on_progress: impl Fn(u8, &str) -> bool) -> Result<String, String> {
         let fsids = serde_json::to_string(&[remote.fs_id]).map_err(|err| format!("生成百度下载请求失败：{err}"))?;
         let url = format!("{API_BASE}/rest/2.0/xpan/multimedia");
         let token = self.token.access_token.clone();
@@ -456,24 +544,31 @@ impl BaiduNetdiskClient {
         let parent = target_path.parent().ok_or_else(|| "本体包下载路径无父目录".to_string())?;
         fs::create_dir_all(parent).map_err(|err| format!("创建本体包下载目录失败：{err}"))?;
         let temporary = target_path.with_extension("download.tmp");
-        let mut output = fs::File::create(&temporary).map_err(|err| format!("创建本体包下载临时文件失败：{err}"))?;
+        let file = fs::File::create(&temporary).map_err(|err| format!("创建本体包下载临时文件失败：{err}"))?;
+        let mut output = BufWriter::with_capacity(4 * 1024 * 1024, file);
+        let mut hasher = Sha256::new();
         let mut written = 0u64;
         let mut buffer = vec![0u8; 1024 * 1024];
         loop {
             let read = response.read(&mut buffer).map_err(|err| format!("读取百度本体包失败：{err}"))?;
             if read == 0 { break; }
             output.write_all(&buffer[..read]).map_err(|err| format!("写入本体包下载文件失败：{err}"))?;
+            hasher.update(&buffer[..read]);
             written = written.saturating_add(read as u64);
             if !on_progress(5 + ((written.min(remote.size) * 90 / remote.size.max(1)) as u8), &format!("正在下载本体包 {} / {} MB", written / 1024 / 1024, remote.size / 1024 / 1024)) {
+                drop(output);
                 let _ = fs::remove_file(&temporary);
                 return Err("任务已取消".to_string());
             }
         }
-        output.sync_all().map_err(|err| format!("刷新本体包下载文件失败：{err}"))?;
+        output.flush().map_err(|err| format!("刷新本体包下载文件失败：{err}"))?;
+        output.get_ref().sync_all().map_err(|err| format!("同步本体包下载文件失败：{err}"))?;
+        drop(output);
         if written != remote.size { let _ = fs::remove_file(&temporary); return Err(format!("本体包下载大小不匹配：{} / {}", written, remote.size)); }
         fs::rename(&temporary, target_path).map_err(|err| format!("提交本体包下载文件失败：{err}"))?;
+        let sha256_hex = hex::encode(hasher.finalize());
         on_progress(100, "本体包下载完成");
-        Ok(())
+        Ok(sha256_hex)
     }
 
     fn send_with_retry<F>(&self, mut request: F, operation: &str) -> Result<Response, String>
@@ -599,13 +694,7 @@ fn parse_value<T: for<'de> Deserialize<'de>>(value: serde_json::Value, operation
     serde_json::from_value(value).map_err(|err| format!("{operation}响应格式无效：{err}"))
 }
 
-fn md5_hex(input: &[u8]) -> String {
-    let mut message = input.to_vec();
-    let bit_length = (message.len() as u64).saturating_mul(8);
-    message.push(0x80);
-    while message.len() % 64 != 56 { message.push(0); }
-    message.extend_from_slice(&bit_length.to_le_bytes());
-    let mut state = [0x67452301u32, 0xefcdab89, 0x98badcfe, 0x10325476];
+fn md5_transform(state: &mut [u32; 4], block: &[u8; 64]) {
     let shifts = [7u32, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
     let constants = [
         0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
@@ -617,28 +706,64 @@ fn md5_hex(input: &[u8]) -> String {
         0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
         0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
     ];
-    for chunk in message.chunks_exact(64) {
-        let mut words = [0u32; 16];
-        for (index, word) in words.iter_mut().enumerate() { *word = u32::from_le_bytes(chunk[index * 4..index * 4 + 4].try_into().unwrap()); }
-        let original = state;
-        let mut a = state[0];
-        let mut b = state[1];
-        let mut c = state[2];
-        let mut d = state[3];
-        for index in 0..64 {
-            let (function, word_index, shift) = if index < 16 { ((b & c) | ((!b) & d), index, shifts[index % 4]) } else if index < 32 { ((d & b) | ((!d) & c), (5 * index + 1) % 16, shifts[4 + index % 4]) } else if index < 48 { (b ^ c ^ d, (3 * index + 5) % 16, shifts[8 + index % 4]) } else { (c ^ (b | (!d)), (7 * index) % 16, shifts[12 + index % 4]) };
-            let next = a.wrapping_add(function).wrapping_add(constants[index]).wrapping_add(words[word_index]).rotate_left(shift);
-            a = d;
-            d = c;
-            c = b;
-            b = b.wrapping_add(next);
-        }
-        state[0] = original[0].wrapping_add(a);
-        state[1] = original[1].wrapping_add(b);
-        state[2] = original[2].wrapping_add(c);
-        state[3] = original[3].wrapping_add(d);
+    let mut words = [0u32; 16];
+    for (index, word) in words.iter_mut().enumerate() {
+        *word = u32::from_le_bytes(block[index * 4..index * 4 + 4].try_into().unwrap());
     }
-    state.iter().flat_map(|word| word.to_le_bytes()).map(|byte| format!("{byte:02x}")).collect()
+    let original = *state;
+    let mut a = state[0];
+    let mut b = state[1];
+    let mut c = state[2];
+    let mut d = state[3];
+    for index in 0..64 {
+        let (function, word_index, shift) = if index < 16 {
+            ((b & c) | ((!b) & d), index, shifts[index % 4])
+        } else if index < 32 {
+            ((d & b) | ((!d) & c), (5 * index + 1) % 16, shifts[4 + index % 4])
+        } else if index < 48 {
+            (b ^ c ^ d, (3 * index + 5) % 16, shifts[8 + index % 4])
+        } else {
+            (c ^ (b | (!d)), (7 * index) % 16, shifts[12 + index % 4])
+        };
+        let next = a
+            .wrapping_add(function)
+            .wrapping_add(constants[index])
+            .wrapping_add(words[word_index])
+            .rotate_left(shift);
+        a = d;
+        d = c;
+        c = b;
+        b = b.wrapping_add(next);
+    }
+    state[0] = original[0].wrapping_add(a);
+    state[1] = original[1].wrapping_add(b);
+    state[2] = original[2].wrapping_add(c);
+    state[3] = original[3].wrapping_add(d);
+}
+
+fn md5_hex(input: &[u8]) -> String {
+    let mut state = [0x67452301u32, 0xefcdab89, 0x98badcfe, 0x10325476];
+    let bit_length = (input.len() as u64).saturating_mul(8);
+    for chunk in input.chunks_exact(64) {
+        md5_transform(&mut state, chunk.try_into().unwrap());
+    }
+    let rem = &input[(input.len() / 64) * 64..];
+    let mut tail = [0u8; 128];
+    tail[..rem.len()].copy_from_slice(rem);
+    tail[rem.len()] = 0x80;
+    if rem.len() < 56 {
+        tail[56..64].copy_from_slice(&bit_length.to_le_bytes());
+        md5_transform(&mut state, tail[..64].try_into().unwrap());
+    } else {
+        tail[120..128].copy_from_slice(&bit_length.to_le_bytes());
+        md5_transform(&mut state, tail[..64].try_into().unwrap());
+        md5_transform(&mut state, tail[64..128].try_into().unwrap());
+    }
+    state
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -654,6 +779,18 @@ mod tests {
     #[test]
     fn md5_matches_known_vectors() {
         assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5_hex(b"a"), "0cc175b9c0f1b6a831c399e269772661");
+        assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(md5_hex(b"message digest"), "f96b697d7cb7938d525a2f31aaf161d0");
+        assert_eq!(md5_hex(b"abcdefghijklmnopqrstuvwxyz"), "c3fcd3d76192e4007dfb496cca67e13b");
+        assert_eq!(
+            md5_hex(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"),
+            "d174ab98d277d9f5a5611c2c9f419d9f"
+        );
+        assert_eq!(
+            md5_hex(b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"),
+            "57edf4a22be3c955ac49da2e2107b67a"
+        );
         assert_eq!(md5_hex(b"GameSaver"), "f28205fc3f14a3b8bfa43c894db2a24b");
     }
 

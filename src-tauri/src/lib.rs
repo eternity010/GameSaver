@@ -1,5 +1,6 @@
 mod app_state;
 mod commands;
+mod cover_protocol;
 mod domain;
 mod logging;
 mod repositories;
@@ -118,12 +119,15 @@ pub fn run() {
             app.manage(AppState::new(store, library_root, tasks, PathBuf::from(tasks_path)));
             Ok(())
         })
+        .register_uri_scheme_protocol("gamesaver-cover", cover_protocol::handle_cover_request)
         .invoke_handler(tauri::generate_handler![
             commands::game_commands::list_games,
             commands::game_commands::get_game,
             commands::game_commands::rename_game,
             commands::game_commands::save_game_cover,
             commands::game_commands::get_game_cover,
+            commands::game_commands::get_game_cover_path,
+            commands::game_commands::get_game_cover_paths,
             commands::add_game_commands::start_add_game_task,
             commands::task_commands::get_task,
             commands::task_commands::list_tasks,
@@ -135,7 +139,10 @@ pub fn run() {
             commands::save_commands::confirm_save_profile,
             commands::save_commands::get_save_profile,
             commands::save_commands::update_save_profile_keep_versions,
+            commands::save_commands::update_save_profile_scopes,
             commands::save_commands::discard_pending_game,
+            commands::save_commands::open_path_in_explorer,
+            commands::save_commands::get_default_save_exclusions,
             commands::launch_commands::precheck_game_launch,
             commands::launch_commands::launch_game,
             commands::launch_commands::get_game_runtime,
@@ -151,6 +158,8 @@ pub fn run() {
             ,commands::baidu_commands::get_baidu_status
             ,commands::baidu_commands::list_cloud_games
             ,commands::baidu_commands::get_cloud_game_cover
+            ,commands::baidu_commands::get_cloud_game_cover_path
+            ,commands::baidu_commands::get_cloud_game_cover_paths
             ,commands::baidu_commands::install_cloud_game
             ,commands::baidu_commands::list_remote_body_packages
             ,commands::baidu_commands::repair_cloud_body_manifest

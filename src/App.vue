@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { AlertTriangle, CloudDownload, CloudUpload, Gamepad2, Library, Plus, Settings, Search, ShieldCheck } from "@lucide/vue";
-import { deleteRemoteBodyPackage, getElevationStatus, getGameCover, getTask, installCloudGame, launchGame, listCloudGames, listGames, listTasks, restartAsAdmin } from "./api";
+import { deleteRemoteBodyPackage, getElevationStatus, getGameCoverUrl, getTask, installCloudGame, launchGame, listCloudGames, listGames, listTasks, restartAsAdmin } from "./api";
 import type { AppTask, ElevationStatus } from "./api";
 import type { CloudGameSummary, CloudGameVersion } from "./api";
 import { gameStatusLabel, type Game } from "./domain/game";
@@ -57,41 +57,15 @@ const filteredGames = computed(() => {
 
 const pageTitle = computed(() => activeView.value === "all" ? "游戏库" : activeView.value === "recent" ? "最近游玩" : activeView.value === "favorites" ? "收藏" : "需要处理");
 
-async function loadGameCovers(list: Game[]) {
-  const currentUids = new Set(list.map((game) => game.gameUid));
-
-  for (const [uid, url] of Object.entries(coverUrls.value)) {
-    if (!currentUids.has(uid)) {
-      URL.revokeObjectURL(url);
-      delete coverUrls.value[uid];
+function loadGameCovers(list: Game[]) {
+  const nextUrls: Record<string, string> = {};
+  for (const game of list) {
+    if (game.cover) {
+      const tag = game.cover.displayPath || game.lastPlayedAt || "1";
+      nextUrls[game.gameUid] = getGameCoverUrl(game.gameUid, tag);
     }
   }
-
-  await Promise.all(
-    list.map(async (game) => {
-      if (!game.cover) {
-        if (coverUrls.value[game.gameUid]) {
-          URL.revokeObjectURL(coverUrls.value[game.gameUid]);
-          delete coverUrls.value[game.gameUid];
-        }
-        return;
-      }
-      try {
-        const bytes = await getGameCover(game.gameUid);
-        if (bytes && bytes.length > 0) {
-          const oldUrl = coverUrls.value[game.gameUid];
-          const newUrl = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: "image/jpeg" }));
-          coverUrls.value[game.gameUid] = newUrl;
-          if (oldUrl) URL.revokeObjectURL(oldUrl);
-        } else if (coverUrls.value[game.gameUid]) {
-          URL.revokeObjectURL(coverUrls.value[game.gameUid]);
-          delete coverUrls.value[game.gameUid];
-        }
-      } catch {
-        // Retain fallback placeholder if loading fails
-      }
-    })
-  );
+  coverUrls.value = nextUrls;
 }
 
 async function loadGames() {
@@ -188,9 +162,6 @@ onMounted(() => {
 onUnmounted(() => {
   if (cloudInstallTimer) clearTimeout(cloudInstallTimer);
   if (transferCountTimer) clearTimeout(transferCountTimer);
-  for (const url of Object.values(coverUrls.value)) {
-    URL.revokeObjectURL(url);
-  }
   coverUrls.value = {};
 });
 
@@ -380,7 +351,7 @@ async function finishAddGame() {
       <div v-else class="game-grid">
         <article v-for="game in filteredGames" :key="game.gameUid" class="game-card" tabindex="0" @click="openGame(game)" @keyup.enter="openGame(game)">
           <div class="game-card-cover">
-            <img v-if="coverUrls[game.gameUid]" :src="coverUrls[game.gameUid]" :alt="`${game.displayName} 封面`" loading="lazy" />
+            <img v-if="coverUrls[game.gameUid]" :src="coverUrls[game.gameUid]" :alt="`${game.displayName} 封面`" loading="lazy" @error="delete coverUrls[game.gameUid]" />
             <div v-else class="cover-placeholder"><Gamepad2 :size="34" /></div>
           </div>
           <div class="game-card-body"><div><h2>{{ game.displayName }}</h2><span class="status-label">{{ gameStatusLabel(game) }}</span></div><button class="launch-button" type="button" :disabled="game.lifecycle !== 'active'" @click.stop="quickLaunch(game)">启动</button></div>

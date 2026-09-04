@@ -308,6 +308,17 @@ h1 { margin-bottom: 0; font-size: 30px; letter-spacing: 0; }
 .issue-list { display: grid; gap: 5px; margin-top: 14px; padding: 11px 12px; border: 1px solid #62494a; border-radius: 5px; background: #2b2226; }
 .issue-list p { margin: 0; color: #e5b4b4; font-size: 12px; overflow-wrap: anywhere; }
 .managed-path { min-height: 42px; margin-bottom: 18px; padding: 11px 12px; border: 1px solid #343b48; border-radius: 5px; color: #c5d0e0; background: #191c22; font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.managed-path-row { display: flex; align-items: stretch; gap: 8px; margin-bottom: 18px; }
+.managed-path-row .managed-path { flex: 1; margin-bottom: 0; }
+.managed-path-row .secondary-button { white-space: nowrap; flex-shrink: 0; }
+.detail-scopes-card { display: grid; gap: 8px; margin-bottom: 18px; }
+.detail-scopes-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.detail-scopes-header .timeline-caption { margin-bottom: 0; }
+.detail-scope-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid #343b48; border-radius: 6px; background: #191c22; }
+.detail-scope-empty { padding: 12px; border: 1px dashed #343b48; border-radius: 6px; background: #191c22; }
+.detail-scope-empty .empty-hint { margin: 0; color: var(--text-secondary); font-size: 13px; }
+.detail-scope-info { min-width: 0; flex: 1; display: grid; gap: 3px; }
+.detail-scope-path { margin: 0; color: #c5d0e0; font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
 .detail-facts { display: grid; gap: 10px; margin: 0; }
 .detail-facts div { display: flex; justify-content: space-between; gap: 14px; color: var(--text-secondary); font-size: 13px; }
 .detail-facts dt, .detail-facts dd { margin: 0; }
@@ -416,6 +427,7 @@ h1 { margin-bottom: 0; font-size: 30px; letter-spacing: 0; }
 .confidence-score span { color: var(--text-secondary); font-size: 12px; }
 .scope-editor { display: grid; gap: 18px; }
 .scope-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.scope-heading-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .scope-heading h2 { max-width: 650px; margin: 5px 0 0; overflow-wrap: anywhere; font-size: 15px; line-height: 1.45; }
 .scope-type { color: var(--brand); font-size: 12px; font-weight: 700; }
 .policy-badge { margin-left: 8px; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 500; }

@@ -1,11 +1,17 @@
 use crate::{
     domain::{
-        game::LaunchConfig, AppStore, GameLifecycle, SaveRootType, SaveScope, UnknownFilePolicy,
+        game::{Game, LaunchConfig},
+        AppStore, GameLifecycle, SaveRootType, SaveScope, UnknownFilePolicy,
     },
     services::{BaiduNetdiskClient, RemoteFile},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fs, io::Write, path::Path};
+use std::{
+    collections::HashSet,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 use uuid::Uuid;
 
 const FORMAT_VERSION: u32 = 1;
@@ -58,6 +64,8 @@ pub struct CloudSaveScope {
     pub root_type: SaveRootType,
     #[serde(default)]
     pub custom_root_path: Option<String>,
+    #[serde(default)]
+    pub sub_path: Option<String>,
     pub confirmed_files: Vec<String>,
     pub include_directories: Vec<String>,
     pub exclude_exact: Vec<String>,
@@ -126,19 +134,27 @@ impl CloudAccountService {
             .save_profiles
             .iter()
             .filter(|profile| active_ids.contains(profile.game_uid.as_str()) && profile.enabled)
-            .map(|profile| CloudSaveProfile {
-                profile_id: profile.profile_id.clone(),
-                game_key: active_games
+            .map(|profile| {
+                let game = active_games
                     .iter()
                     .find(|game| game.game_uid == profile.game_uid)
-                    .map(|game| game.game_key.clone())
-                    .unwrap_or_default(),
-                game_uid: profile.game_uid.clone(),
-                executable_hash: profile.executable_hash.clone(),
-                scopes: profile.scopes.iter().map(cloud_scope).collect(),
-                detection_evidence: profile.detection_evidence.clone(),
-                confidence: profile.confidence,
-                updated_at: profile.updated_at.clone(),
+                    .copied();
+                CloudSaveProfile {
+                    profile_id: profile.profile_id.clone(),
+                    game_key: game
+                        .map(|g| g.game_key.clone())
+                        .unwrap_or_default(),
+                    game_uid: profile.game_uid.clone(),
+                    executable_hash: profile.executable_hash.clone(),
+                    scopes: profile
+                        .scopes
+                        .iter()
+                        .map(|scope| cloud_scope(scope, game))
+                        .collect(),
+                    detection_evidence: profile.detection_evidence.clone(),
+                    confidence: profile.confidence,
+                    updated_at: profile.updated_at.clone(),
+                }
             })
             .collect();
         let body_versions = store
@@ -252,11 +268,12 @@ impl CloudAccountService {
     }
 }
 
-fn cloud_scope(scope: &SaveScope) -> CloudSaveScope {
+fn cloud_scope(scope: &SaveScope, game: Option<&Game>) -> CloudSaveScope {
     CloudSaveScope {
         root_type: scope.root_type,
         custom_root_path: (scope.root_type == SaveRootType::Custom)
             .then(|| scope.root_path.clone()),
+        sub_path: extract_sub_path(scope, game),
         confirmed_files: scope.confirmed_files.clone(),
         include_directories: scope.include_directories.clone(),
         exclude_exact: scope.exclude_exact.clone(),
@@ -265,6 +282,102 @@ fn cloud_scope(scope: &SaveScope) -> CloudSaveScope {
         unknown_file_policy: scope.unknown_file_policy,
         max_file_bytes: scope.max_file_bytes,
     }
+}
+
+pub fn extract_sub_path(scope: &SaveScope, game: Option<&Game>) -> Option<String> {
+    if scope.root_type == SaveRootType::Custom {
+        return None;
+    }
+
+    let norm_path = scope.root_path.trim().replace('/', "\\");
+
+    if scope.root_type == SaveRootType::ManagedGame {
+        if let Some(game) = game {
+            let norm_managed = game.managed_path.trim().replace('/', "\\");
+            if norm_path.eq_ignore_ascii_case(&norm_managed) {
+                return None;
+            }
+            if norm_path
+                .to_ascii_lowercase()
+                .starts_with(&(norm_managed.to_ascii_lowercase() + "\\"))
+            {
+                let sub = &norm_path[norm_managed.len()..].trim_start_matches('\\');
+                let sub_normalized = sub.replace('\\', "/");
+                if is_valid_relative_path(&sub_normalized) {
+                    return Some(sub_normalized);
+                }
+            }
+            let game_folder = Path::new(&game.managed_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if !game_folder.is_empty() {
+                let marker = format!("\\{game_folder}\\");
+                if let Some(pos) = norm_path
+                    .to_ascii_lowercase()
+                    .rfind(&marker.to_ascii_lowercase())
+                {
+                    let sub = &norm_path[pos + marker.len()..].trim_start_matches('\\');
+                    let sub_normalized = sub.replace('\\', "/");
+                    if is_valid_relative_path(&sub_normalized) {
+                        return Some(sub_normalized);
+                    }
+                }
+            }
+        }
+        return None;
+    }
+
+    let env_base = match scope.root_type {
+        SaveRootType::AppData => std::env::var_os("APPDATA").map(PathBuf::from),
+        SaveRootType::LocalAppData => std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        SaveRootType::LocalLow => std::env::var_os("USERPROFILE")
+            .map(|p| PathBuf::from(p).join("AppData").join("LocalLow")),
+        SaveRootType::Documents => std::env::var_os("USERPROFILE")
+            .map(|p| PathBuf::from(p).join("Documents")),
+        SaveRootType::SavedGames => std::env::var_os("USERPROFILE")
+            .map(|p| PathBuf::from(p).join("Saved Games")),
+        SaveRootType::UserProfile => std::env::var_os("USERPROFILE").map(PathBuf::from),
+        SaveRootType::ManagedGame | SaveRootType::Custom => None,
+    };
+
+    if let Some(base) = env_base {
+        let norm_base = base.to_string_lossy().replace('/', "\\");
+        if norm_path.eq_ignore_ascii_case(&norm_base) {
+            return None;
+        }
+        if norm_path
+            .to_ascii_lowercase()
+            .starts_with(&(norm_base.to_ascii_lowercase() + "\\"))
+        {
+            let sub = &norm_path[norm_base.len()..].trim_start_matches('\\');
+            let sub_normalized = sub.replace('\\', "/");
+            if is_valid_relative_path(&sub_normalized) {
+                return Some(sub_normalized);
+            }
+        }
+    }
+
+    let marker = match scope.root_type {
+        SaveRootType::LocalLow => Some(r"\appdata\locallow\"),
+        SaveRootType::LocalAppData => Some(r"\appdata\local\"),
+        SaveRootType::AppData => Some(r"\appdata\roaming\"),
+        SaveRootType::Documents => Some(r"\documents\"),
+        SaveRootType::SavedGames => Some(r"\saved games\"),
+        _ => None,
+    };
+
+    if let Some(marker) = marker {
+        if let Some(pos) = norm_path.to_ascii_lowercase().rfind(marker) {
+            let sub = &norm_path[pos + marker.len()..].trim_start_matches('\\');
+            let sub_normalized = sub.replace('\\', "/");
+            if is_valid_relative_path(&sub_normalized) {
+                return Some(sub_normalized);
+            }
+        }
+    }
+
+    None
 }
 
 fn is_valid_remote_body_path(game_key: &str, path: &str) -> bool {
@@ -371,6 +484,11 @@ fn validate(profile: &CloudAccountProfile) -> Result<(), String> {
                     .is_none_or(|path| !is_valid_custom_root_path(path))
             {
                 return Err("云端账号清单包含无效的自定义存档路径".to_string());
+            }
+            if let Some(sub_path) = scope.sub_path.as_deref() {
+                if !is_valid_relative_path(sub_path) {
+                    return Err("云端账号清单包含无效的存档范围子路径".to_string());
+                }
             }
             if scope
                 .confirmed_files
@@ -587,5 +705,94 @@ mod tests {
     #[test]
     fn platform_settings_has_safe_defaults() {
         assert!(!CloudPlatformSettings::default().auto_upload_body);
+    }
+
+    #[test]
+    fn extract_sub_path_extracts_nested_relative_paths() {
+        let game = Game::new_pending("Game1", r"E:\Games\Game1", "game.exe");
+
+        // 1. LocalLow with subfolder
+        let locallow_scope = SaveScope {
+            root_type: SaveRootType::LocalLow,
+            root_path: r"C:\Users\Alice\AppData\LocalLow\miHoYo\GenshinImpact".to_string(),
+            confirmed_files: vec!["save.dat".to_string()],
+            include_directories: Vec::new(),
+            exclude_exact: Vec::new(),
+            exclude_patterns: Vec::new(),
+            exclude_directories: Vec::new(),
+            unknown_file_policy: UnknownFilePolicy::Protect,
+            max_file_bytes: None,
+        };
+        assert_eq!(
+            super::extract_sub_path(&locallow_scope, Some(&game)),
+            Some("miHoYo/GenshinImpact".to_string())
+        );
+
+        // 2. Documents with My Games
+        let docs_scope = SaveScope {
+            root_type: SaveRootType::Documents,
+            root_path: r"C:\Users\Alice\Documents\My Games\Skyrim".to_string(),
+            ..locallow_scope.clone()
+        };
+        assert_eq!(
+            super::extract_sub_path(&docs_scope, Some(&game)),
+            Some("My Games/Skyrim".to_string())
+        );
+
+        // 3. ManagedGame subdirectory
+        let managed_sub_scope = SaveScope {
+            root_type: SaveRootType::ManagedGame,
+            root_path: r"E:\Games\Game1\SaveData\Slot1".to_string(),
+            ..locallow_scope.clone()
+        };
+        assert_eq!(
+            super::extract_sub_path(&managed_sub_scope, Some(&game)),
+            Some("SaveData/Slot1".to_string())
+        );
+
+        // 4. ManagedGame exact root returns None
+        let managed_exact_scope = SaveScope {
+            root_type: SaveRootType::ManagedGame,
+            root_path: r"E:\Games\Game1".to_string(),
+            ..locallow_scope.clone()
+        };
+        assert_eq!(super::extract_sub_path(&managed_exact_scope, Some(&game)), None);
+
+        // 5. Custom root returns None
+        let custom_scope = SaveScope {
+            root_type: SaveRootType::Custom,
+            root_path: r"D:\CustomSaves\Game".to_string(),
+            ..locallow_scope.clone()
+        };
+        assert_eq!(super::extract_sub_path(&custom_scope, Some(&game)), None);
+    }
+
+    #[test]
+    fn validate_rejects_path_traversal_in_sub_path() {
+        let mut store = AppStore::default();
+        let _game_uid = active_game(&mut store);
+        let mut profile = CloudAccountService::build(&store, false);
+        profile.save_profiles.push(super::CloudSaveProfile {
+            profile_id: "sp1".to_string(),
+            game_key: profile.games[0].game_key.clone(),
+            game_uid: profile.games[0].game_uid.clone(),
+            executable_hash: "hash".to_string(),
+            scopes: vec![super::CloudSaveScope {
+                root_type: SaveRootType::LocalLow,
+                custom_root_path: None,
+                sub_path: Some("../../../Windows/System32".to_string()),
+                confirmed_files: vec!["save.dat".to_string()],
+                include_directories: Vec::new(),
+                exclude_exact: Vec::new(),
+                exclude_patterns: Vec::new(),
+                exclude_directories: Vec::new(),
+                unknown_file_policy: UnknownFilePolicy::Protect,
+                max_file_bytes: None,
+            }],
+            detection_evidence: Vec::new(),
+            confidence: 90,
+            updated_at: "1".to_string(),
+        });
+        assert!(validate(&profile).is_err());
     }
 }

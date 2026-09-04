@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     fs,
-    io::{Read, Write},
+    io::{BufReader, BufWriter, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc,
@@ -348,7 +348,8 @@ impl BodyPackageService {
         let result = (|| -> Result<BodyPackageResult, String> {
             let file = fs::File::create(&temporary)
                 .map_err(|err| format!("创建本体 ZIP 临时文件失败：{err}"))?;
-            let mut writer = ZipWriter::new(file);
+            let writer = BufWriter::with_capacity(1024 * 1024, file);
+            let mut writer = ZipWriter::new(writer);
             let options =
                 SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
             let mut manifest_files = Vec::with_capacity(files.len());
@@ -419,12 +420,17 @@ impl BodyPackageService {
             writer
                 .write_all(&manifest_bytes)
                 .map_err(|err| format!("写入本体包清单失败：{err}"))?;
-            let output = writer
+            let mut output = writer
                 .finish()
                 .map_err(|err| format!("完成本体 ZIP 失败：{err}"))?;
             output
-                .sync_all()
+                .flush()
                 .map_err(|err| format!("刷新本体 ZIP 失败：{err}"))?;
+            output
+                .get_ref()
+                .sync_all()
+                .map_err(|err| format!("同步本体 ZIP 失败：{err}"))?;
+            drop(output);
             on_progress(98, "正在校验本体 ZIP");
             let package_hash = hash_file(&temporary)?;
             fs::rename(&temporary, &package_path)
@@ -451,7 +457,26 @@ impl BodyPackageService {
         executable_relative_path: &str,
         expected_package_sha256: Option<&str>,
     ) -> Result<BodyPackageManifest, String> {
-        let actual_hash = hash_file(package_path)?;
+        Self::validate_package_with_known_hash(
+            package_path,
+            game_uid,
+            executable_relative_path,
+            expected_package_sha256,
+            None,
+        )
+    }
+
+    pub fn validate_package_with_known_hash(
+        package_path: &Path,
+        game_uid: &str,
+        executable_relative_path: &str,
+        expected_package_sha256: Option<&str>,
+        known_package_sha256: Option<&str>,
+    ) -> Result<BodyPackageManifest, String> {
+        let actual_hash = match known_package_sha256 {
+            Some(known) if !known.is_empty() => known.to_string(),
+            _ => hash_file(package_path)?,
+        };
         if let Some(expected) = expected_package_sha256 {
             if actual_hash != expected {
                 return Err("本体 ZIP 哈希校验失败".to_string());
@@ -459,8 +484,9 @@ impl BodyPackageService {
         }
         let file =
             fs::File::open(package_path).map_err(|err| format!("打开本体 ZIP 失败：{err}"))?;
+        let reader = BufReader::with_capacity(512 * 1024, file);
         let mut archive =
-            ZipArchive::new(file).map_err(|err| format!("读取本体 ZIP 失败：{err}"))?;
+            ZipArchive::new(reader).map_err(|err| format!("读取本体 ZIP 失败：{err}"))?;
         let manifest = read_manifest(&mut archive)?;
         if manifest.format_version != PACKAGE_FORMAT_VERSION {
             return Err(format!("不支持的本体包格式：{}", manifest.format_version));
@@ -499,6 +525,7 @@ impl BodyPackageService {
         Self::validate_package(package_path, game_uid, executable_relative_path, None).map(|_| ())
     }
 
+    #[allow(dead_code)]
     pub fn extract_package(
         package_path: &Path,
         staging_root: &Path,
@@ -508,21 +535,47 @@ impl BodyPackageService {
         on_progress: impl Fn(u8, &str),
         is_cancelled: impl Fn() -> bool,
     ) -> Result<BodyPackageManifest, String> {
+        Self::extract_package_with_known_hash(
+            package_path,
+            staging_root,
+            game_uid,
+            executable_relative_path,
+            expected_package_sha256,
+            None,
+            on_progress,
+            is_cancelled,
+        )
+    }
+
+    pub fn extract_package_with_known_hash(
+        package_path: &Path,
+        staging_root: &Path,
+        game_uid: &str,
+        executable_relative_path: &str,
+        expected_package_sha256: Option<&str>,
+        known_package_sha256: Option<&str>,
+        on_progress: impl Fn(u8, &str),
+        is_cancelled: impl Fn() -> bool,
+    ) -> Result<BodyPackageManifest, String> {
         let expected_executable = normalize_relative(executable_relative_path)?;
         let result = (|| -> Result<BodyPackageManifest, String> {
-            let expected_package_hash = hash_file(package_path)?;
-            if expected_package_hash.is_empty() {
+            let actual_package_hash = match known_package_sha256 {
+                Some(known) if !known.is_empty() => known.to_string(),
+                _ => hash_file(package_path)?,
+            };
+            if actual_package_hash.is_empty() {
                 return Err("本体 ZIP 哈希为空".to_string());
             }
             if let Some(expected) = expected_package_sha256 {
-                if expected_package_hash != expected {
+                if actual_package_hash != expected {
                     return Err("本体 ZIP 哈希校验失败".to_string());
                 }
             }
             let file =
                 fs::File::open(package_path).map_err(|err| format!("打开本体 ZIP 失败：{err}"))?;
+            let reader = BufReader::with_capacity(512 * 1024, file);
             let mut archive =
-                ZipArchive::new(file).map_err(|err| format!("读取本体 ZIP 失败：{err}"))?;
+                ZipArchive::new(reader).map_err(|err| format!("读取本体 ZIP 失败：{err}"))?;
             let manifest = read_manifest(&mut archive)?;
             if manifest.format_version != PACKAGE_FORMAT_VERSION {
                 return Err(format!("不支持的本体包格式：{}", manifest.format_version));
@@ -913,7 +966,8 @@ fn collect_files(root: &Path, protected_paths: &[String]) -> Result<Vec<BodyPack
 
 fn read_archive_file_index(package_path: &Path) -> Result<Vec<BodyPackageFile>, String> {
     let file = fs::File::open(package_path).map_err(|err| format!("打开本体 ZIP 失败：{err}"))?;
-    let mut archive = ZipArchive::new(file).map_err(|err| format!("读取本体 ZIP 失败：{err}"))?;
+    let reader = BufReader::with_capacity(512 * 1024, file);
+    let mut archive = ZipArchive::new(reader).map_err(|err| format!("读取本体 ZIP 失败：{err}"))?;
     let mut files = Vec::new();
     for index in 0..archive.len() {
         let entry = archive

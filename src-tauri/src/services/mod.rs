@@ -9,6 +9,7 @@ pub mod game_library_service;
 pub mod launch_service;
 pub mod library_service;
 pub(crate) mod learning;
+pub mod process_service;
 pub mod save_learning_service;
 pub mod task_service;
 
@@ -16,7 +17,7 @@ pub use add_game_service::AddGameService;
 pub use baidu_netdisk_service::{BaiduConnectionStatus, BaiduNetdiskClient, BaiduQuota, BaiduToken, RemoteFile};
 pub use cloud_manifest_service::{CloudGamePage, CloudGameSummary, CloudManifestService, RemoteBodyPackageList};
 pub use cloud_account_service::{CloudAccountProfile, CloudAccountService};
-pub use cloud_save_service::{CloudSaveManifest, CloudSaveManifestVersion, CloudSaveService, CloudSaveSyncStatusView};
+pub use cloud_save_service::{CloudSaveManifestVersion, CloudSaveService, CloudSaveSyncStatusView};
 pub use game_body_package_service::BodyPackageService;
 pub use game_body_update_service::GameBodyUpdateService;
 pub use game_library_service::GameLibraryService;

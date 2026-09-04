@@ -1,6 +1,7 @@
 use crate::domain::{
     ActiveLearningSession, FileFingerprint, Game, LearningSessionView, LearningStatus,
     SaveLearningResult, SaveRootType, SaveScope, SaveScopeDraft, UnknownFilePolicy,
+    DEFAULT_EXCLUDE_DIRECTORIES, DEFAULT_EXCLUDE_PATTERNS,
 };
 use crate::services::learning::{
     collect_related_files_by_trace, extend_tracked_process_tree, stop_etw_capture,
@@ -28,23 +29,6 @@ const RESOURCE_EXTENSIONS: [&str; 12] = [
 const NAME_HINTS: [&str; 7] = ["save", "slot", "profile", "userdata", "autosave", "progress", "system"];
 const SAVE_DIRECTORY_HINTS: [&str; 8] = [
     "save", "savedata", "saves", "savegame", "savegames", "profile", "profiles", "userdata",
-];
-const DEFAULT_EXCLUDE_PATTERNS: [&str; 8] = [
-    "*.tmp",
-    "*.temp",
-    "*.log",
-    "*.dmp",
-    "*.bak",
-    "*.etl",
-    "*.csv",
-    "*.cache",
-];
-const DEFAULT_EXCLUDE_DIRECTORIES: [&str; 5] = [
-    "logs",
-    "crashdumps",
-    "cache",
-    "shadercache",
-    "webcache",
 ];
 
 pub struct SaveLearningService;
@@ -97,9 +81,20 @@ impl SaveLearningService {
             return Err("任务已取消".to_string());
         }
         on_progress(58, "正在启动游戏");
-        let parent = executable_path.parent().ok_or_else(|| "启动程序缺少工作目录".to_string())?;
+        let working_directory = game
+            .launch
+            .working_directory_relative_path
+            .as_deref()
+            .map(|relative| safe_join(Path::new(&game.managed_path), relative))
+            .transpose()?
+            .unwrap_or_else(|| {
+                executable_path
+                    .parent()
+                    .unwrap_or(Path::new(&game.managed_path))
+                    .to_path_buf()
+            });
         let mut command = Command::new(&executable_path);
-        command.current_dir(parent);
+        command.args(&game.launch.arguments).current_dir(&working_directory);
         let child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
@@ -115,9 +110,12 @@ impl SaveLearningService {
         if let Err(error) = extend_tracked_process_tree(&mut tracked_pid_set) {
             etw_start_error.get_or_insert(format!("进程树扩展失败：{error}"));
         }
+        let managed_path = PathBuf::from(&game.managed_path);
+        let dir_pids = crate::services::process_service::find_processes_in_directory(&managed_path);
+        tracked_pid_set.extend(dir_pids);
         let tracked_pids = Arc::new(Mutex::new(sorted_pids(tracked_pid_set)));
         let process_tracker_stop = Arc::new(AtomicBool::new(false));
-        spawn_process_tracker(Arc::clone(&tracked_pids), Arc::clone(&process_tracker_stop));
+        spawn_process_tracker(Arc::clone(&tracked_pids), Arc::clone(&process_tracker_stop), Some(managed_path));
         let view = LearningSessionView {
             session_id,
             game_uid: game.game_uid.clone(),
@@ -152,6 +150,10 @@ impl SaveLearningService {
             .copied()
             .collect::<HashSet<_>>();
         let _ = extend_tracked_process_tree(&mut tracked_pid_set);
+        if let Some(managed_root) = active.roots.iter().find(|r| r.root_type == crate::domain::SaveRootType::ManagedGame) {
+            let dir_pids = crate::services::process_service::find_processes_in_directory(&managed_root.physical_path);
+            tracked_pid_set.extend(dir_pids);
+        }
         let tracked_pids = sorted_pids(tracked_pid_set);
         let mut etw_files = HashSet::new();
         let mut etw_operations = Vec::new();
@@ -172,6 +174,7 @@ impl SaveLearningService {
                 }
                 Err(error) => notes.push(format!("ETW 解析失败，已回退快照差异：{error}")),
             }
+            let _ = std::fs::remove_file(&capture.etl_path);
         } else if let Some(error) = active.etw_start_error.as_ref() {
             notes.push(format!("ETW 未启动，已使用快照差异：{error}"));
         }
@@ -200,15 +203,37 @@ impl SaveLearningService {
                 crate::logging::info("存档学习容器兜底：未找到常见存档容器");
             }
         }
+        let mut effective_roots = active.roots.clone();
+        if !etw_files.is_empty() {
+            let managed_path = active
+                .roots
+                .iter()
+                .find(|r| r.root_type == SaveRootType::ManagedGame)
+                .map(|r| r.physical_path.as_path());
+            for etw_file in &etw_files {
+                let path = Path::new(etw_file);
+                if !effective_roots
+                    .iter()
+                    .any(|r| path_is_within_root(etw_file, &r.physical_path))
+                {
+                    if let Some(inferred) = infer_scan_root_for_etw_file(path, managed_path) {
+                        effective_roots.push(inferred);
+                    }
+                }
+            }
+            let mut seen = HashSet::new();
+            effective_roots.retain(|r| seen.insert(normalize_path(&r.physical_path)));
+        }
+
         let baseline = active.baseline.as_ref();
         let final_snapshot = if etw_files.is_empty() {
-            collect_snapshot(&active.roots, |progress, message| on_progress(snapshot_analysis_progress(progress), message), &is_cancelled)?
+            collect_snapshot(&effective_roots, |progress, message| on_progress(snapshot_analysis_progress(progress), message), &is_cancelled)?
         } else {
             on_progress(45, "ETW 已定位文件，正在读取目标文件状态");
-            let targeted = collect_targeted_snapshot(&active.roots, &etw_files, &is_cancelled)?;
+            let targeted = collect_targeted_snapshot(&effective_roots, &etw_files, &is_cancelled)?;
             if targeted.is_empty() {
                 notes.push("ETW 文件无法直接读取，已回退完整快照差异".to_string());
-                collect_snapshot(&active.roots, |progress, message| on_progress(snapshot_analysis_progress(progress), message), &is_cancelled)?
+                collect_snapshot(&effective_roots, |progress, message| on_progress(snapshot_analysis_progress(progress), message), &is_cancelled)?
             } else {
                 targeted
             }
@@ -217,7 +242,9 @@ impl SaveLearningService {
             return Err("任务已取消".to_string());
         }
         on_progress(92, "正在按文件夹整理存档候选");
-        let (changed_files, scope_drafts, mut inference_notes) = infer_scope_drafts(active, &final_snapshot, baseline, &etw_files);
+        let mut active_effective = active.clone();
+        active_effective.roots = effective_roots;
+        let (changed_files, scope_drafts, mut inference_notes) = infer_scope_drafts(&active_effective, &final_snapshot, baseline, &etw_files);
         notes.append(&mut inference_notes);
         let transaction_summary = (!etw_operations.is_empty() || active.etw_capture.is_some())
             .then(|| crate::services::learning::analyze_save_transactions(etw_operations));
@@ -248,17 +275,84 @@ fn sorted_pids(pids: HashSet<u32>) -> Vec<u32> {
     values
 }
 
-fn spawn_process_tracker(tracked_pids: Arc<Mutex<Vec<u32>>>, stop: Arc<AtomicBool>) {
-    thread::spawn(move || {
-        while !stop.load(Ordering::Relaxed) {
-            if let Ok(mut current) = tracked_pids.lock() {
-                let mut process_set = current.iter().copied().collect::<HashSet<_>>();
-                let _ = extend_tracked_process_tree(&mut process_set);
-                *current = sorted_pids(process_set);
+#[cfg(target_os = "windows")]
+fn any_process_alive(pids: &[u32]) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    for &pid in pids {
+        if pid == 0 {
+            continue;
+        }
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if !handle.is_null() {
+                let mut exit_code: u32 = 0;
+                let result = GetExitCodeProcess(handle, &mut exit_code);
+                CloseHandle(handle);
+                if result != 0 && exit_code == STILL_ACTIVE {
+                    return true;
+                }
             }
-            thread::sleep(Duration::from_secs(1));
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+fn any_process_alive(_pids: &[u32]) -> bool {
+    true
+}
+
+fn spawn_process_tracker(
+    tracked_pids: Arc<Mutex<Vec<u32>>>,
+    stop: Arc<AtomicBool>,
+    managed_path: Option<PathBuf>,
+) {
+    thread::spawn(move || {
+        let mut iterations: usize = 0;
+        while !stop.load(Ordering::Relaxed) {
+            let all_exited = if let Ok(mut current) = tracked_pids.lock() {
+                let alive = any_process_alive(&current);
+                if alive || current.is_empty() {
+                    let mut process_set = current.iter().copied().collect::<HashSet<_>>();
+                    let _ = extend_tracked_process_tree(&mut process_set);
+                    if let Some(dir) = managed_path.as_deref() {
+                        let dir_pids = crate::services::process_service::find_processes_in_directory(dir);
+                        process_set.extend(dir_pids);
+                    }
+                    *current = sorted_pids(process_set);
+                }
+                !current.is_empty() && !alive
+            } else {
+                false
+            };
+
+            iterations += 1;
+            let sleep_duration = if all_exited {
+                Duration::from_secs(3)
+            } else if iterations < 10 {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(1)
+            };
+            thread::sleep(sleep_duration);
         }
     });
+}
+
+fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    let rel_path = Path::new(relative);
+    if rel_path.is_absolute()
+        || rel_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err("相对路径无效，禁止使用绝对路径或父级引用".to_string());
+    }
+    Ok(root.join(rel_path))
 }
 
 fn managed_executable_path(game: &Game) -> Result<PathBuf, String> {
@@ -310,6 +404,21 @@ fn discover_scan_roots(game: &Game) -> Result<Vec<crate::domain::ScanRoot>, Stri
             }
         }
     }
+    if let Ok(public) = env::var("PUBLIC").or_else(|_| env::var("SystemDrive").map(|d| format!(r"{d}\Users\Public"))) {
+        let public_root = PathBuf::from(public);
+        let public_documents = public_root.join("Documents");
+        if public_documents.is_dir() {
+            for path in find_candidate_directories(&public_documents, &hints) {
+                roots.push(crate::domain::ScanRoot { root_type: SaveRootType::Documents, physical_path: path });
+            }
+            let steam_container = public_documents.join("Steam");
+            if steam_container.is_dir() {
+                for path in find_candidate_directories(&steam_container, &hints) {
+                    roots.push(crate::domain::ScanRoot { root_type: SaveRootType::Documents, physical_path: path });
+                }
+            }
+        }
+    }
     let mut seen = HashSet::new();
     roots.retain(|root| seen.insert(normalize_path(&root.physical_path)));
     Ok(roots)
@@ -343,15 +452,134 @@ fn is_scan_noise_directory(path: &Path) -> bool {
     ["temp", "cache", "logs", "crashdumps", "shadercache", "packages", "microsoft", "google", "mozilla", "nvidia"].contains(&name.as_str())
 }
 
+fn infer_scan_root_for_etw_file(
+    file_path: &Path,
+    managed_path: Option<&Path>,
+) -> Option<crate::domain::ScanRoot> {
+    let norm_file = normalize_path(file_path);
+
+    if let Some(managed) = managed_path {
+        let norm_managed = normalize_path(managed);
+        if norm_file.starts_with(&(norm_managed.clone() + "\\")) || norm_file == norm_managed {
+            return Some(crate::domain::ScanRoot {
+                root_type: SaveRootType::ManagedGame,
+                physical_path: managed.to_path_buf(),
+            });
+        }
+    }
+
+    let profile_root = env::var_os("USERPROFILE").map(PathBuf::from)?;
+    let app_data = env::var_os("APPDATA").map(PathBuf::from);
+    let local_app_data = env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let local_low = profile_root.join("AppData").join("LocalLow");
+    let saved_games = profile_root.join("Saved Games");
+    let documents = profile_root.join("Documents");
+    let public_documents = env::var_os("PUBLIC")
+        .or_else(|| env::var_os("SystemDrive").map(|d| format!(r"{}\Users\Public", d.to_string_lossy()).into()))
+        .map(|p| PathBuf::from(p).join("Documents"));
+
+    let bases: [(Option<PathBuf>, SaveRootType); 7] = [
+        (Some(local_low), SaveRootType::LocalLow),
+        (Some(saved_games), SaveRootType::SavedGames),
+        (app_data, SaveRootType::AppData),
+        (local_app_data, SaveRootType::LocalAppData),
+        (Some(documents), SaveRootType::Documents),
+        (public_documents, SaveRootType::Documents),
+        (Some(profile_root.clone()), SaveRootType::UserProfile),
+    ];
+
+    for (base_opt, root_type) in bases {
+        let Some(base) = base_opt else { continue };
+        let norm_base = normalize_path(&base);
+        if norm_file.starts_with(&(norm_base.clone() + "\\")) {
+            let rel_str = norm_file[norm_base.len()..].trim_start_matches('\\');
+            let components = rel_str.split('\\').collect::<Vec<_>>();
+            let candidate_dir = if components.len() >= 3 && components[0] == "steam" {
+                base.join(components[0]).join(components[1]).join(components[2])
+            } else if components.len() >= 2 && components[0] == "my games" {
+                base.join(components[0]).join(components[1])
+            } else if components.len() >= 2
+                && (root_type == SaveRootType::LocalLow
+                    || root_type == SaveRootType::LocalAppData
+                    || root_type == SaveRootType::AppData)
+                && components[0] != "saved"
+                && components[0] != "save"
+                && components[0] != "saves"
+                && components[0] != "savedata"
+            {
+                base.join(components[0]).join(components[1])
+            } else if !components.is_empty() {
+                base.join(components[0])
+            } else {
+                base.clone()
+            };
+            return Some(crate::domain::ScanRoot {
+                root_type,
+                physical_path: candidate_dir,
+            });
+        }
+    }
+    None
+}
+
 fn game_name_hints(game: &Game) -> Vec<String> {
-    let mut hints = game.display_name.split(|character: char| !character.is_ascii_alphanumeric()).filter(|item| item.len() >= 3).map(|item| item.to_ascii_lowercase()).collect::<Vec<_>>();
-    let compact_name = game.display_name.chars().filter(|character| character.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
-    if compact_name.len() >= 3 && !hints.contains(&compact_name) { hints.push(compact_name); }
-    if let Some(stem) = Path::new(&game.launch.executable_relative_path).file_stem().and_then(|value| value.to_str()) {
-        let stem = stem.to_ascii_lowercase();
-        let compact_stem = stem.chars().filter(|character| character.is_ascii_alphanumeric()).collect::<String>();
-        if stem.len() >= 3 && !hints.contains(&stem) { hints.push(stem); }
-        if compact_stem.len() >= 3 && !hints.contains(&compact_stem) { hints.push(compact_stem); }
+    let is_delimiter = |character: char| !character.is_alphanumeric();
+    let mut hints = game
+        .display_name
+        .split(is_delimiter)
+        .filter(|item| item.chars().count() >= 2)
+        .map(|item| item.to_lowercase())
+        .collect::<Vec<_>>();
+    let compact_name = game
+        .display_name
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .collect::<String>()
+        .to_lowercase();
+    if compact_name.chars().count() >= 2 && !hints.contains(&compact_name) {
+        hints.push(compact_name);
+    }
+    if let Some(stem) = Path::new(&game.launch.executable_relative_path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+    {
+        let stem = stem.to_lowercase();
+        let compact_stem = stem
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .collect::<String>();
+        if stem.chars().count() >= 2 && !hints.contains(&stem) {
+            hints.push(stem);
+        }
+        if compact_stem.chars().count() >= 2 && !hints.contains(&compact_stem) {
+            hints.push(compact_stem);
+        }
+    }
+    let managed = Path::new(&game.managed_path);
+    if managed.is_dir() {
+        for entry in WalkDir::new(managed).max_depth(4).into_iter().filter_map(Result::ok) {
+            let file_name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if file_name == "steam_appid.txt" {
+                if let Ok(content) = fs::read_to_string(entry.path()) {
+                    let appid = content.trim();
+                    if !appid.is_empty() && appid.chars().all(|c| c.is_ascii_digit()) && !hints.contains(&appid.to_string()) {
+                        hints.push(appid.to_string());
+                    }
+                }
+            } else if file_name == "steam_emu.ini" {
+                if let Ok(content) = fs::read_to_string(entry.path()) {
+                    for line in content.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.to_ascii_lowercase().starts_with("appid=") {
+                            let appid = trimmed["appid=".len()..].trim();
+                            if !appid.is_empty() && appid.chars().all(|c| c.is_ascii_digit()) && !hints.contains(&appid.to_string()) {
+                                hints.push(appid.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     hints
 }
@@ -361,12 +589,12 @@ fn directory_matches_hint(path: &Path, hint: &str) -> bool {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
-        .to_ascii_lowercase();
+        .to_lowercase();
     let compact_name = name
         .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
+        .filter(|character| character.is_alphanumeric())
         .collect::<String>();
-    name == hint || compact_name == hint || (hint.len() >= 4 && compact_name.contains(hint))
+    name == hint || compact_name == hint || (hint.chars().count() >= 3 && compact_name.contains(hint))
 }
 
 fn discover_save_container_files(
@@ -399,7 +627,7 @@ fn discover_save_container_files(
             }
         }
         for container in containers {
-            for entry in WalkDir::new(container).follow_links(false) {
+            for entry in WalkDir::new(container).follow_links(false).max_depth(6) {
                 if is_cancelled() {
                     return Err("任务已取消".to_string());
                 }
@@ -427,7 +655,16 @@ fn is_save_container_directory(path: &Path) -> bool {
         .filter(|character| character.is_ascii_alphanumeric())
         .collect::<String>()
         .to_ascii_lowercase();
-    SAVE_DIRECTORY_HINTS.contains(&name.as_str())
+    if SAVE_DIRECTORY_HINTS.contains(&name.as_str()) {
+        return true;
+    }
+    let norm = normalize_path(path);
+    if norm.contains(r"\steam\") || norm.contains(r"\rune\") || norm.contains(r"\codex\") || norm.contains(r"\onlinefix\") {
+        if name.chars().all(|c| c.is_ascii_digit()) && name.len() >= 4 {
+            return true;
+        }
+    }
+    false
 }
 
 fn collect_snapshot(
@@ -526,6 +763,21 @@ fn infer_scope_drafts(
     let mut groups: BTreeMap<String, ScopeGroup> = BTreeMap::new();
     let mut unhandled_noise: Vec<(String, &FileFingerprint)> = Vec::new();
 
+    struct CachedScanRoot<'a> {
+        root: &'a crate::domain::ScanRoot,
+        norm_path: String,
+        components_count: usize,
+    }
+    let cached_roots: Vec<CachedScanRoot> = active
+        .roots
+        .iter()
+        .map(|root| CachedScanRoot {
+            root,
+            norm_path: normalize_path(&root.physical_path),
+            components_count: root.physical_path.components().count(),
+        })
+        .collect();
+
     for path in &changed {
         if !etw_files.is_empty() && !etw_files.contains(path) {
             continue;
@@ -542,11 +794,15 @@ fn infer_scope_drafts(
         let is_candidate = fingerprint.size <= MAX_CANDIDATE_FILE_BYTES
             && (candidate_by_etw || candidate_by_snapshot);
 
-        let Some(scan_root) = active
-            .roots
+        let Some(scan_root) = cached_roots
             .iter()
-            .filter(|root| path_is_within_root(path, &root.physical_path))
-            .max_by_key(|root| root.physical_path.components().count())
+            .filter(|cr| {
+                path == &cr.norm_path
+                    || (path.starts_with(&cr.norm_path)
+                        && path.as_bytes().get(cr.norm_path.len()) == Some(&b'\\'))
+            })
+            .max_by_key(|cr| cr.components_count)
+            .map(|cr| cr.root)
         else {
             continue;
         };
@@ -711,26 +967,32 @@ fn collect_targeted_snapshot(
     is_cancelled: &impl Fn() -> bool,
 ) -> Result<HashMap<String, FileFingerprint>, String> {
     let mut files = HashMap::new();
+    let norm_roots: Vec<String> = roots
+        .iter()
+        .map(|root| normalize_path(&root.physical_path))
+        .collect();
+
     for path in etw_files {
         if is_cancelled() {
             return Err("任务已取消".to_string());
         }
-        let candidate = PathBuf::from(path);
-        if !roots.iter().any(|root| {
-            let candidate_path = normalize_path(&candidate);
-            let root_path = normalize_path(&root.physical_path);
-            candidate_path == root_path || candidate_path.starts_with(&(root_path + "\\"))
-        }) {
+        let is_in_roots = norm_roots.iter().any(|root_path| {
+            path == root_path
+                || (path.starts_with(root_path)
+                    && path.as_bytes().get(root_path.len()) == Some(&b'\\'))
+        });
+        if !is_in_roots {
             continue;
         }
-        if !candidate.is_file() || is_noise_path(&candidate) {
+        let candidate = Path::new(path);
+        if !candidate.is_file() || is_noise_path(candidate) {
             continue;
         }
-        let Ok(metadata) = fs::metadata(&candidate) else {
+        let Ok(metadata) = fs::metadata(candidate) else {
             continue;
         };
         files.insert(
-            normalize_path(&candidate),
+            path.clone(),
             FileFingerprint {
                 size: metadata.len(),
                 modified_unix: modified_unix(&metadata),
@@ -780,21 +1042,48 @@ fn path_is_within_root(path: &str, root: &Path) -> bool {
     let normalized_path = normalize_path(Path::new(path));
     let normalized_root = normalize_path(root);
     normalized_path == normalized_root
-        || normalized_path.starts_with(&(normalized_root + "\\"))
+        || (normalized_path.starts_with(&normalized_root)
+            && normalized_path.as_bytes().get(normalized_root.len()) == Some(&b'\\'))
 }
 
 fn is_noise_path(path: &Path) -> bool {
     let text = path.to_string_lossy().to_ascii_lowercase();
+    if text.ends_with(".log")
+        || text.ends_with(".tmp")
+        || text.ends_with(".temp")
+        || text.ends_with(".dmp")
+        || text.ends_with(".bak")
+        || text.ends_with(".etl")
+    {
+        return true;
+    }
     [
         "com.gamesaver.desktop",
         "com.gamesaver.next",
+        "\\appdata\\local\\temp\\",
+        "\\appdata\\local\\microsoft\\windows\\powershell\\",
+        "\\shadervariantanalytics\\",
+        "\\shadercache\\",
+        "\\gpucache\\",
+        "\\d3dscache\\",
+        "\\blob_storage\\",
+        "\\session storage\\",
+        "\\local storage\\",
+        "\\indexeddb\\",
         "\\cache\\",
         "\\logs\\",
         "\\temp\\",
         "\\crashdumps\\",
-        "\\shadercache\\",
+        "\\webcache\\",
+        "\\player.log",
+        "\\player-prev.log",
         "/cache/",
         "/logs/",
+        "/gpucache/",
+        "/shadercache/",
+        "/webcache/",
+        "/player.log",
+        "/player-prev.log",
     ]
     .iter()
     .any(|item| text.contains(item))
@@ -850,6 +1139,9 @@ mod tests {
         assert!(!is_etw_candidate(
             r"C:\Users\Player\AppData\Roaming\com.gamesaver.next\events\trace.etl"
         ));
+        assert!(!is_etw_candidate(r"C:\GameSaver\GPUCache\data_0"));
+        assert!(!is_etw_candidate(r"C:\GameSaver\D3DSCache\cache.bin"));
+        assert!(!is_etw_candidate(r"C:\GameSaver\blob_storage\entry"));
     }
 
     #[test]
@@ -1090,5 +1382,93 @@ mod tests {
         // 必须自动带有通用排除模式
         assert!(draft.scope.exclude_patterns.contains(&"*.tmp".to_string()));
         assert!(draft.scope.exclude_patterns.contains(&"*.log".to_string()));
+    }
+
+    #[test]
+    fn unicode_game_name_hints_extracts_cjk_words() {
+        let game = crate::domain::Game {
+            game_uid: "test-cjk".to_string(),
+            display_name: "黑神话：悟空".to_string(),
+            game_key: "black_myth".to_string(),
+            managed_path: "D:/Games/b1".to_string(),
+            lifecycle: crate::domain::GameLifecycle::Active,
+            health: crate::domain::GameHealth::Ready,
+            cloud_status: crate::domain::game::CloudStatus::LocalOnly,
+            launch: crate::domain::game::LaunchConfig {
+                executable_relative_path: "b1/Binaries/Win64/b1-Win64-Shipping.exe".to_string(),
+                working_directory_relative_path: None,
+                arguments: Vec::new(),
+            },
+            cover: None,
+            save_profile_id: None,
+            last_played_at: None,
+            latest_save_version_id: None,
+        };
+
+        let hints = super::game_name_hints(&game);
+        assert!(hints.contains(&"黑神话".to_string()));
+        assert!(hints.contains(&"悟空".to_string()));
+        assert!(hints.contains(&"黑神话悟空".to_string()));
+    }
+
+    #[test]
+    fn infer_scan_root_for_etw_file_resolves_standard_locations() {
+        let profile = std::env::var("USERPROFILE").unwrap_or_else(|_| r"C:\Users\Player".to_string());
+        let managed = Path::new(r"D:\Games\GameSaverGames\games\game-1");
+
+        // 1. LocalLow under Publisher\Game
+        let local_low_file = PathBuf::from(&profile)
+            .join("AppData")
+            .join("LocalLow")
+            .join("miHoYo")
+            .join("Genshin")
+            .join("save.dat");
+        let root = super::infer_scan_root_for_etw_file(&local_low_file, Some(managed));
+        assert!(root.is_some());
+        let root = root.unwrap();
+        assert_eq!(root.root_type, SaveRootType::LocalLow);
+        assert!(normalize_path(&root.physical_path).contains("genshin"));
+
+        // 2. Saved Games
+        let saved_games_file = PathBuf::from(&profile)
+            .join("Saved Games")
+            .join("Hades")
+            .join("Profile1.sav");
+        let root = super::infer_scan_root_for_etw_file(&saved_games_file, Some(managed));
+        assert!(root.is_some());
+        let root = root.unwrap();
+        assert_eq!(root.root_type, SaveRootType::SavedGames);
+        assert!(normalize_path(&root.physical_path).contains("hades"));
+
+        // 3. Managed Game
+        let managed_file = managed.join("Game_Data").join("slot.bin");
+        let root = super::infer_scan_root_for_etw_file(&managed_file, Some(managed));
+        assert!(root.is_some());
+        let root = root.unwrap();
+        assert_eq!(root.root_type, SaveRootType::ManagedGame);
+
+        // 4. Public Documents Steam emulator container
+        let public_doc = std::env::var_os("PUBLIC")
+            .or_else(|| std::env::var_os("SystemDrive").map(|d| format!(r"{}\Users\Public", d.to_string_lossy()).into()))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Users\Public"))
+            .join("Documents");
+        let steam_file = public_doc.join("Steam").join("RUNE").join("2456740").join("remote").join("slot0.json");
+        let root = super::infer_scan_root_for_etw_file(&steam_file, Some(managed));
+        assert!(root.is_some());
+        let root = root.unwrap();
+        assert_eq!(root.root_type, SaveRootType::Documents);
+        assert!(super::is_save_container_directory(&root.physical_path));
+        assert_eq!(normalize_path(&root.physical_path), normalize_path(&public_doc.join("Steam").join("RUNE").join("2456740")));
+    }
+
+    #[test]
+    fn noise_filtering_rejects_unity_and_engine_logs() {
+        assert!(super::is_noise_path(Path::new(r"C:\Users\User\AppData\LocalLow\Game\Player.log")));
+        assert!(super::is_noise_path(Path::new(r"C:\Users\User\AppData\LocalLow\Game\Player-prev.log")));
+        assert!(super::is_noise_path(Path::new(r"C:\Users\User\AppData\LocalLow\Game\test.tmp")));
+        assert!(super::is_noise_path(Path::new(r"C:\Users\User\AppData\LocalLow\Game\crash.dmp")));
+        assert!(!super::is_noise_path(Path::new(r"C:\Users\User\AppData\LocalLow\Game\save01.dat")));
+        assert!(!super::is_noise_path(Path::new(r"C:\Users\Public\Documents\Steam\RUNE\2456740\remote\slot0.json")));
     }
 }

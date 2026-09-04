@@ -12,9 +12,10 @@ import {
   startAddGameTask,
   startFinishSaveLearningTask,
   startSaveLearningTask,
+  openPathInExplorer,
   type AppTask,
 } from "../api";
-import type { Game, SaveLearningResult, SaveLearningSession, SaveRootType, SaveScope } from "../domain/game";
+import { createDefaultSaveScope, type Game, type SaveLearningResult, type SaveLearningSession, type SaveRootType, type SaveScope } from "../domain/game";
 
 type WizardPhase = "form" | "copying" | "ready" | "capturing" | "analyzing" | "review" | "done";
 
@@ -239,10 +240,18 @@ function removeScope(scopeIndex: number) {
   reviewScopes.value.splice(scopeIndex, 1);
 }
 
+async function openFolder(path: string) {
+  try {
+    await openPathInExplorer(path);
+  } catch (reason) {
+    error.value = `打开目录失败：${String(reason)}`;
+  }
+}
+
 async function addDirectoryScope() {
   const selected = await open({ directory: true, multiple: false });
   if (typeof selected !== "string") return;
-  reviewScopes.value.push({ rootType: "custom", rootPath: selected, confirmedFiles: [], includeDirectories: ["."], excludeExact: [], excludePatterns: [], excludeDirectories: [], unknownFilePolicy: "protect", maxFileBytes: 10 * 1024 * 1024 });
+  reviewScopes.value.push(createDefaultSaveScope(selected, "custom"));
 }
 
 async function confirm() {
@@ -327,7 +336,21 @@ onUnmounted(stopPolling);
     <section v-else-if="phase === 'review'" class="wizard-form">
       <section class="wizard-section result-summary"><div><p class="eyebrow">识别结果</p><h2>确认存档保护范围</h2><p>{{ learningResult?.changedFiles.length || 0 }} 个文件发生变化，已按目录整理为 {{ reviewScopes.length }} 个候选范围。</p><div class="evidence-summary"><span>{{ learningResult?.eventCaptureMode === "etw" ? "ETW + 快照证据" : "快照差异证据" }}</span><span v-if="learningResult?.transactionSummary">事务 {{ learningResult.transactionSummary.transactionCount }} 个 · {{ learningResult.transactionSummary.operationCount }} 条操作 · {{ learningResult.transactionSummary.status === "completed" ? "已确认" : learningResult.transactionSummary.status === "candidate" ? "候选" : "证据不足" }}</span></div></div><div class="confidence-score"><strong>{{ confidence }}%</strong><span>识别置信度</span></div></section>
       <section v-for="(scope, scopeIndex) in reviewScopes" :key="`${scope.rootPath}-${scopeIndex}`" class="wizard-section scope-editor">
-        <header class="scope-heading"><div><span class="scope-type">{{ rootTypeLabel[scope.rootType] }}</span><span class="policy-badge" :class="scope.unknownFilePolicy === 'protect' ? 'policy-protect' : 'policy-ignore'">{{ scope.unknownFilePolicy === 'protect' ? '自动保护新存档' : '仅保护已确认文件' }}</span><h2>{{ scope.rootPath }}</h2></div><button class="icon-button danger-icon" type="button" title="删除这个保护范围" :aria-label="`删除 ${scope.rootPath}`" @click="removeScope(scopeIndex)"><Trash2 :size="16" /></button></header>
+        <header class="scope-heading">
+          <div>
+            <span class="scope-type">{{ rootTypeLabel[scope.rootType] }}</span>
+            <span class="policy-badge" :class="scope.unknownFilePolicy === 'protect' ? 'policy-protect' : 'policy-ignore'">{{ scope.unknownFilePolicy === 'protect' ? '自动保护新存档' : '仅保护已确认文件' }}</span>
+            <h2>{{ scope.rootPath }}</h2>
+          </div>
+          <div class="scope-heading-actions">
+            <button class="secondary-button compact-button" type="button" title="在文件资源管理器中打开这个存档目录" @click="openFolder(scope.rootPath)">
+              <FolderOpen :size="15" />打开目录
+            </button>
+            <button class="icon-button danger-icon" type="button" title="删除这个保护范围" :aria-label="`删除 ${scope.rootPath}`" @click="removeScope(scopeIndex)">
+              <Trash2 :size="16" />
+            </button>
+          </div>
+        </header>
         <div class="editor-block"><div class="editor-label"><strong>保护文件</strong><span>{{ scope.confirmedFiles.length }} 项</span></div><div class="chip-list"><span v-for="(file, fileIndex) in scope.confirmedFiles" :key="file" class="file-chip">{{ file }}<button type="button" :aria-label="`删除 ${file}`" title="删除文件" @click="removeFile(scopeIndex, fileIndex)"><X :size="13" /></button></span><span v-if="!scope.confirmedFiles.length && !scope.includeDirectories.length" class="muted-text">暂无确认文件</span></div><div class="inline-editor"><input v-model="newFileByScope[scopeIndex]" type="text" placeholder="输入相对文件名，例如 save.dat" @keyup.enter="addFile(scopeIndex)" /><button class="secondary-button" type="button" @click="addFile(scopeIndex)"><Plus :size="15" />添加文件</button></div></div>
         <div v-if="scope.includeDirectories.length" class="editor-block"><div class="editor-label"><strong>保护目录</strong><span>{{ scope.includeDirectories.length }} 项</span></div><div class="chip-list"><span v-for="directory in scope.includeDirectories" :key="directory" class="file-chip directory-chip">{{ directory }}</span></div></div>
         <div v-if="scope.excludeDirectories.length" class="editor-block"><div class="editor-label"><strong>排除目录</strong><span>{{ scope.excludeDirectories.length }} 项</span></div><div class="chip-list"><span v-for="(dir, dirIndex) in scope.excludeDirectories" :key="dir" class="file-chip exclude-dir-chip">{{ dir }}<button type="button" :aria-label="`删除排除目录 ${dir}`" title="删除排除目录" @click="removeExcludeDirectory(scopeIndex, dirIndex)"><X :size="13" /></button></span></div></div>

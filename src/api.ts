@@ -175,6 +175,31 @@ export function getGameCover(gameUid: string): Promise<number[] | null> {
   return invokeCommand<number[] | null>("get_game_cover", { gameUid });
 }
 
+export function getGameCoverPath(gameUid: string): Promise<string | null> {
+  return invokeCommand<string | null>("get_game_cover_path", { gameUid });
+}
+
+export function getGameCoverPaths(): Promise<Record<string, string>> {
+  return invokeCommand<Record<string, string>>("get_game_cover_paths");
+}
+
+export function getCloudGameCoverPath(gameKey: string): Promise<string | null> {
+  return invokeCommand<string | null>("get_cloud_game_cover_path", { gameKey });
+}
+
+export function getCloudGameCoverPaths(): Promise<Record<string, string>> {
+  return invokeCommand<Record<string, string>>("get_cloud_game_cover_paths");
+}
+
+export function getGameCoverUrl(gameUid: string, cacheKey?: string | number): string {
+  const base = `http://gamesaver-cover.localhost/game/${encodeURIComponent(gameUid)}`;
+  return cacheKey ? `${base}?v=${encodeURIComponent(cacheKey)}` : base;
+}
+
+export function getCloudGameCoverUrl(gameKey: string): string {
+  return `http://gamesaver-cover.localhost/cloud/${encodeURIComponent(gameKey)}`;
+}
+
 export function startAddGameTask(input: {
   displayName: string;
   gameKey: string;
@@ -246,8 +271,25 @@ export function updateSaveProfileKeepVersions(gameUid: string, keepVersions: num
   return invokeCommand<SaveProfile>("update_save_profile_keep_versions", { gameUid, keepVersions });
 }
 
+export function updateSaveProfileScopes(gameUid: string, scopes: SaveScope[]): Promise<SaveProfile> {
+  return invokeCommand<SaveProfile>("update_save_profile_scopes", { gameUid, scopes });
+}
+
 export function discardPendingGame(gameUid: string): Promise<void> {
   return invokeCommand<void>("discard_pending_game", { gameUid });
+}
+
+export function openPathInExplorer(path: string): Promise<void> {
+  return invokeCommand<void>("open_path_in_explorer", { path });
+}
+
+export interface DefaultSaveExclusions {
+  excludePatterns: string[];
+  excludeDirectories: string[];
+}
+
+export function getDefaultSaveExclusions(): Promise<DefaultSaveExclusions> {
+  return invokeCommand<DefaultSaveExclusions>("get_default_save_exclusions");
 }
 
 export function precheckGameLaunch(gameUid: string): Promise<LaunchPrecheck> {

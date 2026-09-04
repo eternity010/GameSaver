@@ -9,5 +9,5 @@ pub use game::{CoverCrop, CoverPosition, Game, GameBodyVersion, GameCover, GameH
 pub use store::AppStore;
 pub use task::{AppTask, TaskRetry, TaskStatus};
 pub use learning::{ActiveLearningSession, EtwCaptureHandle, FileFingerprint, LearningSessionView, LearningStatus, SaveLearningResult, SaveScopeDraft, SaveTransactionSummary, ScanRoot};
-pub use save_profile::{SaveProfile, SaveRootType, SaveScope, UnknownFilePolicy};
+pub use save_profile::{DEFAULT_EXCLUDE_DIRECTORIES, DEFAULT_EXCLUDE_PATTERNS, SaveProfile, SaveRootType, SaveScope, UnknownFilePolicy};
 pub use save_version::{SaveFileEntry, SaveVersion};

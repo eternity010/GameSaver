@@ -1,6 +1,6 @@
 [package]
 name = "gamesaver_next"
-version = "1.0.4"
+version = "1.0.6"
 description = "GameSaver next-generation game library"
 authors = ["GameSaver"]
 edition = "2021"

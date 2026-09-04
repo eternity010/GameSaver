@@ -184,21 +184,38 @@ pub(crate) fn is_trace_artifact(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("csv") || ext.eq_ignore_ascii_case("etl"))
 }
 
+#[cfg(target_os = "windows")]
 pub(crate) fn is_running_as_admin() -> bool {
-    let mut command = Command::new("powershell");
-    command.args([
-        "-NoProfile",
-        "-Command",
-        "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)",
-    ]);
-    let output = apply_background_process_flags(&mut command).output();
-    let Ok(out) = output else {
-        return false;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
-    let text = String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .to_ascii_lowercase();
-    text.contains("true")
+
+    unsafe {
+        let mut token: HANDLE = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut returned_length = 0;
+        let result = GetTokenInformation(
+            token,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned_length,
+        ) != 0;
+        CloseHandle(token);
+        result && returned_length >= std::mem::size_of::<TOKEN_ELEVATION>() as u32 && elevation.TokenIsElevated != 0
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn is_running_as_admin() -> bool {
+    false
 }
 
 pub(crate) fn collect_related_files_by_trace(
@@ -841,16 +858,42 @@ pub(crate) fn normalize_windows_path(path: &str) -> String {
 
 pub(crate) fn should_ignore_snapshot_path(path: &Path) -> bool {
     let text = path.to_string_lossy().to_ascii_lowercase();
+    if text.ends_with(".log")
+        || text.ends_with(".tmp")
+        || text.ends_with(".temp")
+        || text.ends_with(".dmp")
+        || text.ends_with(".bak")
+        || text.ends_with(".etl")
+    {
+        return true;
+    }
     [
         "com.gamesaver.desktop",
         "com.gamesaver.next",
         "\\appdata\\local\\temp\\",
         "\\appdata\\local\\microsoft\\windows\\powershell\\",
         "\\shadervariantanalytics\\",
+        "\\shadercache\\",
+        "\\gpucache\\",
+        "\\d3dscache\\",
+        "\\blob_storage\\",
+        "\\session storage\\",
+        "\\local storage\\",
+        "\\indexeddb\\",
         "\\cache\\",
         "\\logs\\",
+        "\\temp\\",
         "\\crashdumps\\",
-        "\\shadercache\\",
+        "\\webcache\\",
+        "\\player.log",
+        "\\player-prev.log",
+        "/cache/",
+        "/logs/",
+        "/gpucache/",
+        "/shadercache/",
+        "/webcache/",
+        "/player.log",
+        "/player-prev.log",
     ]
     .iter()
     .any(|fragment| text.contains(fragment))

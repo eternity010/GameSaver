@@ -2,9 +2,10 @@
 import { nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { AlertTriangle, Archive, ArrowLeft, Check, CheckCircle2, Clock3, Cloud, CloudDownload, CloudUpload, Folder, FolderOpen, Gamepad2, HardDrive, ImagePlus, LoaderCircle, Pencil, Play, RefreshCw, RotateCcw, ShieldCheck, Trash2, Upload, X } from "@lucide/vue";
-import { deleteCloudSaveVersion, deleteGameBodyPackage, deleteSaveVersion, getBaiduConfig, getBaiduStatus, getCloudSaveStatus, getGameCover, getGameRuntime, getSaveProfile, getTask, launchGame, listCloudSaveVersions, listGameBodyVersions, listSaveVersions, packageGameBody, precheckGameLaunch, pruneSaveVersions, renameGame, restoreSaveVersion, saveGameCover, startRestoreCloudSaveTask, startUploadSaveVersionTask, uninstallGameBody, updateGameBody, uploadGameBodyPackage, updateSaveProfileKeepVersions } from "../api";
+import { deleteCloudSaveVersion, deleteGameBodyPackage, deleteSaveVersion, getBaiduConfig, getBaiduStatus, getCloudSaveStatus, getGameCover, getGameCoverUrl, getGameRuntime, getSaveProfile, getTask, launchGame, listCloudSaveVersions, listGameBodyVersions, listSaveVersions, openPathInExplorer, packageGameBody, precheckGameLaunch, pruneSaveVersions, renameGame, restoreSaveVersion, saveGameCover, startRestoreCloudSaveTask, startUploadSaveVersionTask, uninstallGameBody, updateGameBody, uploadGameBodyPackage, updateSaveProfileKeepVersions, updateSaveProfileScopes } from "../api";
 import type { BaiduConfigView, BaiduStatus } from "../api";
-import type { CloudSaveManifestVersion, CloudSaveSyncStatusView, CoverCrop, CoverPosition, Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveVersion } from "../domain/game";
+import { createDefaultSaveScope } from "../domain/game";
+import type { CloudSaveManifestVersion, CloudSaveSyncStatusView, CoverCrop, CoverPosition, Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveProfile, SaveRootType, SaveVersion } from "../domain/game";
 
 const props = defineProps<{ game: Game; initialError?: string; coverUrl?: string }>();
 const emit = defineEmits<{ back: []; refresh: []; settings: [] }>();
@@ -25,6 +26,55 @@ const error = ref(props.initialError || "");
 const message = ref("");
 const taskProgress = ref(0);
 const keepVersions = ref(5);
+const saveProfile = ref<SaveProfile | null>(null);
+
+const rootTypeLabel: Record<SaveRootType, string> = {
+  managed_game: "游戏目录",
+  app_data: "AppData",
+  local_app_data: "LocalAppData",
+  local_low: "LocalLow",
+  documents: "文档",
+  saved_games: "Saved Games",
+  user_profile: "用户目录",
+  custom: "自定义目录",
+};
+
+async function openFolder(path: string) {
+  try {
+    await openPathInExplorer(path);
+  } catch (reason) {
+    error.value = `打开目录失败：${String(reason)}`;
+  }
+}
+
+async function changeSaveDirectory() {
+  if (busy.value || runtime.value) return;
+  try {
+    const currentPath = saveProfile.value?.scopes?.[0]?.rootPath;
+    const selected = await open({
+      title: "选择游戏真实的存档所在目录",
+      directory: true,
+      multiple: false,
+      defaultPath: currentPath,
+    });
+    if (!selected || typeof selected !== "string") {
+      return;
+    }
+    busy.value = true;
+    error.value = "";
+    message.value = "正在更新存档保护目录...";
+    const newScope = createDefaultSaveScope(selected, "custom");
+    const updated = await updateSaveProfileScopes(props.game.gameUid, [newScope]);
+    saveProfile.value = updated;
+    message.value = `存档保护目录已更新为：${selected}`;
+    emit("refresh");
+  } catch (reason) {
+    error.value = `更新存档目录失败：${String(reason)}`;
+  } finally {
+    busy.value = false;
+  }
+}
+
 const coverInput = ref<HTMLInputElement | null>(null);
 const coverDisplayUrl = ref(props.coverUrl || "");
 const coverSourceUrl = ref("");
@@ -38,7 +88,6 @@ const coverZoom = ref(1);
 const coverOffsetX = ref(0);
 const coverOffsetY = ref(0);
 const coverDragging = ref(false);
-let coverOwnedUrl = "";
 let coverPointerX = 0;
 let coverPointerY = 0;
 const COVER_STAGE_WIDTH = 640;
@@ -109,6 +158,7 @@ async function refresh() {
     bodyVersions.value = nextBodyVersions;
     baiduStatus.value = nextBaiduStatus;
     baiduConfig.value = nextBaiduConfig;
+    saveProfile.value = profile;
     if (profile?.keepVersions) {
       keepVersions.value = profile.keepVersions;
     }
@@ -619,7 +669,7 @@ async function saveCover() {
     const crop: CoverCrop = { aspectWidth: 16, aspectHeight: 9, outputWidth: 1280, outputHeight: 720 };
     const position: CoverPosition = { offsetXMilli: Math.round(coverOffsetX.value * 1000), offsetYMilli: Math.round(coverOffsetY.value * 1000), zoomMilli: Math.round(coverZoom.value * 1000) };
     await saveGameCover(props.game.gameUid, coverOriginalBytes.value, displayBytes, coverOriginalExtension.value, crop, position);
-    replaceOwnedCover(displayBytes);
+    coverDisplayUrl.value = getGameCoverUrl(props.game.gameUid, Date.now());
     dismissCoverEditor();
     emit("refresh");
   } catch (reason) {
@@ -629,24 +679,18 @@ async function saveCover() {
   }
 }
 
-function replaceOwnedCover(bytes: number[]) {
-  if (coverOwnedUrl) URL.revokeObjectURL(coverOwnedUrl);
-  coverOwnedUrl = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: "image/jpeg" }));
-  coverDisplayUrl.value = coverOwnedUrl;
-}
-
-async function loadCover() {
-  if (props.coverUrl) return;
-  try {
-    const bytes = await getGameCover(props.game.gameUid);
-    if (bytes && !coverDisplayUrl.value) replaceOwnedCover(bytes);
-  } catch {
-    // Missing covers are represented by the placeholder.
+function loadCover() {
+  if (props.coverUrl) {
+    coverDisplayUrl.value = props.coverUrl;
+    return;
+  }
+  if (props.game.cover) {
+    coverDisplayUrl.value = getGameCoverUrl(props.game.gameUid, Date.now());
   }
 }
 
 watch(() => props.coverUrl, (value) => {
-  if (!coverOwnedUrl) coverDisplayUrl.value = value || "";
+  if (value) coverDisplayUrl.value = value;
 });
 
 watch(() => props.initialError, (value) => {
@@ -667,7 +711,6 @@ onMounted(() => {
 onUnmounted(() => {
   stopPolling();
   releaseCoverSource();
-  if (coverOwnedUrl) URL.revokeObjectURL(coverOwnedUrl);
 });
 </script>
 
@@ -750,7 +793,12 @@ onUnmounted(() => {
 
         <section class="detail-section">
           <header class="detail-section-header"><div><p class="eyebrow">游戏本体</p><h2>受管目录</h2></div><HardDrive :size="20" class="detail-muted" /></header>
-          <p class="managed-path">{{ game.managedPath }}</p>
+          <div class="managed-path-row">
+            <p class="managed-path">{{ game.managedPath }}</p>
+            <button class="secondary-button compact-button" type="button" title="在文件资源管理器中打开受管游戏本体目录" @click="openFolder(game.managedPath)">
+              <FolderOpen :size="14" />打开本体目录
+            </button>
+          </div>
           <dl class="detail-facts"><div><dt>启动文件</dt><dd>{{ game.launch.executableRelativePath }}</dd></div><div><dt>保存版本</dt><dd>{{ versions.length }} 个</dd></div><div><dt>旧本体版本</dt><dd>{{ bodyVersions.length }} 个</dd></div></dl>
           <div class="body-action-row"><button class="secondary-button" type="button" :disabled="busy || !!runtime" title="选择新版游戏文件夹并更新" @click="updateBody"><LoaderCircle v-if="busy && (message.includes('更新') || message.includes('新版'))" :size="16" class="spin" /><FolderOpen v-else :size="16" />更新游戏本体</button><button class="secondary-button" type="button" :disabled="busy || !!runtime" title="创建本体 ZIP 缓存" @click="packageBody"><LoaderCircle v-if="busy && message.includes('本体包')" :size="16" class="spin" /><Archive v-else :size="16" />创建本体包</button><button class="secondary-button danger-outline-button" type="button" :disabled="busy || !!runtime" title="删除 GameSaver 管理的本地游戏本体，保留配置和云端版本" @click="uninstallBody"><Trash2 :size="16" />卸载本体</button></div>
           <div class="cloud-summary"><span class="status-dot" :class="{ active: baiduReady() }"></span><strong>百度网盘</strong><span>{{ baiduLabel() }}</span><span v-if="baiduReady()">· 云端版本请在游戏商店管理</span><button v-if="!baiduReady()" class="secondary-button compact-button" type="button" title="配置或授权百度网盘" @click="emit('settings')">{{ baiduActionLabel() }}</button></div>
@@ -783,6 +831,29 @@ onUnmounted(() => {
             <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime || versions.length <= keepVersions" title="清理旧保存版本" @click="pruneVersions"><Trash2 :size="15" />清理</button>
           </div>
         </header>
+
+        <div class="detail-scopes-card">
+          <div class="detail-scopes-header">
+            <p class="timeline-caption">受保护的存档目录</p>
+            <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" title="选择并更改游戏真实存档目录" @click="changeSaveDirectory">
+              <Pencil :size="14" />更改存档目录
+            </button>
+          </div>
+          <div v-if="saveProfile?.scopes?.length">
+            <div v-for="scope in saveProfile.scopes" :key="scope.rootPath" class="detail-scope-row">
+              <div class="detail-scope-info">
+                <span class="scope-type">{{ rootTypeLabel[scope.rootType] || "存档目录" }}</span>
+                <p class="detail-scope-path" :title="scope.rootPath">{{ scope.rootPath }}</p>
+              </div>
+              <button class="secondary-button compact-button" type="button" title="在文件资源管理器中打开这个存档目录" @click="openFolder(scope.rootPath)">
+                <FolderOpen :size="14" />打开存档目录
+              </button>
+            </div>
+          </div>
+          <div v-else class="detail-scope-empty">
+            <p class="empty-hint">暂未配置存档目录，点击上方按钮指定存档位置。</p>
+          </div>
+        </div>
 
         <div class="cloud-save-banner">
           <div class="cloud-save-main">

@@ -5,13 +5,14 @@ use crate::{
     services::{GameLibraryService, TaskService},
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
+use crate::services::process_service::TrackedProcessHandle;
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,6 +70,11 @@ impl LaunchService {
         let operation_lock = state.save_operations.lock().map_err(|_| "lock save operation state failed".to_string())?;
         if operation_lock.contains(&game_uid) {
             return Err("游戏正在进行存档版本操作".to_string());
+        }
+        if let Ok(sessions) = state.learning_sessions.lock() {
+            if sessions.values().any(|s| s.view.game_uid == game_uid) {
+                return Err("游戏正在进行存档识别学习，无法直接启动".to_string());
+            }
         }
         {
             let mut running = state.running_games.lock().map_err(|_| "lock running game state failed".to_string())?;
@@ -195,7 +201,7 @@ fn run_game_session(
         );
     }
     TaskService::update(&state, task_id, TaskStatus::Running, 10, if profile.is_some() { "游戏正在运行，退出后将提交存档版本" } else { "游戏正在运行，存档保护尚未设置" }, None);
-    wait_for_process_tree(&mut child)?;
+    wait_for_game_session(&mut child, Path::new(&game.managed_path), &state, task_id)?;
     if let Ok(mut running) = state.running_games.lock() {
         if let Some(runtime) = running.get_mut(&game.game_uid) {
             runtime.status = GameRuntimeStatus::Saving;
@@ -264,45 +270,92 @@ fn run_game_session(
     Ok((message.to_string(), version_summary))
 }
 
-fn wait_for_process_tree(child: &mut Child) -> Result<ExitStatus, String> {
+fn wait_for_game_session(
+    child: &mut Child,
+    managed_path: &Path,
+    state: &AppState,
+    task_id: &str,
+) -> Result<ExitStatus, String> {
     let root_pid = child.id();
-    let mut tracked = HashSet::from([root_pid]);
+    let mut tracked_pids = HashSet::from([root_pid]);
+    let mut tracked_handles: HashMap<u32, TrackedProcessHandle> = HashMap::new();
     let mut root_status = None;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_scan = Instant::now();
+
+    let refresh_processes = |pids: &mut HashSet<u32>, handles: &mut HashMap<u32, TrackedProcessHandle>| {
+        // 1. Expand process tree via Toolhelp snapshot (parent -> child)
+        let _ = crate::services::learning::extend_tracked_process_tree(pids);
+
+        // 2. Discover any process whose executable image is located within managed_path (handles UAC/detached launchers)
+        let dir_pids = crate::services::process_service::find_processes_in_directory(managed_path);
+        pids.extend(dir_pids);
+
+        // 3. For any newly discovered PID (except root_pid and ignored crash handlers), open and hold handle
+        for &pid in pids.iter() {
+            if pid != root_pid && !handles.contains_key(&pid) {
+                if let Some(handle) = TrackedProcessHandle::open(pid) {
+                    if handle.is_alive() {
+                        if let Some(image_path) = crate::services::process_service::get_process_image_path(pid) {
+                            let file_name = image_path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or_default();
+                            if crate::services::process_service::is_ignored_process_name(file_name) {
+                                continue;
+                            }
+                        }
+                        handles.insert(pid, handle);
+                    }
+                }
+            }
+        }
+    };
+
+    // Initial scan to catch immediate launcher sub-processes
+    refresh_processes(&mut tracked_pids, &mut tracked_handles);
+
     loop {
-        let _ = crate::services::learning::extend_tracked_process_tree(&mut tracked);
+        if TaskService::is_cancelled(state, task_id) {
+            if let Some(status) = root_status {
+                return Ok(status);
+            }
+            let _ = child.kill();
+            let status = child
+                .wait()
+                .map_err(|err| format!("终止游戏进程失败：{err}"))?;
+            return Ok(status);
+        }
+
+        // Check root process exit status
         if root_status.is_none() {
             root_status = child.try_wait().map_err(|err| format!("等待游戏退出失败：{err}"))?;
+            if root_status.is_some() {
+                // When root exits, perform immediate refresh to catch any final spawned process
+                refresh_processes(&mut tracked_pids, &mut tracked_handles);
+            }
         }
-        let descendants_alive = tracked.iter().any(|pid| *pid != root_pid && process_is_running(*pid));
+
+        // Periodic process tree and directory scan (every 1 second)
+        if last_scan.elapsed() >= Duration::from_secs(1) {
+            refresh_processes(&mut tracked_pids, &mut tracked_handles);
+            last_scan = Instant::now();
+        }
+
+        // Prune terminated child processes!
+        // Because TrackedProcessHandle keeps an open handle, Windows cannot recycle the PID.
+        // Once is_alive() returns false, the handle is dropped (closing it), and pruned.
+        tracked_handles.retain(|_, handle| handle.is_alive());
+
+        // Exit evaluation:
+        // When root process has exited and no non-ignored child/directory processes remain alive:
         if let Some(status) = root_status {
-            if !descendants_alive || Instant::now() >= deadline {
+            if tracked_handles.is_empty() {
                 return Ok(status);
             }
         }
+
         thread::sleep(Duration::from_millis(500));
     }
-}
-
-#[cfg(target_os = "windows")]
-fn process_is_running(pid: u32) -> bool {
-    use windows_sys::Win32::{
-        Foundation::CloseHandle,
-        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
-    };
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return false;
-    }
-    let mut exit_code = 0u32;
-    let result = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
-    unsafe { CloseHandle(handle) };
-    result && exit_code == 259
-}
-
-#[cfg(not(target_os = "windows"))]
-fn process_is_running(_pid: u32) -> bool {
-    false
 }
 
 fn managed_executable_path(game: &Game) -> Result<PathBuf, String> {

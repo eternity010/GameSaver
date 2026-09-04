@@ -85,6 +85,7 @@ export interface SaveFileEntry {
   objectHash?: string;
   size: number;
   deleted: boolean;
+  mtimeMs?: number;
 }
 
 export interface SaveVersion {
@@ -110,6 +111,43 @@ export interface SaveProfile {
 
 export type SaveRootType = "managed_game" | "app_data" | "local_app_data" | "local_low" | "documents" | "saved_games" | "user_profile" | "custom";
 export type UnknownFilePolicy = "protect" | "ignore";
+
+export const DEFAULT_EXCLUDE_PATTERNS: string[] = [
+  "*.tmp",
+  "*.temp",
+  "*.log",
+  "*.dmp",
+  "*.bak",
+  "*.etl",
+  "*.csv",
+  "*.cache",
+];
+
+export const DEFAULT_EXCLUDE_DIRECTORIES: string[] = [
+  "logs",
+  "crashdumps",
+  "cache",
+  "shadercache",
+  "shader_cache",
+  "webcache",
+  "gpucache",
+  "d3dscache",
+  "vulkan",
+];
+
+export function createDefaultSaveScope(rootPath: string, rootType: SaveRootType = "custom"): SaveScope {
+  return {
+    rootType,
+    rootPath,
+    confirmedFiles: [],
+    includeDirectories: ["."],
+    excludeExact: [],
+    excludePatterns: [...DEFAULT_EXCLUDE_PATTERNS],
+    excludeDirectories: [...DEFAULT_EXCLUDE_DIRECTORIES],
+    unknownFilePolicy: "protect",
+    maxFileBytes: 10 * 1024 * 1024,
+  };
+}
 
 export interface SaveScope {
   rootType: SaveRootType;

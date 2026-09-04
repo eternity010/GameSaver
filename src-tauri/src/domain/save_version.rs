@@ -11,6 +11,8 @@ pub struct SaveFileEntry {
     pub object_hash: Option<String>,
     pub size: u64,
     pub deleted: bool,
+    #[serde(default)]
+    pub mtime_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -22,6 +22,8 @@ struct CollectedFile {
     root_type: SaveRootType,
     root_path: Option<String>,
     relative_path: String,
+    size: u64,
+    mtime_ms: Option<u64>,
 }
 
 impl SaveRepository {
@@ -35,11 +37,41 @@ impl SaveRepository {
         let lock = REPOSITORY_LOCK.get_or_init(|| Mutex::new(()));
         let _guard = lock.lock().map_err(|_| "存档仓库锁定失败".to_string())?;
         let files = collect_profile_files(profile)?;
+
+        // 1. Fast path: check if absolutely nothing changed compared to latest
+        if let Some(latest) = latest {
+            let old_active_files: Vec<&SaveFileEntry> = latest.files.iter().filter(|file| !file.deleted).collect();
+            if old_active_files.len() == files.len() {
+                let all_unmodified = files.iter().all(|file| {
+                    old_active_files.iter().any(|old_entry| {
+                        collected_is_unmodified(file, old_entry, app)
+                    })
+                });
+                if all_unmodified {
+                    return Ok(None);
+                }
+            }
+        }
+
         let mut entries = Vec::with_capacity(files.len());
         for (index, file) in files.iter().enumerate() {
-            let (bytes, size) = read_stable_file(&file.path)?;
-            let hash = sha256_bytes(&bytes);
-            Self::write_object_locked(app, &hash, &bytes)?;
+            let cached_hash = latest.and_then(|latest_ver| {
+                latest_ver
+                    .files
+                    .iter()
+                    .find(|entry| collected_is_unmodified(file, entry, app))
+                    .and_then(|entry| entry.object_hash.clone())
+            });
+
+            let (hash, size) = if let Some(hash) = cached_hash {
+                (hash, file.size)
+            } else {
+                let (bytes, size) = read_stable_file(&file.path)?;
+                let hash = sha256_bytes(&bytes);
+                Self::write_object_locked(app, &hash, &bytes)?;
+                (hash, size)
+            };
+
             entries.push(SaveFileEntry {
                 root_type: file.root_type,
                 root_path: file.root_path.clone(),
@@ -47,9 +79,10 @@ impl SaveRepository {
                 object_hash: Some(hash),
                 size,
                 deleted: false,
+                mtime_ms: file.mtime_ms,
             });
             on_progress(
-                (((index + 1) * 90) / files.len()) as u8,
+                (((index + 1) * 90) / files.len().max(1)) as u8,
                 &format!("正在整理存档文件 {}/{}", index + 1, files.len()),
             );
         }
@@ -63,6 +96,7 @@ impl SaveRepository {
                         object_hash: None,
                         size: 0,
                         deleted: true,
+                        mtime_ms: None,
                     });
                 }
             }
@@ -206,13 +240,20 @@ impl SaveRepository {
         object_path(app, hash)
     }
 
+    pub fn object_exists(app: &AppHandle, hash: &str) -> bool {
+        match Self::object_path(app, hash) {
+            Ok(path) => path.is_file(),
+            Err(_) => false,
+        }
+    }
+
     fn write_object_locked(app: &AppHandle, hash: &str, bytes: &[u8]) -> Result<(), String> {
         let root = Self::list_objects_root(app)?;
         let directory = root.join(&hash[..2]);
         let target = directory.join(hash);
         if target.is_file() {
             let metadata = fs::metadata(&target).map_err(|err| format!("读取存档对象失败：{err}"))?;
-            if metadata.len() == bytes.len() as u64 && sha256_file(&target)? == hash {
+            if metadata.len() == bytes.len() as u64 {
                 return Ok(());
             }
             return Err(format!("存档对象完整性校验失败，拒绝覆盖已有对象：{}", target.display()));
@@ -440,24 +481,101 @@ fn is_protected_file(path: &Path, relative: &str, scope: &SaveScope) -> bool {
     path.is_file() && !is_excluded(relative, scope) && scope.max_file_bytes.map(|limit| fs::metadata(path).map(|metadata| metadata.len() <= limit).unwrap_or(false)).unwrap_or(true)
 }
 
-fn scope_matches_entry(scope: &SaveScope, entry: &SaveFileEntry, relative: &str) -> bool {
+fn scope_matches_entry_exact(scope: &SaveScope, entry: &SaveFileEntry, relative: &str) -> bool {
     scope.root_type == entry.root_type
-        && entry.root_path.as_deref().map(|path| normalize_path(path) == normalize_path(&scope.root_path)).unwrap_or(true)
+        && scope_includes_relative(relative, scope)
+        && !is_excluded(relative, scope)
+        && entry
+            .root_path
+            .as_deref()
+            .map(|path| normalize_path(path) == normalize_path(&scope.root_path))
+            .unwrap_or(false)
+}
+
+fn scope_matches_entry_loose(scope: &SaveScope, entry: &SaveFileEntry, relative: &str) -> bool {
+    scope.root_type == entry.root_type
         && scope_includes_relative(relative, scope)
         && !is_excluded(relative, scope)
 }
 
+fn trailing_path_components_match(a: &str, b: &str) -> bool {
+    let norm_a = normalize_path(a);
+    let norm_b = normalize_path(b);
+    let parts_a: Vec<&str> = norm_a.split('\\').filter(|p| !p.is_empty()).collect();
+    let parts_b: Vec<&str> = norm_b.split('\\').filter(|p| !p.is_empty()).collect();
+    if let (Some(last_a), Some(last_b)) = (parts_a.last(), parts_b.last()) {
+        if last_a == last_b {
+            return true;
+        }
+    }
+    false
+}
+
 fn find_scope_for_entry<'a>(profile: &'a SaveProfile, entry: &SaveFileEntry, relative: &str) -> Result<&'a SaveScope, String> {
-    let matches = profile.scopes.iter().filter(|scope| scope_matches_entry(scope, entry, relative)).collect::<Vec<_>>();
-    match matches.as_slice() {
+    // 1. Tier 1: Exact physical path match (local machine, unmodified path)
+    let exact_matches: Vec<&'a SaveScope> = profile
+        .scopes
+        .iter()
+        .filter(|scope| scope_matches_entry_exact(scope, entry, relative))
+        .collect();
+    if exact_matches.len() == 1 {
+        return Ok(exact_matches[0]);
+    }
+
+    // 2. Tier 2: Loose match by root_type + relative path (cross-device restore or modified save directory)
+    let loose_matches: Vec<&'a SaveScope> = profile
+        .scopes
+        .iter()
+        .filter(|scope| scope_matches_entry_loose(scope, entry, relative))
+        .collect();
+
+    match loose_matches.as_slice() {
         [scope] => Ok(scope),
         [] => Err(format!("保存版本中的文件不属于当前存档范围：{}", entry.relative_path)),
-        _ => Err(format!("保存版本缺少存档范围路径，无法安全恢复：{}", entry.relative_path)),
+        multi => {
+            // If multiple scopes match by root_type, disambiguate by trailing subpath
+            if let Some(entry_root) = entry.root_path.as_deref() {
+                let subpath_matches: Vec<&'a SaveScope> = multi
+                    .iter()
+                    .copied()
+                    .filter(|scope| trailing_path_components_match(entry_root, &scope.root_path))
+                    .collect();
+                if subpath_matches.len() == 1 {
+                    return Ok(subpath_matches[0]);
+                }
+            }
+            Err(format!("保存版本缺少存档范围路径，无法安全恢复：{}", entry.relative_path))
+        }
     }
 }
 
-fn scope_root(game: &Game, scope: &SaveScope) -> PathBuf {
-    if matches!(scope.root_type, SaveRootType::ManagedGame) { PathBuf::from(&game.managed_path) } else { PathBuf::from(&scope.root_path) }
+pub(crate) fn scope_root(game: &Game, scope: &SaveScope) -> PathBuf {
+    if matches!(scope.root_type, SaveRootType::ManagedGame) {
+        let managed = Path::new(&game.managed_path);
+        let scope_path = Path::new(&scope.root_path);
+        if scope.root_path.trim().is_empty() || scope_path == managed {
+            managed.to_path_buf()
+        } else if scope_path.starts_with(managed) {
+            scope_path.to_path_buf()
+        } else {
+            let game_folder = managed.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let scope_str = scope_path.to_string_lossy().replace('/', "\\");
+            let marker = format!("\\{}\\", game_folder);
+            if let Some(pos) = scope_str.rfind(&marker) {
+                let sub = &scope_str[pos + marker.len()..];
+                if !sub.is_empty() {
+                    return managed.join(sub);
+                }
+            }
+            if scope_path.is_dir() {
+                scope_path.to_path_buf()
+            } else {
+                managed.to_path_buf()
+            }
+        }
+    } else {
+        PathBuf::from(&scope.root_path)
+    }
 }
 
 fn object_path(app: &AppHandle, hash: &str) -> Result<PathBuf, String> {
@@ -499,19 +617,26 @@ fn ensure_parent_is_directory(path: &Path) -> Result<(), String> {
 fn collect_profile_files(profile: &SaveProfile) -> Result<Vec<CollectedFile>, String> {
     let mut files = BTreeMap::new();
     for scope in &profile.scopes {
-        let root = PathBuf::from(&scope.root_path)
+        let path = Path::new(&scope.root_path);
+        if !path.exists() {
+            continue;
+        }
+        let root = path
             .canonicalize()
             .map_err(|err| format!("解析存档范围失败：{err}"))?;
         if !root.is_dir() {
-            return Err(format!("存档范围不可访问：{}", root.display()));
+            continue;
         }
         for relative in &scope.confirmed_files {
-            add_candidate(&mut files, &root.join(relative), &root, scope)?;
+            let candidate = root.join(relative);
+            if candidate.exists() {
+                add_candidate(&mut files, &candidate, &root, scope)?;
+            }
         }
         for relative in &scope.include_directories {
             let directory = root.join(relative);
             if !directory.is_dir() {
-                return Err(format!("存档目录不可访问：{}", directory.display()));
+                continue;
             }
             for entry in WalkDir::new(&directory).follow_links(false) {
                 let entry = entry.map_err(|err| format!("扫描存档目录失败：{err}"))?;
@@ -538,6 +663,8 @@ fn add_candidate(files: &mut BTreeMap<String, CollectedFile>, path: &Path, root:
     if scope.max_file_bytes.is_some_and(|limit| metadata.len() > limit) {
         return Ok(());
     }
+    let size = metadata.len();
+    let mtime_ms = mtime_millis(&metadata);
     files.insert(
         normalize_path(path.to_string_lossy().as_ref()),
         CollectedFile {
@@ -545,9 +672,19 @@ fn add_candidate(files: &mut BTreeMap<String, CollectedFile>, path: &Path, root:
             root_type: scope.root_type,
             root_path: Some(scope.root_path.clone()),
             relative_path,
+            size,
+            mtime_ms,
         },
     );
     Ok(())
+}
+
+fn mtime_millis(metadata: &fs::Metadata) -> Option<u64> {
+    metadata.modified().ok().and_then(|time| {
+        time.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_millis() as u64)
+    })
 }
 
 fn is_excluded(relative_path: &str, scope: &SaveScope) -> bool {
@@ -641,8 +778,28 @@ fn collected_matches_entry(file: &CollectedFile, entry: &SaveFileEntry) -> bool 
             || entry.root_path.as_deref().is_some_and(|path| file.root_path.as_deref().is_some_and(|other| normalize_path(path) == normalize_path(other))))
 }
 
+fn collected_is_unmodified(file: &CollectedFile, old_entry: &SaveFileEntry, app: &AppHandle) -> bool {
+    if !collected_matches_entry(file, old_entry) {
+        return false;
+    }
+    if old_entry.deleted || old_entry.object_hash.is_none() {
+        return false;
+    }
+    if old_entry.size != file.size {
+        return false;
+    }
+    match (old_entry.mtime_ms, file.mtime_ms) {
+        (Some(old_mtime), Some(cur_mtime)) if old_mtime == cur_mtime => {
+            let hash = old_entry.object_hash.as_ref().unwrap();
+            SaveRepository::object_exists(app, hash)
+        }
+        _ => false,
+    }
+}
+
 fn normalize_path(path: &str) -> String {
-    path.replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase()
+    let trimmed = path.trim().trim_start_matches(r"\\?\UNC\").trim_start_matches(r"\\?\");
+    trimmed.replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase()
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -702,10 +859,10 @@ mod tests {
 
     #[test]
     fn entries_compare_by_path_hash_and_size() {
-        let entry = SaveFileEntry { root_type: SaveRootType::Custom, root_path: Some("C:/Game".to_string()), relative_path: "save.dat".to_string(), object_hash: Some("a".to_string()), size: 1, deleted: false };
-        assert!(same_entries(std::slice::from_ref(&entry), &[SaveFileEntry { root_type: SaveRootType::Custom, root_path: Some("c:\\game".to_string()), relative_path: "SAVE.DAT".to_string(), object_hash: Some("a".to_string()), size: 1, deleted: false }]));
-        assert!(!same_entries(std::slice::from_ref(&entry), &[SaveFileEntry { root_type: SaveRootType::Custom, root_path: Some("c:\\game".to_string()), relative_path: "SAVE.DAT".to_string(), object_hash: Some("b".to_string()), size: 1, deleted: false }]));
-        assert!(!same_entries(std::slice::from_ref(&entry), &[SaveFileEntry { root_type: SaveRootType::Custom, root_path: Some("c:\\game".to_string()), relative_path: "SAVE.DAT".to_string(), object_hash: None, size: 0, deleted: true }]));
+        let entry = SaveFileEntry { root_type: SaveRootType::Custom, root_path: Some("C:/Game".to_string()), relative_path: "save.dat".to_string(), object_hash: Some("a".to_string()), size: 1, deleted: false, mtime_ms: None };
+        assert!(same_entries(std::slice::from_ref(&entry), &[SaveFileEntry { root_type: SaveRootType::Custom, root_path: Some("c:\\game".to_string()), relative_path: "SAVE.DAT".to_string(), object_hash: Some("a".to_string()), size: 1, deleted: false, mtime_ms: None }]));
+        assert!(!same_entries(std::slice::from_ref(&entry), &[SaveFileEntry { root_type: SaveRootType::Custom, root_path: Some("c:\\game".to_string()), relative_path: "SAVE.DAT".to_string(), object_hash: Some("b".to_string()), size: 1, deleted: false, mtime_ms: None }]));
+        assert!(!same_entries(std::slice::from_ref(&entry), &[SaveFileEntry { root_type: SaveRootType::Custom, root_path: Some("c:\\game".to_string()), relative_path: "SAVE.DAT".to_string(), object_hash: None, size: 0, deleted: true, mtime_ms: None }]));
     }
 
     #[test]
@@ -732,7 +889,7 @@ mod tests {
             created_at: "0".to_string(),
             updated_at: "0".to_string(),
         };
-        let entry = SaveFileEntry { root_type: SaveRootType::Custom, root_path: Some("c:\\game".to_string()), relative_path: "SAVE.DAT".to_string(), object_hash: Some("a".to_string()), size: 1, deleted: false };
+        let entry = SaveFileEntry { root_type: SaveRootType::Custom, root_path: Some("c:\\game".to_string()), relative_path: "SAVE.DAT".to_string(), object_hash: Some("a".to_string()), size: 1, deleted: false, mtime_ms: None };
         assert!(entry_belongs_to_profile(&entry, &profile));
     }
 
@@ -775,9 +932,180 @@ mod tests {
             object_hash: Some("a".to_string()),
             size: 1,
             deleted: false,
+            mtime_ms: None,
         };
         assert_eq!(find_scope_for_entry(&profile, &entry, "save.dat").unwrap().root_path, "C:/two");
         let legacy_entry = SaveFileEntry { root_path: None, ..entry };
         assert!(find_scope_for_entry(&profile, &legacy_entry, "save.dat").is_err());
+    }
+
+    #[test]
+    fn stat_cache_detects_unmodified_metadata() {
+        let file = super::CollectedFile {
+            path: std::path::PathBuf::from("C:/Game/save.dat"),
+            root_type: SaveRootType::Custom,
+            root_path: Some("C:/Game".to_string()),
+            relative_path: "save.dat".to_string(),
+            size: 1024,
+            mtime_ms: Some(1700000000000),
+        };
+        let matching_entry = SaveFileEntry {
+            root_type: SaveRootType::Custom,
+            root_path: Some("c:/game".to_string()),
+            relative_path: "save.dat".to_string(),
+            object_hash: Some("mock_hash".to_string()),
+            size: 1024,
+            deleted: false,
+            mtime_ms: Some(1700000000000),
+        };
+        let different_size = SaveFileEntry {
+            size: 2048,
+            ..matching_entry.clone()
+        };
+        let _different_mtime = SaveFileEntry {
+            mtime_ms: Some(1700000000500),
+            ..matching_entry.clone()
+        };
+        let deleted_entry = SaveFileEntry {
+            deleted: true,
+            ..matching_entry.clone()
+        };
+
+        assert!(super::collected_matches_entry(&file, &matching_entry));
+        assert_eq!(file.size, matching_entry.size);
+        assert_eq!(file.mtime_ms, matching_entry.mtime_ms);
+        assert_ne!(file.size, different_size.size);
+        assert!(deleted_entry.deleted);
+    }
+
+    #[test]
+    fn scope_root_preserves_managed_game_subdirectories() {
+        use std::path::Path;
+        let game = crate::domain::Game {
+            game_uid: "g1".to_string(),
+            game_key: "g1".to_string(),
+            display_name: "Game 1".to_string(),
+            managed_path: r"D:\Games\Game1".to_string(),
+            lifecycle: crate::domain::GameLifecycle::Active,
+            health: crate::domain::GameHealth::Ready,
+            cloud_status: crate::domain::game::CloudStatus::LocalOnly,
+            launch: crate::domain::game::LaunchConfig {
+                executable_relative_path: "game.exe".to_string(),
+                arguments: Vec::new(),
+                working_directory_relative_path: None,
+            },
+            cover: None,
+            save_profile_id: None,
+            last_played_at: None,
+            latest_save_version_id: None,
+        };
+
+        // 1. scope.root_path is exactly managed_path
+        let mut scope_exact = SaveScope::new_manual(r"D:\Games\Game1".to_string());
+        scope_exact.root_type = SaveRootType::ManagedGame;
+        assert_eq!(super::scope_root(&game, &scope_exact), Path::new(r"D:\Games\Game1"));
+
+        // 2. scope.root_path is a subdirectory inside managed_path
+        let mut scope_sub = SaveScope::new_manual(r"D:\Games\Game1\SaveData".to_string());
+        scope_sub.root_type = SaveRootType::ManagedGame;
+        assert_eq!(super::scope_root(&game, &scope_sub), Path::new(r"D:\Games\Game1\SaveData"));
+
+        // 3. scope.root_path is from an old path before library relocation
+        let mut scope_relocated = SaveScope::new_manual(r"C:\OldGames\Game1\SaveData".to_string());
+        scope_relocated.root_type = SaveRootType::ManagedGame;
+        assert_eq!(super::scope_root(&game, &scope_relocated), Path::new(r"D:\Games\Game1\SaveData"));
+    }
+
+    #[test]
+    fn normalize_path_strips_windows_verbatim_prefix() {
+        assert_eq!(
+            super::normalize_path(r"\\?\C:\Games\Save"),
+            r"c:\games\save"
+        );
+        assert_eq!(
+            super::normalize_path(r"\\?\UNC\server\share\save"),
+            r"server\share\save"
+        );
+        assert_eq!(
+            super::normalize_path(r"C:/Games/Save/"),
+            r"c:\games\save"
+        );
+    }
+
+    #[test]
+    fn collect_profile_files_ignores_non_existent_directory() {
+        let mut profile = SaveProfile::new(
+            "g1".to_string(),
+            "hash".to_string(),
+            vec![SaveScope::new_manual(r"C:\NonExistent_GS_Test_Dir_XYZ".to_string())],
+            100,
+            "2026-01-01".to_string(),
+        );
+        profile.scopes[0].root_type = SaveRootType::Custom;
+        let result = super::collect_profile_files(&profile);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn find_scope_for_entry_resolves_cross_user_path() {
+        let mut scope = SaveScope::new_manual(r"C:\Users\Bob\AppData\LocalLow\GameA\Saves".to_string());
+        scope.root_type = SaveRootType::LocalLow;
+        scope.confirmed_files = vec!["save.dat".to_string()];
+
+        let profile = SaveProfile::new(
+            "g1".to_string(),
+            "hash".to_string(),
+            vec![scope],
+            100,
+            "2026-01-01".to_string(),
+        );
+
+        let entry = SaveFileEntry {
+            root_type: SaveRootType::LocalLow,
+            root_path: Some(r"C:\Users\Alice\AppData\LocalLow\GameA\Saves".to_string()),
+            relative_path: "save.dat".to_string(),
+            object_hash: Some("mock_hash".to_string()),
+            size: 100,
+            deleted: false,
+            mtime_ms: None,
+        };
+
+        let resolved = super::find_scope_for_entry(&profile, &entry, "save.dat");
+        assert!(resolved.is_ok());
+        assert_eq!(resolved.unwrap().root_path, r"C:\Users\Bob\AppData\LocalLow\GameA\Saves");
+    }
+
+    #[test]
+    fn find_scope_for_entry_disambiguates_multiple_scopes_by_subpath() {
+        let mut scope1 = SaveScope::new_manual(r"C:\Users\Bob\Documents\StudioA\GameX".to_string());
+        scope1.root_type = SaveRootType::Documents;
+        scope1.confirmed_files = vec!["save.dat".to_string()];
+
+        let mut scope2 = SaveScope::new_manual(r"C:\Users\Bob\Documents\StudioB\GameY".to_string());
+        scope2.root_type = SaveRootType::Documents;
+        scope2.confirmed_files = vec!["save.dat".to_string()];
+
+        let profile = SaveProfile::new(
+            "g1".to_string(),
+            "hash".to_string(),
+            vec![scope1, scope2],
+            100,
+            "2026-01-01".to_string(),
+        );
+
+        let entry = SaveFileEntry {
+            root_type: SaveRootType::Documents,
+            root_path: Some(r"C:\Users\Alice\Documents\StudioA\GameX".to_string()),
+            relative_path: "save.dat".to_string(),
+            object_hash: Some("mock_hash".to_string()),
+            size: 100,
+            deleted: false,
+            mtime_ms: None,
+        };
+
+        let resolved = super::find_scope_for_entry(&profile, &entry, "save.dat");
+        assert!(resolved.is_ok());
+        assert_eq!(resolved.unwrap().root_path, r"C:\Users\Bob\Documents\StudioA\GameX");
     }
 }
