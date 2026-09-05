@@ -1,5 +1,9 @@
 use crate::domain::{ActiveLearningSession, AppStore, AppTask, GameRuntime};
-use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Mutex,
+};
 
 pub struct AppState {
     pub store: Mutex<AppStore>,
@@ -14,7 +18,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(store: AppStore, library_root: PathBuf, tasks: HashMap<String, AppTask>, tasks_path: PathBuf) -> Self {
+    pub fn new(
+        store: AppStore,
+        library_root: PathBuf,
+        tasks: HashMap<String, AppTask>,
+        tasks_path: PathBuf,
+    ) -> Self {
         Self {
             store: Mutex::new(store),
             library_root: Mutex::new(library_root),

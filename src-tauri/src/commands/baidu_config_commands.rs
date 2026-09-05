@@ -1,4 +1,7 @@
-use crate::{repositories::{BaiduConfig, BaiduConfigRepository, BaiduConfigView}, services::{BaiduNetdiskClient, BaiduToken}};
+use crate::{
+    repositories::{BaiduConfig, BaiduConfigRepository, BaiduConfigView},
+    services::{BaiduNetdiskClient, BaiduToken},
+};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -20,13 +23,28 @@ pub fn get_baidu_config(app: AppHandle) -> Result<BaiduConfigView, String> {
 }
 
 #[tauri::command]
-pub fn save_baidu_config(app: AppHandle, app_key: String, secret_key: String) -> Result<BaiduConfigView, String> {
+pub fn save_baidu_config(
+    app: AppHandle,
+    app_key: String,
+    secret_key: String,
+) -> Result<BaiduConfigView, String> {
     let app_data_dir = app_data_dir(&app)?;
     let existing = BaiduConfigRepository::load(&app_data_dir)?;
-    let auto_upload_body = existing.as_ref().is_some_and(|config| config.auto_upload_body);
-    let auto_sync_save = existing.as_ref().map(|config| config.auto_sync_save).unwrap_or(true);
-    let check_cloud_save_on_launch = existing.as_ref().map(|config| config.check_cloud_save_on_launch).unwrap_or(true);
-    let cloud_save_keep_limit = existing.as_ref().map(|config| config.cloud_save_keep_limit).unwrap_or(10);
+    let auto_upload_body = existing
+        .as_ref()
+        .is_some_and(|config| config.auto_upload_body);
+    let auto_sync_save = existing
+        .as_ref()
+        .map(|config| config.auto_sync_save)
+        .unwrap_or(true);
+    let check_cloud_save_on_launch = existing
+        .as_ref()
+        .map(|config| config.check_cloud_save_on_launch)
+        .unwrap_or(true);
+    let cloud_save_keep_limit = existing
+        .as_ref()
+        .map(|config| config.cloud_save_keep_limit)
+        .unwrap_or(10);
     let config = BaiduConfig {
         app_key: app_key.trim().to_string(),
         secret_key: secret_key.trim().to_string(),
@@ -107,25 +125,46 @@ pub fn exchange_baidu_code(app: AppHandle, code: String) -> Result<(), String> {
         .send()
         .map_err(|error| format!("请求百度授权 Token 失败：{error}"))?;
     let status = response.status();
-    let body = response.text().map_err(|error| format!("读取百度授权响应失败：{error}"))?;
+    let body = response
+        .text()
+        .map_err(|error| format!("读取百度授权响应失败：{error}"))?;
     let value = serde_json::from_str::<serde_json::Value>(&body)
         .map_err(|error| format!("百度授权返回非 JSON：HTTP {status}，{error}"))?;
     if let Some(error_code) = value.get("error").and_then(serde_json::Value::as_str) {
-        let description = value.get("error_description").and_then(serde_json::Value::as_str).unwrap_or("未知授权错误");
+        let description = value
+            .get("error_description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("未知授权错误");
         return Err(format!("百度授权失败：{description} ({error_code})"));
     }
-    let token: TokenResponse = serde_json::from_value(value)
-        .map_err(|error| format!("百度授权响应格式无效：{error}"))?;
-    let access_token = token.access_token.filter(|value| !value.trim().is_empty())
+    let token: TokenResponse =
+        serde_json::from_value(value).map_err(|error| format!("百度授权响应格式无效：{error}"))?;
+    let access_token = token
+        .access_token
+        .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "百度授权响应缺少 access_token".to_string())?;
-    let expires_at = token.expires_in.map(|seconds| now_millis().saturating_add(seconds.saturating_mul(1000)));
-    BaiduNetdiskClient::save_token(&app_data_dir(&app)?, BaiduToken { access_token, expires_at, refresh_token: token.refresh_token })
+    let expires_at = token
+        .expires_in
+        .map(|seconds| now_millis().saturating_add(seconds.saturating_mul(1000)));
+    BaiduNetdiskClient::save_token(
+        &app_data_dir(&app)?,
+        BaiduToken {
+            access_token,
+            expires_at,
+            refresh_token: token.refresh_token,
+        },
+    )
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path().app_data_dir().map_err(|error| format!("解析 GameSaver 数据目录失败：{error}"))
+    app.path()
+        .app_data_dir()
+        .map_err(|error| format!("解析 GameSaver 数据目录失败：{error}"))
 }
 
 fn now_millis() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|duration| duration.as_millis() as u64).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }

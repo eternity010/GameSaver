@@ -35,10 +35,7 @@ pub fn get_baidu_quota(app: AppHandle) -> Result<BaiduQuota, String> {
 }
 
 #[tauri::command]
-pub fn get_cloud_game_cover(
-    app: AppHandle,
-    game_key: String,
-) -> Result<Option<Vec<u8>>, String> {
+pub fn get_cloud_game_cover(app: AppHandle, game_key: String) -> Result<Option<Vec<u8>>, String> {
     let game_key = game_key.trim();
     if game_key.is_empty() {
         return Ok(None);
@@ -114,14 +111,20 @@ pub fn get_cloud_game_cover_paths(
         if catalog_file.is_file() {
             if let Ok(content) = std::fs::read_to_string(&catalog_file) {
                 if let Ok(catalog) = serde_json::from_str::<serde_json::Value>(&content) {
-                    game_key = catalog.get("gameKey").and_then(|v| v.as_str()).map(ToString::to_string);
+                    game_key = catalog
+                        .get("gameKey")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
                 }
             }
         }
         if game_key.is_none() && manifest_file.is_file() {
             if let Ok(content) = std::fs::read_to_string(&manifest_file) {
                 if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) {
-                    game_key = manifest.get("gameKey").and_then(|v| v.as_str()).map(ToString::to_string);
+                    game_key = manifest
+                        .get("gameKey")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
                 }
             }
         }
@@ -240,7 +243,8 @@ pub fn list_cloud_games(
                 .flatten()
                 .is_some();
                 let local = local_games_ref.iter().find(|game| {
-                    matches!(game.lifecycle, GameLifecycle::Active) && game.game_key == remote_game_key
+                    matches!(game.lifecycle, GameLifecycle::Active)
+                        && game.game_key == remote_game_key
                 });
                 let remote_game_uid = catalog
                     .as_ref()
@@ -254,7 +258,8 @@ pub fn list_cloud_games(
                     .cloned()
                     .collect::<Vec<_>>();
                 let packages =
-                    CloudManifestService::project(&files, manifest.as_ref(), &local_versions).packages;
+                    CloudManifestService::project(&files, manifest.as_ref(), &local_versions)
+                        .packages;
                 let package = packages
                     .iter()
                     .max_by(|left, right| {
@@ -289,7 +294,9 @@ pub fn list_cloud_games(
                         .as_ref()
                         .and_then(|value| value.working_directory_relative_path.clone())
                         .or_else(|| {
-                            local.and_then(|game| game.launch.working_directory_relative_path.clone())
+                            local.and_then(|game| {
+                                game.launch.working_directory_relative_path.clone()
+                            })
                         }),
                     version_id: package.version_id,
                     package_path: package.path,
@@ -553,7 +560,13 @@ pub fn list_remote_body_packages(
     let temporary_root = base_data_dir.join("cloud-manifest-temp");
     let cache_root = base_data_dir.join("cloud-manifest-cache");
     let mut warnings = Vec::new();
-    let manifest = match CloudManifestService::read(&client, &files, &directory, &temporary_root, Some(&cache_root)) {
+    let manifest = match CloudManifestService::read(
+        &client,
+        &files,
+        &directory,
+        &temporary_root,
+        Some(&cache_root),
+    ) {
         Ok(manifest) => manifest,
         Err(error) => {
             warnings.push(format!("云端版本清单读取失败：{error}"));
@@ -972,17 +985,18 @@ fn download_body_task(
         &game.game_uid,
         &format!(".download-{temporary_version_id}"),
     );
-    let downloaded_sha256 = client.download_file(&remote, &temporary_path, |progress, message| {
-        TaskService::update(
-            &state,
-            task_id,
-            TaskStatus::Running,
-            progress,
-            message,
-            None,
-        );
-        !TaskService::is_cancelled(&state, task_id)
-    })?;
+    let downloaded_sha256 =
+        client.download_file(&remote, &temporary_path, |progress, message| {
+            TaskService::update(
+                &state,
+                task_id,
+                TaskStatus::Running,
+                progress,
+                message,
+                None,
+            );
+            !TaskService::is_cancelled(&state, task_id)
+        })?;
     let manifest = match BodyPackageService::validate_package_with_known_hash(
         &temporary_path,
         &game.game_uid,
@@ -1110,15 +1124,27 @@ fn rebuild_remote_manifest(
     let base_data_dir = app_data_dir(app)?;
     let temporary_root = base_data_dir.join("cloud-manifest-temp");
     let cache_root = base_data_dir.join("cloud-manifest-cache");
-    let existing = CloudManifestService::read(client, &remote_files, directory, &temporary_root, Some(&cache_root))?;
+    let existing = CloudManifestService::read(
+        client,
+        &remote_files,
+        directory,
+        &temporary_root,
+        Some(&cache_root),
+    )?;
     let game_uid = existing
         .as_ref()
         .map(|manifest| manifest.game_uid.clone())
         .or_else(|| {
-            CloudManifestService::read_catalog(client, &remote_files, directory, &temporary_root, Some(&cache_root))
-                .ok()
-                .flatten()
-                .map(|catalog| catalog.game_uid)
+            CloudManifestService::read_catalog(
+                client,
+                &remote_files,
+                directory,
+                &temporary_root,
+                Some(&cache_root),
+            )
+            .ok()
+            .flatten()
+            .map(|catalog| catalog.game_uid)
         })
         .ok_or_else(|| "云端游戏缺少可用的版本清单，无法更新删除结果".to_string())?;
     CloudManifestService::rebuild(
@@ -1369,12 +1395,23 @@ fn install_cloud_game_task(
         .ok_or_else(|| "百度网盘中没有找到这个游戏本体包，可能已被删除".to_string())?;
     let temporary_root = app_data_dir.join("cloud-manifest-temp");
     let cache_root = app_data_dir.join("cloud-manifest-cache");
-    let catalog =
-        CloudManifestService::read_catalog(&client, &remote_files, &directory, &temporary_root, Some(&cache_root))?
-            .ok_or_else(|| "云端游戏缺少启动信息，请在本地重新上传一次游戏本体包".to_string())?;
-    let manifest = CloudManifestService::read(&client, &remote_files, &directory, &temporary_root, Some(&cache_root))
-        .ok()
-        .flatten();
+    let catalog = CloudManifestService::read_catalog(
+        &client,
+        &remote_files,
+        &directory,
+        &temporary_root,
+        Some(&cache_root),
+    )?
+    .ok_or_else(|| "云端游戏缺少启动信息，请在本地重新上传一次游戏本体包".to_string())?;
+    let manifest = CloudManifestService::read(
+        &client,
+        &remote_files,
+        &directory,
+        &temporary_root,
+        Some(&cache_root),
+    )
+    .ok()
+    .flatten();
     let existing = state
         .store
         .lock()
@@ -1799,7 +1836,6 @@ fn remote_file_name_without_extension(path: &str) -> String {
         .unwrap_or("cloud-game")
         .to_string()
 }
-
 
 fn now_iso() -> String {
     std::time::SystemTime::now()

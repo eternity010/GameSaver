@@ -141,9 +141,7 @@ impl CloudAccountService {
                     .copied();
                 CloudSaveProfile {
                     profile_id: profile.profile_id.clone(),
-                    game_key: game
-                        .map(|g| g.game_key.clone())
-                        .unwrap_or_default(),
+                    game_key: game.map(|g| g.game_key.clone()).unwrap_or_default(),
                     game_uid: profile.game_uid.clone(),
                     executable_hash: profile.executable_hash.clone(),
                     scopes: profile
@@ -162,15 +160,12 @@ impl CloudAccountService {
             .iter()
             .filter(|version| {
                 active_ids.contains(version.game_uid.as_str())
-                    && version
-                        .remote_path
-                        .as_deref()
-                        .is_some_and(|path| {
-                            active_games
-                                .iter()
-                                .find(|game| game.game_uid == version.game_uid)
-                                .is_some_and(|game| is_valid_remote_body_path(&game.game_key, path))
-                        })
+                    && version.remote_path.as_deref().is_some_and(|path| {
+                        active_games
+                            .iter()
+                            .find(|game| game.game_uid == version.game_uid)
+                            .is_some_and(|game| is_valid_remote_body_path(&game.game_key, path))
+                    })
             })
             .map(|version| CloudBodyVersionRecord {
                 version_id: version.version_id.clone(),
@@ -333,10 +328,12 @@ pub fn extract_sub_path(scope: &SaveScope, game: Option<&Game>) -> Option<String
         SaveRootType::LocalAppData => std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
         SaveRootType::LocalLow => std::env::var_os("USERPROFILE")
             .map(|p| PathBuf::from(p).join("AppData").join("LocalLow")),
-        SaveRootType::Documents => std::env::var_os("USERPROFILE")
-            .map(|p| PathBuf::from(p).join("Documents")),
-        SaveRootType::SavedGames => std::env::var_os("USERPROFILE")
-            .map(|p| PathBuf::from(p).join("Saved Games")),
+        SaveRootType::Documents => {
+            std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join("Documents"))
+        }
+        SaveRootType::SavedGames => {
+            std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join("Saved Games"))
+        }
         SaveRootType::UserProfile => std::env::var_os("USERPROFILE").map(PathBuf::from),
         SaveRootType::ManagedGame | SaveRootType::Custom => None,
     };
@@ -524,16 +521,13 @@ fn validate(profile: &CloudAccountProfile) -> Result<(), String> {
                         .is_none_or(|game| game.game_key != version.game_key)))
             || version.file_count == 0
             || !version_ids.insert((version.game_uid.as_str(), version.version_id.as_str()))
-            || version
-                .remote_path
-                .as_deref()
-                .is_none_or(|path| {
-                    profile
-                        .games
-                        .iter()
-                        .find(|game| game.game_uid == version.game_uid)
-                        .is_none_or(|game| !is_valid_remote_body_path(&game.game_key, path))
-                })
+            || version.remote_path.as_deref().is_none_or(|path| {
+                profile
+                    .games
+                    .iter()
+                    .find(|game| game.game_uid == version.game_uid)
+                    .is_none_or(|game| !is_valid_remote_body_path(&game.game_key, path))
+            })
         {
             return Err("云端账号清单包含无效本体版本".to_string());
         }
@@ -756,7 +750,10 @@ mod tests {
             root_path: r"E:\Games\Game1".to_string(),
             ..locallow_scope.clone()
         };
-        assert_eq!(super::extract_sub_path(&managed_exact_scope, Some(&game)), None);
+        assert_eq!(
+            super::extract_sub_path(&managed_exact_scope, Some(&game)),
+            None
+        );
 
         // 5. Custom root returns None
         let custom_scope = SaveScope {

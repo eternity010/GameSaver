@@ -42,7 +42,7 @@ fn is_running_as_admin() -> bool {
     use std::ptr::null_mut;
     use windows_sys::Win32::{
         Foundation::{CloseHandle, GetLastError, HANDLE},
-        Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
+        Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY},
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
 
@@ -63,7 +63,9 @@ fn is_running_as_admin() -> bool {
             &mut returned_length,
         ) != 0;
         CloseHandle(token);
-        result && returned_length >= std::mem::size_of::<TOKEN_ELEVATION>() as u32 && elevation.TokenIsElevated != 0
+        result
+            && returned_length >= std::mem::size_of::<TOKEN_ELEVATION>() as u32
+            && elevation.TokenIsElevated != 0
     }
 }
 
@@ -80,9 +82,14 @@ fn relaunch_as_admin() -> Result<(), String> {
         UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
     };
 
-    let executable = std::env::current_exe().map_err(|error| format!("获取应用路径失败：{error}"))?;
+    let executable =
+        std::env::current_exe().map_err(|error| format!("获取应用路径失败：{error}"))?;
     let working_directory = executable.parent().unwrap_or_else(|| Path::new("."));
-    let arguments = std::env::args_os().skip(1).map(quote_windows_argument).collect::<Vec<_>>().join(" ");
+    let arguments = std::env::args_os()
+        .skip(1)
+        .map(quote_windows_argument)
+        .collect::<Vec<_>>()
+        .join(" ");
     let verb = wide(OsStr::new("runas"));
     let executable = wide(executable.as_os_str());
     let arguments = wide(OsStr::new(&arguments));
@@ -99,7 +106,9 @@ fn relaunch_as_admin() -> Result<(), String> {
         )
     };
     if (result as isize) <= 32 {
-        return Err(format!("请求管理员模式重启失败：错误 {}", unsafe { GetLastError() }));
+        return Err(format!("请求管理员模式重启失败：错误 {}", unsafe {
+            GetLastError()
+        }));
     }
     Ok(())
 }
@@ -116,7 +125,10 @@ fn quote_windows_argument(value: std::ffi::OsString) -> String {
     if value.is_empty() {
         return "\"\"".to_string();
     }
-    if !value.chars().any(|character| character.is_whitespace() || character == '"') {
+    if !value
+        .chars()
+        .any(|character| character.is_whitespace() || character == '"')
+    {
         return value.into_owned();
     }
 
@@ -147,6 +159,9 @@ mod tests {
 
     #[test]
     fn quotes_arguments_with_spaces() {
-        assert_eq!(quote_windows_argument(OsString::from("C:\\Game Files")), "\"C:\\Game Files\"");
+        assert_eq!(
+            quote_windows_argument(OsString::from("C:\\Game Files")),
+            "\"C:\\Game Files\""
+        );
     }
 }

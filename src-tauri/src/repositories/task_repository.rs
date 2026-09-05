@@ -1,6 +1,11 @@
 use crate::domain::{AppTask, TaskStatus};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, io::Write, path::{Path, PathBuf}};
+use std::{
+    collections::HashMap,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 use uuid::Uuid;
 
 const TASK_SCHEMA_VERSION: u32 = 1;
@@ -46,14 +51,20 @@ impl TaskRepository {
     }
 
     pub fn persist(path: &Path, tasks: &HashMap<String, AppTask>) -> Result<(), String> {
-        let parent = path.parent().ok_or_else(|| "任务记录路径无父目录".to_string())?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| "任务记录路径无父目录".to_string())?;
         fs::create_dir_all(parent).map_err(|err| format!("创建任务记录目录失败：{err}"))?;
         let mut snapshot = tasks.clone();
         trim(&mut snapshot);
         let mut entries = snapshot.values().cloned().collect::<Vec<_>>();
         entries.sort_by(|left, right| left.created_at.cmp(&right.created_at));
-        let store = TaskStore { schema_version: TASK_SCHEMA_VERSION, tasks: entries };
-        let bytes = serde_json::to_vec_pretty(&store).map_err(|err| format!("序列化任务记录失败：{err}"))?;
+        let store = TaskStore {
+            schema_version: TASK_SCHEMA_VERSION,
+            tasks: entries,
+        };
+        let bytes = serde_json::to_vec_pretty(&store)
+            .map_err(|err| format!("序列化任务记录失败：{err}"))?;
         atomic_replace(path, &bytes)
     }
 }
@@ -72,12 +83,23 @@ fn trim(tasks: &mut HashMap<String, AppTask>) {
 }
 
 fn atomic_replace(target: &Path, bytes: &[u8]) -> Result<(), String> {
-    let temp = target.with_file_name(format!(".{}.tmp-{}", target.file_name().unwrap_or_default().to_string_lossy(), Uuid::new_v4().simple()));
-    let backup = target.with_file_name(format!(".{}.bak-{}", target.file_name().unwrap_or_default().to_string_lossy(), Uuid::new_v4().simple()));
+    let temp = target.with_file_name(format!(
+        ".{}.tmp-{}",
+        target.file_name().unwrap_or_default().to_string_lossy(),
+        Uuid::new_v4().simple()
+    ));
+    let backup = target.with_file_name(format!(
+        ".{}.bak-{}",
+        target.file_name().unwrap_or_default().to_string_lossy(),
+        Uuid::new_v4().simple()
+    ));
     let result = (|| -> Result<(), String> {
-        let mut file = fs::File::create(&temp).map_err(|err| format!("创建任务记录临时文件失败：{err}"))?;
-        file.write_all(bytes).map_err(|err| format!("写入任务记录临时文件失败：{err}"))?;
-        file.sync_all().map_err(|err| format!("刷新任务记录临时文件失败：{err}"))?;
+        let mut file =
+            fs::File::create(&temp).map_err(|err| format!("创建任务记录临时文件失败：{err}"))?;
+        file.write_all(bytes)
+            .map_err(|err| format!("写入任务记录临时文件失败：{err}"))?;
+        file.sync_all()
+            .map_err(|err| format!("刷新任务记录临时文件失败：{err}"))?;
         let had_target = target.exists();
         if had_target {
             fs::rename(target, &backup).map_err(|err| format!("暂存任务记录失败：{err}"))?;
@@ -129,7 +151,8 @@ mod tests {
 
     #[test]
     fn interrupted_tasks_are_recovered_with_retry_data() {
-        let root = std::env::temp_dir().join(format!("gamesaver-task-repository-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("gamesaver-task-repository-{}", Uuid::new_v4()));
         let path = root.join("tasks.json");
         fs::create_dir_all(&root).expect("create task repository directory");
         let pending = task(TaskStatus::Running);
@@ -140,14 +163,25 @@ mod tests {
         let loaded = TaskRepository::load(&path).expect("load task repository");
         let recovered = loaded.get(&task_id).expect("recovered task");
         assert_eq!(recovered.status, TaskStatus::Interrupted);
-        assert!(recovered.error.as_deref().unwrap_or_default().contains("中断"));
-        assert_eq!(recovered.retry.as_ref().and_then(|retry| retry.remote_fs_id), Some(7));
+        assert!(recovered
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("中断"));
+        assert_eq!(
+            recovered
+                .retry
+                .as_ref()
+                .and_then(|retry| retry.remote_fs_id),
+            Some(7)
+        );
         fs::remove_dir_all(root).expect("cleanup task repository");
     }
 
     #[test]
     fn completed_task_history_is_trimmed() {
-        let root = std::env::temp_dir().join(format!("gamesaver-task-repository-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("gamesaver-task-repository-{}", Uuid::new_v4()));
         let path = root.join("tasks.json");
         fs::create_dir_all(&root).expect("create task repository directory");
         let mut tasks = HashMap::new();

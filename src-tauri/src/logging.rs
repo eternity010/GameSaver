@@ -58,7 +58,9 @@ fn write_line(level: &str, message: &str) {
 }
 
 fn rotate_if_needed(path: &Path) -> Result<(), String> {
-    let size = fs::metadata(path).map(|metadata| metadata.len()).unwrap_or_default();
+    let size = fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or_default();
     if size < MAX_LOG_BYTES {
         return Ok(());
     }

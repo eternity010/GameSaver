@@ -13,7 +13,6 @@ use windows_sys::Win32::{
     },
 };
 
-
 #[cfg(target_os = "windows")]
 const SYNCHRONIZE: u32 = 0x00100000;
 
@@ -33,13 +32,8 @@ impl TrackedProcessHandle {
         if pid == 0 {
             return None;
         }
-        let handle = unsafe {
-            OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
-                0,
-                pid,
-            )
-        };
+        let handle =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
         if handle.is_null() {
             None
         } else {

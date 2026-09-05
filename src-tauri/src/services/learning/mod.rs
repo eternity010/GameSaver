@@ -4,6 +4,6 @@ mod transactions;
 
 pub(crate) use etw_capture::{
     cleanup_stale_captures, collect_related_files_by_trace, extend_tracked_process_tree,
-    stop_etw_capture, try_start_etw_capture,
+    should_ignore_snapshot_path, stop_etw_capture, try_start_etw_capture,
 };
-pub(crate) use transactions::analyze_save_transactions;
+pub(crate) use transactions::{analyze_save_transactions, FileOperation, FileOperationKind};

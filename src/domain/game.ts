@@ -165,7 +165,11 @@ export interface SaveScopeDraft {
   scope: SaveScope;
   changedFiles: string[];
   confidence: number;
+  evidenceLevel: SaveCandidateEvidenceLevel;
+  evidenceReason: string;
 }
+
+export type SaveCandidateEvidenceLevel = "strong" | "review" | "noise";
 
 export interface SaveLearningSession {
   sessionId: string;

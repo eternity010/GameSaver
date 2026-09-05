@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::{fs, io::Write, path::{Path, PathBuf}};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 use uuid::Uuid;
 
 const CONFIG_FILE: &str = "library-config.json";
@@ -29,14 +33,20 @@ impl LibraryConfigRepository {
 
     pub fn save(app_data_dir: &Path, config: &LibraryConfig) -> Result<(), String> {
         let path = Self::path(app_data_dir);
-        let parent = path.parent().ok_or_else(|| "游戏库配置路径缺少父目录".to_string())?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| "游戏库配置路径缺少父目录".to_string())?;
         fs::create_dir_all(parent).map_err(|error| format!("创建游戏库配置目录失败：{error}"))?;
-        let bytes = serde_json::to_vec_pretty(config).map_err(|error| format!("序列化游戏库配置失败：{error}"))?;
+        let bytes = serde_json::to_vec_pretty(config)
+            .map_err(|error| format!("序列化游戏库配置失败：{error}"))?;
         let temporary = parent.join(format!(".{CONFIG_FILE}.tmp-{}", Uuid::new_v4().simple()));
         let result = (|| -> Result<(), String> {
-            let mut file = fs::File::create(&temporary).map_err(|error| format!("创建游戏库配置临时文件失败：{error}"))?;
-            file.write_all(&bytes).map_err(|error| format!("写入游戏库配置临时文件失败：{error}"))?;
-            file.sync_all().map_err(|error| format!("刷新游戏库配置临时文件失败：{error}"))?;
+            let mut file = fs::File::create(&temporary)
+                .map_err(|error| format!("创建游戏库配置临时文件失败：{error}"))?;
+            file.write_all(&bytes)
+                .map_err(|error| format!("写入游戏库配置临时文件失败：{error}"))?;
+            file.sync_all()
+                .map_err(|error| format!("刷新游戏库配置临时文件失败：{error}"))?;
             replace_file(&temporary, &path)
         })();
         let _ = fs::remove_file(&temporary);
@@ -59,7 +69,11 @@ impl LibraryConfigRepository {
 
 fn replace_file(source: &Path, target: &Path) -> Result<(), String> {
     if target.exists() {
-        let backup = target.with_file_name(format!(".{}.bak-{}", target.file_name().unwrap_or_default().to_string_lossy(), Uuid::new_v4().simple()));
+        let backup = target.with_file_name(format!(
+            ".{}.bak-{}",
+            target.file_name().unwrap_or_default().to_string_lossy(),
+            Uuid::new_v4().simple()
+        ));
         fs::rename(target, &backup).map_err(|error| format!("暂存旧游戏库配置失败：{error}"))?;
         if let Err(error) = fs::rename(source, target) {
             let _ = fs::rename(&backup, target);
@@ -85,9 +99,19 @@ mod tests {
 
     #[test]
     fn configured_root_is_loaded_from_config() {
-        let root = std::env::temp_dir().join(format!("gamesaver-library-config-{}", uuid::Uuid::new_v4()));
-        LibraryConfigRepository::save(&root, &LibraryConfig { library_root: Some(r"E:\GameSaverLibrary".to_string()) }).unwrap();
-        assert_eq!(LibraryConfigRepository::resolve_root(&root).unwrap(), Path::new(r"E:\GameSaverLibrary"));
+        let root =
+            std::env::temp_dir().join(format!("gamesaver-library-config-{}", uuid::Uuid::new_v4()));
+        LibraryConfigRepository::save(
+            &root,
+            &LibraryConfig {
+                library_root: Some(r"E:\GameSaverLibrary".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            LibraryConfigRepository::resolve_root(&root).unwrap(),
+            Path::new(r"E:\GameSaverLibrary")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

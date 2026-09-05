@@ -52,8 +52,11 @@ impl GameRepository {
 
     pub fn persist(app: &AppHandle, store: &AppStore) -> Result<(), String> {
         let path = Self::store_path(app)?;
-        let parent = path.parent().ok_or_else(|| "store path has no parent".to_string())?;
-        fs::create_dir_all(parent).map_err(|err| format!("create GameSaver data directory failed: {err}"))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| "store path has no parent".to_string())?;
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("create GameSaver data directory failed: {err}"))?;
         let mut candidate = store.clone();
         candidate.normalize();
         let bytes = serde_json::to_vec_pretty(&candidate)
@@ -77,16 +80,28 @@ impl GameRepository {
 }
 
 fn atomic_replace(target: &Path, bytes: &[u8]) -> Result<(), String> {
-    let temp = target.with_file_name(format!(".{}.tmp-{}", target.file_name().unwrap_or_default().to_string_lossy(), Uuid::new_v4().simple()));
-    let backup = target.with_file_name(format!(".{}.bak-{}", target.file_name().unwrap_or_default().to_string_lossy(), Uuid::new_v4().simple()));
+    let temp = target.with_file_name(format!(
+        ".{}.tmp-{}",
+        target.file_name().unwrap_or_default().to_string_lossy(),
+        Uuid::new_v4().simple()
+    ));
+    let backup = target.with_file_name(format!(
+        ".{}.bak-{}",
+        target.file_name().unwrap_or_default().to_string_lossy(),
+        Uuid::new_v4().simple()
+    ));
     let result = (|| -> Result<(), String> {
-        let mut file = fs::File::create(&temp).map_err(|err| format!("create store temporary file failed: {err}"))?;
-        file.write_all(bytes).map_err(|err| format!("write store temporary file failed: {err}"))?;
-        file.sync_all().map_err(|err| format!("flush store temporary file failed: {err}"))?;
+        let mut file = fs::File::create(&temp)
+            .map_err(|err| format!("create store temporary file failed: {err}"))?;
+        file.write_all(bytes)
+            .map_err(|err| format!("write store temporary file failed: {err}"))?;
+        file.sync_all()
+            .map_err(|err| format!("flush store temporary file failed: {err}"))?;
         drop(file);
         let had_target = target.exists();
         if had_target {
-            fs::rename(target, &backup).map_err(|err| format!("stage existing store failed: {err}"))?;
+            fs::rename(target, &backup)
+                .map_err(|err| format!("stage existing store failed: {err}"))?;
         }
         if let Err(err) = fs::rename(&temp, target) {
             if had_target {

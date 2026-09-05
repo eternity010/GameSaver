@@ -94,7 +94,8 @@ pub fn start_set_library_root_task(
         }
         *migrating = true;
     }
-    let task_id = match TaskService::create(&state, "set_library_root", None, "准备迁移游戏库") {
+    let task_id = match TaskService::create(&state, "set_library_root", None, "准备迁移游戏库")
+    {
         Ok(task_id) => task_id,
         Err(error) => {
             if let Ok(mut migrating) = state.library_migration.lock() {
@@ -110,9 +111,33 @@ pub fn start_set_library_root_task(
             *migrating = false;
         }
         match result {
-            Ok(()) => TaskService::finish(&app.state(), &task_id_for_thread, TaskStatus::Success, 100, "游戏库迁移完成", None, None),
-            Err(error) if error == "任务已取消" => TaskService::finish(&app.state(), &task_id_for_thread, TaskStatus::Cancelled, 100, "已取消游戏库迁移", None, None),
-            Err(error) => TaskService::finish(&app.state(), &task_id_for_thread, TaskStatus::Failed, 100, "游戏库迁移失败", None, Some(error)),
+            Ok(()) => TaskService::finish(
+                &app.state(),
+                &task_id_for_thread,
+                TaskStatus::Success,
+                100,
+                "游戏库迁移完成",
+                None,
+                None,
+            ),
+            Err(error) if error == "任务已取消" => TaskService::finish(
+                &app.state(),
+                &task_id_for_thread,
+                TaskStatus::Cancelled,
+                100,
+                "已取消游戏库迁移",
+                None,
+                None,
+            ),
+            Err(error) => TaskService::finish(
+                &app.state(),
+                &task_id_for_thread,
+                TaskStatus::Failed,
+                100,
+                "游戏库迁移失败",
+                None,
+                Some(error),
+            ),
         }
     });
     Ok(task_id)
@@ -126,9 +151,23 @@ fn migrate_library(
     store: &crate::domain::AppStore,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
-    TaskService::update(&state, task_id, TaskStatus::Running, 1, "正在迁移游戏库文件", None);
+    TaskService::update(
+        &state,
+        task_id,
+        TaskStatus::Running,
+        1,
+        "正在迁移游戏库文件",
+        None,
+    );
     let candidate = LibraryService::migrate(source, target, store, |progress, message| {
-        TaskService::update(&state, task_id, TaskStatus::Running, progress, message, None);
+        TaskService::update(
+            &state,
+            task_id,
+            TaskStatus::Running,
+            progress,
+            message,
+            None,
+        );
     })?;
     if TaskService::is_cancelled(&state, task_id) {
         let _ = std::fs::remove_dir_all(target);
@@ -158,7 +197,14 @@ fn migrate_library(
         .map_err(|_| "更新游戏库根目录失败".to_string())? = target.to_path_buf();
     if let Err(error) = LibraryService::cleanup_source(source) {
         crate::logging::error(format!("旧游戏库大文件清理失败：{error}"));
-        TaskService::update(&state, task_id, TaskStatus::Running, 98, "游戏库已切换，正在等待旧目录清理", None);
+        TaskService::update(
+            &state,
+            task_id,
+            TaskStatus::Running,
+            98,
+            "游戏库已切换，正在等待旧目录清理",
+            None,
+        );
     }
     Ok(())
 }
@@ -175,7 +221,12 @@ fn same_path(left: &Path, right: &Path) -> bool {
     left.to_string_lossy()
         .replace('/', "\\")
         .trim_end_matches('\\')
-        .eq_ignore_ascii_case(right.to_string_lossy().replace('/', "\\").trim_end_matches('\\'))
+        .eq_ignore_ascii_case(
+            right
+                .to_string_lossy()
+                .replace('/', "\\")
+                .trim_end_matches('\\'),
+        )
 }
 
 fn disk_free_bytes(path: &Path) -> u64 {

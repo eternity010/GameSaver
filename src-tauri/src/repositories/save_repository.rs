@@ -1,4 +1,7 @@
-use crate::{app_state::AppState, domain::{Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope, SaveVersion}};
+use crate::{
+    app_state::AppState,
+    domain::{Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope, SaveVersion},
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -40,12 +43,13 @@ impl SaveRepository {
 
         // 1. Fast path: check if absolutely nothing changed compared to latest
         if let Some(latest) = latest {
-            let old_active_files: Vec<&SaveFileEntry> = latest.files.iter().filter(|file| !file.deleted).collect();
+            let old_active_files: Vec<&SaveFileEntry> =
+                latest.files.iter().filter(|file| !file.deleted).collect();
             if old_active_files.len() == files.len() {
                 let all_unmodified = files.iter().all(|file| {
-                    old_active_files.iter().any(|old_entry| {
-                        collected_is_unmodified(file, old_entry, app)
-                    })
+                    old_active_files
+                        .iter()
+                        .any(|old_entry| collected_is_unmodified(file, old_entry, app))
                 });
                 if all_unmodified {
                     return Ok(None);
@@ -88,7 +92,11 @@ impl SaveRepository {
         }
         if let Some(latest) = latest {
             for old_file in latest.files.iter().filter(|file| !file.deleted) {
-                if !files.iter().any(|file| collected_matches_entry(file, old_file)) && entry_belongs_to_profile(old_file, profile) {
+                if !files
+                    .iter()
+                    .any(|file| collected_matches_entry(file, old_file))
+                    && entry_belongs_to_profile(old_file, profile)
+                {
                     entries.push(SaveFileEntry {
                         root_type: old_file.root_type,
                         root_path: old_file.root_path.clone(),
@@ -134,7 +142,10 @@ impl SaveRepository {
         if groups.is_empty() {
             return Err("保存版本没有可恢复的存档文件".to_string());
         }
-        let total_files = groups.iter().map(|group| group.entries.len()).sum::<usize>();
+        let total_files = groups
+            .iter()
+            .map(|group| group.entries.len())
+            .sum::<usize>();
         let mut completed = 0usize;
         let mut undo_groups = Vec::new();
         for group in groups {
@@ -146,7 +157,12 @@ impl SaveRepository {
                 Err(error) => {
                     let mut rollback_errors = Vec::new();
                     for undo in undo_groups.iter().rev() {
-                        if let Err(rollback_error) = rollback_group(&undo.root, &undo.rollback, &undo.installed_paths, &undo.backed_up_paths) {
+                        if let Err(rollback_error) = rollback_group(
+                            &undo.root,
+                            &undo.rollback,
+                            &undo.installed_paths,
+                            &undo.backed_up_paths,
+                        ) {
                             rollback_errors.push(rollback_error);
                         } else {
                             cleanup_restore_artifacts(undo);
@@ -169,13 +185,22 @@ impl SaveRepository {
     pub fn rollback_restore(receipt: RestoreReceipt) -> Result<(), String> {
         let mut rollback_errors = Vec::new();
         for undo in receipt.undo_groups.iter().rev() {
-            if let Err(error) = rollback_group(&undo.root, &undo.rollback, &undo.installed_paths, &undo.backed_up_paths) {
+            if let Err(error) = rollback_group(
+                &undo.root,
+                &undo.rollback,
+                &undo.installed_paths,
+                &undo.backed_up_paths,
+            ) {
                 rollback_errors.push(error);
             } else {
                 cleanup_restore_artifacts(undo);
             }
         }
-        if rollback_errors.is_empty() { Ok(()) } else { Err(rollback_errors.join("；")) }
+        if rollback_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(rollback_errors.join("；"))
+        }
     }
 
     pub fn collect_garbage(app: &AppHandle, versions: &[SaveVersion]) -> Result<usize, String> {
@@ -197,17 +222,28 @@ impl SaveRepository {
             .map_err(|_| "存档仓库待提交对象状态损坏".to_string())?;
         referenced.extend(pending.keys().cloned());
         let mut removed = 0usize;
-        for prefix in fs::read_dir(&root).map_err(|err| format!("读取存档对象目录失败：{err}"))? {
-            let prefix = prefix.map_err(|err| format!("读取存档对象目录失败：{err}"))?.path();
+        for prefix in fs::read_dir(&root).map_err(|err| format!("读取存档对象目录失败：{err}"))?
+        {
+            let prefix = prefix
+                .map_err(|err| format!("读取存档对象目录失败：{err}"))?
+                .path();
             if !prefix.is_dir() {
                 continue;
             }
-            for item in fs::read_dir(&prefix).map_err(|err| format!("读取存档对象目录失败：{err}"))? {
-                let path = item.map_err(|err| format!("读取存档对象失败：{err}"))?.path();
+            for item in
+                fs::read_dir(&prefix).map_err(|err| format!("读取存档对象目录失败：{err}"))?
+            {
+                let path = item
+                    .map_err(|err| format!("读取存档对象失败：{err}"))?
+                    .path();
                 if !path.is_file() {
                     continue;
                 }
-                let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default().to_ascii_lowercase();
+                let name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
                 if name.starts_with('.') || !referenced.contains(&name) {
                     fs::remove_file(&path).map_err(|err| format!("回收孤立存档对象失败：{err}"))?;
                     removed += 1;
@@ -252,18 +288,25 @@ impl SaveRepository {
         let directory = root.join(&hash[..2]);
         let target = directory.join(hash);
         if target.is_file() {
-            let metadata = fs::metadata(&target).map_err(|err| format!("读取存档对象失败：{err}"))?;
+            let metadata =
+                fs::metadata(&target).map_err(|err| format!("读取存档对象失败：{err}"))?;
             if metadata.len() == bytes.len() as u64 {
                 return Ok(());
             }
-            return Err(format!("存档对象完整性校验失败，拒绝覆盖已有对象：{}", target.display()));
+            return Err(format!(
+                "存档对象完整性校验失败，拒绝覆盖已有对象：{}",
+                target.display()
+            ));
         }
         fs::create_dir_all(&directory).map_err(|err| format!("创建存档对象目录失败：{err}"))?;
         let temporary = directory.join(format!(".{hash}.tmp-{}", Uuid::new_v4().simple()));
         let result = (|| -> Result<(), String> {
-            let mut file = fs::File::create(&temporary).map_err(|err| format!("创建存档对象临时文件失败：{err}"))?;
-            file.write_all(bytes).map_err(|err| format!("写入存档对象失败：{err}"))?;
-            file.sync_all().map_err(|err| format!("刷新存档对象失败：{err}"))?;
+            let mut file = fs::File::create(&temporary)
+                .map_err(|err| format!("创建存档对象临时文件失败：{err}"))?;
+            file.write_all(bytes)
+                .map_err(|err| format!("写入存档对象失败：{err}"))?;
+            file.sync_all()
+                .map_err(|err| format!("刷新存档对象失败：{err}"))?;
             fs::rename(&temporary, &target).map_err(|err| format!("提交存档对象失败：{err}"))?;
             Ok(())
         })();
@@ -273,12 +316,22 @@ impl SaveRepository {
 }
 
 pub fn release_pending_objects(version: &SaveVersion) {
-    let Some(pending) = PENDING_OBJECTS.get() else { return };
+    let Some(pending) = PENDING_OBJECTS.get() else {
+        return;
+    };
     if let Ok(mut pending) = pending.lock() {
-        for hash in version.files.iter().filter_map(|file| file.object_hash.as_ref()) {
+        for hash in version
+            .files
+            .iter()
+            .filter_map(|file| file.object_hash.as_ref())
+        {
             let hash = hash.to_ascii_lowercase();
             if let Some(count) = pending.get_mut(&hash) {
-                if *count > 1 { *count -= 1; } else { pending.remove(&hash); }
+                if *count > 1 {
+                    *count -= 1;
+                } else {
+                    pending.remove(&hash);
+                }
             }
         }
     }
@@ -286,8 +339,14 @@ pub fn release_pending_objects(version: &SaveVersion) {
 
 fn protect_pending_objects(version: &SaveVersion) -> Result<(), String> {
     let pending = PENDING_OBJECTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut pending = pending.lock().map_err(|_| "存档仓库待提交对象状态损坏".to_string())?;
-    for hash in version.files.iter().filter_map(|file| file.object_hash.as_ref()) {
+    let mut pending = pending
+        .lock()
+        .map_err(|_| "存档仓库待提交对象状态损坏".to_string())?;
+    for hash in version
+        .files
+        .iter()
+        .filter_map(|file| file.object_hash.as_ref())
+    {
         *pending.entry(hash.to_ascii_lowercase()).or_insert(0) += 1;
     }
     Ok(())
@@ -311,32 +370,57 @@ pub struct RestoreReceipt {
     undo_groups: Vec<RestoreUndo>,
 }
 
-fn build_restore_groups(game: &Game, profile: &SaveProfile, version: &SaveVersion) -> Result<Vec<RestoreGroup>, String> {
+fn build_restore_groups(
+    game: &Game,
+    profile: &SaveProfile,
+    version: &SaveVersion,
+) -> Result<Vec<RestoreGroup>, String> {
     let mut groups = HashMap::<String, RestoreGroup>::new();
     for entry in &version.files {
         let relative = validate_relative(&entry.relative_path)?;
         let scope = find_scope_for_entry(profile, entry, &relative)?;
         let root = scope_root(game, scope);
-        if !root.is_dir() {
+        if root.exists() && !root.is_dir() {
             return Err(format!("存档范围不可访问：{}", root.display()));
+        }
+        if !root.exists() && !can_create_missing_restore_root(scope.root_type) {
+            return Err(format!(
+                "存档范围不存在，请先创建或重新选择：{}",
+                root.display()
+            ));
         }
         let key = normalize_path(root.to_string_lossy().as_ref());
         if !groups.contains_key(&key) {
             let mut protected_paths = HashSet::new();
-            for candidate in profile.scopes.iter().filter(|candidate| normalize_path(scope_root(game, candidate).to_string_lossy().as_ref()) == key) {
+            for candidate in profile.scopes.iter().filter(|candidate| {
+                normalize_path(scope_root(game, candidate).to_string_lossy().as_ref()) == key
+            }) {
                 protected_paths.extend(collect_protected_paths(&root, candidate)?);
             }
-            groups.insert(key.clone(), RestoreGroup {
-                root: root.clone(),
-                entries: Vec::new(),
-                protected_paths,
-            });
+            groups.insert(
+                key.clone(),
+                RestoreGroup {
+                    root: root.clone(),
+                    entries: Vec::new(),
+                    protected_paths,
+                },
+            );
         }
         if !entry.deleted {
-            let hash = entry.object_hash.clone().ok_or_else(|| format!("保存版本缺少对象：{}", entry.relative_path))?;
+            let hash = entry
+                .object_hash
+                .clone()
+                .ok_or_else(|| format!("保存版本缺少对象：{}", entry.relative_path))?;
             let group = groups.get_mut(&key).expect("restore group was inserted");
-            if group.entries.iter().any(|(existing, existing_hash)| existing == &relative && existing_hash != &hash) {
-                return Err(format!("保存版本包含冲突的存档文件：{}", entry.relative_path));
+            if group
+                .entries
+                .iter()
+                .any(|(existing, existing_hash)| existing == &relative && existing_hash != &hash)
+            {
+                return Err(format!(
+                    "保存版本包含冲突的存档文件：{}",
+                    entry.relative_path
+                ));
             }
             group.entries.push((relative, hash));
         }
@@ -346,16 +430,31 @@ fn build_restore_groups(game: &Game, profile: &SaveProfile, version: &SaveVersio
         group.entries.dedup();
     }
     let mut groups = groups.into_values().collect::<Vec<_>>();
-    groups.sort_by(|left, right| normalize_path(left.root.to_string_lossy().as_ref()).cmp(&normalize_path(right.root.to_string_lossy().as_ref())));
+    groups.sort_by(|left, right| {
+        normalize_path(left.root.to_string_lossy().as_ref())
+            .cmp(&normalize_path(right.root.to_string_lossy().as_ref()))
+    });
     Ok(groups)
 }
 
-fn restore_group(app: &AppHandle, group: &RestoreGroup, mut on_progress: impl FnMut(usize, &str)) -> Result<RestoreUndo, String> {
+fn restore_group(
+    app: &AppHandle,
+    group: &RestoreGroup,
+    mut on_progress: impl FnMut(usize, &str),
+) -> Result<RestoreUndo, String> {
     let restore_id = Uuid::new_v4().simple().to_string();
     let staging = group.root.join(format!(".gamesaver-restore-{restore_id}"));
     let rollback = group.root.join(format!(".gamesaver-rollback-{restore_id}"));
-    let target_paths = group.entries.iter().map(|(relative, _)| relative.clone()).collect::<HashSet<_>>();
-    let touched = group.protected_paths.union(&target_paths).cloned().collect::<HashSet<_>>();
+    let target_paths = group
+        .entries
+        .iter()
+        .map(|(relative, _)| relative.clone())
+        .collect::<HashSet<_>>();
+    let touched = group
+        .protected_paths
+        .union(&target_paths)
+        .cloned()
+        .collect::<HashSet<_>>();
     let mut backed_up_paths = HashSet::new();
     let mut installed_paths = HashSet::new();
     let result = (|| -> Result<(), String> {
@@ -370,7 +469,10 @@ fn restore_group(app: &AppHandle, group: &RestoreGroup, mut on_progress: impl Fn
                 fs::create_dir_all(parent).map_err(|err| format!("创建存档恢复目录失败：{err}"))?;
             }
             fs::copy(&object, &staged).map_err(|err| format!("物化存档对象失败：{err}"))?;
-            on_progress(0, &format!("正在校验存档对象 {}/{}", index + 1, group.entries.len()));
+            on_progress(
+                0,
+                &format!("正在校验存档对象 {}/{}", index + 1, group.entries.len()),
+            );
         }
         for relative in &target_paths {
             let destination = safe_join(&group.root, relative)?;
@@ -383,9 +485,11 @@ fn restore_group(app: &AppHandle, group: &RestoreGroup, mut on_progress: impl Fn
             if destination.exists() {
                 let backup = safe_join(&rollback, relative)?;
                 if let Some(parent) = backup.parent() {
-                    fs::create_dir_all(parent).map_err(|err| format!("创建存档回滚目录失败：{err}"))?;
+                    fs::create_dir_all(parent)
+                        .map_err(|err| format!("创建存档回滚目录失败：{err}"))?;
                 }
-                fs::rename(&destination, &backup).map_err(|err| format!("保护当前存档失败：{err}"))?;
+                fs::rename(&destination, &backup)
+                    .map_err(|err| format!("保护当前存档失败：{err}"))?;
                 backed_up_paths.insert(relative.clone());
             }
         }
@@ -397,29 +501,56 @@ fn restore_group(app: &AppHandle, group: &RestoreGroup, mut on_progress: impl Fn
             }
             fs::rename(&staged, &destination).map_err(|err| format!("提交存档文件失败：{err}"))?;
             installed_paths.insert(relative.clone());
-            on_progress(1, &format!("正在恢复存档文件 {}/{}", index + 1, group.entries.len()));
+            on_progress(
+                1,
+                &format!("正在恢复存档文件 {}/{}", index + 1, group.entries.len()),
+            );
         }
         Ok(())
     })();
     if let Err(error) = result {
-        let rollback_result = rollback_group(&group.root, &rollback, &installed_paths, &backed_up_paths);
+        let rollback_result =
+            rollback_group(&group.root, &rollback, &installed_paths, &backed_up_paths);
         let _ = fs::remove_dir_all(&staging);
         if rollback_result.is_ok() {
             let _ = fs::remove_dir_all(&rollback);
         }
-        return Err(append_rollback_errors(error, rollback_result.err().into_iter().collect()));
+        return Err(append_rollback_errors(
+            error,
+            rollback_result.err().into_iter().collect(),
+        ));
     }
-    Ok(RestoreUndo { root: group.root.clone(), staging, rollback, backed_up_paths, installed_paths })
+    Ok(RestoreUndo {
+        root: group.root.clone(),
+        staging,
+        rollback,
+        backed_up_paths,
+        installed_paths,
+    })
 }
 
-fn rollback_group(root: &Path, rollback: &Path, installed_paths: &HashSet<String>, backed_up_paths: &HashSet<String>) -> Result<(), String> {
+fn rollback_group(
+    root: &Path,
+    rollback: &Path,
+    installed_paths: &HashSet<String>,
+    backed_up_paths: &HashSet<String>,
+) -> Result<(), String> {
     let mut errors = Vec::new();
     for relative in installed_paths {
         match safe_join(root, relative) {
             Ok(destination) => {
-                let result = if destination.is_dir() { fs::remove_dir_all(&destination) } else { fs::remove_file(&destination) };
+                let result = if destination.is_dir() {
+                    fs::remove_dir_all(&destination)
+                } else {
+                    fs::remove_file(&destination)
+                };
                 if let Err(error) = result {
-                    if error.kind() != std::io::ErrorKind::NotFound { errors.push(format!("删除恢复文件 {} 失败：{error}", destination.display())); }
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        errors.push(format!(
+                            "删除恢复文件 {} 失败：{error}",
+                            destination.display()
+                        ));
+                    }
                 }
             }
             Err(error) => {
@@ -430,23 +561,50 @@ fn rollback_group(root: &Path, rollback: &Path, installed_paths: &HashSet<String
     for relative in backed_up_paths {
         let backup = match safe_join(rollback, relative) {
             Ok(path) => path,
-            Err(error) => { errors.push(error); continue; }
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
         };
-        if !backup.exists() { continue; }
+        if !backup.exists() {
+            continue;
+        }
         let destination = match safe_join(root, relative) {
             Ok(path) => path,
-            Err(error) => { errors.push(error); continue; }
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
         };
         if let Some(parent) = destination.parent() {
-            if let Err(error) = fs::create_dir_all(parent) { errors.push(format!("创建存档回滚目录失败：{error}")); continue; }
+            if let Err(error) = fs::create_dir_all(parent) {
+                errors.push(format!("创建存档回滚目录失败：{error}"));
+                continue;
+            }
         }
-        if let Err(error) = fs::rename(&backup, &destination) { errors.push(format!("恢复当前存档 {} 失败：{error}", destination.display())); }
+        if let Err(error) = fs::rename(&backup, &destination) {
+            errors.push(format!(
+                "恢复当前存档 {} 失败：{error}",
+                destination.display()
+            ));
+        }
     }
-    if errors.is_empty() { Ok(()) } else { Err(errors.join("；")) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
 }
 
 fn append_rollback_errors(error: String, rollback_errors: Vec<String>) -> String {
-    if rollback_errors.is_empty() { error } else { format!("{error}；自动回滚失败，回滚副本已保留：{}", rollback_errors.join("；")) }
+    if rollback_errors.is_empty() {
+        error
+    } else {
+        format!(
+            "{error}；自动回滚失败，回滚副本已保留：{}",
+            rollback_errors.join("；")
+        )
+    }
 }
 
 fn cleanup_restore_artifacts(undo: &RestoreUndo) {
@@ -466,19 +624,41 @@ fn collect_protected_paths(root: &Path, scope: &SaveScope) -> Result<HashSet<Str
     for relative in &scope.include_directories {
         let directory = validate_relative(relative)?;
         let path = safe_join(root, &directory)?;
-        if !path.is_dir() { continue; }
+        if !path.is_dir() {
+            continue;
+        }
         for entry in WalkDir::new(&path).follow_links(false) {
             let entry = entry.map_err(|err| format!("扫描当前存档失败：{err}"))?;
-            if !entry.file_type().is_file() { continue; }
-            let relative = normalize_relative(entry.path().strip_prefix(root).map_err(|_| "存档文件超出保护范围".to_string())?.to_string_lossy().as_ref());
-            if is_protected_file(entry.path(), &relative, scope) { paths.insert(relative); }
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let relative = normalize_relative(
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .map_err(|_| "存档文件超出保护范围".to_string())?
+                    .to_string_lossy()
+                    .as_ref(),
+            );
+            if is_protected_file(entry.path(), &relative, scope) {
+                paths.insert(relative);
+            }
         }
     }
     Ok(paths)
 }
 
 fn is_protected_file(path: &Path, relative: &str, scope: &SaveScope) -> bool {
-    path.is_file() && !is_excluded(relative, scope) && scope.max_file_bytes.map(|limit| fs::metadata(path).map(|metadata| metadata.len() <= limit).unwrap_or(false)).unwrap_or(true)
+    path.is_file()
+        && !is_excluded(relative, scope)
+        && scope
+            .max_file_bytes
+            .map(|limit| {
+                fs::metadata(path)
+                    .map(|metadata| metadata.len() <= limit)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true)
 }
 
 fn scope_matches_entry_exact(scope: &SaveScope, entry: &SaveFileEntry, relative: &str) -> bool {
@@ -511,7 +691,11 @@ fn trailing_path_components_match(a: &str, b: &str) -> bool {
     false
 }
 
-fn find_scope_for_entry<'a>(profile: &'a SaveProfile, entry: &SaveFileEntry, relative: &str) -> Result<&'a SaveScope, String> {
+fn find_scope_for_entry<'a>(
+    profile: &'a SaveProfile,
+    entry: &SaveFileEntry,
+    relative: &str,
+) -> Result<&'a SaveScope, String> {
     // 1. Tier 1: Exact physical path match (local machine, unmodified path)
     let exact_matches: Vec<&'a SaveScope> = profile
         .scopes
@@ -531,7 +715,10 @@ fn find_scope_for_entry<'a>(profile: &'a SaveProfile, entry: &SaveFileEntry, rel
 
     match loose_matches.as_slice() {
         [scope] => Ok(scope),
-        [] => Err(format!("保存版本中的文件不属于当前存档范围：{}", entry.relative_path)),
+        [] => Err(format!(
+            "保存版本中的文件不属于当前存档范围：{}",
+            entry.relative_path
+        )),
         multi => {
             // If multiple scopes match by root_type, disambiguate by trailing subpath
             if let Some(entry_root) = entry.root_path.as_deref() {
@@ -544,7 +731,10 @@ fn find_scope_for_entry<'a>(profile: &'a SaveProfile, entry: &SaveFileEntry, rel
                     return Ok(subpath_matches[0]);
                 }
             }
-            Err(format!("保存版本缺少存档范围路径，无法安全恢复：{}", entry.relative_path))
+            Err(format!(
+                "保存版本缺少存档范围路径，无法安全恢复：{}",
+                entry.relative_path
+            ))
         }
     }
 }
@@ -558,7 +748,10 @@ pub(crate) fn scope_root(game: &Game, scope: &SaveScope) -> PathBuf {
         } else if scope_path.starts_with(managed) {
             scope_path.to_path_buf()
         } else {
-            let game_folder = managed.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let game_folder = managed
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
             let scope_str = scope_path.to_string_lossy().replace('/', "\\");
             let marker = format!("\\{}\\", game_folder);
             if let Some(pos) = scope_str.rfind(&marker) {
@@ -578,26 +771,60 @@ pub(crate) fn scope_root(game: &Game, scope: &SaveScope) -> PathBuf {
     }
 }
 
+fn can_create_missing_restore_root(root_type: SaveRootType) -> bool {
+    matches!(
+        root_type,
+        SaveRootType::AppData
+            | SaveRootType::LocalAppData
+            | SaveRootType::LocalLow
+            | SaveRootType::Documents
+            | SaveRootType::SavedGames
+            | SaveRootType::UserProfile
+    )
+}
+
 fn object_path(app: &AppHandle, hash: &str) -> Result<PathBuf, String> {
-    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) { return Err(format!("存档对象哈希无效：{hash}")); }
-    Ok(SaveRepository::list_objects_root(app)?.join(&hash[..2]).join(hash))
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("存档对象哈希无效：{hash}"));
+    }
+    Ok(SaveRepository::list_objects_root(app)?
+        .join(&hash[..2])
+        .join(hash))
 }
 
 fn validate_relative(path: &str) -> Result<String, String> {
     let path = Path::new(path);
-    if path.is_absolute() || path.components().any(|component| matches!(component, std::path::Component::ParentDir)) { return Err(format!("存档相对路径无效：{}", path.display())); }
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!("存档相对路径无效：{}", path.display()));
+    }
     Ok(normalize_relative(path.to_string_lossy().as_ref()))
 }
 
 fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, String> {
     let relative = Path::new(relative);
-    if relative.is_absolute() || relative.components().any(|component| matches!(component, std::path::Component::ParentDir)) { return Err(format!("存档路径包含无效的上级目录：{relative:?}")); }
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!("存档路径包含无效的上级目录：{relative:?}"));
+    }
     let mut current = root.to_path_buf();
     for component in relative.components() {
         if let std::path::Component::Normal(part) = component {
             current.push(part);
-            if fs::symlink_metadata(&current).map(|metadata| metadata.file_type().is_symlink()).unwrap_or(false) {
-                return Err(format!("存档路径包含不安全的符号链接：{}", current.display()));
+            if fs::symlink_metadata(&current)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                return Err(format!(
+                    "存档路径包含不安全的符号链接：{}",
+                    current.display()
+                ));
             }
         }
     }
@@ -607,10 +834,14 @@ fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, String> {
 fn ensure_parent_is_directory(path: &Path) -> Result<(), String> {
     let mut current = path;
     while !current.exists() {
-        let Some(parent) = current.parent() else { break; };
+        let Some(parent) = current.parent() else {
+            break;
+        };
         current = parent;
     }
-    if current.is_file() { return Err(format!("存档目标目录被文件占用：{}", current.display())); }
+    if current.is_file() {
+        return Err(format!("存档目标目录被文件占用：{}", current.display()));
+    }
     Ok(())
 }
 
@@ -649,18 +880,30 @@ fn collect_profile_files(profile: &SaveProfile) -> Result<Vec<CollectedFile>, St
     Ok(files.into_values().collect())
 }
 
-fn add_candidate(files: &mut BTreeMap<String, CollectedFile>, path: &Path, root: &Path, scope: &SaveScope) -> Result<(), String> {
+fn add_candidate(
+    files: &mut BTreeMap<String, CollectedFile>,
+    path: &Path,
+    root: &Path,
+    scope: &SaveScope,
+) -> Result<(), String> {
     if !path.is_file() {
         return Ok(());
     }
-    let path = path.canonicalize().map_err(|err| format!("解析存档文件失败：{err}"))?;
-    let relative = path.strip_prefix(root).map_err(|_| format!("存档文件超出保护范围：{}", path.display()))?;
+    let path = path
+        .canonicalize()
+        .map_err(|err| format!("解析存档文件失败：{err}"))?;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| format!("存档文件超出保护范围：{}", path.display()))?;
     let relative_path = normalize_relative(relative.to_string_lossy().as_ref());
     if is_excluded(&relative_path, scope) {
         return Ok(());
     }
     let metadata = fs::metadata(&path).map_err(|err| format!("读取存档文件信息失败：{err}"))?;
-    if scope.max_file_bytes.is_some_and(|limit| metadata.len() > limit) {
+    if scope
+        .max_file_bytes
+        .is_some_and(|limit| metadata.len() > limit)
+    {
         return Ok(());
     }
     let size = metadata.len();
@@ -689,37 +932,71 @@ fn mtime_millis(metadata: &fs::Metadata) -> Option<u64> {
 
 fn is_excluded(relative_path: &str, scope: &SaveScope) -> bool {
     let normalized = normalize_relative(relative_path);
-    let file_name = Path::new(&normalized).file_name().and_then(|value| value.to_str()).unwrap_or_default();
-    scope.exclude_exact.iter().any(|value| normalized == normalize_relative(value))
-        || scope.exclude_directories.iter().any(|value| normalized.split('/').any(|part| part.eq_ignore_ascii_case(value.trim_matches('/'))))
-        || scope.exclude_patterns.iter().any(|pattern| wildcard_matches(file_name, pattern))
+    let file_name = Path::new(&normalized)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    scope
+        .exclude_exact
+        .iter()
+        .any(|value| normalized == normalize_relative(value))
+        || scope.exclude_directories.iter().any(|value| {
+            normalized
+                .split('/')
+                .any(|part| part.eq_ignore_ascii_case(value.trim_matches('/')))
+        })
+        || scope
+            .exclude_patterns
+            .iter()
+            .any(|pattern| wildcard_matches(file_name, pattern))
 }
 
 fn scope_includes_relative(relative_path: &str, scope: &SaveScope) -> bool {
     let relative_path = normalize_relative(relative_path);
-    scope.confirmed_files.iter().any(|value| relative_path == normalize_relative(value))
+    scope
+        .confirmed_files
+        .iter()
+        .any(|value| relative_path == normalize_relative(value))
         || scope.include_directories.iter().any(|value| {
             let directory = normalize_relative(value);
-            directory == "." || relative_path == directory || relative_path.starts_with(&(directory + "/"))
+            directory == "."
+                || relative_path == directory
+                || relative_path.starts_with(&(directory + "/"))
         })
 }
 
 fn entry_belongs_to_profile(entry: &SaveFileEntry, profile: &SaveProfile) -> bool {
     profile.scopes.iter().any(|scope| {
         scope.root_type == entry.root_type
-            && entry.root_path.as_deref().map(|path| normalize_path(path) == normalize_path(&scope.root_path)).unwrap_or(true)
+            && entry
+                .root_path
+                .as_deref()
+                .map(|path| normalize_path(path) == normalize_path(&scope.root_path))
+                .unwrap_or(true)
             && scope_includes_relative(&entry.relative_path, scope)
             && !is_excluded(&entry.relative_path, scope)
     })
 }
 
 fn entry_key(file: &SaveFileEntry) -> String {
-    normalize_path(&format!("{:?}:{}:{}", file.root_type, file.root_path.as_deref().unwrap_or_default(), file.relative_path))
+    normalize_path(&format!(
+        "{:?}:{}:{}",
+        file.root_type,
+        file.root_path.as_deref().unwrap_or_default(),
+        file.relative_path
+    ))
 }
 
 fn normalize_relative(path: &str) -> String {
-    let normalized = path.replace('\\', "/").trim_matches('/').to_ascii_lowercase();
-    if normalized == "." || normalized.is_empty() { ".".to_string() } else { normalized.trim_start_matches("./").to_string() }
+    let normalized = path
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_ascii_lowercase();
+    if normalized == "." || normalized.is_empty() {
+        ".".to_string()
+    } else {
+        normalized.trim_start_matches("./").to_string()
+    }
 }
 
 fn wildcard_matches(value: &str, pattern: &str) -> bool {
@@ -741,7 +1018,8 @@ fn read_stable_file(path: &Path) -> Result<(Vec<u8>, u64), String> {
     let before = fs::metadata(path).map_err(|err| format!("读取存档文件失败：{err}"))?;
     let mut file = fs::File::open(path).map_err(|err| format!("打开存档文件失败：{err}"))?;
     let mut bytes = Vec::with_capacity(before.len().min(8 * 1024 * 1024) as usize);
-    file.read_to_end(&mut bytes).map_err(|err| format!("读取存档文件失败：{err}"))?;
+    file.read_to_end(&mut bytes)
+        .map_err(|err| format!("读取存档文件失败：{err}"))?;
     let after = fs::metadata(path).map_err(|err| format!("确认存档文件状态失败：{err}"))?;
     if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
         return Err(format!("存档文件在读取期间发生变化：{}", path.display()));
@@ -750,7 +1028,10 @@ fn read_stable_file(path: &Path) -> Result<(Vec<u8>, u64), String> {
 }
 
 fn repository_root(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app.state::<AppState>().saves_root()?.join(".gamesaver-repository"))
+    Ok(app
+        .state::<AppState>()
+        .saves_root()?
+        .join(".gamesaver-repository"))
 }
 
 fn same_entries(left: &[SaveFileEntry], right: &[SaveFileEntry]) -> bool {
@@ -768,17 +1049,30 @@ fn same_entry_location(left: &SaveFileEntry, right: &SaveFileEntry) -> bool {
         && normalize_relative(&left.relative_path) == normalize_relative(&right.relative_path)
         && (left.root_path.is_none()
             || right.root_path.is_none()
-            || left.root_path.as_deref().is_some_and(|path| right.root_path.as_deref().is_some_and(|other| normalize_path(path) == normalize_path(other))))
+            || left.root_path.as_deref().is_some_and(|path| {
+                right
+                    .root_path
+                    .as_deref()
+                    .is_some_and(|other| normalize_path(path) == normalize_path(other))
+            }))
 }
 
 fn collected_matches_entry(file: &CollectedFile, entry: &SaveFileEntry) -> bool {
     file.root_type == entry.root_type
         && normalize_relative(&file.relative_path) == normalize_relative(&entry.relative_path)
         && (entry.root_path.is_none()
-            || entry.root_path.as_deref().is_some_and(|path| file.root_path.as_deref().is_some_and(|other| normalize_path(path) == normalize_path(other))))
+            || entry.root_path.as_deref().is_some_and(|path| {
+                file.root_path
+                    .as_deref()
+                    .is_some_and(|other| normalize_path(path) == normalize_path(other))
+            }))
 }
 
-fn collected_is_unmodified(file: &CollectedFile, old_entry: &SaveFileEntry, app: &AppHandle) -> bool {
+fn collected_is_unmodified(
+    file: &CollectedFile,
+    old_entry: &SaveFileEntry,
+    app: &AppHandle,
+) -> bool {
     if !collected_matches_entry(file, old_entry) {
         return false;
     }
@@ -798,8 +1092,14 @@ fn collected_is_unmodified(file: &CollectedFile, old_entry: &SaveFileEntry, app:
 }
 
 fn normalize_path(path: &str) -> String {
-    let trimmed = path.trim().trim_start_matches(r"\\?\UNC\").trim_start_matches(r"\\?\");
-    trimmed.replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase()
+    let trimmed = path
+        .trim()
+        .trim_start_matches(r"\\?\UNC\")
+        .trim_start_matches(r"\\?\");
+    trimmed
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -813,7 +1113,9 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     let mut digest = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
-        let read = file.read(&mut buffer).map_err(|err| format!("读取存档对象失败：{err}"))?;
+        let read = file
+            .read(&mut buffer)
+            .map_err(|err| format!("读取存档对象失败：{err}"))?;
         if read == 0 {
             break;
         }
@@ -823,13 +1125,21 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 }
 
 fn now_iso() -> String {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_secs().to_string()).unwrap_or_else(|_| "0".to_string())
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{entry_belongs_to_profile, find_scope_for_entry, is_excluded, same_entries, wildcard_matches};
-    use crate::domain::{SaveFileEntry, SaveProfile, SaveRootType, SaveScope, UnknownFilePolicy};
+    use super::{
+        build_restore_groups, entry_belongs_to_profile, find_scope_for_entry, is_excluded,
+        same_entries, wildcard_matches,
+    };
+    use crate::domain::{
+        Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope, SaveVersion, UnknownFilePolicy,
+    };
 
     #[test]
     fn wildcard_patterns_match_common_exclusions() {
@@ -859,10 +1169,51 @@ mod tests {
 
     #[test]
     fn entries_compare_by_path_hash_and_size() {
-        let entry = SaveFileEntry { root_type: SaveRootType::Custom, root_path: Some("C:/Game".to_string()), relative_path: "save.dat".to_string(), object_hash: Some("a".to_string()), size: 1, deleted: false, mtime_ms: None };
-        assert!(same_entries(std::slice::from_ref(&entry), &[SaveFileEntry { root_type: SaveRootType::Custom, root_path: Some("c:\\game".to_string()), relative_path: "SAVE.DAT".to_string(), object_hash: Some("a".to_string()), size: 1, deleted: false, mtime_ms: None }]));
-        assert!(!same_entries(std::slice::from_ref(&entry), &[SaveFileEntry { root_type: SaveRootType::Custom, root_path: Some("c:\\game".to_string()), relative_path: "SAVE.DAT".to_string(), object_hash: Some("b".to_string()), size: 1, deleted: false, mtime_ms: None }]));
-        assert!(!same_entries(std::slice::from_ref(&entry), &[SaveFileEntry { root_type: SaveRootType::Custom, root_path: Some("c:\\game".to_string()), relative_path: "SAVE.DAT".to_string(), object_hash: None, size: 0, deleted: true, mtime_ms: None }]));
+        let entry = SaveFileEntry {
+            root_type: SaveRootType::Custom,
+            root_path: Some("C:/Game".to_string()),
+            relative_path: "save.dat".to_string(),
+            object_hash: Some("a".to_string()),
+            size: 1,
+            deleted: false,
+            mtime_ms: None,
+        };
+        assert!(same_entries(
+            std::slice::from_ref(&entry),
+            &[SaveFileEntry {
+                root_type: SaveRootType::Custom,
+                root_path: Some("c:\\game".to_string()),
+                relative_path: "SAVE.DAT".to_string(),
+                object_hash: Some("a".to_string()),
+                size: 1,
+                deleted: false,
+                mtime_ms: None
+            }]
+        ));
+        assert!(!same_entries(
+            std::slice::from_ref(&entry),
+            &[SaveFileEntry {
+                root_type: SaveRootType::Custom,
+                root_path: Some("c:\\game".to_string()),
+                relative_path: "SAVE.DAT".to_string(),
+                object_hash: Some("b".to_string()),
+                size: 1,
+                deleted: false,
+                mtime_ms: None
+            }]
+        ));
+        assert!(!same_entries(
+            std::slice::from_ref(&entry),
+            &[SaveFileEntry {
+                root_type: SaveRootType::Custom,
+                root_path: Some("c:\\game".to_string()),
+                relative_path: "SAVE.DAT".to_string(),
+                object_hash: None,
+                size: 0,
+                deleted: true,
+                mtime_ms: None
+            }]
+        ));
     }
 
     #[test]
@@ -889,7 +1240,15 @@ mod tests {
             created_at: "0".to_string(),
             updated_at: "0".to_string(),
         };
-        let entry = SaveFileEntry { root_type: SaveRootType::Custom, root_path: Some("c:\\game".to_string()), relative_path: "SAVE.DAT".to_string(), object_hash: Some("a".to_string()), size: 1, deleted: false, mtime_ms: None };
+        let entry = SaveFileEntry {
+            root_type: SaveRootType::Custom,
+            root_path: Some("c:\\game".to_string()),
+            relative_path: "SAVE.DAT".to_string(),
+            object_hash: Some("a".to_string()),
+            size: 1,
+            deleted: false,
+            mtime_ms: None,
+        };
         assert!(entry_belongs_to_profile(&entry, &profile));
     }
 
@@ -897,7 +1256,10 @@ mod tests {
     fn restore_paths_reject_absolute_and_parent_segments() {
         assert!(super::validate_relative("C:/outside.dat").is_err());
         assert!(super::validate_relative("../outside.dat").is_err());
-        assert_eq!(super::validate_relative("slot\\save.dat").unwrap(), "slot/save.dat");
+        assert_eq!(
+            super::validate_relative("slot\\save.dat").unwrap(),
+            "slot/save.dat"
+        );
     }
 
     #[test]
@@ -934,9 +1296,64 @@ mod tests {
             deleted: false,
             mtime_ms: None,
         };
-        assert_eq!(find_scope_for_entry(&profile, &entry, "save.dat").unwrap().root_path, "C:/two");
-        let legacy_entry = SaveFileEntry { root_path: None, ..entry };
+        assert_eq!(
+            find_scope_for_entry(&profile, &entry, "save.dat")
+                .unwrap()
+                .root_path,
+            "C:/two"
+        );
+        let legacy_entry = SaveFileEntry {
+            root_path: None,
+            ..entry
+        };
         assert!(find_scope_for_entry(&profile, &legacy_entry, "save.dat").is_err());
+    }
+
+    #[test]
+    fn restore_allows_missing_standard_root_on_new_machine() {
+        let destination = std::env::temp_dir().join(format!(
+            "gamesaver-new-machine-save-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let game = Game::new_pending("Test Game", r"E:\GameSaverGames\games\test", "game.exe");
+        let profile = SaveProfile::new(
+            game.game_uid.clone(),
+            "hash".to_string(),
+            vec![SaveScope {
+                root_type: SaveRootType::LocalLow,
+                root_path: destination.to_string_lossy().to_string(),
+                confirmed_files: vec!["slot1.sav".to_string()],
+                include_directories: Vec::new(),
+                exclude_exact: Vec::new(),
+                exclude_patterns: Vec::new(),
+                exclude_directories: Vec::new(),
+                unknown_file_policy: UnknownFilePolicy::Protect,
+                max_file_bytes: None,
+            }],
+            100,
+            "0".to_string(),
+        );
+        let version = SaveVersion {
+            version_id: "remote-version".to_string(),
+            game_uid: game.game_uid.clone(),
+            created_at: "0".to_string(),
+            files: vec![SaveFileEntry {
+                root_type: SaveRootType::LocalLow,
+                root_path: Some(r"C:\Users\OldUser\AppData\LocalLow\Studio\Game".to_string()),
+                relative_path: "slot1.sav".to_string(),
+                object_hash: Some("a".repeat(64)),
+                size: 1,
+                deleted: false,
+                mtime_ms: None,
+            }],
+            total_bytes: 1,
+        };
+
+        assert!(!destination.exists());
+        let groups = build_restore_groups(&game, &profile, &version)
+            .expect("new machine root is restorable");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].root, destination);
     }
 
     #[test]
@@ -1003,17 +1420,26 @@ mod tests {
         // 1. scope.root_path is exactly managed_path
         let mut scope_exact = SaveScope::new_manual(r"D:\Games\Game1".to_string());
         scope_exact.root_type = SaveRootType::ManagedGame;
-        assert_eq!(super::scope_root(&game, &scope_exact), Path::new(r"D:\Games\Game1"));
+        assert_eq!(
+            super::scope_root(&game, &scope_exact),
+            Path::new(r"D:\Games\Game1")
+        );
 
         // 2. scope.root_path is a subdirectory inside managed_path
         let mut scope_sub = SaveScope::new_manual(r"D:\Games\Game1\SaveData".to_string());
         scope_sub.root_type = SaveRootType::ManagedGame;
-        assert_eq!(super::scope_root(&game, &scope_sub), Path::new(r"D:\Games\Game1\SaveData"));
+        assert_eq!(
+            super::scope_root(&game, &scope_sub),
+            Path::new(r"D:\Games\Game1\SaveData")
+        );
 
         // 3. scope.root_path is from an old path before library relocation
         let mut scope_relocated = SaveScope::new_manual(r"C:\OldGames\Game1\SaveData".to_string());
         scope_relocated.root_type = SaveRootType::ManagedGame;
-        assert_eq!(super::scope_root(&game, &scope_relocated), Path::new(r"D:\Games\Game1\SaveData"));
+        assert_eq!(
+            super::scope_root(&game, &scope_relocated),
+            Path::new(r"D:\Games\Game1\SaveData")
+        );
     }
 
     #[test]
@@ -1026,10 +1452,7 @@ mod tests {
             super::normalize_path(r"\\?\UNC\server\share\save"),
             r"server\share\save"
         );
-        assert_eq!(
-            super::normalize_path(r"C:/Games/Save/"),
-            r"c:\games\save"
-        );
+        assert_eq!(super::normalize_path(r"C:/Games/Save/"), r"c:\games\save");
     }
 
     #[test]
@@ -1037,7 +1460,9 @@ mod tests {
         let mut profile = SaveProfile::new(
             "g1".to_string(),
             "hash".to_string(),
-            vec![SaveScope::new_manual(r"C:\NonExistent_GS_Test_Dir_XYZ".to_string())],
+            vec![SaveScope::new_manual(
+                r"C:\NonExistent_GS_Test_Dir_XYZ".to_string(),
+            )],
             100,
             "2026-01-01".to_string(),
         );
@@ -1049,7 +1474,8 @@ mod tests {
 
     #[test]
     fn find_scope_for_entry_resolves_cross_user_path() {
-        let mut scope = SaveScope::new_manual(r"C:\Users\Bob\AppData\LocalLow\GameA\Saves".to_string());
+        let mut scope =
+            SaveScope::new_manual(r"C:\Users\Bob\AppData\LocalLow\GameA\Saves".to_string());
         scope.root_type = SaveRootType::LocalLow;
         scope.confirmed_files = vec!["save.dat".to_string()];
 
@@ -1073,7 +1499,10 @@ mod tests {
 
         let resolved = super::find_scope_for_entry(&profile, &entry, "save.dat");
         assert!(resolved.is_ok());
-        assert_eq!(resolved.unwrap().root_path, r"C:\Users\Bob\AppData\LocalLow\GameA\Saves");
+        assert_eq!(
+            resolved.unwrap().root_path,
+            r"C:\Users\Bob\AppData\LocalLow\GameA\Saves"
+        );
     }
 
     #[test]
@@ -1106,6 +1535,9 @@ mod tests {
 
         let resolved = super::find_scope_for_entry(&profile, &entry, "save.dat");
         assert!(resolved.is_ok());
-        assert_eq!(resolved.unwrap().root_path, r"C:\Users\Bob\Documents\StudioA\GameX");
+        assert_eq!(
+            resolved.unwrap().root_path,
+            r"C:\Users\Bob\Documents\StudioA\GameX"
+        );
     }
 }

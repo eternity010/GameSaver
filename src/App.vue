@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
-import { AlertTriangle, CloudDownload, CloudUpload, Gamepad2, Library, Plus, Settings, Search, ShieldCheck } from "@lucide/vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { AlertTriangle, ChevronLeft, ChevronRight, CloudDownload, CloudUpload, Gamepad2, Library, Plus, Settings, Search, ShieldCheck } from "@lucide/vue";
 import { deleteRemoteBodyPackage, getElevationStatus, getGameCoverUrl, getTask, installCloudGame, launchGame, listCloudGames, listGames, listTasks, restartAsAdmin } from "./api";
 import type { AppTask, ElevationStatus } from "./api";
 import type { CloudGameSummary, CloudGameVersion } from "./api";
@@ -35,6 +35,8 @@ const storeLoaded = ref(false);
 const storePage = ref(1);
 const storeHasMore = ref(false);
 const STORE_PAGE_SIZE = 9;
+const LIBRARY_PAGE_SIZE = 9;
+const libraryPage = ref(1);
 const elevationStatus = ref<ElevationStatus | null>(null);
 const elevationLoading = ref(false);
 const elevationError = ref("");
@@ -55,7 +57,18 @@ const filteredGames = computed(() => {
   return result;
 });
 
+const libraryPageCount = computed(() => Math.max(1, Math.ceil(filteredGames.value.length / LIBRARY_PAGE_SIZE)));
+const pagedGames = computed(() => {
+  const page = Math.min(libraryPage.value, libraryPageCount.value);
+  const start = (page - 1) * LIBRARY_PAGE_SIZE;
+  return filteredGames.value.slice(start, start + LIBRARY_PAGE_SIZE);
+});
+
 const pageTitle = computed(() => activeView.value === "all" ? "游戏库" : activeView.value === "recent" ? "最近游玩" : activeView.value === "favorites" ? "收藏" : "需要处理");
+
+watch([search, activeView], () => {
+  libraryPage.value = 1;
+});
 
 function loadGameCovers(list: Game[]) {
   const nextUrls: Record<string, string> = {};
@@ -74,6 +87,7 @@ async function loadGames() {
   try {
     const loaded = await listGames();
     games.value = loaded;
+    libraryPage.value = Math.min(libraryPage.value, Math.max(1, Math.ceil(loaded.length / LIBRARY_PAGE_SIZE)));
     if (selectedGame.value) {
       selectedGame.value = loaded.find((game) => game.gameUid === selectedGame.value?.gameUid) || selectedGame.value;
     }
@@ -113,6 +127,11 @@ function refreshStore() {
 function changeStorePage(page: number) {
   if (page < 1 || (page > storePage.value && !storeHasMore.value)) return;
   void loadStore(true, page);
+}
+
+function changeLibraryPage(page: number) {
+  if (page < 1 || page > libraryPageCount.value) return;
+  libraryPage.value = page;
 }
 
 async function loadElevationStatus() {
@@ -278,6 +297,8 @@ async function watchCloudInstall(taskId: string, cloudGame: CloudGameSummary) {
 
 async function finishAddGame() {
   activePage.value = "library";
+  activeView.value = "all";
+  search.value = "";
   await loadGames();
 }
 </script>
@@ -342,6 +363,7 @@ async function finishAddGame() {
       <template v-else-if="activePage === 'library'">
       <div class="library-toolbar" role="tablist" aria-label="游戏库视图">
         <button v-for="view in ([['all', '全部游戏'], ['recent', '最近游玩'], ['favorites', '收藏'], ['attention', '需要处理']] as const)" :key="view[0]" class="view-tab" :class="{ active: activeView === view[0] }" type="button" @click="activeView = view[0]">{{ view[1] }}</button>
+        <span v-if="filteredGames.length" class="library-count">{{ filteredGames.length }} 个游戏</span>
         <button class="refresh-button" type="button" @click="loadGames">刷新</button>
       </div>
 
@@ -349,7 +371,7 @@ async function finishAddGame() {
       <div v-else-if="error" class="state-panel error-state"><strong>游戏库加载失败</strong><p>{{ error }}</p><button type="button" @click="loadGames">重试</button></div>
       <div v-else-if="!filteredGames.length" class="state-panel empty-state"><div class="empty-icon"><Gamepad2 :size="28" /></div><strong>{{ games.length ? "没有匹配的游戏" : "还没有加入游戏" }}</strong><p>{{ games.length ? "调整搜索或筛选条件。" : "添加游戏本体后，它会出现在这里。" }}</p><button class="primary-button" type="button" @click="openAddGame"><Plus :size="17" /> 添加游戏</button></div>
       <div v-else class="game-grid">
-        <article v-for="game in filteredGames" :key="game.gameUid" class="game-card" tabindex="0" @click="openGame(game)" @keyup.enter="openGame(game)">
+        <article v-for="game in pagedGames" :key="game.gameUid" class="game-card" tabindex="0" @click="openGame(game)" @keyup.enter="openGame(game)">
           <div class="game-card-cover">
             <img v-if="coverUrls[game.gameUid]" :src="coverUrls[game.gameUid]" :alt="`${game.displayName} 封面`" loading="lazy" @error="delete coverUrls[game.gameUid]" />
             <div v-else class="cover-placeholder"><Gamepad2 :size="34" /></div>
@@ -357,6 +379,11 @@ async function finishAddGame() {
           <div class="game-card-body"><div><h2>{{ game.displayName }}</h2><span class="status-label">{{ gameStatusLabel(game) }}</span></div><button class="launch-button" type="button" :disabled="game.lifecycle !== 'active'" @click.stop="quickLaunch(game)">启动</button></div>
         </article>
       </div>
+      <nav v-if="filteredGames.length" class="library-pagination" aria-label="游戏库分页">
+        <button class="icon-button" type="button" :disabled="libraryPage <= 1" title="上一页" aria-label="上一页" @click="changeLibraryPage(libraryPage - 1)"><ChevronLeft :size="18" /></button>
+        <span>第 {{ libraryPage }} / {{ libraryPageCount }} 页</span>
+        <button class="icon-button" type="button" :disabled="libraryPage >= libraryPageCount" title="下一页" aria-label="下一页" @click="changeLibraryPage(libraryPage + 1)"><ChevronRight :size="18" /></button>
+      </nav>
       </template>
     </section>
   </main>

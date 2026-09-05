@@ -9,7 +9,10 @@ mod services;
 use app_state::AppState;
 use repositories::{GameRepository, LibraryConfigRepository, TaskRepository};
 use services::{learning::cleanup_stale_captures, BodyPackageService, GameBodyUpdateService};
-use std::{collections::{HashMap, HashSet}, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -33,22 +36,32 @@ pub fn run() {
                 eprintln!("GameSaver 本体包临时文件清理失败：{error}");
             }
             let store = GameRepository::load(app.handle())?;
-            let removed_restore_archives = match GameBodyUpdateService::cleanup_removed_restore_archives(&games_root) {
-                Ok(paths) => paths,
-                Err(error) => {
-                    logging::error(format!("清理已取消功能的本体恢复副本失败：{error}"));
-                    Vec::new()
-                }
-            };
+            let removed_restore_archives =
+                match GameBodyUpdateService::cleanup_removed_restore_archives(&games_root) {
+                    Ok(paths) => paths,
+                    Err(error) => {
+                        logging::error(format!("清理已取消功能的本体恢复副本失败：{error}"));
+                        Vec::new()
+                    }
+                };
             let mut store = store;
             if !removed_restore_archives.is_empty() {
                 let removed = removed_restore_archives
                     .iter()
-                    .map(|path| path.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase())
+                    .map(|path| {
+                        path.to_string_lossy()
+                            .replace('/', "\\")
+                            .trim_end_matches('\\')
+                            .to_ascii_lowercase()
+                    })
                     .collect::<HashSet<_>>();
                 let mut cleaned = store.clone();
                 for version in &mut cleaned.body_versions {
-                    let archive = version.archive_path.replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase();
+                    let archive = version
+                        .archive_path
+                        .replace('/', "\\")
+                        .trim_end_matches('\\')
+                        .to_ascii_lowercase();
                     if removed.contains(&archive) {
                         version.archive_path.clear();
                     }
@@ -106,9 +119,10 @@ pub fn run() {
                 logging::error(format!("游戏更新恢复失败：{error}"));
                 eprintln!("GameSaver 游戏更新恢复失败：{error}");
             }
-            if let Err(error) =
-                GameBodyUpdateService::cleanup_archived_body_versions(&games_root, &mut store.body_versions)
-            {
+            if let Err(error) = GameBodyUpdateService::cleanup_archived_body_versions(
+                &games_root,
+                &mut store.body_versions,
+            ) {
                 logging::error(format!("清理历史游戏本体失败：{error}"));
                 eprintln!("GameSaver 清理历史游戏本体失败：{error}");
             }
@@ -116,7 +130,12 @@ pub fn run() {
                 logging::error(format!("清理历史游戏本体记录失败：{error}"));
                 eprintln!("GameSaver 清理历史游戏本体记录失败：{error}");
             }
-            app.manage(AppState::new(store, library_root, tasks, PathBuf::from(tasks_path)));
+            app.manage(AppState::new(
+                store,
+                library_root,
+                tasks,
+                PathBuf::from(tasks_path),
+            ));
             Ok(())
         })
         .register_uri_scheme_protocol("gamesaver-cover", cover_protocol::handle_cover_request)
@@ -134,6 +153,7 @@ pub fn run() {
             commands::task_commands::cancel_task,
             commands::task_commands::delete_tasks,
             commands::save_commands::start_save_learning_task,
+            commands::save_commands::start_save_candidate_verification_task,
             commands::save_commands::start_finish_save_learning_task,
             commands::save_commands::cancel_save_learning,
             commands::save_commands::confirm_save_profile,
@@ -153,39 +173,39 @@ pub fn run() {
             commands::game_body_commands::list_game_body_versions,
             commands::game_body_commands::update_game_body,
             commands::game_body_commands::package_game_body,
-            commands::game_body_commands::delete_game_body_package
-            ,commands::game_body_commands::uninstall_game_body
-            ,commands::baidu_commands::get_baidu_status
-            ,commands::baidu_commands::list_cloud_games
-            ,commands::baidu_commands::get_cloud_game_cover
-            ,commands::baidu_commands::get_cloud_game_cover_path
-            ,commands::baidu_commands::get_cloud_game_cover_paths
-            ,commands::baidu_commands::install_cloud_game
-            ,commands::baidu_commands::list_remote_body_packages
-            ,commands::baidu_commands::repair_cloud_body_manifest
-            ,commands::baidu_commands::upload_game_body_package
-            ,commands::baidu_commands::download_game_body_package
-            ,commands::baidu_config_commands::get_baidu_config
-            ,commands::baidu_config_commands::save_baidu_config
-            ,commands::baidu_config_commands::build_baidu_authorize_url
-            ,commands::baidu_config_commands::exchange_baidu_code
-            ,commands::baidu_config_commands::set_baidu_auto_upload
-            ,commands::baidu_commands::get_baidu_quota
-            ,commands::baidu_commands::delete_remote_body_package
-            ,commands::diagnostics_commands::report_frontend_error
-            ,commands::admin_commands::get_elevation_status
-            ,commands::admin_commands::restart_as_admin
-            ,commands::library_commands::get_library_settings
-            ,commands::library_commands::start_set_library_root_task
-            ,commands::cloud_account_commands::get_cloud_account_status
-            ,commands::cloud_account_commands::start_upload_cloud_account_task
-            ,commands::cloud_account_commands::start_download_cloud_account_task
-            ,commands::baidu_config_commands::update_baidu_save_sync_settings
-            ,commands::cloud_save_commands::get_cloud_save_status
-            ,commands::cloud_save_commands::list_cloud_save_versions
-            ,commands::cloud_save_commands::start_upload_save_version_task
-            ,commands::cloud_save_commands::start_restore_cloud_save_task
-            ,commands::cloud_save_commands::delete_cloud_save_version
+            commands::game_body_commands::delete_game_body_package,
+            commands::game_body_commands::uninstall_game_body,
+            commands::baidu_commands::get_baidu_status,
+            commands::baidu_commands::list_cloud_games,
+            commands::baidu_commands::get_cloud_game_cover,
+            commands::baidu_commands::get_cloud_game_cover_path,
+            commands::baidu_commands::get_cloud_game_cover_paths,
+            commands::baidu_commands::install_cloud_game,
+            commands::baidu_commands::list_remote_body_packages,
+            commands::baidu_commands::repair_cloud_body_manifest,
+            commands::baidu_commands::upload_game_body_package,
+            commands::baidu_commands::download_game_body_package,
+            commands::baidu_config_commands::get_baidu_config,
+            commands::baidu_config_commands::save_baidu_config,
+            commands::baidu_config_commands::build_baidu_authorize_url,
+            commands::baidu_config_commands::exchange_baidu_code,
+            commands::baidu_config_commands::set_baidu_auto_upload,
+            commands::baidu_commands::get_baidu_quota,
+            commands::baidu_commands::delete_remote_body_package,
+            commands::diagnostics_commands::report_frontend_error,
+            commands::admin_commands::get_elevation_status,
+            commands::admin_commands::restart_as_admin,
+            commands::library_commands::get_library_settings,
+            commands::library_commands::start_set_library_root_task,
+            commands::cloud_account_commands::get_cloud_account_status,
+            commands::cloud_account_commands::start_upload_cloud_account_task,
+            commands::cloud_account_commands::start_download_cloud_account_task,
+            commands::baidu_config_commands::update_baidu_save_sync_settings,
+            commands::cloud_save_commands::get_cloud_save_status,
+            commands::cloud_save_commands::list_cloud_save_versions,
+            commands::cloud_save_commands::start_upload_save_version_task,
+            commands::cloud_save_commands::start_restore_cloud_save_task,
+            commands::cloud_save_commands::delete_cloud_save_version
         ])
         .run(tauri::generate_context!());
     if let Err(error) = result {

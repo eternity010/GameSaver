@@ -1,4 +1,7 @@
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use walkdir::WalkDir;
 
 pub const LARGE_SOURCE_WARNING_PREFIX: &str = "LARGE_SOURCE_REQUIRED:";
@@ -19,7 +22,8 @@ impl AddGameService {
         let staging_path = games_root.join(format!(".{game_uid}.copying"));
         for path in [managed_path, staging_path] {
             if path.exists() {
-                fs::remove_dir_all(&path).map_err(|err| format!("清理失败的游戏本体失败：{}：{err}", path.display()))?;
+                fs::remove_dir_all(&path)
+                    .map_err(|err| format!("清理失败的游戏本体失败：{}：{err}", path.display()))?;
             }
         }
         Ok(())
@@ -32,8 +36,12 @@ impl AddGameService {
         if !executable.is_file() {
             return Err("启动程序不存在或不可访问".to_string());
         }
-        let source = source.canonicalize().map_err(|err| format!("解析游戏目录失败：{err}"))?;
-        let executable = executable.canonicalize().map_err(|err| format!("解析启动程序失败：{err}"))?;
+        let source = source
+            .canonicalize()
+            .map_err(|err| format!("解析游戏目录失败：{err}"))?;
+        let executable = executable
+            .canonicalize()
+            .map_err(|err| format!("解析启动程序失败：{err}"))?;
         let relative = executable
             .strip_prefix(&source)
             .map_err(|_| "启动程序必须位于游戏本体目录内".to_string())?;
@@ -52,7 +60,9 @@ impl AddGameService {
         on_progress: impl Fn(u8, &str),
         is_cancelled: impl Fn() -> bool,
     ) -> Result<CopyResult, String> {
-        let source = source.canonicalize().map_err(|err| format!("解析游戏目录失败：{err}"))?;
+        let source = source
+            .canonicalize()
+            .map_err(|err| format!("解析游戏目录失败：{err}"))?;
         fs::create_dir_all(games_root).map_err(|err| format!("创建游戏库目录失败：{err}"))?;
         let managed_path = games_root.join(game_uid);
         let staging_path = games_root.join(format!(".{game_uid}.copying"));
@@ -60,7 +70,8 @@ impl AddGameService {
             return Err("受管游戏目录已存在".to_string());
         }
         if staging_path.exists() {
-            fs::remove_dir_all(&staging_path).map_err(|err| format!("清理上次未完成复制失败：{err}"))?;
+            fs::remove_dir_all(&staging_path)
+                .map_err(|err| format!("清理上次未完成复制失败：{err}"))?;
         }
 
         let mut files = Vec::new();
@@ -68,10 +79,15 @@ impl AddGameService {
         for entry in WalkDir::new(&source).follow_links(false) {
             let entry = entry.map_err(|err| format!("扫描游戏目录失败：{err}"))?;
             if entry.file_type().is_symlink() {
-                return Err(format!("游戏目录包含不支持的符号链接：{}", entry.path().display()));
+                return Err(format!(
+                    "游戏目录包含不支持的符号链接：{}",
+                    entry.path().display()
+                ));
             }
             if entry.file_type().is_file() {
-                let metadata = entry.metadata().map_err(|err| format!("读取游戏文件信息失败：{err}"))?;
+                let metadata = entry
+                    .metadata()
+                    .map_err(|err| format!("读取游戏文件信息失败：{err}"))?;
                 total_bytes = total_bytes.saturating_add(metadata.len());
                 files.push((entry.path().to_path_buf(), metadata.len()));
             }
@@ -94,19 +110,27 @@ impl AddGameService {
                 if is_cancelled() {
                     return Err("任务已取消".to_string());
                 }
-                let relative = source_file.strip_prefix(&source).map_err(|err| format!("计算游戏文件相对路径失败：{err}"))?;
+                let relative = source_file
+                    .strip_prefix(&source)
+                    .map_err(|err| format!("计算游戏文件相对路径失败：{err}"))?;
                 let target = staging_path.join(relative);
                 if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent).map_err(|err| format!("创建游戏文件目录失败：{err}"))?;
+                    fs::create_dir_all(parent)
+                        .map_err(|err| format!("创建游戏文件目录失败：{err}"))?;
                 }
-                fs::copy(source_file, &target).map_err(|err| format!("复制游戏文件失败（{}）：{err}", relative.display()))?;
+                fs::copy(source_file, &target)
+                    .map_err(|err| format!("复制游戏文件失败（{}）：{err}", relative.display()))?;
                 let progress = 5 + (((index + 1) * 90) / files.len()) as u8;
-                on_progress(progress.min(95), &format!("正在复制游戏文件 {}/{}", index + 1, files.len()));
+                on_progress(
+                    progress.min(95),
+                    &format!("正在复制游戏文件 {}/{}", index + 1, files.len()),
+                );
             }
             if is_cancelled() {
                 return Err("任务已取消".to_string());
             }
-            fs::rename(&staging_path, &managed_path).map_err(|err| format!("提交受管游戏目录失败：{err}"))?;
+            fs::rename(&staging_path, &managed_path)
+                .map_err(|err| format!("提交受管游戏目录失败：{err}"))?;
             on_progress(100, &format!("已复制 {} 个文件", files.len()));
             Ok(CopyResult {
                 managed_path,
@@ -133,15 +157,30 @@ fn ensure_available_space(target_root: &Path, required_bytes: u64) -> Result<(),
                 break;
             }
         }
-        let wide = probe.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+        let wide = probe
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
         let mut available = 0u64;
-        let result = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, std::ptr::null_mut(), std::ptr::null_mut()) };
+        let result = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut available,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
         if result == 0 {
             return Err("无法确认 GameSaver 游戏库所在磁盘的可用空间".to_string());
         }
         let required_with_headroom = required_bytes.saturating_add(128 * 1024 * 1024);
         if available < required_with_headroom {
-            return Err(format!("游戏库磁盘空间不足，需要至少 {} MB，可用 {} MB", required_with_headroom / 1024 / 1024, available / 1024 / 1024));
+            return Err(format!(
+                "游戏库磁盘空间不足，需要至少 {} MB，可用 {} MB",
+                required_with_headroom / 1024 / 1024,
+                available / 1024 / 1024
+            ));
         }
     }
     #[cfg(not(target_os = "windows"))]
@@ -164,10 +203,23 @@ mod tests {
         fs::write(source.join("bin/game.exe"), b"exe").expect("write exe");
         fs::write(source.join("save.dat"), b"save").expect("write save");
 
-        let relative = AddGameService::validate_source(&source, &source.join("bin/game.exe")).expect("validate source");
-        let result = AddGameService::copy_to_managed(&source, &games_root, "game-1", relative, false, |_, _| {}, || false).expect("copy game");
+        let relative = AddGameService::validate_source(&source, &source.join("bin/game.exe"))
+            .expect("validate source");
+        let result = AddGameService::copy_to_managed(
+            &source,
+            &games_root,
+            "game-1",
+            relative,
+            false,
+            |_, _| {},
+            || false,
+        )
+        .expect("copy game");
         assert_eq!(result.executable_relative_path, "bin/game.exe");
-        assert_eq!(fs::read(result.managed_path.join("save.dat")).expect("read copied file"), b"save");
+        assert_eq!(
+            fs::read(result.managed_path.join("save.dat")).expect("read copied file"),
+            b"save"
+        );
         fs::remove_dir_all(root).expect("cleanup test directory");
     }
 
@@ -178,7 +230,15 @@ mod tests {
         let games_root = root.join("games");
         fs::create_dir_all(&source).expect("create source");
         fs::write(source.join("game.exe"), b"exe").expect("write exe");
-        let result = AddGameService::copy_to_managed(&source, &games_root, "game-2", "game.exe".to_string(), false, |_, _| {}, || true);
+        let result = AddGameService::copy_to_managed(
+            &source,
+            &games_root,
+            "game-2",
+            "game.exe".to_string(),
+            false,
+            |_, _| {},
+            || true,
+        );
         assert!(result.is_err());
         assert!(!games_root.join("game-2").exists());
         assert!(!games_root.join(".game-2.copying").exists());
@@ -190,9 +250,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("gamesaver-next-cleanup-{}", Uuid::new_v4()));
         let games_root = root.join("games");
         fs::create_dir_all(games_root.join("game-3/bin")).expect("create managed directory");
-        fs::create_dir_all(games_root.join(".game-3.copying/bin")).expect("create staging directory");
+        fs::create_dir_all(games_root.join(".game-3.copying/bin"))
+            .expect("create staging directory");
         fs::write(games_root.join("game-3/bin/game.exe"), b"exe").expect("write managed file");
-        fs::write(games_root.join(".game-3.copying/bin/game.exe"), b"exe").expect("write staging file");
+        fs::write(games_root.join(".game-3.copying/bin/game.exe"), b"exe")
+            .expect("write staging file");
 
         AddGameService::cleanup_copy_artifacts(&games_root, "game-3").expect("cleanup artifacts");
 

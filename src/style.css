@@ -217,6 +217,7 @@ h1 { margin-bottom: 0; font-size: 30px; letter-spacing: 0; }
 .view-tab, .refresh-button { padding: 10px 14px; border: 0; color: var(--text-secondary); background: transparent; }
 .view-tab:hover, .view-tab.active { color: var(--text-primary); }
 .view-tab.active { border-bottom: 2px solid var(--brand); }
+.library-count { margin-left: 8px; color: var(--text-secondary); font-size: 12px; white-space: nowrap; }
 .refresh-button { margin-left: auto; color: #8792a2; }
 .refresh-button:hover { color: var(--text-primary); }
 .game-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 18px; max-width: 1320px; margin: 0 auto; }
@@ -233,6 +234,8 @@ h1 { margin-bottom: 0; font-size: 30px; letter-spacing: 0; }
 .launch-button { min-width: 56px; padding: 8px 11px; color: #152033; background: var(--brand); }
 .launch-button:disabled { cursor: not-allowed; opacity: .4; }
 .primary-button { padding: 11px 16px; color: #152033; background: var(--brand); }
+.library-pagination { display: flex; align-items: center; justify-content: center; gap: 16px; max-width: 1320px; margin: 28px auto 0; color: var(--text-secondary); font-size: 12px; }
+.library-pagination .icon-button { display: inline-grid; place-items: center; width: 34px; height: 34px; }
 .state-panel { display: grid; place-items: center; min-height: 360px; gap: 10px; color: var(--text-secondary); text-align: center; }
 .state-panel strong { color: var(--text-primary); font-size: 16px; }
 .state-panel p { max-width: 420px; margin-bottom: 5px; overflow-wrap: anywhere; }
@@ -539,4 +542,3 @@ h1 { margin-bottom: 0; font-size: 30px; letter-spacing: 0; }
 .cloud-save-meta span { color: #94a3b8; font-size: 11px; }
 .cloud-save-btns { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .cloud-save-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 36px 0; color: #64748b; font-size: 13px; }
-

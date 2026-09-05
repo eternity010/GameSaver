@@ -1,5 +1,5 @@
-use reqwest::blocking::{Client, multipart};
 use reqwest::blocking::Response;
+use reqwest::blocking::{multipart, Client};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -87,7 +87,9 @@ struct LocateResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct UploadServer { server: Option<String> }
+struct UploadServer {
+    server: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct FileListResponse {
@@ -139,7 +141,9 @@ struct MetaResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct MetaItem { dlink: Option<String> }
+struct MetaItem {
+    dlink: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct OAuthTokenResponse {
@@ -174,14 +178,22 @@ impl BaiduNetdiskClient {
         let has_credentials = app_key.is_some_and(|value| !value.trim().is_empty())
             && secret_key.is_some_and(|value| !value.trim().is_empty());
         if !has_credentials {
-            if client.token.expires_at.is_some_and(|expires_at| expires_at <= now_millis()) {
-                return Err("百度网盘授权已过期，请先配置 AppKey 和 SecretKey 后重新授权".to_string());
+            if client
+                .token
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= now_millis())
+            {
+                return Err(
+                    "百度网盘授权已过期，请先配置 AppKey 和 SecretKey 后重新授权".to_string(),
+                );
             }
             return Ok(client);
         }
 
         let lock = TOKEN_REFRESH_LOCK.get_or_init(|| Mutex::new(()));
-        let _guard = lock.lock().map_err(|_| "百度网盘 Token 刷新锁不可用".to_string())?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| "百度网盘 Token 刷新锁不可用".to_string())?;
         let (latest_path, latest_token) = read_token(app_data_dir)?;
         if !token_needs_refresh(latest_token.expires_at) {
             return Self::new(latest_token);
@@ -197,11 +209,18 @@ impl BaiduNetdiskClient {
     }
 
     pub fn connection_status(app_data_dir: &Path) -> BaiduConnectionStatus {
-        let path = token_paths(app_data_dir).into_iter().find(|path| path.is_file());
-        let token = path.as_ref().and_then(|path| fs::read(path).ok()).and_then(|raw| serde_json::from_slice::<BaiduToken>(&raw).ok());
+        let path = token_paths(app_data_dir)
+            .into_iter()
+            .find(|path| path.is_file());
+        let token = path
+            .as_ref()
+            .and_then(|path| fs::read(path).ok())
+            .and_then(|raw| serde_json::from_slice::<BaiduToken>(&raw).ok());
         let expires_at = token.as_ref().and_then(|token| token.expires_at);
         BaiduConnectionStatus {
-            authorized: token.as_ref().is_some_and(|token| !token.access_token.trim().is_empty()),
+            authorized: token
+                .as_ref()
+                .is_some_and(|token| !token.access_token.trim().is_empty()),
             token_path: path.map(|path| path.to_string_lossy().to_string()),
             expires_at,
             expired: expires_at.is_some_and(|value| value <= now_millis()),
@@ -229,7 +248,9 @@ impl BaiduNetdiskClient {
 
     pub fn save_token(app_data_dir: &Path, token: BaiduToken) -> Result<(), String> {
         let lock = TOKEN_REFRESH_LOCK.get_or_init(|| Mutex::new(()));
-        let _guard = lock.lock().map_err(|_| "百度网盘 Token 刷新锁不可用".to_string())?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| "百度网盘 Token 刷新锁不可用".to_string())?;
         save_token_at(&app_data_dir.join(TOKEN_FILE_NAME), token)
     }
 
@@ -253,9 +274,14 @@ impl BaiduNetdiskClient {
         app_key: &str,
         secret_key: &str,
     ) -> Result<(), String> {
-        let refresh_token = self.token.refresh_token.as_deref().filter(|value| !value.trim().is_empty())
+        let refresh_token = self
+            .token
+            .refresh_token
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| "百度网盘授权即将过期，但没有 refresh token，请重新授权".to_string())?;
-        let response = self.client
+        let response = self
+            .client
             .get(OAUTH_TOKEN_URL)
             .query(&[
                 ("grant_type", "refresh_token"),
@@ -266,24 +292,39 @@ impl BaiduNetdiskClient {
             .send()
             .map_err(|error| format!("请求百度 Token 刷新失败：{error}"))?;
         let status = response.status();
-        let body = response.text().map_err(|error| format!("读取百度 Token 刷新响应失败：{error}"))?;
+        let body = response
+            .text()
+            .map_err(|error| format!("读取百度 Token 刷新响应失败：{error}"))?;
         let value = serde_json::from_str::<serde_json::Value>(&body)
             .map_err(|error| format!("百度 Token 刷新返回非 JSON：HTTP {status}，{error}"))?;
         let parsed = serde_json::from_value::<OAuthTokenResponse>(value.clone())
             .map_err(|error| format!("百度 Token 刷新响应格式无效：{error}"))?;
         if let Some(error_code) = parsed.error.as_deref() {
-            let description = parsed.error_description.as_deref().unwrap_or("未知授权错误");
-            return Err(format!("百度 Token 自动刷新失败：{description} ({error_code})"));
+            let description = parsed
+                .error_description
+                .as_deref()
+                .unwrap_or("未知授权错误");
+            return Err(format!(
+                "百度 Token 自动刷新失败：{description} ({error_code})"
+            ));
         }
         if !status.is_success() {
             return Err(format!("百度 Token 自动刷新失败：HTTP {status}"));
         }
-        let access_token = parsed.access_token.filter(|value| !value.trim().is_empty())
+        let access_token = parsed
+            .access_token
+            .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| "百度 Token 刷新响应缺少 access_token".to_string())?;
         let next_token = BaiduToken {
             access_token,
-            expires_at: parsed.expires_in.map(|seconds| now_millis().saturating_add(seconds.saturating_mul(1000))).or(self.token.expires_at),
-            refresh_token: parsed.refresh_token.filter(|value| !value.trim().is_empty()).or_else(|| self.token.refresh_token.clone()),
+            expires_at: parsed
+                .expires_in
+                .map(|seconds| now_millis().saturating_add(seconds.saturating_mul(1000)))
+                .or(self.token.expires_at),
+            refresh_token: parsed
+                .refresh_token
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| self.token.refresh_token.clone()),
         };
         save_token_at(token_path, next_token.clone())?;
         self.token = next_token;
@@ -314,8 +355,8 @@ impl BaiduNetdiskClient {
         let url = format!("{API_BASE}/rest/2.0/xpan/file");
         let token = self.token.access_token.clone();
         let limit = limit.clamp(1, 1000);
-        let response = self
-            .send_with_retry(|client| {
+        let response = self.send_with_retry(
+            |client| {
                 client
                     .get(&url)
                     .query(&[
@@ -329,7 +370,9 @@ impl BaiduNetdiskClient {
                         ("access_token", token.as_str()),
                     ])
                     .send()
-            }, "请求百度网盘文件列表")?;
+            },
+            "请求百度网盘文件列表",
+        )?;
         let body: FileListResponse = parse_json(response, "读取百度网盘文件列表")?;
         Ok(RemoteFilePage {
             files: body
@@ -351,41 +394,80 @@ impl BaiduNetdiskClient {
 
     pub fn quota(&self) -> Result<BaiduQuota, String> {
         let token = self.token.access_token.clone();
-        let response = self.send_with_retry(|client| client.get(format!("{API_BASE}/api/quota"))
-            .query(&[("access_token", token.as_str()), ("checkfree", "1"), ("checkexpire", "1")])
-            .send(), "查询百度网盘空间")?;
+        let response = self.send_with_retry(
+            |client| {
+                client
+                    .get(format!("{API_BASE}/api/quota"))
+                    .query(&[
+                        ("access_token", token.as_str()),
+                        ("checkfree", "1"),
+                        ("checkexpire", "1"),
+                    ])
+                    .send()
+            },
+            "查询百度网盘空间",
+        )?;
         let body: QuotaResponse = parse_json(response, "读取百度网盘空间")?;
-        Ok(BaiduQuota { total: body.total, used: body.used, free: body.free, expires_soon: body.expire })
+        Ok(BaiduQuota {
+            total: body.total,
+            used: body.used,
+            free: body.free,
+            expires_soon: body.expire,
+        })
     }
 
     pub fn delete_file(&self, remote_path: &str) -> Result<(), String> {
-        let filelist = serde_json::to_string(&[remote_path]).map_err(|error| format!("生成百度删除请求失败：{error}"))?;
+        let filelist = serde_json::to_string(&[remote_path])
+            .map_err(|error| format!("生成百度删除请求失败：{error}"))?;
         let token = self.token.access_token.clone();
-        let response = self.send_with_retry(|client| client.post(format!("{API_BASE}/rest/2.0/xpan/file"))
-            .query(&[("method", "filemanager"), ("opera", "delete"), ("access_token", token.as_str())])
-            .form(&[("async", "0"), ("filelist", filelist.as_str())])
-            .send(), "删除百度网盘本体包")?;
+        let response = self.send_with_retry(
+            |client| {
+                client
+                    .post(format!("{API_BASE}/rest/2.0/xpan/file"))
+                    .query(&[
+                        ("method", "filemanager"),
+                        ("opera", "delete"),
+                        ("access_token", token.as_str()),
+                    ])
+                    .form(&[("async", "0"), ("filelist", filelist.as_str())])
+                    .send()
+            },
+            "删除百度网盘本体包",
+        )?;
         let _: serde_json::Value = parse_json(response, "删除百度网盘本体包")?;
         Ok(())
     }
 
     pub fn ensure_directory(&self, remote_dir: &str) -> Result<(), String> {
         let mut current = String::new();
-        for component in remote_dir.split('/').filter(|component| !component.is_empty()) {
+        for component in remote_dir
+            .split('/')
+            .filter(|component| !component.is_empty())
+        {
             current.push('/');
             current.push_str(component);
             match self.list(&current) {
                 Ok(_) => continue,
-                Err(error) if !error.contains("(-9)") && !error.contains("(-8)") => return Err(error),
+                Err(error) if !error.contains("(-9)") && !error.contains("(-8)") => {
+                    return Err(error)
+                }
                 Err(_) => {}
             }
             let url = format!("{API_BASE}/rest/2.0/xpan/file");
             let token = self.token.access_token.clone();
-            let response = self.send_with_retry(|client| client.post(&url)
-                .query(&[("method", "create"), ("access_token", token.as_str())])
-                .form(&[("path", current.as_str()), ("isdir", "1"), ("rtype", "3")])
-                .send(), "创建百度网盘目录")?;
-            let body = response.text().map_err(|err| format!("创建百度网盘目录读取响应失败：{err}"))?;
+            let response = self.send_with_retry(
+                |client| {
+                    client
+                        .post(&url)
+                        .query(&[("method", "create"), ("access_token", token.as_str())])
+                        .form(&[("path", current.as_str()), ("isdir", "1"), ("rtype", "3")])
+                        .send()
+                },
+                "创建百度网盘目录",
+            )?;
+            let body = response
+                .text()
+                .map_err(|err| format!("创建百度网盘目录读取响应失败：{err}"))?;
             let value = serde_json::from_str::<serde_json::Value>(&body)
                 .map_err(|err| format!("创建百度网盘目录返回非 JSON：{err}"))?;
             if value.get("errno").and_then(serde_json::Value::as_i64) == Some(-8) {
@@ -396,26 +478,80 @@ impl BaiduNetdiskClient {
         Ok(())
     }
 
-    pub fn upload_file(&self, local_path: &Path, remote_path: &str, on_progress: impl Fn(u8, &str) -> bool + Send) -> Result<RemoteFile, String> {
-        let metadata = fs::metadata(local_path).map_err(|err| format!("读取待上传本体包失败：{err}"))?;
+    pub fn upload_file(
+        &self,
+        local_path: &Path,
+        remote_path: &str,
+        on_progress: impl Fn(u8, &str) -> bool + Send,
+    ) -> Result<RemoteFile, String> {
+        let metadata =
+            fs::metadata(local_path).map_err(|err| format!("读取待上传本体包失败：{err}"))?;
         let total_size = metadata.len();
-        if total_size == 0 { return Err("不能上传空的本体包".to_string()); }
+        if total_size == 0 {
+            return Err("不能上传空的本体包".to_string());
+        }
         let block_md5 = block_md5_list(local_path, total_size)?;
-        let block_list = serde_json::to_string(&block_md5).map_err(|err| format!("生成百度分片清单失败：{err}"))?;
+        let block_list = serde_json::to_string(&block_md5)
+            .map_err(|err| format!("生成百度分片清单失败：{err}"))?;
         let url = format!("{API_BASE}/rest/2.0/xpan/file");
         let token = self.token.access_token.clone();
-        let precreate: PrecreateResponse = parse_json(self.send_with_retry(|client| client.post(&url)
-            .query(&[("method", "precreate"), ("access_token", token.as_str())])
-            .form(&[("path", remote_path), ("size", &total_size.to_string()), ("isdir", "0"), ("autoinit", "1"), ("block_list", &block_list), ("rtype", "3")])
-            .send(), "请求百度预创建")?, "百度预创建")?;
-        let upload_id = precreate.uploadid.ok_or_else(|| "百度预创建未返回 uploadid".to_string())?;
+        let precreate: PrecreateResponse = parse_json(
+            self.send_with_retry(
+                |client| {
+                    client
+                        .post(&url)
+                        .query(&[("method", "precreate"), ("access_token", token.as_str())])
+                        .form(&[
+                            ("path", remote_path),
+                            ("size", &total_size.to_string()),
+                            ("isdir", "0"),
+                            ("autoinit", "1"),
+                            ("block_list", &block_list),
+                            ("rtype", "3"),
+                        ])
+                        .send()
+                },
+                "请求百度预创建",
+            )?,
+            "百度预创建",
+        )?;
+        let upload_id = precreate
+            .uploadid
+            .ok_or_else(|| "百度预创建未返回 uploadid".to_string())?;
         let url = format!("{UPLOAD_API_BASE}/rest/2.0/pcs/file");
         let token = self.token.access_token.clone();
-        let located: LocateResponse = parse_json(self.send_with_retry(|client| client.get(&url)
-            .query(&[("method", "locateupload"), ("appid", "250528"), ("access_token", token.as_str()), ("path", remote_path), ("uploadid", upload_id.as_str()), ("upload_version", "2.0")])
-            .send(), "定位百度上传服务器")?, "定位百度上传服务器")?;
-        let host = located.servers.unwrap_or_default().into_iter().chain(located.bak_servers.unwrap_or_default()).find_map(|item| item.server).or(located.host).ok_or_else(|| "百度未返回可用上传服务器".to_string())?;
-        let host = if host.starts_with("http") { host } else { format!("https://{host}") };
+        let located: LocateResponse = parse_json(
+            self.send_with_retry(
+                |client| {
+                    client
+                        .get(&url)
+                        .query(&[
+                            ("method", "locateupload"),
+                            ("appid", "250528"),
+                            ("access_token", token.as_str()),
+                            ("path", remote_path),
+                            ("uploadid", upload_id.as_str()),
+                            ("upload_version", "2.0"),
+                        ])
+                        .send()
+                },
+                "定位百度上传服务器",
+            )?,
+            "定位百度上传服务器",
+        )?;
+        let host = located
+            .servers
+            .unwrap_or_default()
+            .into_iter()
+            .chain(located.bak_servers.unwrap_or_default())
+            .find_map(|item| item.server)
+            .or(located.host)
+            .ok_or_else(|| "百度未返回可用上传服务器".to_string())?;
+        let host = if host.starts_with("http") {
+            host
+        } else {
+            format!("https://{host}")
+        };
         let chunk_count = block_md5.len();
         let concurrency = UPLOAD_CONCURRENCY.min(chunk_count);
         let next_chunk = AtomicUsize::new(0);
@@ -465,12 +601,28 @@ impl BaiduNetdiskClient {
 
                         let upload_url = format!("{host}/rest/2.0/pcs/superfile2");
                         let token = self.token.access_token.clone();
-                        let upload_result = self.send_with_retry(|client| {
-                            let form = multipart::Form::new().part("file", multipart::Part::bytes(bytes.clone()).file_name("package.zip"));
-                            client.post(&upload_url)
-                                .query(&[("method", "upload"), ("access_token", token.as_str()), ("type", "tmpfile"), ("path", remote_path), ("uploadid", upload_id.as_str()), ("upload_version", "2.0"), ("partseq", &index.to_string())])
-                                .multipart(form).send()
-                        }, &format!("上传百度本体包分片 {}/{}", index + 1, chunk_count));
+                        let upload_result = self.send_with_retry(
+                            |client| {
+                                let form = multipart::Form::new().part(
+                                    "file",
+                                    multipart::Part::bytes(bytes.clone()).file_name("package.zip"),
+                                );
+                                client
+                                    .post(&upload_url)
+                                    .query(&[
+                                        ("method", "upload"),
+                                        ("access_token", token.as_str()),
+                                        ("type", "tmpfile"),
+                                        ("path", remote_path),
+                                        ("uploadid", upload_id.as_str()),
+                                        ("upload_version", "2.0"),
+                                        ("partseq", &index.to_string()),
+                                    ])
+                                    .multipart(form)
+                                    .send()
+                            },
+                            &format!("上传百度本体包分片 {}/{}", index + 1, chunk_count),
+                        );
 
                         let response = match upload_result {
                             Ok(res) => res,
@@ -484,7 +636,9 @@ impl BaiduNetdiskClient {
                             }
                         };
 
-                        if let Err(err) = parse_json::<serde_json::Value>(response, "上传百度本体包分片") {
+                        if let Err(err) =
+                            parse_json::<serde_json::Value>(response, "上传百度本体包分片")
+                        {
                             aborted.store(true, Ordering::Relaxed);
                             let mut err_guard = first_error.lock().unwrap();
                             if err_guard.is_none() {
@@ -495,7 +649,8 @@ impl BaiduNetdiskClient {
 
                         let finished = completed_count.fetch_add(1, Ordering::SeqCst) + 1;
                         let progress_pct = 10 + ((finished * 80) / chunk_count.max(1)) as u8;
-                        let progress_msg = format!("正在上传本体包分片 {}/{}", finished, chunk_count);
+                        let progress_msg =
+                            format!("正在上传本体包分片 {}/{}", finished, chunk_count);
                         let keep_going = match progress_callback.lock() {
                             Ok(cb) => cb(progress_pct, &progress_msg),
                             Err(_) => false,
@@ -518,54 +673,138 @@ impl BaiduNetdiskClient {
         }
         let url = format!("{API_BASE}/rest/2.0/xpan/file");
         let token = self.token.access_token.clone();
-        let created: CreatedFileResponse = parse_json(self.send_with_retry(|client| client.post(&url)
-            .query(&[("method", "create"), ("access_token", token.as_str())])
-            .form(&[("path", remote_path), ("size", &total_size.to_string()), ("isdir", "0"), ("uploadid", upload_id.as_str()), ("block_list", &block_list), ("rtype", "3"), ("is_revision", "1")])
-            .send(), "提交百度本体包")?, "提交百度本体包")?;
+        let created: CreatedFileResponse = parse_json(
+            self.send_with_retry(
+                |client| {
+                    client
+                        .post(&url)
+                        .query(&[("method", "create"), ("access_token", token.as_str())])
+                        .form(&[
+                            ("path", remote_path),
+                            ("size", &total_size.to_string()),
+                            ("isdir", "0"),
+                            ("uploadid", upload_id.as_str()),
+                            ("block_list", &block_list),
+                            ("rtype", "3"),
+                            ("is_revision", "1"),
+                        ])
+                        .send()
+                },
+                "提交百度本体包",
+            )?,
+            "提交百度本体包",
+        )?;
         if let Ok(cb) = progress_callback.lock() {
             cb(100, "本体包上传完成");
         }
-        Ok(RemoteFile { path: remote_path.to_string(), fs_id: created.fs_id, size: created.size.max(total_size), md5: created.md5, is_dir: false, server_mtime: None })
+        Ok(RemoteFile {
+            path: remote_path.to_string(),
+            fs_id: created.fs_id,
+            size: created.size.max(total_size),
+            md5: created.md5,
+            is_dir: false,
+            server_mtime: None,
+        })
     }
 
-    pub fn download_file(&self, remote: &RemoteFile, target_path: &Path, on_progress: impl Fn(u8, &str) -> bool) -> Result<String, String> {
-        let fsids = serde_json::to_string(&[remote.fs_id]).map_err(|err| format!("生成百度下载请求失败：{err}"))?;
+    pub fn download_file(
+        &self,
+        remote: &RemoteFile,
+        target_path: &Path,
+        on_progress: impl Fn(u8, &str) -> bool,
+    ) -> Result<String, String> {
+        let fsids = serde_json::to_string(&[remote.fs_id])
+            .map_err(|err| format!("生成百度下载请求失败：{err}"))?;
         let url = format!("{API_BASE}/rest/2.0/xpan/multimedia");
         let token = self.token.access_token.clone();
-        let metadata: MetaResponse = parse_json(self.send_with_retry(|client| client.get(&url)
-            .query(&[("method", "filemetas"), ("access_token", token.as_str()), ("fsids", fsids.as_str()), ("dlink", "1")])
-            .send(), "请求百度本体包下载地址")?, "读取百度本体包下载地址")?;
-        let dlink = metadata.list.and_then(|list| list.into_iter().next()).and_then(|item| item.dlink).ok_or_else(|| "百度未返回本体包下载地址".to_string())?;
+        let metadata: MetaResponse = parse_json(
+            self.send_with_retry(
+                |client| {
+                    client
+                        .get(&url)
+                        .query(&[
+                            ("method", "filemetas"),
+                            ("access_token", token.as_str()),
+                            ("fsids", fsids.as_str()),
+                            ("dlink", "1"),
+                        ])
+                        .send()
+                },
+                "请求百度本体包下载地址",
+            )?,
+            "读取百度本体包下载地址",
+        )?;
+        let dlink = metadata
+            .list
+            .and_then(|list| list.into_iter().next())
+            .and_then(|item| item.dlink)
+            .ok_or_else(|| "百度未返回本体包下载地址".to_string())?;
         let token = self.token.access_token.clone();
-        let mut response = self.send_with_retry(|client| client.get(&dlink)
-            .query(&[("access_token", token.as_str())])
-            .send(), "下载百度本体包")?;
-        if !response.status().is_success() { return Err(format!("下载百度本体包失败：HTTP {}", response.status())); }
-        let parent = target_path.parent().ok_or_else(|| "本体包下载路径无父目录".to_string())?;
+        let mut response = self.send_with_retry(
+            |client| {
+                client
+                    .get(&dlink)
+                    .query(&[("access_token", token.as_str())])
+                    .send()
+            },
+            "下载百度本体包",
+        )?;
+        if !response.status().is_success() {
+            return Err(format!("下载百度本体包失败：HTTP {}", response.status()));
+        }
+        let parent = target_path
+            .parent()
+            .ok_or_else(|| "本体包下载路径无父目录".to_string())?;
         fs::create_dir_all(parent).map_err(|err| format!("创建本体包下载目录失败：{err}"))?;
         let temporary = target_path.with_extension("download.tmp");
-        let file = fs::File::create(&temporary).map_err(|err| format!("创建本体包下载临时文件失败：{err}"))?;
+        let file = fs::File::create(&temporary)
+            .map_err(|err| format!("创建本体包下载临时文件失败：{err}"))?;
         let mut output = BufWriter::with_capacity(4 * 1024 * 1024, file);
         let mut hasher = Sha256::new();
         let mut written = 0u64;
         let mut buffer = vec![0u8; 1024 * 1024];
         loop {
-            let read = response.read(&mut buffer).map_err(|err| format!("读取百度本体包失败：{err}"))?;
-            if read == 0 { break; }
-            output.write_all(&buffer[..read]).map_err(|err| format!("写入本体包下载文件失败：{err}"))?;
+            let read = response
+                .read(&mut buffer)
+                .map_err(|err| format!("读取百度本体包失败：{err}"))?;
+            if read == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..read])
+                .map_err(|err| format!("写入本体包下载文件失败：{err}"))?;
             hasher.update(&buffer[..read]);
             written = written.saturating_add(read as u64);
-            if !on_progress(5 + ((written.min(remote.size) * 90 / remote.size.max(1)) as u8), &format!("正在下载本体包 {} / {} MB", written / 1024 / 1024, remote.size / 1024 / 1024)) {
+            if !on_progress(
+                5 + ((written.min(remote.size) * 90 / remote.size.max(1)) as u8),
+                &format!(
+                    "正在下载本体包 {} / {} MB",
+                    written / 1024 / 1024,
+                    remote.size / 1024 / 1024
+                ),
+            ) {
                 drop(output);
                 let _ = fs::remove_file(&temporary);
                 return Err("任务已取消".to_string());
             }
         }
-        output.flush().map_err(|err| format!("刷新本体包下载文件失败：{err}"))?;
-        output.get_ref().sync_all().map_err(|err| format!("同步本体包下载文件失败：{err}"))?;
+        output
+            .flush()
+            .map_err(|err| format!("刷新本体包下载文件失败：{err}"))?;
+        output
+            .get_ref()
+            .sync_all()
+            .map_err(|err| format!("同步本体包下载文件失败：{err}"))?;
         drop(output);
-        if written != remote.size { let _ = fs::remove_file(&temporary); return Err(format!("本体包下载大小不匹配：{} / {}", written, remote.size)); }
-        fs::rename(&temporary, target_path).map_err(|err| format!("提交本体包下载文件失败：{err}"))?;
+        if written != remote.size {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!(
+                "本体包下载大小不匹配：{} / {}",
+                written, remote.size
+            ));
+        }
+        fs::rename(&temporary, target_path)
+            .map_err(|err| format!("提交本体包下载文件失败：{err}"))?;
         let sha256_hex = hex::encode(hasher.finalize());
         on_progress(100, "本体包下载完成");
         Ok(sha256_hex)
@@ -578,7 +817,12 @@ impl BaiduNetdiskClient {
         let mut last_error = None;
         for attempt in 0..MAX_REQUEST_ATTEMPTS {
             match request(&self.client) {
-                Ok(response) if response.status().is_success() || !is_retryable_status(response.status()) => return Ok(response),
+                Ok(response)
+                    if response.status().is_success()
+                        || !is_retryable_status(response.status()) =>
+                {
+                    return Ok(response)
+                }
                 Ok(response) => {
                     if attempt + 1 == MAX_REQUEST_ATTEMPTS {
                         return Ok(response);
@@ -594,7 +838,10 @@ impl BaiduNetdiskClient {
             }
             std::thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
         }
-        Err(format!("{operation}失败：{}", last_error.unwrap_or_else(|| "未知网络错误".to_string())))
+        Err(format!(
+            "{operation}失败：{}",
+            last_error.unwrap_or_else(|| "未知网络错误".to_string())
+        ))
     }
 }
 
@@ -614,7 +861,10 @@ fn token_paths(app_data_dir: &Path) -> Vec<std::path::PathBuf> {
 }
 
 fn read_token(app_data_dir: &Path) -> Result<(PathBuf, BaiduToken), String> {
-    let Some(path) = token_paths(app_data_dir).into_iter().find(|path| path.is_file()) else {
+    let Some(path) = token_paths(app_data_dir)
+        .into_iter()
+        .find(|path| path.is_file())
+    else {
         return Err("未找到百度网盘授权信息，请先完成百度网盘授权".to_string());
     };
     let raw = fs::read(&path).map_err(|err| format!("读取百度网盘授权信息失败：{err}"))?;
@@ -628,16 +878,22 @@ fn token_needs_refresh(expires_at: Option<u64>) -> bool {
 }
 
 fn save_token_at(path: &Path, token: BaiduToken) -> Result<(), String> {
-    let parent = path.parent().ok_or_else(|| "百度 Token 路径无父目录".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "百度 Token 路径无父目录".to_string())?;
     fs::create_dir_all(parent).map_err(|error| format!("创建百度 Token 目录失败：{error}"))?;
-    let bytes = serde_json::to_vec_pretty(&token).map_err(|error| format!("序列化百度 Token 失败：{error}"))?;
+    let bytes = serde_json::to_vec_pretty(&token)
+        .map_err(|error| format!("序列化百度 Token 失败：{error}"))?;
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let temporary = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4().simple()));
     let backup = parent.join(format!(".{name}.bak-{}", uuid::Uuid::new_v4().simple()));
     let result = (|| -> Result<(), String> {
-        let mut file = fs::File::create(&temporary).map_err(|error| format!("创建百度 Token 临时文件失败：{error}"))?;
-        file.write_all(&bytes).map_err(|error| format!("写入百度 Token 临时文件失败：{error}"))?;
-        file.sync_all().map_err(|error| format!("刷新百度 Token 临时文件失败：{error}"))?;
+        let mut file = fs::File::create(&temporary)
+            .map_err(|error| format!("创建百度 Token 临时文件失败：{error}"))?;
+        file.write_all(&bytes)
+            .map_err(|error| format!("写入百度 Token 临时文件失败：{error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("刷新百度 Token 临时文件失败：{error}"))?;
         let had_token = path.exists();
         if had_token {
             fs::rename(path, &backup).map_err(|error| format!("暂存百度 Token 失败：{error}"))?;
@@ -658,7 +914,10 @@ fn save_token_at(path: &Path, token: BaiduToken) -> Result<(), String> {
 }
 
 fn now_millis() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|duration| duration.as_millis() as u64).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn block_md5_list(path: &Path, total_size: u64) -> Result<Vec<String>, String> {
@@ -668,27 +927,53 @@ fn block_md5_list(path: &Path, total_size: u64) -> Result<Vec<String>, String> {
     let mut buffer = vec![0u8; CHUNK_SIZE as usize];
     while remaining > 0 {
         let length = remaining.min(CHUNK_SIZE) as usize;
-        file.read_exact(&mut buffer[..length]).map_err(|err| format!("读取本体包分片失败：{err}"))?;
+        file.read_exact(&mut buffer[..length])
+            .map_err(|err| format!("读取本体包分片失败：{err}"))?;
         result.push(md5_hex(&buffer[..length]));
         remaining -= length as u64;
     }
     Ok(result)
 }
 
-fn parse_json<T: for<'de> Deserialize<'de>>(response: reqwest::blocking::Response, operation: &str) -> Result<T, String> {
+fn parse_json<T: for<'de> Deserialize<'de>>(
+    response: reqwest::blocking::Response,
+    operation: &str,
+) -> Result<T, String> {
     let status = response.status();
-    let body = response.text().map_err(|err| format!("{operation}读取响应失败：{err}"))?;
-    let value = serde_json::from_str::<serde_json::Value>(&body).map_err(|_| format!("{operation}返回非 JSON：HTTP {status}"))?;
+    let body = response
+        .text()
+        .map_err(|err| format!("{operation}读取响应失败：{err}"))?;
+    let value = serde_json::from_str::<serde_json::Value>(&body)
+        .map_err(|_| format!("{operation}返回非 JSON：HTTP {status}"))?;
     parse_value(value, operation)
 }
 
-fn parse_value<T: for<'de> Deserialize<'de>>(value: serde_json::Value, operation: &str) -> Result<T, String> {
-    if let Some(errno) = value.get("errno").and_then(serde_json::Value::as_i64).filter(|value| *value != 0) {
-        let message = value.get("errmsg").and_then(serde_json::Value::as_str).or_else(|| value.get("error_msg").and_then(serde_json::Value::as_str)).unwrap_or("未知错误");
+fn parse_value<T: for<'de> Deserialize<'de>>(
+    value: serde_json::Value,
+    operation: &str,
+) -> Result<T, String> {
+    if let Some(errno) = value
+        .get("errno")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|value| *value != 0)
+    {
+        let message = value
+            .get("errmsg")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("error_msg").and_then(serde_json::Value::as_str))
+            .unwrap_or("未知错误");
         return Err(format!("{operation}失败：{message} ({errno})"));
     }
-    if let Some(error_code) = value.get("error_code").and_then(serde_json::Value::as_i64).filter(|value| *value != 0) {
-        let message = value.get("error_description").and_then(serde_json::Value::as_str).or_else(|| value.get("error_msg").and_then(serde_json::Value::as_str)).unwrap_or("未知错误");
+    if let Some(error_code) = value
+        .get("error_code")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|value| *value != 0)
+    {
+        let message = value
+            .get("error_description")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("error_msg").and_then(serde_json::Value::as_str))
+            .unwrap_or("未知错误");
         return Err(format!("{operation}失败：{message} ({error_code})"));
     }
     serde_json::from_value(value).map_err(|err| format!("{operation}响应格式无效：{err}"))
@@ -697,14 +982,16 @@ fn parse_value<T: for<'de> Deserialize<'de>>(value: serde_json::Value, operation
 fn md5_transform(state: &mut [u32; 4], block: &[u8; 64]) {
     let shifts = [7u32, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
     let constants = [
-        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
-        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
-        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
-        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
-        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
-        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
-        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
-        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
+        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
+        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
+        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
+        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
+        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
+        0xeb86d391,
     ];
     let mut words = [0u32; 16];
     for (index, word) in words.iter_mut().enumerate() {
@@ -719,7 +1006,11 @@ fn md5_transform(state: &mut [u32; 4], block: &[u8; 64]) {
         let (function, word_index, shift) = if index < 16 {
             ((b & c) | ((!b) & d), index, shifts[index % 4])
         } else if index < 32 {
-            ((d & b) | ((!d) & c), (5 * index + 1) % 16, shifts[4 + index % 4])
+            (
+                (d & b) | ((!d) & c),
+                (5 * index + 1) % 16,
+                shifts[4 + index % 4],
+            )
         } else if index < 48 {
             (b ^ c ^ d, (3 * index + 5) % 16, shifts[8 + index % 4])
         } else {
@@ -772,7 +1063,11 @@ mod tests {
 
     #[test]
     fn client_requires_access_token() {
-        let result = BaiduNetdiskClient::new(super::BaiduToken { access_token: String::new(), expires_at: None, refresh_token: None });
+        let result = BaiduNetdiskClient::new(super::BaiduToken {
+            access_token: String::new(),
+            expires_at: None,
+            refresh_token: None,
+        });
         assert!(result.is_err());
     }
 
@@ -781,14 +1076,22 @@ mod tests {
         assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
         assert_eq!(md5_hex(b"a"), "0cc175b9c0f1b6a831c399e269772661");
         assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
-        assert_eq!(md5_hex(b"message digest"), "f96b697d7cb7938d525a2f31aaf161d0");
-        assert_eq!(md5_hex(b"abcdefghijklmnopqrstuvwxyz"), "c3fcd3d76192e4007dfb496cca67e13b");
+        assert_eq!(
+            md5_hex(b"message digest"),
+            "f96b697d7cb7938d525a2f31aaf161d0"
+        );
+        assert_eq!(
+            md5_hex(b"abcdefghijklmnopqrstuvwxyz"),
+            "c3fcd3d76192e4007dfb496cca67e13b"
+        );
         assert_eq!(
             md5_hex(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"),
             "d174ab98d277d9f5a5611c2c9f419d9f"
         );
         assert_eq!(
-            md5_hex(b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"),
+            md5_hex(
+                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"
+            ),
             "57edf4a22be3c955ac49da2e2107b67a"
         );
         assert_eq!(md5_hex(b"GameSaver"), "f28205fc3f14a3b8bfa43c894db2a24b");
@@ -797,8 +1100,12 @@ mod tests {
     #[test]
     fn token_refresh_window_is_five_minutes() {
         let now = super::now_millis();
-        assert!(!token_needs_refresh(Some(now.saturating_add(5 * 60 * 1000 + 1))));
-        assert!(token_needs_refresh(Some(now.saturating_add(5 * 60 * 1000 - 1))));
+        assert!(!token_needs_refresh(Some(
+            now.saturating_add(5 * 60 * 1000 + 1)
+        )));
+        assert!(token_needs_refresh(Some(
+            now.saturating_add(5 * 60 * 1000 - 1)
+        )));
         assert!(token_needs_refresh(Some(now.saturating_sub(1))));
         assert!(!token_needs_refresh(None));
     }

@@ -3,12 +3,7 @@ use crate::{
     services::{BaiduNetdiskClient, RemoteFile},
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    fs,
-    io::Write,
-    path::Path,
-};
+use std::{collections::HashMap, fs, io::Write, path::Path};
 use uuid::Uuid;
 
 const MANIFEST_VERSION: u32 = 1;
@@ -294,11 +289,13 @@ impl CloudManifestService {
         }
         fs::create_dir_all(temporary_root)
             .map_err(|error| format!("创建云端封面下载目录失败：{error}"))?;
-        let temporary = temporary_root.join(format!(".cloud-cover-download-{}.jpg", Uuid::new_v4().simple()));
+        let temporary = temporary_root.join(format!(
+            ".cloud-cover-download-{}.jpg",
+            Uuid::new_v4().simple()
+        ));
         let result = (|| -> Result<Vec<u8>, String> {
             client.download_file(remote_cover, &temporary, |_, _| true)?;
-            let raw = fs::read(&temporary)
-                .map_err(|error| format!("读取云端封面失败：{error}"))?;
+            let raw = fs::read(&temporary).map_err(|error| format!("读取云端封面失败：{error}"))?;
             if let Some(cache_root) = cache_root {
                 let _ = Self::save_cached_cover(cache_root, remote_dir, remote_cover, &raw);
             }
@@ -318,7 +315,8 @@ impl CloudManifestService {
     ) -> Result<(), String> {
         fs::create_dir_all(temporary_root)
             .map_err(|error| format!("创建云端封面临时目录失败：{error}"))?;
-        let temporary = temporary_root.join(format!(".cloud-cover-{}.jpg", Uuid::new_v4().simple()));
+        let temporary =
+            temporary_root.join(format!(".cloud-cover-{}.jpg", Uuid::new_v4().simple()));
         let result = (|| -> Result<(), String> {
             let mut file = fs::File::create(&temporary)
                 .map_err(|error| format!("创建云端封面临时文件失败：{error}"))?;
@@ -361,7 +359,8 @@ impl CloudManifestService {
             .map_err(|error| format!("序列化云端游戏信息失败：{error}"))?;
         fs::create_dir_all(temporary_root)
             .map_err(|error| format!("创建云端游戏信息临时目录失败：{error}"))?;
-        let temporary = temporary_root.join(format!(".cloud-game-{}.json", Uuid::new_v4().simple()));
+        let temporary =
+            temporary_root.join(format!(".cloud-game-{}.json", Uuid::new_v4().simple()));
         let result = (|| -> Result<(), String> {
             let mut file = fs::File::create(&temporary)
                 .map_err(|error| format!("创建云端游戏信息临时文件失败：{error}"))?;
@@ -391,17 +390,21 @@ impl CloudManifestService {
             return Ok(None);
         };
         if let Some(cache_root) = cache_root {
-            if let Some(cached) = Self::load_cached_catalog(cache_root, remote_dir, remote_catalog) {
+            if let Some(cached) = Self::load_cached_catalog(cache_root, remote_dir, remote_catalog)
+            {
                 return Ok(Some(cached));
             }
         }
         fs::create_dir_all(temporary_root)
             .map_err(|error| format!("创建云端游戏信息下载目录失败：{error}"))?;
-        let temporary = temporary_root.join(format!(".cloud-game-download-{}.json", Uuid::new_v4().simple()));
+        let temporary = temporary_root.join(format!(
+            ".cloud-game-download-{}.json",
+            Uuid::new_v4().simple()
+        ));
         let result = (|| -> Result<CloudGameCatalog, String> {
             client.download_file(remote_catalog, &temporary, |_, _| true)?;
-            let raw = fs::read(&temporary)
-                .map_err(|error| format!("读取云端游戏信息失败：{error}"))?;
+            let raw =
+                fs::read(&temporary).map_err(|error| format!("读取云端游戏信息失败：{error}"))?;
             let catalog = serde_json::from_slice::<CloudGameCatalog>(&raw)
                 .map_err(|error| format!("解析云端游戏信息失败：{error}"))?;
             validate_catalog(&catalog, remote_dir)?;
@@ -425,7 +428,10 @@ impl CloudManifestService {
             .iter()
             .filter(|version| {
                 version.game_uid == game_uid
-                    && version.remote_path.as_deref().is_some_and(|path| !path.is_empty())
+                    && version
+                        .remote_path
+                        .as_deref()
+                        .is_some_and(|path| !path.is_empty())
                     && version.remote_fs_id.is_some()
             })
             .map(|version| CloudBodyManifestVersion {
@@ -484,9 +490,9 @@ impl CloudManifestService {
                 let local = local_by_path
                     .get(&file.path)
                     .and_then(|version| {
-                        local_versions.iter().find(|local| {
-                            local.version_id == version.version_id
-                        })
+                        local_versions
+                            .iter()
+                            .find(|local| local.version_id == version.version_id)
                     })
                     .or_else(|| {
                         local_versions.iter().find(|version| {
@@ -542,7 +548,8 @@ impl CloudManifestService {
             .map_err(|error| format!("序列化云端本体版本清单失败：{error}"))?;
         fs::create_dir_all(temporary_root)
             .map_err(|error| format!("创建云端版本清单临时目录失败：{error}"))?;
-        let temporary = temporary_root.join(format!(".cloud-manifest-{}.json", Uuid::new_v4().simple()));
+        let temporary =
+            temporary_root.join(format!(".cloud-manifest-{}.json", Uuid::new_v4().simple()));
         let result = (|| -> Result<(), String> {
             let mut file = fs::File::create(&temporary)
                 .map_err(|error| format!("创建云端版本清单临时文件失败：{error}"))?;
@@ -550,11 +557,7 @@ impl CloudManifestService {
                 .map_err(|error| format!("写入云端版本清单临时文件失败：{error}"))?;
             file.sync_all()
                 .map_err(|error| format!("刷新云端版本清单临时文件失败：{error}"))?;
-            client.upload_file(
-                &temporary,
-                &Self::manifest_path(remote_dir),
-                |_, _| true,
-            )?;
+            client.upload_file(&temporary, &Self::manifest_path(remote_dir), |_, _| true)?;
             Ok(())
         })();
         let _ = fs::remove_file(&temporary);
@@ -576,22 +579,28 @@ impl CloudManifestService {
             return Ok(None);
         };
         if let Some(cache_root) = cache_root {
-            if let Some(cached) = Self::load_cached_manifest(cache_root, remote_dir, remote_manifest) {
+            if let Some(cached) =
+                Self::load_cached_manifest(cache_root, remote_dir, remote_manifest)
+            {
                 return Ok(Some(cached));
             }
         }
         fs::create_dir_all(temporary_root)
             .map_err(|error| format!("创建云端版本清单下载目录失败：{error}"))?;
-        let temporary = temporary_root.join(format!(".cloud-manifest-download-{}.json", Uuid::new_v4().simple()));
+        let temporary = temporary_root.join(format!(
+            ".cloud-manifest-download-{}.json",
+            Uuid::new_v4().simple()
+        ));
         let result = (|| -> Result<CloudBodyManifest, String> {
             client.download_file(remote_manifest, &temporary, |_, _| true)?;
-            let raw = fs::read(&temporary)
-                .map_err(|error| format!("读取云端版本清单失败：{error}"))?;
+            let raw =
+                fs::read(&temporary).map_err(|error| format!("读取云端版本清单失败：{error}"))?;
             let manifest = serde_json::from_slice::<CloudBodyManifest>(&raw)
                 .map_err(|error| format!("解析云端版本清单失败：{error}"))?;
             validate(&manifest, remote_dir)?;
             if let Some(cache_root) = cache_root {
-                let _ = Self::save_cached_manifest(cache_root, remote_dir, remote_manifest, &manifest);
+                let _ =
+                    Self::save_cached_manifest(cache_root, remote_dir, remote_manifest, &manifest);
             }
             Ok(manifest)
         })();
@@ -621,7 +630,8 @@ impl CloudManifestService {
                 let manifest_version = manifest_versions.get(&file.path).copied();
                 let local_version = local_versions.iter().find(|version| {
                     version.remote_path.as_deref() == Some(file.path.as_str())
-                        || manifest_version.is_some_and(|item| item.version_id == version.version_id)
+                        || manifest_version
+                            .is_some_and(|item| item.version_id == version.version_id)
                         || version.version_id == file_name_without_extension(&file.path)
                 });
                 let package_sha256 = manifest_version.and_then(|item| item.package_sha256.clone());
@@ -656,7 +666,8 @@ impl CloudManifestService {
                         .map(|item| item.created_at.clone())
                         .or_else(|| file.server_mtime.map(|time| time.to_string())),
                     sync_state: sync_state.to_string(),
-                    manifest_verified: manifest_version.is_some_and(|item| item.package_sha256.is_some()),
+                    manifest_verified: manifest_version
+                        .is_some_and(|item| item.package_sha256.is_some()),
                 }
             })
             .collect::<Vec<_>>();
@@ -681,21 +692,30 @@ impl CloudManifestService {
         if manifest.is_some() {
             for package in &packages {
                 if package.sync_state == "manifest_pending" {
-                    warnings.push(format!("云端本体包未登记在版本清单中：{}", package.version_id));
+                    warnings.push(format!(
+                        "云端本体包未登记在版本清单中：{}",
+                        package.version_id
+                    ));
                 }
             }
-            for version in manifest
-                .into_iter()
-                .flat_map(|value| value.versions.iter())
-            {
-                if !remote_files.iter().any(|file| file.path == version.package_path) {
-                    warnings.push(format!("版本清单记录的本体包不存在：{}", version.version_id));
+            for version in manifest.into_iter().flat_map(|value| value.versions.iter()) {
+                if !remote_files
+                    .iter()
+                    .any(|file| file.path == version.package_path)
+                {
+                    warnings.push(format!(
+                        "版本清单记录的本体包不存在：{}",
+                        version.version_id
+                    ));
                 }
             }
         }
         for package in &packages {
             if package.sync_state == "mismatch" {
-                warnings.push(format!("云端本体包与本地版本校验值不一致：{}", package.version_id));
+                warnings.push(format!(
+                    "云端本体包与本地版本校验值不一致：{}",
+                    package.version_id
+                ));
             }
         }
         RemoteBodyPackageList {
@@ -716,7 +736,10 @@ impl CloudManifestService {
 
 fn validate(manifest: &CloudBodyManifest, remote_dir: &str) -> Result<(), String> {
     if manifest.format_version != MANIFEST_VERSION {
-        return Err(format!("不支持的云端版本清单格式：{}", manifest.format_version));
+        return Err(format!(
+            "不支持的云端版本清单格式：{}",
+            manifest.format_version
+        ));
     }
     let expected_game_key = game_key_from_body_dir(remote_dir);
     if manifest.game_key != expected_game_key
@@ -739,7 +762,10 @@ fn validate(manifest: &CloudBodyManifest, remote_dir: &str) -> Result<(), String
 fn validate_catalog(catalog: &CloudGameCatalog, remote_dir: &str) -> Result<(), String> {
     let expected_game_key = game_key_from_body_dir(remote_dir);
     if catalog.format_version != MANIFEST_VERSION {
-        return Err(format!("不支持的云端游戏信息格式：{}", catalog.format_version));
+        return Err(format!(
+            "不支持的云端游戏信息格式：{}",
+            catalog.format_version
+        ));
     }
     if catalog.game_key != expected_game_key || !is_valid_game_uid(&catalog.game_uid) {
         return Err("云端游戏信息不属于当前游戏".to_string());
@@ -819,7 +845,12 @@ mod tests {
         not_uploaded.version_id = "v2".to_string();
         not_uploaded.remote_path = None;
         not_uploaded.remote_fs_id = None;
-        let manifest = CloudManifestService::build("game one", "game-1", &[local.clone(), not_uploaded], "2".to_string());
+        let manifest = CloudManifestService::build(
+            "game one",
+            "game-1",
+            &[local.clone(), not_uploaded],
+            "2".to_string(),
+        );
         assert_eq!(manifest.versions.len(), 1);
         assert_eq!(manifest.versions[0].package_size, 30);
     }
@@ -935,7 +966,8 @@ mod tests {
 
     #[test]
     fn cache_roundtrip_loads_matching_catalog_and_manifest() {
-        let temp_dir = std::env::temp_dir().join(format!("cloud-manifest-cache-test-{}", Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("cloud-manifest-cache-test-{}", Uuid::new_v4()));
         let remote_dir = "/apps/GameSaver/games/game-test/body";
         let remote_file = RemoteFile {
             path: format!("{remote_dir}/game.json"),
@@ -966,7 +998,10 @@ mod tests {
         // Mismatched fs_id should return None (cache miss)
         let mut modified_remote = remote_file.clone();
         modified_remote.fs_id = 102;
-        assert!(CloudManifestService::load_cached_catalog(&temp_dir, remote_dir, &modified_remote).is_none());
+        assert!(
+            CloudManifestService::load_cached_catalog(&temp_dir, remote_dir, &modified_remote)
+                .is_none()
+        );
 
         // Cover cache test
         let cover_remote = RemoteFile {
@@ -980,7 +1015,8 @@ mod tests {
         let cover_bytes = b"fake-jpeg-content";
         CloudManifestService::save_cached_cover(&temp_dir, remote_dir, &cover_remote, cover_bytes)
             .expect("save cached cover");
-        let loaded_cover = CloudManifestService::load_cached_cover(&temp_dir, remote_dir, &cover_remote);
+        let loaded_cover =
+            CloudManifestService::load_cached_cover(&temp_dir, remote_dir, &cover_remote);
         assert_eq!(loaded_cover, Some(cover_bytes.to_vec()));
 
         let _ = fs::remove_dir_all(temp_dir);

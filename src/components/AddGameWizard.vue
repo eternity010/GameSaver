@@ -10,12 +10,13 @@ import {
   getGame,
   getTask,
   startAddGameTask,
+  startSaveCandidateVerificationTask,
   startFinishSaveLearningTask,
   startSaveLearningTask,
   openPathInExplorer,
   type AppTask,
 } from "../api";
-import { createDefaultSaveScope, type Game, type SaveLearningResult, type SaveLearningSession, type SaveRootType, type SaveScope } from "../domain/game";
+import { createDefaultSaveScope, type Game, type SaveCandidateEvidenceLevel, type SaveLearningResult, type SaveLearningSession, type SaveRootType, type SaveScope } from "../domain/game";
 
 type WizardPhase = "form" | "copying" | "ready" | "capturing" | "analyzing" | "review" | "done";
 
@@ -30,6 +31,8 @@ const taskId = ref("");
 const session = ref<SaveLearningSession | null>(null);
 const learningResult = ref<SaveLearningResult | null>(null);
 const reviewScopes = ref<SaveScope[]>([]);
+const scopeEvidence = ref<Record<string, { level: SaveCandidateEvidenceLevel; reason: string }>>({});
+const validatingCandidates = ref(false);
 const confidence = ref(0);
 const progress = ref(0);
 const message = ref("");
@@ -47,6 +50,7 @@ const canStart = computed(() => Boolean(displayName.value.trim() && sourcePath.v
 const stepNumber = computed(() => phase.value === "form" || phase.value === "copying" ? 1 : phase.value === "ready" || phase.value === "capturing" ? 2 : phase.value === "analyzing" || phase.value === "review" ? 3 : 4);
 const stepTitle = computed(() => phase.value === "form" || phase.value === "copying" ? "选择并复制游戏本体" : phase.value === "ready" || phase.value === "capturing" ? "完成一次游戏内保存" : phase.value === "analyzing" ? "分析存档变化" : phase.value === "review" ? "确认存档保护范围" : "添加完成");
 const canConfirm = computed(() => reviewScopes.value.length > 0 && reviewScopes.value.every((scope) => scope.confirmedFiles.length > 0 || scope.includeDirectories.length > 0));
+const hasReviewCandidates = computed(() => reviewScopes.value.some((scope) => scopeEvidence.value[scopeEvidenceKey(scope)]?.level === "review"));
 
 const rootTypeLabel: Record<SaveRootType, string> = {
   managed_game: "游戏目录",
@@ -58,6 +62,51 @@ const rootTypeLabel: Record<SaveRootType, string> = {
   user_profile: "用户目录",
   custom: "自定义目录",
 };
+
+function scopeEvidenceKey(scope: SaveScope): string {
+  return scope.rootPath.replace(/[\\/]+/g, "\\").replace(/\\+$/, "").toLocaleLowerCase();
+}
+
+function evidenceForScope(scope: SaveScope) {
+  return scopeEvidence.value[scopeEvidenceKey(scope)] || { level: "review" as const, reason: "手动添加的范围，请在确认前检查内容。" };
+}
+
+function evidenceLabel(scope: SaveScope): string {
+  return evidenceForScope(scope).level === "strong" ? "高可信" : "待确认";
+}
+
+function applyInitialLearningResult(result: SaveLearningResult) {
+  learningResult.value = result;
+  reviewScopes.value = result.scopeDrafts.map((draft) => ({ ...draft.scope, confirmedFiles: [...draft.scope.confirmedFiles], includeDirectories: [...draft.scope.includeDirectories], excludeExact: [...draft.scope.excludeExact], excludePatterns: [...draft.scope.excludePatterns], excludeDirectories: [...draft.scope.excludeDirectories] }));
+  scopeEvidence.value = Object.fromEntries(result.scopeDrafts.map((draft) => [scopeEvidenceKey(draft.scope), { level: draft.evidenceLevel, reason: draft.evidenceReason }]));
+  confidence.value = result.confidence;
+}
+
+function mergeCandidateVerification(result: SaveLearningResult) {
+  const verified = new Map(result.scopeDrafts.map((draft) => [scopeEvidenceKey(draft.scope), draft]));
+  let promoted = 0;
+  for (const scope of reviewScopes.value) {
+    const key = scopeEvidenceKey(scope);
+    const prior = scopeEvidence.value[key];
+    const matched = verified.get(key);
+    if (!matched) continue;
+    for (const file of matched.scope.confirmedFiles) {
+      if (!scope.confirmedFiles.includes(file)) scope.confirmedFiles.push(file);
+    }
+    if (prior?.level === "review") {
+      scopeEvidence.value[key] = { level: "strong", reason: "两次独立保存均命中此范围，已提升为高可信。" };
+      promoted += 1;
+    }
+  }
+  const summary = promoted > 0
+    ? `再次保存验证完成：${promoted} 个候选范围已提升为高可信。`
+    : "再次保存验证未命中待确认范围；现有范围仍保留，可继续手动调整。";
+  learningResult.value = {
+    ...result,
+    notes: [...(learningResult.value?.notes || []), summary, ...result.notes],
+  };
+  confidence.value = Math.max(confidence.value, result.confidence, promoted > 0 ? 90 : 0);
+}
 
 async function chooseSource() {
   const selected = await open({ directory: true, multiple: false });
@@ -193,13 +242,48 @@ async function analyze() {
     await watchTask(async (task) => {
       const result = task.result as SaveLearningResult | undefined;
       if (!result) throw new Error("分析完成，但没有返回学习结果");
-      learningResult.value = result;
-      reviewScopes.value = result.scopeDrafts.map((draft) => ({ ...draft.scope, confirmedFiles: [...draft.scope.confirmedFiles], includeDirectories: [...draft.scope.includeDirectories], excludeExact: [...draft.scope.excludeExact], excludePatterns: [...draft.scope.excludePatterns], excludeDirectories: [...draft.scope.excludeDirectories] }));
-      confidence.value = result.confidence;
+      if (validatingCandidates.value) {
+        mergeCandidateVerification(result);
+        validatingCandidates.value = false;
+      } else {
+        applyInitialLearningResult(result);
+      }
       phase.value = "review";
-    }, "已取消分析", "存档分析失败");
+    }, "已取消分析", "存档分析失败", async () => {
+      if (validatingCandidates.value) {
+        validatingCandidates.value = false;
+        phase.value = "review";
+      }
+    });
   } catch (reason) {
-    phase.value = "capturing";
+    const wasValidating = validatingCandidates.value;
+    validatingCandidates.value = false;
+    phase.value = wasValidating ? "review" : "capturing";
+    error.value = String(reason);
+  }
+}
+
+async function beginCandidateVerification() {
+  if (!completedGame.value || phase.value !== "review" || !hasReviewCandidates.value) return;
+  const candidates = reviewScopes.value.filter((scope) => evidenceForScope(scope).level === "review");
+  error.value = "";
+  message.value = "准备启动游戏并再次验证待确认范围";
+  validatingCandidates.value = true;
+  phase.value = "capturing";
+  try {
+    taskId.value = await startSaveCandidateVerificationTask(completedGame.value.gameUid, candidates);
+    await watchTask(async (task) => {
+      const learnedSession = task.result as SaveLearningSession | undefined;
+      if (!learnedSession?.sessionId) throw new Error("再次验证会话没有正确建立");
+      session.value = learnedSession;
+      message.value = "请在游戏内再次完成一次保存，然后回来分析";
+    }, "已取消再次验证", "启动再次验证失败", async () => {
+      validatingCandidates.value = false;
+      phase.value = "review";
+    });
+  } catch (reason) {
+    validatingCandidates.value = false;
+    phase.value = "review";
     error.value = String(reason);
   }
 }
@@ -237,7 +321,8 @@ function removeExcludeDirectory(scopeIndex: number, dirIndex: number) {
 }
 
 function removeScope(scopeIndex: number) {
-  reviewScopes.value.splice(scopeIndex, 1);
+  const [removed] = reviewScopes.value.splice(scopeIndex, 1);
+  if (removed) delete scopeEvidence.value[scopeEvidenceKey(removed)];
 }
 
 async function openFolder(path: string) {
@@ -251,7 +336,9 @@ async function openFolder(path: string) {
 async function addDirectoryScope() {
   const selected = await open({ directory: true, multiple: false });
   if (typeof selected !== "string") return;
-  reviewScopes.value.push(createDefaultSaveScope(selected, "custom"));
+  const scope = createDefaultSaveScope(selected, "custom");
+  reviewScopes.value.push(scope);
+  scopeEvidence.value[scopeEvidenceKey(scope)] = { level: "review", reason: "手动添加的范围，请在确认前检查内容。" };
 }
 
 async function confirm() {
@@ -277,6 +364,10 @@ async function cancelTaskOrLearning() {
     return;
   }
   if (session.value) await cancelSaveLearning(session.value.sessionId);
+  if (validatingCandidates.value) {
+    validatingCandidates.value = false;
+    phase.value = "review";
+  }
 }
 
 async function abandonPendingGame() {
@@ -322,10 +413,10 @@ onUnmounted(stopPolling);
     </form>
 
     <section v-else-if="phase === 'ready' || phase === 'capturing'" class="wizard-form">
-      <section class="wizard-section learning-intro"><div class="section-icon"><Gamepad2 :size="22" /></div><div><h2>{{ completedGame?.displayName }} 的存档保护</h2><p>启动受管游戏，在游戏内完成一次保存。回来后点击分析，GameSaver 会根据变化生成候选范围。</p></div></section>
-      <section class="wizard-section"><div class="task-progress-heading"><span>学习会话</span><strong v-if="session">PID {{ session.rootPid }}</strong><strong v-else>尚未启动</strong></div><p v-if="phase === 'ready'" class="field-note">只会记录本次学习期间的文件变化，不会立即创建正式存档版本。</p><p v-else class="field-note">完成一次保存后，先退出游戏，再回来分析本次变化。</p><div v-if="phase === 'capturing'" class="capture-state"><span class="loader"></span><strong>正在记录文件变化</strong><span>{{ message }}</span></div></section>
+      <section class="wizard-section learning-intro"><div class="section-icon"><Gamepad2 :size="22" /></div><div><h2>{{ completedGame?.displayName }} 的存档保护</h2><p>{{ validatingCandidates ? "只验证待确认的候选目录。请在游戏内再次完成一次保存。" : "启动受管游戏，在游戏内完成一次保存。回来后点击分析，GameSaver 会根据变化生成候选范围。" }}</p></div></section>
+      <section class="wizard-section"><div class="task-progress-heading"><span>{{ validatingCandidates ? "再次验证会话" : "学习会话" }}</span><strong v-if="session">PID {{ session.rootPid }}</strong><strong v-else>尚未启动</strong></div><p v-if="phase === 'ready'" class="field-note">只会记录本次学习期间的文件变化，不会立即创建正式存档版本。</p><p v-else class="field-note">完成一次保存后，先退出游戏，再回来分析本次变化。</p><div v-if="phase === 'capturing'" class="capture-state"><span class="loader"></span><strong>{{ validatingCandidates ? "正在验证候选范围" : "正在记录文件变化" }}</strong><span>{{ message }}</span></div></section>
       <p v-if="error" class="error-message" role="alert">{{ error }}</p>
-      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="phase === 'capturing'" @click="abandonPendingGame">放弃添加</button><button v-if="phase === 'capturing'" class="secondary-button" type="button" @click="cancelTaskOrLearning"><X :size="16" />停止识别</button><button v-if="phase === 'ready'" class="primary-button" type="button" @click="beginLearning"><Gamepad2 :size="17" />启动并开始识别</button><button v-else class="primary-button" type="button" @click="analyze"><Check :size="17" />完成保存，开始分析</button></footer>
+      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="phase === 'capturing'" @click="abandonPendingGame">放弃添加</button><button v-if="phase === 'capturing'" class="secondary-button" type="button" @click="cancelTaskOrLearning"><X :size="16" />停止{{ validatingCandidates ? "验证" : "识别" }}</button><button v-if="phase === 'ready'" class="primary-button" type="button" @click="beginLearning"><Gamepad2 :size="17" />启动并开始识别</button><button v-else class="primary-button" type="button" @click="analyze"><Check :size="17" />完成保存，开始{{ validatingCandidates ? "验证" : "分析" }}</button></footer>
     </section>
 
     <section v-else-if="phase === 'analyzing'" class="wizard-form">
@@ -340,6 +431,7 @@ onUnmounted(stopPolling);
           <div>
             <span class="scope-type">{{ rootTypeLabel[scope.rootType] }}</span>
             <span class="policy-badge" :class="scope.unknownFilePolicy === 'protect' ? 'policy-protect' : 'policy-ignore'">{{ scope.unknownFilePolicy === 'protect' ? '自动保护新存档' : '仅保护已确认文件' }}</span>
+            <span class="policy-badge" :class="evidenceForScope(scope).level === 'strong' ? 'policy-protect' : 'policy-ignore'" :title="evidenceForScope(scope).reason">{{ evidenceLabel(scope) }}</span>
             <h2>{{ scope.rootPath }}</h2>
           </div>
           <div class="scope-heading-actions">
@@ -356,13 +448,13 @@ onUnmounted(stopPolling);
         <div v-if="scope.excludeDirectories.length" class="editor-block"><div class="editor-label"><strong>排除目录</strong><span>{{ scope.excludeDirectories.length }} 项</span></div><div class="chip-list"><span v-for="(dir, dirIndex) in scope.excludeDirectories" :key="dir" class="file-chip exclude-dir-chip">{{ dir }}<button type="button" :aria-label="`删除排除目录 ${dir}`" title="删除排除目录" @click="removeExcludeDirectory(scopeIndex, dirIndex)"><X :size="13" /></button></span></div></div>
         <div v-if="scope.excludeExact.length" class="editor-block"><div class="editor-label"><strong>排除特定文件</strong><span>{{ scope.excludeExact.length }} 项</span></div><div class="chip-list"><span v-for="(exact, exactIndex) in scope.excludeExact" :key="exact" class="file-chip exclude-chip">{{ exact }}<button type="button" :aria-label="`删除排除文件 ${exact}`" title="删除排除文件" @click="removeExcludeExact(scopeIndex, exactIndex)"><X :size="13" /></button></span></div></div>
         <div class="editor-block"><div class="editor-label"><strong>排除模式</strong><span>{{ scope.excludePatterns.length }} 项</span></div><div class="chip-list"><span v-for="(pattern, patternIndex) in scope.excludePatterns" :key="pattern" class="file-chip exclude-chip">{{ pattern }}<button type="button" :aria-label="`删除排除模式 ${pattern}`" title="删除排除模式" @click="removePattern(scopeIndex, patternIndex)"><X :size="13" /></button></span><span v-if="!scope.excludePatterns.length" class="muted-text">暂未添加排除模式</span></div><div class="inline-editor"><input v-model="newPatternByScope[scopeIndex]" type="text" placeholder="输入排除模式，例如 *.log" @keyup.enter="addPattern(scopeIndex)" /><button class="secondary-button" type="button" @click="addPattern(scopeIndex)"><Plus :size="15" />添加排除</button></div></div>
-        <p class="scope-note">大于 10 MB 的文件默认不会自动加入；日志与临时文件已自动排除。</p>
+        <p class="scope-note">{{ evidenceForScope(scope).reason }}</p>
       </section>
       <div v-if="!reviewScopes.length" class="empty-review"><strong>没有自动识别到存档范围</strong><p>可以手动添加一个存档目录，或放弃本次设置稍后重新学习。</p></div>
       <button class="secondary-button add-scope-button" type="button" @click="addDirectoryScope"><Plus :size="16" />手动添加存档目录</button>
       <div v-if="learningResult?.notes.length" class="notes-panel"><strong>识别说明</strong><p v-for="note in learningResult.notes" :key="note">{{ note }}</p></div>
       <p v-if="error" class="error-message" role="alert">{{ error }}</p>
-      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="confirming" @click="abandonPendingGame">放弃添加</button><button class="primary-button" type="button" :disabled="!canConfirm || confirming" @click="confirm"><LoaderCircle v-if="confirming" :size="17" class="spin" /><Check v-else :size="17" />{{ confirming ? "正在保存" : "确认并加入游戏库" }}</button></footer>
+      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="confirming" @click="abandonPendingGame">放弃添加</button><button v-if="hasReviewCandidates" class="secondary-button" type="button" :disabled="confirming" @click="beginCandidateVerification"><Gamepad2 :size="17" />再次保存验证</button><button class="primary-button" type="button" :disabled="!canConfirm || confirming" @click="confirm"><LoaderCircle v-if="confirming" :size="17" class="spin" /><Check v-else :size="17" />{{ confirming ? "正在保存" : "确认并加入游戏库" }}</button></footer>
     </section>
 
     <div v-else class="wizard-success"><CheckCircle2 :size="34" /><div><h2>{{ completedGame?.displayName }} 已加入游戏库</h2><p>存档保护范围已确认，现在可以从游戏库启动它。</p></div><button class="primary-button" type="button" @click="emit('completed', completedGame!)">返回游戏库</button></div>

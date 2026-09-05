@@ -251,6 +251,10 @@ export function startSaveLearningTask(gameUid: string): Promise<string> {
   return invokeCommand<string>("start_save_learning_task", { gameUid });
 }
 
+export function startSaveCandidateVerificationTask(gameUid: string, scopes: SaveScope[]): Promise<string> {
+  return invokeCommand<string>("start_save_candidate_verification_task", { gameUid, scopes });
+}
+
 export function startFinishSaveLearningTask(sessionId: string): Promise<string> {
   return invokeCommand<string>("start_finish_save_learning_task", { sessionId });
 }

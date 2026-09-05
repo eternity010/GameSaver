@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
+use super::etw_capture::normalize_windows_path;
 use super::etw_capture::should_ignore_snapshot_path;
 use super::etw_capture::{
     build_device_path_map, resolve_device_path, should_skip_kernel_task, TraceCollectionResult,
 };
 use super::transactions::{FileOperation, FileOperationKind};
-use super::etw_capture::normalize_windows_path;
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::{

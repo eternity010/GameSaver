@@ -112,7 +112,10 @@ pub(crate) fn try_start_etw_capture(
         let stderr = String::from_utf8_lossy(&created.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&created.stdout).trim().to_string();
         let msg = if !stderr.is_empty() { stderr } else { stdout };
-        return Err(format!("ETW 启动失败：logman 返回 {}", command_failure_detail(&created, &msg)));
+        return Err(format!(
+            "ETW 启动失败：logman 返回 {}",
+            command_failure_detail(&created, &msg)
+        ));
     }
 
     Ok(EtwCaptureHandle {
@@ -138,7 +141,10 @@ pub(crate) fn stop_etw_capture(trace_name: &str) -> Result<(), String> {
     let stderr = String::from_utf8_lossy(&stopped.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&stopped.stdout).trim().to_string();
     let message = if !stderr.is_empty() { stderr } else { stdout };
-    Err(format!("ETW 停止失败：logman 返回 {}", command_failure_detail(&stopped, &message)))
+    Err(format!(
+        "ETW 停止失败：logman 返回 {}",
+        command_failure_detail(&stopped, &message)
+    ))
 }
 
 pub(crate) fn cleanup_stale_captures(app: &AppHandle) {
@@ -152,7 +158,11 @@ pub(crate) fn cleanup_stale_captures(app: &AppHandle) {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            for trace_name in text.lines().map(str::trim).filter(|line| line.starts_with("GameSaverTrace_")) {
+            for trace_name in text
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("GameSaverTrace_"))
+            {
                 let mut stop = Command::new("logman");
                 stop.args(["stop", trace_name, "-ets"]);
                 let _ = apply_background_process_flags(&mut stop).output();
@@ -189,7 +199,7 @@ pub(crate) fn is_running_as_admin() -> bool {
     use std::ptr::null_mut;
     use windows_sys::Win32::{
         Foundation::{CloseHandle, HANDLE},
-        Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
+        Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY},
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
 
@@ -209,7 +219,9 @@ pub(crate) fn is_running_as_admin() -> bool {
             &mut returned_length,
         ) != 0;
         CloseHandle(token);
-        result && returned_length >= std::mem::size_of::<TOKEN_ELEVATION>() as u32 && elevation.TokenIsElevated != 0
+        result
+            && returned_length >= std::mem::size_of::<TOKEN_ELEVATION>() as u32
+            && elevation.TokenIsElevated != 0
     }
 }
 
@@ -884,6 +896,15 @@ pub(crate) fn should_ignore_snapshot_path(path: &Path) -> bool {
         "\\logs\\",
         "\\temp\\",
         "\\crashdumps\\",
+        "\\crashreportclient\\",
+        "\\crashpad\\",
+        "\\nvidia\\dxcache\\",
+        "\\nvidia\\glcache\\",
+        "\\nvidia\\compute_cache\\",
+        "\\wettype\\",
+        "\\inputmethod\\",
+        "\\microsoft\\inputmethod\\",
+        "\\wer\\",
         "\\webcache\\",
         "\\player.log",
         "\\player-prev.log",
@@ -931,13 +952,13 @@ fn command_failure_detail(output: &std::process::Output, message: &str) -> Strin
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use super::{
         classify_file_operation, event_field_value, event_file_object_id, event_pid_value,
         fast_csv_field, is_trace_artifact, parse_csv_line, parse_trace_timestamp_ms, parse_u32,
         resolve_device_path, should_skip_kernel_task, KERNEL_FILE_CAPTURE_KEYWORDS,
     };
     use crate::services::learning::transactions::FileOperationKind;
+    use std::path::Path;
 
     #[test]
     fn parses_decimal_and_hexadecimal_process_ids() {
@@ -1047,9 +1068,13 @@ mod tests {
     fn recognizes_trace_artifacts_for_cleanup() {
         assert!(is_trace_artifact(Path::new("C:/appdata/events/trace.etl")));
         assert!(is_trace_artifact(Path::new("C:/appdata/events/trace.ETL")));
-        assert!(is_trace_artifact(Path::new("C:/appdata/events/trace.etl.csv")));
+        assert!(is_trace_artifact(Path::new(
+            "C:/appdata/events/trace.etl.csv"
+        )));
         assert!(is_trace_artifact(Path::new("C:/appdata/events/trace.CSV")));
-        assert!(!is_trace_artifact(Path::new("C:/appdata/events/store.json")));
+        assert!(!is_trace_artifact(Path::new(
+            "C:/appdata/events/store.json"
+        )));
         assert!(!is_trace_artifact(Path::new("C:/appdata/events/game.exe")));
     }
 }

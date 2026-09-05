@@ -1,6 +1,13 @@
+use crate::{
+    app_state::AppState,
+    commands::baidu_commands::remote_body_dir,
+    services::{CloudManifestService, GameLibraryService},
+};
 use std::{fs, path::Path};
-use tauri::{http::{header, Response, StatusCode}, Manager, UriSchemeContext};
-use crate::{app_state::AppState, commands::baidu_commands::remote_body_dir, services::{CloudManifestService, GameLibraryService}};
+use tauri::{
+    http::{header, Response, StatusCode},
+    Manager, UriSchemeContext,
+};
 
 pub fn handle_cover_request<R: tauri::Runtime>(
     ctx: UriSchemeContext<'_, R>,
@@ -87,9 +94,12 @@ pub fn handle_cover_request<R: tauri::Runtime>(
                         let matches_key = ["game.json", "manifest.json"].iter().any(|name| {
                             let file = dir.join(name);
                             if let Ok(content) = fs::read_to_string(&file) {
-                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                                    if val.get("gameKey").and_then(|v| v.as_str()) == Some(identifier)
-                                        || val.get("gameUid").and_then(|v| v.as_str()) == Some(identifier)
+                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
+                                {
+                                    if val.get("gameKey").and_then(|v| v.as_str())
+                                        == Some(identifier)
+                                        || val.get("gameUid").and_then(|v| v.as_str())
+                                            == Some(identifier)
                                     {
                                         return true;
                                     }
@@ -202,7 +212,10 @@ mod tests {
 
         // "[g20240404]black market"
         let encoded_brackets = "%5Bg20240404%5Dblack%20market";
-        assert_eq!(super::percent_decode(encoded_brackets), "[g20240404]black market");
+        assert_eq!(
+            super::percent_decode(encoded_brackets),
+            "[g20240404]black market"
+        );
 
         // Plain text remains unchanged
         let plain = "test_game_key_123";

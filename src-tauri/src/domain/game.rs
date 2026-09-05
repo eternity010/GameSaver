@@ -209,6 +209,9 @@ mod tests {
 
     #[test]
     fn game_key_normalizes_whitespace_and_case() {
-        assert_eq!(Game::derive_game_key("  Monster   Black Market  "), "monster black market");
+        assert_eq!(
+            Game::derive_game_key("  Monster   Black Market  "),
+            "monster black market"
+        );
     }
 }

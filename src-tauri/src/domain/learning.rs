@@ -30,6 +30,16 @@ pub struct SaveScopeDraft {
     pub scope: SaveScope,
     pub changed_files: Vec<String>,
     pub confidence: u8,
+    pub evidence_level: SaveCandidateEvidenceLevel,
+    pub evidence_reason: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SaveCandidateEvidenceLevel {
+    Strong,
+    Review,
+    Noise,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +97,8 @@ pub struct ActiveLearningSession {
     pub baseline: Option<HashMap<String, FileFingerprint>>,
     pub tracked_pids: Arc<Mutex<Vec<u32>>>,
     pub process_tracker_stop: Arc<AtomicBool>,
+    pub process_tracker_done: Arc<AtomicBool>,
     pub etw_capture: Option<EtwCaptureHandle>,
     pub etw_start_error: Option<String>,
+    pub validation_only: bool,
 }
