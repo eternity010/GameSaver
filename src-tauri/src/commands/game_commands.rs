@@ -9,7 +9,7 @@ use std::{
     io::Write,
     path::{Component, Path, PathBuf},
 };
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, State};
 use uuid::Uuid;
 
 #[tauri::command]
@@ -168,7 +168,6 @@ pub fn save_game_cover(
 
 #[tauri::command]
 pub fn arm_game_cover_capture(
-    app: AppHandle,
     state: State<AppState>,
     game_uid: String,
 ) -> Result<crate::services::CaptureArmView, String> {
@@ -197,16 +196,11 @@ pub fn arm_game_cover_capture(
 
     crate::logging::info(format!("确认进入封面截图模式：game_uid={game_uid}"));
 
-    let capture = CoverCaptureService::arm(&app, &game_uid, PathBuf::from(managed_path))?;
-    let Some(window) = app.get_webview_window("main") else {
-        CoverCaptureService::discard(&capture.capture_id);
-        return Err("未找到主窗口，无法进入截图模式".to_string());
-    };
-    if let Err(error) = window.hide() {
-        crate::logging::error(format!("隐藏主窗口进入封面截图模式失败：{error}"));
-        CoverCaptureService::discard(&capture.capture_id);
-        return Err(format!("隐藏窗口以截取游戏画面失败：{error}"));
-    }
+    let capture = CoverCaptureService::arm(&game_uid, PathBuf::from(managed_path))?;
+    crate::logging::info(format!(
+        "封面截图会话已准备，等待前端最小化窗口：capture_id={}",
+        capture.capture_id
+    ));
     Ok(capture)
 }
 

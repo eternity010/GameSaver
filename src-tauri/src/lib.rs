@@ -8,7 +8,10 @@ mod services;
 
 use app_state::AppState;
 use repositories::{GameRepository, LibraryConfigRepository, TaskRepository};
-use services::{learning::cleanup_stale_captures, BodyPackageService, GameBodyUpdateService};
+use services::{
+    learning::cleanup_stale_captures, BodyPackageService, CoverCaptureService,
+    GameBodyUpdateService,
+};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -136,6 +139,9 @@ pub fn run() {
                 tasks,
                 PathBuf::from(tasks_path),
             ));
+            if let Err(error) = CoverCaptureService::start_global_listener(app.handle().clone()) {
+                logging::error(format!("全局截图快捷键初始化失败：{error}"));
+            }
             Ok(())
         })
         .register_uri_scheme_protocol("gamesaver-cover", cover_protocol::handle_cover_request)

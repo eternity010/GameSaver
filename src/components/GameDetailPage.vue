@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { AlertTriangle, Archive, ArrowLeft, Camera, Check, CheckCircle2, Clock3, Cloud, CloudDownload, CloudUpload, Folder, FolderOpen, Gamepad2, HardDrive, ImagePlus, LoaderCircle, Pencil, Play, RefreshCw, RotateCcw, ShieldCheck, Trash2, Upload, X } from "@lucide/vue";
 import { armGameCoverCapture, deleteCloudSaveVersion, deleteGameBodyPackage, deleteSaveVersion, discardGameCoverCapture, getBaiduConfig, getBaiduStatus, getCloudSaveStatus, getGameCover, getGameCoverCaptureUrl, getGameCoverUrl, getGameRuntime, getSaveProfile, getTask, launchGame, listCloudSaveVersions, listGameBodyVersions, listSaveVersions, openPathInExplorer, packageGameBody, precheckGameLaunch, pruneSaveVersions, renameGame, restoreSaveVersion, saveGameCover, startRestoreCloudSaveTask, startUploadSaveVersionTask, uninstallGameBody, updateGameBody, uploadGameBodyPackage, updateSaveProfileKeepVersions, updateSaveProfileScopes } from "../api";
@@ -8,8 +9,18 @@ import type { BaiduConfigView, BaiduStatus } from "../api";
 import { createDefaultSaveScope } from "../domain/game";
 import type { CloudSaveManifestVersion, CloudSaveSyncStatusView, CoverCrop, CoverPosition, Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveProfile, SaveRootType, SaveVersion } from "../domain/game";
 
-const props = defineProps<{ game: Game; initialError?: string; coverUrl?: string }>();
-const emit = defineEmits<{ back: []; refresh: []; settings: [] }>();
+const props = defineProps<{
+  game: Game;
+  initialError?: string;
+  coverUrl?: string;
+  pendingCoverCapture?: { captureId: string; gameUid: string } | null;
+}>();
+const emit = defineEmits<{
+  back: [];
+  refresh: [];
+  settings: [];
+  captureHandled: [captureId: string];
+}>();
 
 const precheck = ref<LaunchPrecheck | null>(null);
 const runtime = ref<GameRuntime | null>(null);
@@ -574,7 +585,7 @@ async function openCoverFile(file: File) {
 }
 
 async function beginCoverCapture() {
-  if (!runtime.value || busy.value || coverSaving.value || coverCapturePending.value) return;
+  if (coverSaving.value || coverCapturePending.value) return;
   try {
     coverError.value = "";
     error.value = "";
@@ -582,14 +593,26 @@ async function beginCoverCapture() {
     coverCaptureId.value = capture.captureId;
     coverCaptureShortcut.value = capture.shortcut;
     coverCapturePending.value = true;
-    message.value = `已隐藏 GameSaver，请切回游戏后按 ${capture.shortcut} 截取封面。`;
+    message.value = `已准备截图，请切回游戏后按 ${capture.shortcut} 截取封面。`;
+    try {
+      await getCurrentWindow().minimize();
+      message.value = `GameSaver 已最小化，请切回游戏后按 ${capture.shortcut} 截取封面。`;
+    } catch (reason) {
+      error.value = `GameSaver 未能自动最小化，请手动切回游戏后按 ${capture.shortcut} 截取封面：${String(reason)}`;
+    }
   } catch (reason) {
     error.value = `启动封面截图失败：${String(reason)}`;
   }
 }
 
 async function handleCoverCaptureReady(payload: { captureId: string; gameUid: string }) {
-  if (payload.gameUid !== props.game.gameUid || payload.captureId !== coverCaptureId.value) return;
+  if (payload.gameUid !== props.game.gameUid) return;
+  if (coverCaptureId.value && payload.captureId !== coverCaptureId.value) return;
+  emit("captureHandled", payload.captureId);
+  if (!coverCaptureId.value) {
+    coverCaptureId.value = payload.captureId;
+    coverCaptureShortcut.value = "Ctrl + Alt + S";
+  }
   coverCapturePending.value = false;
   message.value = "正在载入游戏截图...";
   try {
@@ -607,7 +630,8 @@ async function handleCoverCaptureReady(payload: { captureId: string; gameUid: st
 }
 
 function handleCoverCaptureFailed(payload: { captureId: string; gameUid: string; message: string }) {
-  if (payload.gameUid !== props.game.gameUid || payload.captureId !== coverCaptureId.value) return;
+  if (payload.gameUid !== props.game.gameUid) return;
+  if (coverCaptureId.value && payload.captureId !== coverCaptureId.value) return;
   coverCapturePending.value = false;
   coverCaptureId.value = "";
   coverCaptureShortcut.value = "";
@@ -775,6 +799,9 @@ onMounted(() => {
     if (captureListenersDisposed) unlisten();
     else stopCoverCaptureFailed = unlisten;
   });
+  if (props.pendingCoverCapture) {
+    void handleCoverCaptureReady(props.pendingCoverCapture);
+  }
 });
 onUnmounted(() => {
   captureListenersDisposed = true;
@@ -852,7 +879,7 @@ onUnmounted(() => {
           <img v-if="coverDisplayUrl" :src="coverDisplayUrl" :alt="`${game.displayName} 封面`" />
           <Gamepad2 v-else :size="42" />
           <div class="cover-actions">
-            <button v-if="runtime" class="cover-edit-button" type="button" :disabled="busy || coverSaving || coverCapturePending" title="隐藏 GameSaver 后，按 Ctrl + Alt + S 截取当前游戏画面" @click="beginCoverCapture"><Camera :size="15" />{{ coverCapturePending ? "等待截图" : "截取游戏画面" }}</button>
+            <button class="cover-edit-button" type="button" :disabled="coverSaving || coverCapturePending" title="隐藏 GameSaver 后，按 Ctrl + Alt + S 截取当前游戏画面" @click="beginCoverCapture"><Camera :size="15" />{{ coverCapturePending ? "等待截图" : "截取游戏画面" }}</button>
             <button class="cover-edit-button" type="button" :disabled="busy || coverSaving || coverCapturePending" title="上传并调整游戏封面" @click="chooseCover"><ImagePlus :size="15" />{{ coverDisplayUrl ? "更换封面" : "上传封面" }}</button>
           </div>
           <span v-if="coverCapturePending" class="cover-capture-hint">{{ coverCaptureShortcut }}</span>

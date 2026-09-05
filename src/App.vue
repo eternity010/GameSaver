@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { AlertTriangle, ChevronLeft, ChevronRight, CloudDownload, CloudUpload, Gamepad2, Library, Plus, Settings, Search, ShieldCheck } from "@lucide/vue";
-import { deleteRemoteBodyPackage, getElevationStatus, getGameCoverUrl, getTask, installCloudGame, launchGame, listCloudGames, listGames, listTasks, restartAsAdmin } from "./api";
+import { deleteRemoteBodyPackage, discardGameCoverCapture, getElevationStatus, getGameCoverUrl, getTask, installCloudGame, launchGame, listCloudGames, listGames, listTasks, restartAsAdmin } from "./api";
 import type { AppTask, ElevationStatus } from "./api";
 import type { CloudGameSummary, CloudGameVersion } from "./api";
 import { gameStatusLabel, type Game } from "./domain/game";
@@ -24,6 +25,7 @@ const loading = ref(true);
 const error = ref("");
 const selectedGame = ref<Game | null>(null);
 const selectedGameError = ref("");
+const pendingCoverCapture = ref<{ captureId: string; gameUid: string } | null>(null);
 const cloudInstallUid = ref("");
 const cloudInstallProgress = ref(0);
 const cloudInstallMessage = ref("");
@@ -43,6 +45,8 @@ const elevationError = ref("");
 const activeTransferCount = ref(0);
 let cloudInstallTimer: ReturnType<typeof setTimeout> | undefined;
 let transferCountTimer: ReturnType<typeof setTimeout> | undefined;
+let stopCoverCaptureRoute: UnlistenFn | undefined;
+let appDisposed = false;
 
 const filteredGames = computed(() => {
   const keyword = search.value.trim().toLocaleLowerCase();
@@ -177,8 +181,31 @@ onMounted(() => {
   void loadElevationStatus();
   void loadStore();
   void updateTransferCount();
+  void listen<{ captureId: string; gameUid: string }>("cover-capture-ready", async (event) => {
+    if (activePage.value === "detail" && selectedGame.value?.gameUid === event.payload.gameUid) return;
+    let game = games.value.find((item) => item.gameUid === event.payload.gameUid);
+    if (!game) {
+      await loadGames();
+      game = games.value.find((item) => item.gameUid === event.payload.gameUid);
+    }
+    if (!game) {
+      void discardGameCoverCapture(event.payload.captureId);
+      return;
+    }
+    selectedGame.value = game;
+    selectedGameError.value = "";
+    pendingCoverCapture.value = event.payload;
+    activePage.value = "detail";
+  }).then((unlisten) => {
+    if (appDisposed) unlisten();
+    else stopCoverCaptureRoute = unlisten;
+  }).catch((reason) => {
+    console.error("监听封面截图跳转事件失败", reason);
+  });
 });
 onUnmounted(() => {
+  appDisposed = true;
+  stopCoverCaptureRoute?.();
   if (cloudInstallTimer) clearTimeout(cloudInstallTimer);
   if (transferCountTimer) clearTimeout(transferCountTimer);
   coverUrls.value = {};
@@ -194,9 +221,14 @@ function openStore() {
 }
 
 function openGame(game: Game, detailError = "") {
+  pendingCoverCapture.value = null;
   selectedGame.value = game;
   selectedGameError.value = detailError;
   activePage.value = "detail";
+}
+
+function finishPendingCoverCapture(captureId: string) {
+  if (pendingCoverCapture.value?.captureId === captureId) pendingCoverCapture.value = null;
 }
 
 async function quickLaunch(game: Game) {
@@ -355,7 +387,7 @@ async function finishAddGame() {
       </header>
 
       <AddGameWizard v-if="activePage === 'add'" @back="activePage = 'library'" @completed="finishAddGame" />
-      <GameDetailPage v-else-if="activePage === 'detail' && selectedGame" :game="selectedGame" :cover-url="selectedGame ? coverUrls[selectedGame.gameUid] : ''" :initial-error="selectedGameError" @back="activePage = 'library'" @settings="activePage = 'settings'" @refresh="loadGames" />
+      <GameDetailPage v-else-if="activePage === 'detail' && selectedGame" :game="selectedGame" :cover-url="selectedGame ? coverUrls[selectedGame.gameUid] : ''" :initial-error="selectedGameError" :pending-cover-capture="pendingCoverCapture" @back="activePage = 'library'" @settings="activePage = 'settings'" @refresh="loadGames" @capture-handled="finishPendingCoverCapture" />
       <GameStorePage v-else-if="activePage === 'store'" :games="cloudGames" :search="search" :loading="storeLoading" :load-error="storeError" :install-uid="cloudInstallUid" :install-progress="cloudInstallProgress" :install-message="cloudInstallMessage" :install-error="cloudInstallError" :install-notice="cloudInstallNotice" :page="storePage" :has-more="storeHasMore" @install="installAndLaunch" @delete-version="deleteCloudVersion" @retry="refreshStore" @refresh="refreshStore" @page-change="changeStorePage" />
       <TransferCenter v-else-if="activePage === 'transfers'" :games="games" :cloud-games="cloudGames" />
       <PlatformSettings v-else-if="activePage === 'settings'" />
