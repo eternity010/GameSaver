@@ -10,7 +10,7 @@ use app_state::AppState;
 use repositories::{GameRepository, LibraryConfigRepository, TaskRepository};
 use services::{
     learning::cleanup_stale_captures, BodyPackageService, CoverCaptureService,
-    GameBodyUpdateService,
+    GameBodyUpdateService, InstanceService,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -20,6 +20,14 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    match InstanceService::acquire_or_focus_existing() {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            eprintln!("GameSaver 单实例检查失败：{error}");
+            return;
+        }
+    }
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {

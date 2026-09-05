@@ -85,11 +85,12 @@ fn relaunch_as_admin() -> Result<(), String> {
     let executable =
         std::env::current_exe().map_err(|error| format!("获取应用路径失败：{error}"))?;
     let working_directory = executable.parent().unwrap_or_else(|| Path::new("."));
-    let arguments = std::env::args_os()
+    let mut arguments = std::env::args_os()
         .skip(1)
         .map(quote_windows_argument)
-        .collect::<Vec<_>>()
-        .join(" ");
+        .collect::<Vec<_>>();
+    arguments.push(crate::services::InstanceService::admin_relaunch_argument());
+    let arguments = arguments.join(" ");
     let verb = wide(OsStr::new("runas"));
     let executable = wide(executable.as_os_str());
     let arguments = wide(OsStr::new(&arguments));
