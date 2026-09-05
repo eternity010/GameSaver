@@ -171,6 +171,19 @@ export function saveGameCover(gameUid: string, originalBytes: number[], displayB
   return invokeCommand<GameCover>("save_game_cover", { gameUid, originalBytes, displayBytes, originalExtension, crop, position });
 }
 
+export interface CaptureArmView {
+  captureId: string;
+  shortcut: string;
+}
+
+export function armGameCoverCapture(gameUid: string): Promise<CaptureArmView> {
+  return invokeCommand<CaptureArmView>("arm_game_cover_capture", { gameUid });
+}
+
+export function discardGameCoverCapture(captureId: string): Promise<void> {
+  return invokeCommand<void>("discard_game_cover_capture", { captureId });
+}
+
 export function getGameCover(gameUid: string): Promise<number[] | null> {
   return invokeCommand<number[] | null>("get_game_cover", { gameUid });
 }
@@ -194,6 +207,10 @@ export function getCloudGameCoverPaths(): Promise<Record<string, string>> {
 export function getGameCoverUrl(gameUid: string, cacheKey?: string | number): string {
   const base = `http://gamesaver-cover.localhost/game/${encodeURIComponent(gameUid)}`;
   return cacheKey ? `${base}?v=${encodeURIComponent(cacheKey)}` : base;
+}
+
+export function getGameCoverCaptureUrl(captureId: string): string {
+  return `http://gamesaver-cover.localhost/capture/${encodeURIComponent(captureId)}`;
 }
 
 export function getCloudGameCoverUrl(gameKey: string): string {

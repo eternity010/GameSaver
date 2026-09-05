@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { AlertTriangle, Archive, ArrowLeft, Check, CheckCircle2, Clock3, Cloud, CloudDownload, CloudUpload, Folder, FolderOpen, Gamepad2, HardDrive, ImagePlus, LoaderCircle, Pencil, Play, RefreshCw, RotateCcw, ShieldCheck, Trash2, Upload, X } from "@lucide/vue";
-import { deleteCloudSaveVersion, deleteGameBodyPackage, deleteSaveVersion, getBaiduConfig, getBaiduStatus, getCloudSaveStatus, getGameCover, getGameCoverUrl, getGameRuntime, getSaveProfile, getTask, launchGame, listCloudSaveVersions, listGameBodyVersions, listSaveVersions, openPathInExplorer, packageGameBody, precheckGameLaunch, pruneSaveVersions, renameGame, restoreSaveVersion, saveGameCover, startRestoreCloudSaveTask, startUploadSaveVersionTask, uninstallGameBody, updateGameBody, uploadGameBodyPackage, updateSaveProfileKeepVersions, updateSaveProfileScopes } from "../api";
+import { AlertTriangle, Archive, ArrowLeft, Camera, Check, CheckCircle2, Clock3, Cloud, CloudDownload, CloudUpload, Folder, FolderOpen, Gamepad2, HardDrive, ImagePlus, LoaderCircle, Pencil, Play, RefreshCw, RotateCcw, ShieldCheck, Trash2, Upload, X } from "@lucide/vue";
+import { armGameCoverCapture, deleteCloudSaveVersion, deleteGameBodyPackage, deleteSaveVersion, discardGameCoverCapture, getBaiduConfig, getBaiduStatus, getCloudSaveStatus, getGameCover, getGameCoverCaptureUrl, getGameCoverUrl, getGameRuntime, getSaveProfile, getTask, launchGame, listCloudSaveVersions, listGameBodyVersions, listSaveVersions, openPathInExplorer, packageGameBody, precheckGameLaunch, pruneSaveVersions, renameGame, restoreSaveVersion, saveGameCover, startRestoreCloudSaveTask, startUploadSaveVersionTask, uninstallGameBody, updateGameBody, uploadGameBodyPackage, updateSaveProfileKeepVersions, updateSaveProfileScopes } from "../api";
 import type { BaiduConfigView, BaiduStatus } from "../api";
 import { createDefaultSaveScope } from "../domain/game";
 import type { CloudSaveManifestVersion, CloudSaveSyncStatusView, CoverCrop, CoverPosition, Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveProfile, SaveRootType, SaveVersion } from "../domain/game";
@@ -84,12 +85,18 @@ const coverOriginalExtension = ref("jpg");
 const coverEditorOpen = ref(false);
 const coverSaving = ref(false);
 const coverError = ref("");
+const coverCapturePending = ref(false);
+const coverCaptureId = ref("");
+const coverCaptureShortcut = ref("");
 const coverZoom = ref(1);
 const coverOffsetX = ref(0);
 const coverOffsetY = ref(0);
 const coverDragging = ref(false);
 let coverPointerX = 0;
 let coverPointerY = 0;
+let stopCoverCaptureReady: UnlistenFn | undefined;
+let stopCoverCaptureFailed: UnlistenFn | undefined;
+let captureListenersDisposed = false;
 const COVER_STAGE_WIDTH = 640;
 const COVER_STAGE_HEIGHT = 360;
 let pollTimer: ReturnType<typeof setTimeout> | undefined;
@@ -515,7 +522,7 @@ function runtimeLabel(status: GameRuntime["status"]): string {
 }
 
 function chooseCover() {
-  if (busy.value || runtime.value || coverSaving.value) return;
+  if (busy.value || coverSaving.value || coverCapturePending.value) return;
   coverInput.value?.click();
 }
 
@@ -532,6 +539,10 @@ async function handleCoverSelected(event: Event) {
   const file = input.files?.[0];
   input.value = "";
   if (!file) return;
+  await openCoverFile(file);
+}
+
+async function openCoverFile(file: File) {
   if (file.size > 32 * 1024 * 1024) {
     coverError.value = "封面图片不能超过 32 MB";
     return;
@@ -560,6 +571,47 @@ async function handleCoverSelected(event: Event) {
   };
   coverLoadToken = token;
   image.src = objectUrl;
+}
+
+async function beginCoverCapture() {
+  if (!runtime.value || busy.value || coverSaving.value || coverCapturePending.value) return;
+  try {
+    coverError.value = "";
+    error.value = "";
+    const capture = await armGameCoverCapture(props.game.gameUid);
+    coverCaptureId.value = capture.captureId;
+    coverCaptureShortcut.value = capture.shortcut;
+    coverCapturePending.value = true;
+    message.value = `已隐藏 GameSaver，请切回游戏后按 ${capture.shortcut} 截取封面。`;
+  } catch (reason) {
+    error.value = `启动封面截图失败：${String(reason)}`;
+  }
+}
+
+async function handleCoverCaptureReady(payload: { captureId: string; gameUid: string }) {
+  if (payload.gameUid !== props.game.gameUid || payload.captureId !== coverCaptureId.value) return;
+  coverCapturePending.value = false;
+  message.value = "正在载入游戏截图...";
+  try {
+    const response = await fetch(getGameCoverCaptureUrl(payload.captureId));
+    if (!response.ok) throw new Error("临时截图不可用");
+    const image = new File([await response.blob()], "game-capture.png", { type: "image/png" });
+    await openCoverFile(image);
+    message.value = "已截取游戏画面，请调整裁剪范围后保存。";
+  } catch (reason) {
+    error.value = `读取游戏截图失败：${String(reason)}`;
+    void discardGameCoverCapture(payload.captureId);
+    coverCaptureId.value = "";
+    coverCaptureShortcut.value = "";
+  }
+}
+
+function handleCoverCaptureFailed(payload: { captureId: string; gameUid: string; message: string }) {
+  if (payload.gameUid !== props.game.gameUid || payload.captureId !== coverCaptureId.value) return;
+  coverCapturePending.value = false;
+  coverCaptureId.value = "";
+  coverCaptureShortcut.value = "";
+  error.value = `截取游戏画面失败：${payload.message}`;
 }
 
 let coverLoadToken = 0;
@@ -631,6 +683,10 @@ function releaseCoverSource() {
 }
 
 function dismissCoverEditor() {
+  const captureId = coverCaptureId.value;
+  coverCaptureId.value = "";
+  coverCaptureShortcut.value = "";
+  if (captureId) void discardGameCoverCapture(captureId);
   coverEditorOpen.value = false;
   coverOriginalBytes.value = [];
   coverError.value = "";
@@ -707,8 +763,24 @@ watch(coverZoom, clampCoverPosition);
 onMounted(() => {
   void refresh();
   void loadCover();
+  void listen<{ captureId: string; gameUid: string }>("cover-capture-ready", (event) => {
+    void handleCoverCaptureReady(event.payload);
+  }).then((unlisten) => {
+    if (captureListenersDisposed) unlisten();
+    else stopCoverCaptureReady = unlisten;
+  });
+  void listen<{ captureId: string; gameUid: string; message: string }>("cover-capture-failed", (event) => {
+    handleCoverCaptureFailed(event.payload);
+  }).then((unlisten) => {
+    if (captureListenersDisposed) unlisten();
+    else stopCoverCaptureFailed = unlisten;
+  });
 });
 onUnmounted(() => {
+  captureListenersDisposed = true;
+  stopCoverCaptureReady?.();
+  stopCoverCaptureFailed?.();
+  if (coverCaptureId.value) void discardGameCoverCapture(coverCaptureId.value);
   stopPolling();
   releaseCoverSource();
 });
@@ -779,7 +851,11 @@ onUnmounted(() => {
         <div class="detail-cover">
           <img v-if="coverDisplayUrl" :src="coverDisplayUrl" :alt="`${game.displayName} 封面`" />
           <Gamepad2 v-else :size="42" />
-          <button class="cover-edit-button" type="button" :disabled="busy || !!runtime || coverSaving" title="上传并调整游戏封面" @click="chooseCover"><ImagePlus :size="15" />{{ coverDisplayUrl ? "更换封面" : "上传封面" }}</button>
+          <div class="cover-actions">
+            <button v-if="runtime" class="cover-edit-button" type="button" :disabled="busy || coverSaving || coverCapturePending" title="隐藏 GameSaver 后，按 Ctrl + Alt + S 截取当前游戏画面" @click="beginCoverCapture"><Camera :size="15" />{{ coverCapturePending ? "等待截图" : "截取游戏画面" }}</button>
+            <button class="cover-edit-button" type="button" :disabled="busy || coverSaving || coverCapturePending" title="上传并调整游戏封面" @click="chooseCover"><ImagePlus :size="15" />{{ coverDisplayUrl ? "更换封面" : "上传封面" }}</button>
+          </div>
+          <span v-if="coverCapturePending" class="cover-capture-hint">{{ coverCaptureShortcut }}</span>
           <input ref="coverInput" class="visually-hidden" type="file" accept="image/jpeg,image/png,image/webp" @change="handleCoverSelected" />
         </div>
         <div class="detail-hero-copy"><span class="status-label">{{ runtime ? runtimeLabel(runtime.status) : (precheck?.canLaunch ? "可启动" : "需要处理") }}</span><h2>{{ precheck?.canLaunch ? "准备就绪" : "启动前需要处理" }}</h2><p>{{ message || (precheck?.canLaunch ? "游戏本体和存档保护配置均可用。" : "完成下方检查后才能启动游戏。") }}</p><button class="primary-button detail-launch" type="button" :disabled="busy || !precheck?.canLaunch" @click="start"><LoaderCircle v-if="busy" :size="17" class="spin" /><Play v-else :size="17" />{{ busy ? "游戏运行中" : "启动游戏" }}</button></div>

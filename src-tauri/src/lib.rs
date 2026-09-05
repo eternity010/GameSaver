@@ -144,6 +144,8 @@ pub fn run() {
             commands::game_commands::get_game,
             commands::game_commands::rename_game,
             commands::game_commands::save_game_cover,
+            commands::game_commands::arm_game_cover_capture,
+            commands::game_commands::discard_game_cover_capture,
             commands::game_commands::get_game_cover,
             commands::game_commands::get_game_cover_path,
             commands::game_commands::get_game_cover_paths,

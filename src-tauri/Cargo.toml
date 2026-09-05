@@ -1,6 +1,6 @@
 [package]
 name = "gamesaver_next"
-version = "1.0.8"
+version = "1.0.9"
 description = "GameSaver next-generation game library"
 authors = ["GameSaver"]
 edition = "2021"
@@ -28,11 +28,14 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_JobObjects",
     "Win32_System_Time",
     "Win32_System_Threading",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 sha2 = "0.10"
 hex = "0.4"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "multipart", "query", "rustls"] }
 

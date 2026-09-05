@@ -2,14 +2,14 @@ use crate::{
     app_state::AppState,
     domain::{CoverCrop, CoverPosition, GameCover},
     repositories::GameRepository,
-    services::GameLibraryService,
+    services::{CoverCaptureService, GameLibraryService},
 };
 use std::{
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
 };
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
 #[tauri::command]
@@ -164,6 +164,58 @@ pub fn save_game_cover(
     );
     release_cover_operation(&state, &game_uid);
     result
+}
+
+#[tauri::command]
+pub fn arm_game_cover_capture(
+    app: AppHandle,
+    state: State<AppState>,
+    game_uid: String,
+) -> Result<crate::services::CaptureArmView, String> {
+    let game_uid = game_uid.trim().to_string();
+    validate_component(&game_uid, "游戏标识")?;
+    let managed_path = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "读取游戏记录失败".to_string())?;
+        GameLibraryService::find(&store, &game_uid)
+            .ok_or_else(|| "游戏不存在".to_string())?
+            .managed_path
+    };
+    if !Path::new(&managed_path).is_dir() {
+        return Err("受管游戏目录不存在，无法截取封面".to_string());
+    }
+    if !state
+        .running_games
+        .lock()
+        .map_err(|_| "读取游戏运行状态失败".to_string())?
+        .contains_key(&game_uid)
+    {
+        return Err("请先启动游戏后再截取封面".to_string());
+    }
+
+    crate::logging::info(format!("确认进入封面截图模式：game_uid={game_uid}"));
+
+    let capture = CoverCaptureService::arm(&app, &game_uid, PathBuf::from(managed_path))?;
+    let Some(window) = app.get_webview_window("main") else {
+        CoverCaptureService::discard(&capture.capture_id);
+        return Err("未找到主窗口，无法进入截图模式".to_string());
+    };
+    if let Err(error) = window.hide() {
+        crate::logging::error(format!("隐藏主窗口进入封面截图模式失败：{error}"));
+        CoverCaptureService::discard(&capture.capture_id);
+        return Err(format!("隐藏窗口以截取游戏画面失败：{error}"));
+    }
+    Ok(capture)
+}
+
+#[tauri::command]
+pub fn discard_game_cover_capture(capture_id: String) -> Result<(), String> {
+    let capture_id = capture_id.trim();
+    validate_component(capture_id, "封面截图标识")?;
+    CoverCaptureService::discard(capture_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -479,14 +531,6 @@ fn cleanup_old_cover(
 }
 
 fn reserve_cover_operation(state: &AppState, game_uid: &str) -> Result<(), String> {
-    if state
-        .running_games
-        .lock()
-        .map_err(|_| "读取运行状态失败".to_string())?
-        .contains_key(game_uid)
-    {
-        return Err("游戏运行中，暂时不能修改封面".to_string());
-    }
     let mut operations = state
         .save_operations
         .lock()

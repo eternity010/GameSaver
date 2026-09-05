@@ -1,7 +1,7 @@
 use crate::{
     app_state::AppState,
     commands::baidu_commands::remote_body_dir,
-    services::{CloudManifestService, GameLibraryService},
+    services::{CloudManifestService, CoverCaptureService, GameLibraryService},
 };
 use std::{fs, path::Path};
 use tauri::{
@@ -120,6 +120,12 @@ pub fn handle_cover_request<R: tauri::Runtime>(
             };
             cover
         }
+        "capture" => {
+            let Some(path) = CoverCaptureService::capture_path(identifier) else {
+                return not_found();
+            };
+            path
+        }
         _ => return not_found(),
     };
 
@@ -136,7 +142,14 @@ pub fn handle_cover_request<R: tauri::Runtime>(
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
-        .header(header::CACHE_CONTROL, "public, max-age=604800, immutable")
+        .header(
+            header::CACHE_CONTROL,
+            if kind == "capture" {
+                "no-store"
+            } else {
+                "public, max-age=604800, immutable"
+            },
+        )
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .body(bytes)
         .unwrap_or_else(|_| not_found())
