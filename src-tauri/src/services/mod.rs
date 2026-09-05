@@ -23,7 +23,9 @@ pub use cloud_account_service::{CloudAccountProfile, CloudAccountService};
 pub use cloud_manifest_service::{
     CloudGamePage, CloudGameSummary, CloudManifestService, RemoteBodyPackageList,
 };
-pub use cloud_save_service::{CloudSaveManifestVersion, CloudSaveService, CloudSaveSyncStatusView};
+pub use cloud_save_service::{
+    CloudSaveManifestVersion, CloudSaveOverview, CloudSaveService, CloudSaveSyncStatusView,
+};
 pub use cover_capture_service::{CaptureArmView, CoverCaptureService};
 pub use game_body_package_service::BodyPackageService;
 pub use game_body_update_service::GameBodyUpdateService;

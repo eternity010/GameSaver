@@ -224,6 +224,11 @@ export interface CloudSaveSyncStatusView {
   warnings: string[];
 }
 
+export interface CloudSaveOverview {
+  status: CloudSaveSyncStatusView;
+  versions: CloudSaveManifestVersion[];
+}
+
 export function gameStatusLabel(game: Game): string {
   if (game.lifecycle === "pending_setup") return "需要设置";
   if (game.lifecycle === "needs_repair" || game.health === "broken" || game.health === "needs_attention") {

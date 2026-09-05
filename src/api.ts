@@ -462,6 +462,10 @@ export function getCloudSaveStatus(gameUid: string): Promise<import("./domain/ga
   return invokeCommand<import("./domain/game").CloudSaveSyncStatusView>("get_cloud_save_status", { gameUid });
 }
 
+export function getCloudSaveOverview(gameUid: string): Promise<import("./domain/game").CloudSaveOverview> {
+  return invokeCommand<import("./domain/game").CloudSaveOverview>("get_cloud_save_overview", { gameUid });
+}
+
 export function listCloudSaveVersions(gameUid: string): Promise<import("./domain/game").CloudSaveManifestVersion[]> {
   return invokeCommand<import("./domain/game").CloudSaveManifestVersion[]>("list_cloud_save_versions", { gameUid });
 }

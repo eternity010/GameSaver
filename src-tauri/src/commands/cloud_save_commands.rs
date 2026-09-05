@@ -3,8 +3,8 @@ use crate::{
     domain::{Game, SaveProfile, SaveVersion, TaskStatus},
     repositories::BaiduConfigRepository,
     services::{
-        BaiduNetdiskClient, CloudSaveManifestVersion, CloudSaveService, CloudSaveSyncStatusView,
-        TaskService,
+        BaiduNetdiskClient, CloudSaveManifestVersion, CloudSaveOverview, CloudSaveService,
+        CloudSaveSyncStatusView, TaskService,
     },
 };
 use tauri::{AppHandle, Manager, State};
@@ -28,6 +28,27 @@ pub fn get_cloud_save_status(
     drop(store);
 
     CloudSaveService::get_sync_status(&app, &game)
+}
+
+#[tauri::command]
+pub fn get_cloud_save_overview(
+    app: AppHandle,
+    state: State<AppState>,
+    game_uid: String,
+) -> Result<CloudSaveOverview, String> {
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "锁定本地存储失败".to_string())?;
+    let game = store
+        .games
+        .iter()
+        .find(|g| g.game_uid == game_uid)
+        .ok_or_else(|| "未找到指定游戏".to_string())?
+        .clone();
+    drop(store);
+
+    CloudSaveService::get_overview(&app, &game)
 }
 
 #[tauri::command]

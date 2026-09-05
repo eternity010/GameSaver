@@ -71,6 +71,13 @@ pub struct CloudSaveSyncStatusView {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudSaveOverview {
+    pub status: CloudSaveSyncStatusView,
+    pub versions: Vec<CloudSaveManifestVersion>,
+}
+
 pub struct CloudSaveService;
 
 impl CloudSaveService {
@@ -521,6 +528,10 @@ impl CloudSaveService {
         app: &AppHandle,
         game: &Game,
     ) -> Result<CloudSaveSyncStatusView, String> {
+        Ok(Self::get_overview(app, game)?.status)
+    }
+
+    pub fn get_overview(app: &AppHandle, game: &Game) -> Result<CloudSaveOverview, String> {
         let data_dir = app_data_dir(app)?;
         let baidu_config = BaiduConfigRepository::load(&data_dir)?;
         let auto_sync_save = baidu_config
@@ -540,6 +551,7 @@ impl CloudSaveService {
             .filter(|v| v.game_uid == game.game_uid)
             .cloned()
             .collect::<Vec<_>>();
+        drop(store);
         local_versions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
         let latest_local = local_versions.first();
@@ -547,55 +559,71 @@ impl CloudSaveService {
 
         let client = BaiduNetdiskClient::load_from_app_data(&data_dir);
         let Ok(client) = client else {
-            return Ok(CloudSaveSyncStatusView {
-                auto_sync_save,
-                local_version_count: local_versions.len(),
-                cloud_version_count: 0,
-                latest_local_created_at,
-                latest_cloud_created_at: None,
-                latest_cloud_version_id: None,
-                sync_state: "offline".to_string(),
-                warnings: vec!["未连接或未授权百度网盘".to_string()],
+            return Ok(CloudSaveOverview {
+                status: CloudSaveSyncStatusView {
+                    auto_sync_save,
+                    local_version_count: local_versions.len(),
+                    cloud_version_count: 0,
+                    latest_local_created_at,
+                    latest_cloud_created_at: None,
+                    latest_cloud_version_id: None,
+                    sync_state: "offline".to_string(),
+                    warnings: vec!["未连接或未授权百度网盘".to_string()],
+                },
+                versions: Vec::new(),
             });
         };
 
-        let manifest =
-            Self::fetch_manifest(&client, &game.game_key, &game.game_uid).unwrap_or(None);
+        let manifest = Self::fetch_manifest(&client, &game.game_key, &game.game_uid)?;
         let cloud_versions = manifest
             .as_ref()
             .map(|m| m.versions.clone())
             .unwrap_or_default();
-        let latest_cloud = cloud_versions.first();
-        let latest_cloud_created_at = latest_cloud.map(|v| v.created_at.clone());
-        let latest_cloud_version_id = latest_cloud.map(|v| v.version_id.clone());
+        let status = build_sync_status(auto_sync_save, &local_versions, &cloud_versions);
 
-        let sync_state = match (latest_local, latest_cloud) {
-            (None, None) => "synced",
-            (Some(_), None) => "no_cloud_saves",
-            (None, Some(_)) => "cloud_ahead",
-            (Some(loc), Some(cld)) => {
-                let loc_time = loc.created_at.parse::<u64>().unwrap_or(0);
-                let cld_time = cld.created_at.parse::<u64>().unwrap_or(0);
-                if loc.version_id == cld.version_id || loc_time == cld_time {
-                    "synced"
-                } else if loc_time > cld_time {
-                    "local_ahead"
-                } else {
-                    "cloud_ahead"
-                }
-            }
-        };
-
-        Ok(CloudSaveSyncStatusView {
-            auto_sync_save,
-            local_version_count: local_versions.len(),
-            cloud_version_count: cloud_versions.len(),
-            latest_local_created_at,
-            latest_cloud_created_at,
-            latest_cloud_version_id,
-            sync_state: sync_state.to_string(),
-            warnings: Vec::new(),
+        Ok(CloudSaveOverview {
+            status,
+            versions: cloud_versions,
         })
+    }
+}
+
+fn build_sync_status(
+    auto_sync_save: bool,
+    local_versions: &[SaveVersion],
+    cloud_versions: &[CloudSaveManifestVersion],
+) -> CloudSaveSyncStatusView {
+    let latest_local = local_versions.first();
+    let latest_cloud = cloud_versions.first();
+    let latest_cloud_created_at = latest_cloud.map(|v| v.created_at.clone());
+    let latest_cloud_version_id = latest_cloud.map(|v| v.version_id.clone());
+
+    let sync_state = match (latest_local, latest_cloud) {
+        (None, None) => "synced",
+        (Some(_), None) => "no_cloud_saves",
+        (None, Some(_)) => "cloud_ahead",
+        (Some(loc), Some(cld)) => {
+            let loc_time = loc.created_at.parse::<u64>().unwrap_or(0);
+            let cld_time = cld.created_at.parse::<u64>().unwrap_or(0);
+            if loc.version_id == cld.version_id || loc_time == cld_time {
+                "synced"
+            } else if loc_time > cld_time {
+                "local_ahead"
+            } else {
+                "cloud_ahead"
+            }
+        }
+    };
+
+    CloudSaveSyncStatusView {
+        auto_sync_save,
+        local_version_count: local_versions.len(),
+        cloud_version_count: cloud_versions.len(),
+        latest_local_created_at: latest_local.map(|v| v.created_at.clone()),
+        latest_cloud_created_at,
+        latest_cloud_version_id,
+        sync_state: sync_state.to_string(),
+        warnings: Vec::new(),
     }
 }
 
@@ -881,5 +909,24 @@ mod tests {
         assert!(validate_package_data_path("data/SaveData/slot1.sav").is_ok());
         assert!(validate_package_data_path("data/../outside.sav").is_err());
         assert!(validate_package_data_path("data/C:\\outside.sav").is_err());
+    }
+
+    #[test]
+    fn sync_status_uses_shared_local_and_cloud_versions() {
+        let local = vec![SaveVersion {
+            version_id: "local-new".to_string(),
+            game_uid: "game-1".to_string(),
+            created_at: "200".to_string(),
+            files: Vec::new(),
+            total_bytes: 0,
+        }];
+        let mut cloud = remote_version("cloud-old");
+        cloud.created_at = "100".to_string();
+
+        let status = build_sync_status(true, &local, &[cloud]);
+
+        assert_eq!(status.sync_state, "local_ahead");
+        assert_eq!(status.local_version_count, 1);
+        assert_eq!(status.cloud_version_count, 1);
     }
 }
