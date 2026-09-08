@@ -1,6 +1,6 @@
 use crate::{
     app_state::AppState,
-    domain::{GameBodyVersion, GameLifecycle, SaveProfile, SaveVersion, TaskStatus},
+    domain::{GameBodyVersion, GameHealth, GameLifecycle, SaveProfile, SaveVersion, TaskStatus},
     repositories::{BaiduConfigRepository, GameRepository, SaveRepository},
     services::{BodyPackageService, GameBodyUpdateService, GameLibraryService, TaskService},
 };
@@ -824,21 +824,25 @@ fn update_game_body_task(
         "正在保护并恢复当前存档",
         None,
     );
-    let protected = match SaveRepository::commit(app, game, profile, latest, |progress, message| {
-        TaskService::update(
-            &state,
-            task_id,
-            TaskStatus::Running,
-            92 + progress / 20,
-            message,
-            None,
-        );
-    }) {
-        Ok(protected) => protected,
-        Err(error) => {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(error);
+    let protected = if Path::new(&game.managed_path).is_dir() {
+        match SaveRepository::commit(app, game, profile, latest, |progress, message| {
+            TaskService::update(
+                &state,
+                task_id,
+                TaskStatus::Running,
+                92 + progress / 20,
+                message,
+                None,
+            );
+        }) {
+            Ok(protected) => protected,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(error);
+            }
         }
+    } else {
+        None
     };
     let pending_protected = protected.clone();
     if TaskService::is_cancelled(&state, task_id) {
@@ -913,7 +917,11 @@ fn update_game_body_task(
         version_id: version_id.clone(),
         game_uid: game.game_uid.clone(),
         created_at: now_iso(),
-        archive_path: swap.archive_path.to_string_lossy().to_string(),
+        archive_path: if swap.archive_path.exists() {
+            swap.archive_path.to_string_lossy().to_string()
+        } else {
+            String::new()
+        },
         file_count: plan.file_count,
         total_bytes: plan.total_bytes,
         package_path: None,
@@ -962,6 +970,8 @@ fn update_game_body_task(
     {
         game_record.latest_save_version_id = Some(protected.version_id.clone());
     }
+    game_record.lifecycle = GameLifecycle::Active;
+    game_record.health = GameHealth::Ready;
     if let Err(error) = GameRepository::persist(app, &candidate) {
         let save_rollback = receipt.map(SaveRepository::rollback_restore);
         let body_rollback = GameBodyUpdateService::rollback(Path::new(&game.managed_path), &swap);

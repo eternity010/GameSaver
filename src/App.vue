@@ -47,6 +47,8 @@ let cloudInstallTimer: ReturnType<typeof setTimeout> | undefined;
 let transferCountTimer: ReturnType<typeof setTimeout> | undefined;
 let stopCoverCaptureRoute: UnlistenFn | undefined;
 let appDisposed = false;
+let gamesLoadGeneration = 0;
+let storeLoadGeneration = 0;
 
 const filteredGames = computed(() => {
   const keyword = search.value.trim().toLocaleLowerCase();
@@ -86,41 +88,55 @@ function loadGameCovers(list: Game[]) {
 }
 
 async function loadGames() {
+  const generation = ++gamesLoadGeneration;
   loading.value = true;
   error.value = "";
   try {
     const loaded = await listGames();
+    if (generation !== gamesLoadGeneration) return;
     games.value = loaded;
     libraryPage.value = Math.min(libraryPage.value, Math.max(1, Math.ceil(loaded.length / LIBRARY_PAGE_SIZE)));
     if (selectedGame.value) {
-      selectedGame.value = loaded.find((game) => game.gameUid === selectedGame.value?.gameUid) || selectedGame.value;
+      const refreshedGame = loaded.find((game) => game.gameUid === selectedGame.value?.gameUid);
+      selectedGame.value = refreshedGame || null;
+      if (!refreshedGame && activePage.value === "detail") {
+        activePage.value = "library";
+      }
     }
     void loadGameCovers(loaded);
   } catch (reason) {
+    if (generation !== gamesLoadGeneration) return;
     error.value = String(reason);
   } finally {
-    loading.value = false;
+    if (generation === gamesLoadGeneration) {
+      loading.value = false;
+    }
   }
 }
 
 async function loadStore(force = false, page = 1) {
-  if (storeLoading.value || (!force && storeLoaded.value && page === storePage.value)) return;
+  if ((!force && storeLoading.value) || (!force && storeLoaded.value && page === storePage.value)) return;
+  const generation = ++storeLoadGeneration;
   storeLoading.value = true;
   storeError.value = "";
   try {
     const result = await listCloudGames(page, STORE_PAGE_SIZE);
+    if (generation !== storeLoadGeneration) return;
     cloudGames.value = result.games;
     storePage.value = result.page;
     storeHasMore.value = result.hasMore;
     storeLoaded.value = true;
   } catch (reason) {
+    if (generation !== storeLoadGeneration) return;
     if (page === 1) {
       cloudGames.value = [];
       storeHasMore.value = false;
     }
     storeError.value = String(reason);
   } finally {
-    storeLoading.value = false;
+    if (generation === storeLoadGeneration) {
+      storeLoading.value = false;
+    }
   }
 }
 
@@ -327,11 +343,14 @@ async function watchCloudInstall(taskId: string, cloudGame: CloudGameSummary) {
   cloudInstallTimer = setTimeout(() => void watchCloudInstall(taskId, cloudGame), 700);
 }
 
-async function finishAddGame() {
+async function finishAddGame(completedGame?: Game) {
   activePage.value = "library";
   activeView.value = "all";
   search.value = "";
   await loadGames();
+  if (completedGame && !games.value.some((game) => game.gameUid === completedGame.gameUid)) {
+    await loadGames();
+  }
 }
 </script>
 

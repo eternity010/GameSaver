@@ -739,14 +739,25 @@ fn find_scope_for_entry<'a>(
     }
 }
 
+pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{}", rest))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 pub(crate) fn scope_root(game: &Game, scope: &SaveScope) -> PathBuf {
     if matches!(scope.root_type, SaveRootType::ManagedGame) {
-        let managed = Path::new(&game.managed_path);
-        let scope_path = Path::new(&scope.root_path);
+        let managed = strip_verbatim_prefix(Path::new(&game.managed_path));
+        let scope_path = strip_verbatim_prefix(Path::new(&scope.root_path));
         if scope.root_path.trim().is_empty() || scope_path == managed {
-            managed.to_path_buf()
-        } else if scope_path.starts_with(managed) {
-            scope_path.to_path_buf()
+            managed
+        } else if scope_path.starts_with(&managed) {
+            scope_path
         } else {
             let game_folder = managed
                 .file_name()
@@ -761,13 +772,13 @@ pub(crate) fn scope_root(game: &Game, scope: &SaveScope) -> PathBuf {
                 }
             }
             if scope_path.is_dir() {
-                scope_path.to_path_buf()
+                scope_path
             } else {
-                managed.to_path_buf()
+                managed
             }
         }
     } else {
-        PathBuf::from(&scope.root_path)
+        strip_verbatim_prefix(Path::new(&scope.root_path))
     }
 }
 
@@ -848,13 +859,15 @@ fn ensure_parent_is_directory(path: &Path) -> Result<(), String> {
 fn collect_profile_files(profile: &SaveProfile) -> Result<Vec<CollectedFile>, String> {
     let mut files = BTreeMap::new();
     for scope in &profile.scopes {
-        let path = Path::new(&scope.root_path);
+        let path = strip_verbatim_prefix(Path::new(&scope.root_path));
         if !path.exists() {
             continue;
         }
-        let root = path
-            .canonicalize()
-            .map_err(|err| format!("解析存档范围失败：{err}"))?;
+        let root = strip_verbatim_prefix(
+            &path
+                .canonicalize()
+                .map_err(|err| format!("解析存档范围失败：{err}"))?,
+        );
         if !root.is_dir() {
             continue;
         }
@@ -889,9 +902,11 @@ fn add_candidate(
     if !path.is_file() {
         return Ok(());
     }
-    let path = path
-        .canonicalize()
-        .map_err(|err| format!("解析存档文件失败：{err}"))?;
+    let path = strip_verbatim_prefix(
+        &path
+            .canonicalize()
+            .map_err(|err| format!("解析存档文件失败：{err}"))?,
+    );
     let relative = path
         .strip_prefix(root)
         .map_err(|_| format!("存档文件超出保护范围：{}", path.display()))?;

@@ -15,6 +15,7 @@ const deleting = ref("");
 const sortMode = ref<"newest" | "oldest" | "status" | "game">("newest");
 const statusFilter = ref<"all" | "active" | "success" | "failed" | "cancelled" | "interrupted">("all");
 let pollTimer: ReturnType<typeof setTimeout> | undefined;
+let taskLoadGeneration = 0;
 
 const allTransferTasks = computed(() => tasks.value.filter((task) => isTransferTask(task)));
 
@@ -41,15 +42,21 @@ const failedCount = computed(() => allTransferTasks.value.filter((task) => task.
 const finishedTransferTasks = computed(() => allTransferTasks.value.filter((task) => !isActive(task)));
 
 async function refresh() {
+  const generation = ++taskLoadGeneration;
   try {
-    tasks.value = await listTasks();
+    const loaded = await listTasks();
+    if (generation !== taskLoadGeneration) return;
+    tasks.value = loaded;
     error.value = "";
   } catch (reason) {
+    if (generation !== taskLoadGeneration) return;
     error.value = String(reason);
   } finally {
-    loading.value = false;
+    if (generation === taskLoadGeneration) {
+      loading.value = false;
+      scheduleRefresh();
+    }
   }
-  scheduleRefresh();
 }
 
 function scheduleRefresh() {

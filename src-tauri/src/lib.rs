@@ -163,6 +163,8 @@ pub fn run() {
             commands::game_commands::get_game_cover,
             commands::game_commands::get_game_cover_path,
             commands::game_commands::get_game_cover_paths,
+            commands::game_commands::remove_game_from_library,
+            commands::game_commands::get_game_detail_view,
             commands::add_game_commands::start_add_game_task,
             commands::task_commands::get_task,
             commands::task_commands::list_tasks,

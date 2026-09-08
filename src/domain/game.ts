@@ -229,6 +229,14 @@ export interface CloudSaveOverview {
   versions: CloudSaveManifestVersion[];
 }
 
+export interface GameDetailView {
+  precheck: LaunchPrecheck;
+  versions: SaveVersion[];
+  runtime: GameRuntime | null;
+  bodyVersions: GameBodyVersion[];
+  saveProfile: SaveProfile | null;
+}
+
 export function gameStatusLabel(game: Game): string {
   if (game.lifecycle === "pending_setup") return "需要设置";
   if (game.lifecycle === "needs_repair" || game.health === "broken" || game.health === "needs_attention") {

@@ -21,7 +21,12 @@ impl GameLibraryService {
             .games
             .iter()
             .filter(|game| {
-                matches!(game.lifecycle, GameLifecycle::Active) && Self::is_installed(game)
+                matches!(
+                    game.lifecycle,
+                    GameLifecycle::PendingSetup
+                        | GameLifecycle::Active
+                        | GameLifecycle::NeedsRepair
+                )
             })
             .map(|game| {
                 let mut game = game.clone();
@@ -83,7 +88,7 @@ impl GameLibraryService {
         scope
             .confirmed_files
             .iter()
-            .all(|value| valid_relative(value) && root.join(value).is_file())
+            .all(|value| valid_relative(value))
             && scope
                 .include_directories
                 .iter()
@@ -94,7 +99,7 @@ impl GameLibraryService {
 #[cfg(test)]
 mod tests {
     use super::GameLibraryService;
-    use crate::domain::{AppStore, Game};
+    use crate::domain::{game::GameLifecycle, AppStore, Game};
     use std::{fs, path::PathBuf};
     use uuid::Uuid;
 
@@ -109,25 +114,29 @@ mod tests {
     }
 
     #[test]
-    fn library_excludes_game_when_managed_body_is_missing() {
+    fn library_keeps_broken_game_when_managed_body_is_missing() {
         let root = test_root();
         let mut store = AppStore::default();
         store.games.push(test_game(root.clone()));
 
         assert!(!GameLibraryService::is_installed(&store.games[0]));
-        assert!(GameLibraryService::list(&store).is_empty());
+        let listed = GameLibraryService::list(&store);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].health, crate::domain::GameHealth::Broken);
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn library_excludes_game_when_executable_is_missing() {
+    fn library_keeps_broken_game_when_executable_is_missing() {
         let root = test_root();
         fs::create_dir_all(&root).expect("create managed body");
         let mut store = AppStore::default();
         store.games.push(test_game(root.clone()));
 
         assert!(!GameLibraryService::is_installed(&store.games[0]));
-        assert!(GameLibraryService::list(&store).is_empty());
+        let listed = GameLibraryService::list(&store);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].health, crate::domain::GameHealth::Broken);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -141,6 +150,88 @@ mod tests {
 
         assert!(GameLibraryService::is_installed(&store.games[0]));
         assert_eq!(GameLibraryService::list(&store).len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn library_includes_pending_game_when_body_and_executable_exist() {
+        let root = test_root();
+        fs::create_dir_all(&root).expect("create managed body");
+        fs::write(root.join("game.exe"), b"test executable").expect("create executable");
+        let mut store = AppStore::default();
+        let game = Game::new_pending("Pending Game", root.to_string_lossy(), "game.exe");
+        store.games.push(game);
+
+        let listed = GameLibraryService::list(&store);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].lifecycle, GameLifecycle::PendingSetup);
+        assert_eq!(listed[0].health, crate::domain::GameHealth::NeedsAttention);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scope_stays_valid_when_confirmed_save_file_is_temporarily_missing() {
+        let root = test_root();
+        fs::create_dir_all(&root).expect("create save scope");
+        let mut store = AppStore::default();
+        let mut game = test_game(root.clone());
+        game.save_profile_id = Some("profile-1".to_string());
+        store.games.push(game);
+        store.save_profiles.push(crate::domain::SaveProfile {
+            profile_id: "profile-1".to_string(),
+            game_uid: store.games[0].game_uid.clone(),
+            executable_hash: "hash".to_string(),
+            scopes: vec![crate::domain::SaveScope {
+                root_type: crate::domain::SaveRootType::Custom,
+                root_path: root.to_string_lossy().to_string(),
+                confirmed_files: vec!["future-save.json".to_string()],
+                include_directories: vec![".".to_string()],
+                exclude_exact: Vec::new(),
+                exclude_patterns: Vec::new(),
+                exclude_directories: Vec::new(),
+                unknown_file_policy: crate::domain::UnknownFilePolicy::Protect,
+                max_file_bytes: Some(10 * 1024 * 1024),
+            }],
+            detection_evidence: Vec::new(),
+            confidence: 0,
+            enabled: true,
+            keep_versions: 5,
+            created_at: "0".to_string(),
+            updated_at: "0".to_string(),
+        });
+
+        assert_eq!(
+            GameLibraryService::valid_scope_count(&store.save_profiles[0]),
+            1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scope_is_invalid_when_included_directory_is_missing() {
+        let root = test_root();
+        fs::create_dir_all(&root).expect("create save scope");
+        let mut profile = crate::domain::SaveProfile::new(
+            "game-1".to_string(),
+            "hash".to_string(),
+            vec![crate::domain::SaveScope {
+                root_type: crate::domain::SaveRootType::Custom,
+                root_path: root.to_string_lossy().to_string(),
+                confirmed_files: Vec::new(),
+                include_directories: vec!["missing".to_string()],
+                exclude_exact: Vec::new(),
+                exclude_patterns: Vec::new(),
+                exclude_directories: Vec::new(),
+                unknown_file_policy: crate::domain::UnknownFilePolicy::Protect,
+                max_file_bytes: Some(10 * 1024 * 1024),
+            }],
+            0,
+            "0".to_string(),
+        );
+
+        assert_eq!(GameLibraryService::valid_scope_count(&profile), 0);
+        profile.scopes[0].include_directories = vec![".".to_string()];
+        assert_eq!(GameLibraryService::valid_scope_count(&profile), 1);
         let _ = fs::remove_dir_all(root);
     }
 }

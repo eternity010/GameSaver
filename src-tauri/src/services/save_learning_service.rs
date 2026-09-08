@@ -41,6 +41,18 @@ const SAVE_DIRECTORY_HINTS: [&str; 8] = [
     "profiles",
     "userdata",
 ];
+const GENERIC_NAME_BLACKLIST: [&str; 38] = [
+    "game", "games", "play", "player", "start", "launch", "launcher", "app", "application",
+    "main", "run", "runner", "client", "test", "demo", "patch", "update", "edition",
+    "version", "ver", "setup", "install", "installer", "steam", "epic", "gog", "final",
+    "release", "debug", "unity", "unreal", "shipping", "win64", "win32", "windows",
+    "x64", "x86", "default",
+];
+
+fn is_generic_hint(token: &str) -> bool {
+    let lower = token.trim().to_ascii_lowercase();
+    GENERIC_NAME_BLACKLIST.contains(&lower.as_str())
+}
 
 pub struct SaveLearningService;
 
@@ -305,25 +317,38 @@ impl SaveLearningService {
             notes.push(format!("ETW 未启动，已使用快照差异：{error}"));
         }
         if event_capture_mode == "etw" && !active.validation_only {
-            let fallback_files = discover_save_container_files(&active.roots, &is_cancelled)?;
+            let etw_relevant_roots: Vec<_> = active
+                .roots
+                .iter()
+                .filter(|r| {
+                    r.root_type == SaveRootType::ManagedGame
+                        || etw_files
+                            .iter()
+                            .any(|path| path_is_within_root(path, &r.physical_path))
+                })
+                .cloned()
+                .collect();
+            let fallback_files = discover_save_container_files(&etw_relevant_roots, &is_cancelled)?;
             if !fallback_files.is_empty() {
                 let existing_count = etw_files.len();
                 let added_count = fallback_files
                     .iter()
                     .filter(|path| !etw_files.contains(*path))
                     .count();
-                notes.push(format!(
-                    "已从游戏专属目录补充 {} 个常见存档容器文件（新增 {} 个）；候选仍可编辑",
-                    fallback_files.len(),
-                    added_count
-                ));
-                etw_files.extend(fallback_files);
-                crate::logging::info(format!(
-                    "存档学习容器兜底：ETW 文件={}，补充文件={}，新增文件={}",
-                    existing_count,
-                    etw_files.len().saturating_sub(existing_count),
-                    added_count
-                ));
+                if added_count > 0 {
+                    notes.push(format!(
+                        "已从游戏专属目录补充 {} 个常见存档容器文件（新增 {} 个）；候选仍可编辑",
+                        fallback_files.len(),
+                        added_count
+                    ));
+                    etw_files.extend(fallback_files);
+                    crate::logging::info(format!(
+                        "存档学习容器兜底：ETW 文件={}，补充文件={}，新增文件={}",
+                        existing_count,
+                        etw_files.len().saturating_sub(existing_count),
+                        added_count
+                    ));
+                }
             } else {
                 notes.push(
                     "ETW 未在已识别游戏目录找到常见存档容器，将仅使用 ETW 文件证据".to_string(),
@@ -528,10 +553,23 @@ fn managed_executable_path(game: &Game) -> Result<PathBuf, String> {
     Ok(root.join(relative))
 }
 
+pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{}", rest))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 fn discover_scan_roots(game: &Game) -> Result<Vec<crate::domain::ScanRoot>, String> {
-    let managed_path = PathBuf::from(&game.managed_path)
-        .canonicalize()
-        .map_err(|err| format!("解析受管游戏目录失败：{err}"))?;
+    let managed_path = strip_verbatim_prefix(
+        &PathBuf::from(&game.managed_path)
+            .canonicalize()
+            .map_err(|err| format!("解析受管游戏目录失败：{err}"))?,
+    );
     let mut roots = vec![crate::domain::ScanRoot {
         root_type: SaveRootType::ManagedGame,
         physical_path: managed_path,
@@ -660,6 +698,18 @@ fn is_scan_noise_directory(path: &Path) -> bool {
         "google",
         "mozilla",
         "nvidia",
+        "epic games",
+        "epicgameslauncher",
+        "wegame",
+        "tencent",
+        "riot games",
+        "ubisoft game launcher",
+        "battle.net",
+        "gog.com",
+        "electronic arts",
+        "ea desktop",
+        "com.gamesaver.desktop",
+        "com.gamesaver.next",
     ]
     .contains(&name.as_str())
 }
@@ -748,7 +798,7 @@ fn game_name_hints(game: &Game) -> Vec<String> {
     let mut hints = game
         .display_name
         .split(is_delimiter)
-        .filter(|item| item.chars().count() >= 2)
+        .filter(|item| item.chars().count() >= 2 && !is_generic_hint(item))
         .map(|item| item.to_lowercase())
         .collect::<Vec<_>>();
     let compact_name = game
@@ -757,22 +807,40 @@ fn game_name_hints(game: &Game) -> Vec<String> {
         .filter(|character| character.is_alphanumeric())
         .collect::<String>()
         .to_lowercase();
-    if compact_name.chars().count() >= 2 && !hints.contains(&compact_name) {
+    if compact_name.chars().count() >= 2
+        && !is_generic_hint(&compact_name)
+        && !hints.contains(&compact_name)
+    {
         hints.push(compact_name);
     }
     if let Some(stem) = Path::new(&game.launch.executable_relative_path)
         .file_stem()
         .and_then(|value| value.to_str())
     {
-        let stem = stem.to_lowercase();
-        let compact_stem = stem
+        for part in stem.split(is_delimiter) {
+            let part_lower = part.to_lowercase();
+            if part_lower.chars().count() >= 2
+                && !is_generic_hint(&part_lower)
+                && !hints.contains(&part_lower)
+            {
+                hints.push(part_lower);
+            }
+        }
+        let stem_lower = stem.to_lowercase();
+        let compact_stem = stem_lower
             .chars()
             .filter(|character| character.is_alphanumeric())
             .collect::<String>();
-        if stem.chars().count() >= 2 && !hints.contains(&stem) {
-            hints.push(stem);
+        if stem_lower.chars().count() >= 2
+            && !is_generic_hint(&stem_lower)
+            && !hints.contains(&stem_lower)
+        {
+            hints.push(stem_lower);
         }
-        if compact_stem.chars().count() >= 2 && !hints.contains(&compact_stem) {
+        if compact_stem.chars().count() >= 2
+            && !is_generic_hint(&compact_stem)
+            && !hints.contains(&compact_stem)
+        {
             hints.push(compact_stem);
         }
     }
@@ -816,18 +884,46 @@ fn game_name_hints(game: &Game) -> Vec<String> {
 }
 
 fn directory_matches_hint(path: &Path, hint: &str) -> bool {
+    if is_save_container_directory(path) || is_scan_noise_directory(path) {
+        return false;
+    }
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_lowercase();
+    if is_generic_hint(&name) || is_generic_hint(hint) {
+        return false;
+    }
     let compact_name = name
         .chars()
         .filter(|character| character.is_alphanumeric())
         .collect::<String>();
-    name == hint
-        || compact_name == hint
-        || (hint.chars().count() >= 3 && compact_name.contains(hint))
+    let compact_hint = hint
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .collect::<String>();
+    if compact_hint.is_empty() {
+        return false;
+    }
+    if name == hint || compact_name == compact_hint {
+        return true;
+    }
+    if compact_hint.chars().count() >= 4 {
+        if compact_name.starts_with(&compact_hint) {
+            return true;
+        }
+        if name
+            .split(['_', '-', '.', ' '])
+            .any(|token| token == hint || token == compact_hint)
+        {
+            return true;
+        }
+        if compact_hint.chars().count() >= 5 && compact_name.contains(&compact_hint) {
+            return true;
+        }
+    }
+    false
 }
 
 fn discover_save_container_files(
@@ -904,6 +1000,10 @@ fn is_save_container_directory(path: &Path) -> bool {
         .collect::<String>()
         .to_ascii_lowercase();
     if SAVE_DIRECTORY_HINTS.contains(&name.as_str()) {
+        if name == "userdata" {
+            let norm = normalize_path(path);
+            return norm.contains(r"\steam\");
+        }
         return true;
     }
     let norm = normalize_path(path);
@@ -1175,7 +1275,9 @@ fn infer_scope_drafts(
                 UnknownFilePolicy::Ignore
             };
 
-        let physical_root_str = group.physical_path.to_string_lossy().replace('/', "\\");
+        let physical_root_str = strip_verbatim_prefix(&group.physical_path)
+            .to_string_lossy()
+            .replace('/', "\\");
 
         let (evidence_level, evidence_reason, confidence) = classify_scope_evidence(
             &group.physical_path,
@@ -1514,7 +1616,9 @@ fn modified_unix(metadata: &fs::Metadata) -> u64 {
 }
 
 fn normalize_path(path: &Path) -> String {
-    path.to_string_lossy()
+    let clean = strip_verbatim_prefix(path);
+    clean
+        .to_string_lossy()
         .replace('/', "\\")
         .trim_end_matches('\\')
         .to_ascii_lowercase()
@@ -2111,6 +2215,74 @@ mod tests {
         )));
         assert!(super::is_noise_path(Path::new(
             r"C:\Users\User\AppData\LocalLow\Tencent\WetType\mm_tip.xlog"
+        )));
+    }
+
+    #[test]
+    fn generic_executable_stems_are_not_extracted_as_hints() {
+        let game = crate::domain::Game {
+            game_uid: "test-generic-stem".to_string(),
+            display_name: "My RPG Game".to_string(),
+            game_key: "my_rpg".to_string(),
+            managed_path: "D:/Games/my_rpg".to_string(),
+            lifecycle: crate::domain::GameLifecycle::Active,
+            health: crate::domain::GameHealth::Ready,
+            cloud_status: crate::domain::game::CloudStatus::LocalOnly,
+            launch: crate::domain::game::LaunchConfig {
+                executable_relative_path: "Game.exe".to_string(),
+                working_directory_relative_path: None,
+                arguments: Vec::new(),
+            },
+            cover: None,
+            save_profile_id: None,
+            last_played_at: None,
+            latest_save_version_id: None,
+        };
+
+        let hints = super::game_name_hints(&game);
+        assert!(!hints.contains(&"game".to_string()));
+        assert!(hints.contains(&"rpg".to_string()));
+    }
+
+    #[test]
+    fn directory_matches_hint_rejects_save_containers_and_noise() {
+        assert!(!super::directory_matches_hint(
+            Path::new(r"C:\Users\Player\AppData\Local\BrightMemoryInfinite\Saved\SaveGames"),
+            "game"
+        ));
+        assert!(!super::directory_matches_hint(
+            Path::new(r"C:\Users\Player\AppData\Local\EpicGamesLauncher"),
+            "game"
+        ));
+        assert!(!super::directory_matches_hint(
+            Path::new(r"C:\Users\Player\AppData\Local\SaveData"),
+            "save"
+        ));
+    }
+
+    #[test]
+    fn is_save_container_directory_rejects_appdata_user_data() {
+        assert!(!super::is_save_container_directory(Path::new(
+            r"C:\Users\Player\AppData\Local\rmmz-game\User Data"
+        )));
+        assert!(super::is_save_container_directory(Path::new(
+            r"C:\Program Files (x86)\Steam\userdata"
+        )));
+        assert!(super::is_save_container_directory(Path::new(
+            r"C:\Program Files (x86)\Steam\userdata\123456\2456740"
+        )));
+    }
+
+    #[test]
+    fn noise_filtering_rejects_chromium_user_data_cache() {
+        assert!(super::is_noise_path(Path::new(
+            r"C:\Users\Player\AppData\Local\rmmz-game\User Data\Default\Cookies"
+        )));
+        assert!(super::is_noise_path(Path::new(
+            r"C:\Users\Player\AppData\Local\rmmz-game\User Data\Default\Code Cache\js\123_0"
+        )));
+        assert!(super::is_noise_path(Path::new(
+            r"C:\Users\Player\AppData\Local\rmmz-game\User Data\crashpadmetrics-active.pma"
         )));
     }
 }

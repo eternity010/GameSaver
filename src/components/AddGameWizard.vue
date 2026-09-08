@@ -39,6 +39,7 @@ const message = ref("");
 const error = ref("");
 const completedGame = ref<Game | null>(null);
 const confirming = ref(false);
+const cancelling = ref(false);
 const showLargeConfirmModal = ref(false);
 const largeConfirmMessage = ref("");
 const newFileByScope = ref<Record<number, string>>({});
@@ -62,6 +63,29 @@ const rootTypeLabel: Record<SaveRootType, string> = {
   user_profile: "用户目录",
   custom: "自定义目录",
 };
+
+function cleanDisplayPath(rawPath: string): string {
+  return rawPath.replace(/^\\\\\?\\UNC\\/i, "\\\\").replace(/^\\\\\?\\/i, "");
+}
+
+function formatScopeDisplay(scope: SaveScope): string {
+  const clean = cleanDisplayPath(scope.rootPath);
+  if (scope.rootType === "managed_game" && completedGame.value?.managedPath) {
+    const normManaged = cleanDisplayPath(completedGame.value.managedPath)
+      .replace(/[/\\]+/g, "\\")
+      .replace(/\\+$/, "")
+      .toLowerCase();
+    const normClean = clean.replace(/[/\\]+/g, "\\").replace(/\\+$/, "").toLowerCase();
+    if (normClean === normManaged) {
+      return "<游戏根目录>";
+    }
+    if (normClean.startsWith(normManaged + "\\")) {
+      const sub = clean.slice(cleanDisplayPath(completedGame.value.managedPath).length).replace(/^[/\\]+/, "");
+      return `<游戏根目录>\\${sub}`;
+    }
+  }
+  return clean;
+}
 
 function scopeEvidenceKey(scope: SaveScope): string {
   return scope.rootPath.replace(/[\\/]+/g, "\\").replace(/\\+$/, "").toLocaleLowerCase();
@@ -135,6 +159,7 @@ function stopPolling() {
 function handleTaskFailure(task: AppTask, cancelledMessage: string, failedMessage: string) {
   stopPolling();
   taskId.value = "";
+  cancelling.value = false;
   const taskError = task.error || "";
   const cleanError = taskError.replace(/^LARGE_SOURCE_REQUIRED:\s*/, "");
   error.value = cleanError || (task.status === "cancelled" ? cancelledMessage : failedMessage);
@@ -151,6 +176,7 @@ async function watchTask(onSuccess: (task: AppTask) => Promise<void>, cancelledM
     if (task.status === "success") {
       stopPolling();
       taskId.value = "";
+      cancelling.value = false;
       await onSuccess(task);
       return;
     }
@@ -163,6 +189,7 @@ async function watchTask(onSuccess: (task: AppTask) => Promise<void>, cancelledM
   } catch (reason) {
     stopPolling();
     taskId.value = "";
+    cancelling.value = false;
     error.value = String(reason);
     phase.value = completedGame.value ? "ready" : "form";
   }
@@ -327,7 +354,7 @@ function removeScope(scopeIndex: number) {
 
 async function openFolder(path: string) {
   try {
-    await openPathInExplorer(path);
+    await openPathInExplorer(cleanDisplayPath(path));
   } catch (reason) {
     error.value = `打开目录失败：${String(reason)}`;
   }
@@ -358,15 +385,37 @@ async function confirm() {
 }
 
 async function cancelTaskOrLearning() {
+  if (cancelling.value) return;
+  cancelling.value = true;
+  error.value = "";
   if (taskId.value) {
-    await cancelTask(taskId.value);
-    message.value = "正在取消...";
+    try {
+      await cancelTask(taskId.value);
+      message.value = "正在停止识别并清理临时数据...";
+    } catch (reason) {
+      error.value = String(reason);
+      cancelling.value = false;
+    }
     return;
   }
-  if (session.value) await cancelSaveLearning(session.value.sessionId);
-  if (validatingCandidates.value) {
-    validatingCandidates.value = false;
-    phase.value = "review";
+  try {
+    const sessionId = session.value?.sessionId;
+    if (sessionId) await cancelSaveLearning(sessionId);
+    stopPolling();
+    taskId.value = "";
+    session.value = null;
+    if (validatingCandidates.value) {
+      validatingCandidates.value = false;
+      phase.value = "review";
+      message.value = "已停止候选验证，可继续调整范围。";
+    } else {
+      phase.value = "ready";
+      message.value = "已停止存档识别，可重新开始。";
+    }
+  } catch (reason) {
+    error.value = String(reason);
+  } finally {
+    cancelling.value = false;
   }
 }
 
@@ -407,7 +456,7 @@ onUnmounted(stopPolling);
       <section class="wizard-section"><h2>游戏信息</h2><label class="field"><span>游戏名称</span><input v-model="displayName" :disabled="phase === 'copying'" type="text" placeholder="例如：Black Market" @input="!gameKey && (gameKey = normalizeGameKey(displayName))" /></label><label class="field"><span>游戏标识</span><input v-model="gameKey" :disabled="phase === 'copying'" type="text" placeholder="用于关联云端游戏" /><small class="field-note">默认由游戏名称生成，确认后不随显示名称变化。</small></label></section>
       <section class="wizard-section"><h2>游戏本体目录</h2><p class="field-note">GameSaver 会复制一份本体到自己的游戏库，原始目录不会被修改。</p><div class="path-row"><input v-model="sourcePath" :disabled="phase === 'copying'" type="text" placeholder="选择游戏所在文件夹" /><button type="button" :disabled="phase === 'copying'" title="选择游戏目录" @click="chooseSource"><FolderOpen :size="17" />选择</button></div></section>
       <section class="wizard-section"><h2>启动程序</h2><p class="field-note">启动程序必须位于游戏本体目录内。</p><div class="path-row"><input v-model="executablePath" :disabled="phase === 'copying'" type="text" placeholder="选择游戏 EXE" /><button type="button" :disabled="phase === 'copying'" title="选择启动程序" @click="chooseExecutable"><Gamepad2 :size="17" />选择</button></div></section>
-      <div v-if="phase === 'copying'" class="task-progress"><div class="task-progress-heading"><span>{{ message || "正在处理" }}</span><strong>{{ progress }}%</strong></div><div class="progress-track"><span :style="{ width: `${progress}%` }"></span></div><button class="secondary-button" type="button" @click="cancelTaskOrLearning"><X :size="16" />取消复制</button></div>
+      <div v-if="phase === 'copying'" class="task-progress"><div class="task-progress-heading"><span>{{ message || "正在处理" }}</span><strong>{{ progress }}%</strong></div><div class="progress-track"><span :style="{ width: `${progress}%` }"></span></div><button class="secondary-button" type="button" :disabled="cancelling" @click="cancelTaskOrLearning"><LoaderCircle v-if="cancelling" :size="16" class="spin" /><X v-else :size="16" />{{ cancelling ? "正在取消" : "取消复制" }}</button></div>
       <p v-if="error" class="error-message" role="alert">{{ error }}</p>
       <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="phase === 'copying'" @click="emit('back')">取消</button><button class="primary-button" type="submit" :disabled="!canStart"><LoaderCircle v-if="phase === 'copying'" :size="17" class="spin" />{{ phase === 'copying' ? "正在复制" : "开始添加" }}</button></footer>
     </form>
@@ -416,12 +465,12 @@ onUnmounted(stopPolling);
       <section class="wizard-section learning-intro"><div class="section-icon"><Gamepad2 :size="22" /></div><div><h2>{{ completedGame?.displayName }} 的存档保护</h2><p>{{ validatingCandidates ? "只验证待确认的候选目录。请在游戏内再次完成一次保存。" : "启动受管游戏，在游戏内完成一次保存。回来后点击分析，GameSaver 会根据变化生成候选范围。" }}</p></div></section>
       <section class="wizard-section"><div class="task-progress-heading"><span>{{ validatingCandidates ? "再次验证会话" : "学习会话" }}</span><strong v-if="session">PID {{ session.rootPid }}</strong><strong v-else>尚未启动</strong></div><p v-if="phase === 'ready'" class="field-note">只会记录本次学习期间的文件变化，不会立即创建正式存档版本。</p><p v-else class="field-note">完成一次保存后，先退出游戏，再回来分析本次变化。</p><div v-if="phase === 'capturing'" class="capture-state"><span class="loader"></span><strong>{{ validatingCandidates ? "正在验证候选范围" : "正在记录文件变化" }}</strong><span>{{ message }}</span></div></section>
       <p v-if="error" class="error-message" role="alert">{{ error }}</p>
-      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="phase === 'capturing'" @click="abandonPendingGame">放弃添加</button><button v-if="phase === 'capturing'" class="secondary-button" type="button" @click="cancelTaskOrLearning"><X :size="16" />停止{{ validatingCandidates ? "验证" : "识别" }}</button><button v-if="phase === 'ready'" class="primary-button" type="button" @click="beginLearning"><Gamepad2 :size="17" />启动并开始识别</button><button v-else class="primary-button" type="button" @click="analyze"><Check :size="17" />完成保存，开始{{ validatingCandidates ? "验证" : "分析" }}</button></footer>
+      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="phase === 'capturing'" @click="abandonPendingGame">放弃添加</button><button v-if="phase === 'capturing'" class="secondary-button" type="button" :disabled="cancelling" @click="cancelTaskOrLearning"><LoaderCircle v-if="cancelling" :size="16" class="spin" /><X v-else :size="16" />{{ cancelling ? "正在停止" : `停止${validatingCandidates ? "验证" : "识别"}` }}</button><button v-if="phase === 'ready'" class="primary-button" type="button" @click="beginLearning"><Gamepad2 :size="17" />启动并开始识别</button><button v-else class="primary-button" type="button" @click="analyze"><Check :size="17" />完成保存，开始{{ validatingCandidates ? "验证" : "分析" }}</button></footer>
     </section>
 
     <section v-else-if="phase === 'analyzing'" class="wizard-form">
       <section class="wizard-section analysis-state"><span class="loader"></span><h2>正在分析存档变化</h2><p>{{ message || "正在整理候选文件夹" }}</p><div class="progress-track"><span :style="{ width: `${progress}%` }"></span></div><strong>{{ progress }}%</strong></section>
-      <footer class="wizard-actions"><button class="secondary-button" type="button" @click="cancelTaskOrLearning"><X :size="16" />取消分析</button></footer>
+      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="cancelling" @click="cancelTaskOrLearning"><LoaderCircle v-if="cancelling" :size="16" class="spin" /><X v-else :size="16" />{{ cancelling ? "正在取消" : "取消分析" }}</button></footer>
     </section>
 
     <section v-else-if="phase === 'review'" class="wizard-form">
@@ -432,10 +481,11 @@ onUnmounted(stopPolling);
             <span class="scope-type">{{ rootTypeLabel[scope.rootType] }}</span>
             <span class="policy-badge" :class="scope.unknownFilePolicy === 'protect' ? 'policy-protect' : 'policy-ignore'">{{ scope.unknownFilePolicy === 'protect' ? '自动保护新存档' : '仅保护已确认文件' }}</span>
             <span class="policy-badge" :class="evidenceForScope(scope).level === 'strong' ? 'policy-protect' : 'policy-ignore'" :title="evidenceForScope(scope).reason">{{ evidenceLabel(scope) }}</span>
-            <h2>{{ scope.rootPath }}</h2>
+            <h2>{{ formatScopeDisplay(scope) }}</h2>
+            <small v-if="scope.rootType === 'managed_game' && formatScopeDisplay(scope) !== cleanDisplayPath(scope.rootPath)" class="scope-subtitle" :title="cleanDisplayPath(scope.rootPath)">实际物理路径：{{ cleanDisplayPath(scope.rootPath) }}</small>
           </div>
           <div class="scope-heading-actions">
-            <button class="secondary-button compact-button" type="button" title="在文件资源管理器中打开这个存档目录" @click="openFolder(scope.rootPath)">
+            <button class="secondary-button compact-button" type="button" title="在文件资源管理器中打开这个存档目录" @click="openFolder(cleanDisplayPath(scope.rootPath))">
               <FolderOpen :size="15" />打开目录
             </button>
             <button class="icon-button danger-icon" type="button" title="删除这个保护范围" :aria-label="`删除 ${scope.rootPath}`" @click="removeScope(scopeIndex)">

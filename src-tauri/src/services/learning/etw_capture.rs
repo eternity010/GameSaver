@@ -876,6 +876,14 @@ pub(crate) fn should_ignore_snapshot_path(path: &Path) -> bool {
         || text.ends_with(".dmp")
         || text.ends_with(".bak")
         || text.ends_with(".etl")
+        || text.ends_with(".pma")
+        || text.ends_with(".ico.md5")
+        || text.ends_with("chrome_shutdown_ms.txt")
+    {
+        return true;
+    }
+    if (text.contains(r"\appdata\local\") || text.contains(r"\appdata\roaming\"))
+        && (text.contains(r"\user data\") || text.contains("/user data/"))
     {
         return true;
     }
@@ -892,6 +900,28 @@ pub(crate) fn should_ignore_snapshot_path(path: &Path) -> bool {
         "\\session storage\\",
         "\\local storage\\",
         "\\indexeddb\\",
+        "\\code cache\\",
+        "\\dawngraphitecache\\",
+        "\\dawnwebgpucache\\",
+        "\\grshadercache\\",
+        "\\graphitedawncache\\",
+        "\\autofillstrikedatabase\\",
+        "\\clientcertificates\\",
+        "\\data_reduction_proxy_leveldb\\",
+        "\\shared_proto_db\\",
+        "\\optimization_guide_hint_cache_store\\",
+        "\\segmentation platform\\",
+        "\\sync data\\",
+        "\\safe browsing network\\",
+        "\\platform notifications\\",
+        "\\extension rules\\",
+        "\\extension scripts\\",
+        "\\extension state\\",
+        "\\feature engagement tracker\\",
+        "\\gcm store\\",
+        "\\shared dictionary\\",
+        "\\site characteristics database\\",
+        "\\videodecodestats\\",
         "\\cache\\",
         "\\logs\\",
         "\\temp\\",
@@ -913,6 +943,7 @@ pub(crate) fn should_ignore_snapshot_path(path: &Path) -> bool {
         "/gpucache/",
         "/shadercache/",
         "/webcache/",
+        "/code cache/",
         "/player.log",
         "/player-prev.log",
     ]

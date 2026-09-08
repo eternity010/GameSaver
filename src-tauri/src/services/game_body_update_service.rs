@@ -283,20 +283,29 @@ impl GameBodyUpdateService {
                 .to_string_lossy(),
             Uuid::new_v4().simple()
         ));
-        if let Some(parent) = archive_path.parent() {
-            fs::create_dir_all(parent).map_err(|err| format!("创建旧游戏版本目录失败：{err}"))?;
+        if managed_path.exists() {
+            if let Some(parent) = archive_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| format!("创建旧游戏版本目录失败：{err}"))?;
+            }
+            fs::rename(managed_path, archive_path)
+                .map_err(|err| format!("暂存当前游戏本体失败：{err}"))?;
         }
-        fs::rename(managed_path, archive_path)
-            .map_err(|err| format!("暂存当前游戏本体失败：{err}"))?;
+        if let Some(parent) = managed_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| format!("创建游戏安装目录失败：{err}"))?;
+        }
         if let Err(error) = fs::rename(staging, managed_path) {
-            let rollback = fs::rename(archive_path, managed_path);
-            return if let Err(rollback_error) = rollback {
-                Err(format!(
-                    "提交新版游戏失败：{error}；恢复旧游戏本体失败：{rollback_error}"
-                ))
-            } else {
-                Err(format!("提交新版游戏失败：{error}"))
-            };
+            if archive_path.exists() {
+                let rollback = fs::rename(archive_path, managed_path);
+                return if let Err(rollback_error) = rollback {
+                    Err(format!(
+                        "提交新版游戏失败：{error}；恢复旧游戏本体失败：{rollback_error}"
+                    ))
+                } else {
+                    Err(format!("提交新版游戏失败：{error}"))
+                };
+            }
+            return Err(format!("提交新版游戏失败：{error}"));
         }
         Ok(BodySwap {
             archive_path: archive_path.to_path_buf(),
@@ -306,7 +315,10 @@ impl GameBodyUpdateService {
 
     pub fn rollback(managed_path: &Path, swap: &BodySwap) -> Result<(), String> {
         if !swap.archive_path.is_dir() {
-            return Err(format!("旧游戏版本不存在：{}", swap.archive_path.display()));
+            if managed_path.exists() {
+                let _ = fs::remove_dir_all(managed_path);
+            }
+            return Ok(());
         }
         if managed_path.exists() {
             fs::rename(managed_path, &swap.failed_path)
@@ -318,8 +330,10 @@ impl GameBodyUpdateService {
             }
             return Err(format!("恢复旧游戏本体失败：{error}"));
         }
-        fs::remove_dir_all(&swap.failed_path)
-            .map_err(|err| format!("清理失败的新游戏本体失败：{err}"))?;
+        if swap.failed_path.exists() {
+            fs::remove_dir_all(&swap.failed_path)
+                .map_err(|err| format!("清理失败的新游戏本体失败：{err}"))?;
+        }
         Ok(())
     }
 }
@@ -692,5 +706,25 @@ mod tests {
 
         assert!(!staging.exists());
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn swap_succeeds_when_managed_path_does_not_exist() {
+        let root = std::env::temp_dir().join(format!("gamesaver-missing-body-swap-{}", Uuid::new_v4()));
+        let managed = root.join("games").join("game-1");
+        let staging = root.join("games").join(".game-1.updating");
+        let archive = root.join("games").join(".versions").join("game-1").join("version-1");
+        fs::create_dir_all(&staging).expect("create staging");
+        fs::write(staging.join("game.exe"), b"new game").expect("write new game");
+
+        assert!(!managed.exists());
+        let _swap = GameBodyUpdateService::swap(&managed, &staging, &archive)
+            .expect("swap without original managed body");
+
+        assert!(managed.join("game.exe").is_file());
+        assert!(!archive.exists());
+        assert!(!staging.exists());
+        assert_eq!(fs::read(managed.join("game.exe")).expect("read new"), b"new game");
+        let _ = fs::remove_dir_all(root);
     }
 }

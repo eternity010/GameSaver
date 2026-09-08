@@ -1,6 +1,6 @@
 use crate::{
     app_state::AppState,
-    domain::{GameLifecycle, SaveProfile, SaveScope, TaskStatus},
+    domain::{ActiveLearningSession, GameLifecycle, SaveProfile, SaveScope, TaskStatus},
     repositories::{GameRepository, SaveRepository},
     services::{learning::stop_etw_capture, GameLibraryService, SaveLearningService, TaskService},
 };
@@ -62,6 +62,19 @@ pub fn start_save_learning_task(
         );
         match result {
             Ok(active) => {
+                if TaskService::is_cancelled(&app_handle.state(), &task_id_for_thread) {
+                    cleanup_active_learning(&active);
+                    TaskService::finish(
+                        &app_handle.state(),
+                        &task_id_for_thread,
+                        TaskStatus::Cancelled,
+                        100,
+                        "已取消存档识别",
+                        None,
+                        None,
+                    );
+                    return;
+                }
                 let view = active.view.clone();
                 let state: State<AppState> = app_handle.state();
                 if let Ok(mut sessions) = state.learning_sessions.lock() {
@@ -163,6 +176,19 @@ pub fn start_save_candidate_verification_task(
         );
         match result {
             Ok(active) => {
+                if TaskService::is_cancelled(&app_handle.state(), &task_id_for_thread) {
+                    cleanup_active_learning(&active);
+                    TaskService::finish(
+                        &app_handle.state(),
+                        &task_id_for_thread,
+                        TaskStatus::Cancelled,
+                        100,
+                        "已取消再次验证",
+                        None,
+                        None,
+                    );
+                    return;
+                }
                 let view = active.view.clone();
                 let state: State<AppState> = app_handle.state();
                 if let Ok(mut sessions) = state.learning_sessions.lock() {
@@ -286,15 +312,26 @@ pub fn cancel_save_learning(state: State<AppState>, session_id: String) -> Resul
         .map_err(|_| "lock learning session state failed".to_string())?
         .remove(session_id);
     if let Some(active) = active {
-        active
-            .process_tracker_stop
-            .store(true, std::sync::atomic::Ordering::Release);
-        if let Some(capture) = active.etw_capture.as_ref() {
-            let _ = stop_etw_capture(&capture.trace_name);
-            let _ = std::fs::remove_file(&capture.etl_path);
-        }
+        cleanup_active_learning(&active);
+        crate::logging::info(format!("已取消存档识别会话：session_id={session_id}"));
+    } else {
+        crate::logging::info(format!(
+            "存档识别会话已不存在，按幂等取消处理：session_id={session_id}"
+        ));
     }
     Ok(())
+}
+
+fn cleanup_active_learning(active: &ActiveLearningSession) {
+    active
+        .process_tracker_stop
+        .store(true, std::sync::atomic::Ordering::Release);
+    if let Some(capture) = active.etw_capture.as_ref() {
+        if let Err(error) = stop_etw_capture(&capture.trace_name) {
+            crate::logging::error(format!("取消存档识别时停止 ETW 失败：{error}"));
+        }
+        let _ = fs::remove_file(&capture.etl_path);
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

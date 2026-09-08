@@ -42,12 +42,47 @@ pub fn start_add_game_task(
     let game_uid = uuid::Uuid::new_v4().to_string();
     let managed_path = games_root.join(&game_uid);
     {
-        let store = state
+        let mut store = state
             .store
             .lock()
             .map_err(|_| "lock GameSaver store failed".to_string())?;
-        if store.games.iter().any(|game| game.game_key == game_key) {
-            return Err("游戏标识已存在，请使用游戏库中的现有记录".to_string());
+        if let Some(existing) = store
+            .games
+            .iter()
+            .find(|game| game.game_key == game_key)
+            .cloned()
+        {
+            let has_references = store
+                .save_profiles
+                .iter()
+                .any(|profile| profile.game_uid == existing.game_uid)
+                || store
+                    .save_versions
+                    .iter()
+                    .any(|version| version.game_uid == existing.game_uid)
+                || store
+                    .body_versions
+                    .iter()
+                    .any(|version| version.game_uid == existing.game_uid);
+            if matches!(
+                existing.lifecycle,
+                crate::domain::GameLifecycle::PendingSetup
+            ) && !GameLibraryService::is_installed(&existing)
+                && !has_references
+            {
+                let mut cleaned = store.clone();
+                cleaned
+                    .games
+                    .retain(|game| game.game_uid != existing.game_uid);
+                GameRepository::persist(&app, &cleaned)?;
+                *store = cleaned;
+                crate::logging::info(format!(
+                    "清理无本体的待设置游戏残留：game_uid={} game_key={}",
+                    existing.game_uid, existing.game_key
+                ));
+            } else {
+                return Err("游戏标识已存在，请使用游戏库中的现有记录".to_string());
+            }
         }
         if store
             .games

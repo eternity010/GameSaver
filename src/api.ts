@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { CoverCrop, CoverPosition, Game, GameBodyVersion, GameCover, GameRuntime, LaunchPrecheck, SaveLearningResult, SaveLearningSession, SaveProfile, SaveScope, SaveVersion } from "./domain/game";
+import type { CoverCrop, CoverPosition, Game, GameBodyVersion, GameCover, GameDetailView, GameRuntime, LaunchPrecheck, SaveLearningResult, SaveLearningSession, SaveProfile, SaveScope, SaveVersion } from "./domain/game";
 
 export interface FrontendErrorReport {
   source: string;
@@ -300,6 +300,10 @@ export function discardPendingGame(gameUid: string): Promise<void> {
   return invokeCommand<void>("discard_pending_game", { gameUid });
 }
 
+export function removeGameFromLibrary(gameUid: string): Promise<void> {
+  return invokeCommand<void>("remove_game_from_library", { gameUid });
+}
+
 export function openPathInExplorer(path: string): Promise<void> {
   return invokeCommand<void>("open_path_in_explorer", { path });
 }
@@ -311,6 +315,10 @@ export interface DefaultSaveExclusions {
 
 export function getDefaultSaveExclusions(): Promise<DefaultSaveExclusions> {
   return invokeCommand<DefaultSaveExclusions>("get_default_save_exclusions");
+}
+
+export function getGameDetailView(gameUid: string): Promise<GameDetailView> {
+  return invokeCommand<GameDetailView>("get_game_detail_view", { gameUid });
 }
 
 export function precheckGameLaunch(gameUid: string): Promise<LaunchPrecheck> {

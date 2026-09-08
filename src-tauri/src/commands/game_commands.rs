@@ -2,14 +2,14 @@ use crate::{
     app_state::AppState,
     domain::{CoverCrop, CoverPosition, GameCover},
     repositories::GameRepository,
-    services::{CoverCaptureService, GameLibraryService},
+    services::{CoverCaptureService, GameBodyUpdateService, GameLibraryService},
 };
 use std::{
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
 };
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
 #[tauri::command]
@@ -541,9 +541,244 @@ fn release_cover_operation(state: &AppState, game_uid: &str) {
     }
 }
 
+#[tauri::command]
+pub fn remove_game_from_library(
+    app: AppHandle,
+    state: State<AppState>,
+    game_uid: String,
+) -> Result<(), String> {
+    let game_uid = game_uid.trim().to_string();
+    if game_uid.is_empty() {
+        return Err("游戏 ID 不能为空".to_string());
+    }
+
+    if let Ok(running) = state.running_games.lock() {
+        if running.contains_key(&game_uid) {
+            return Err("游戏正在运行中，无法从库中删除".to_string());
+        }
+    }
+
+    reserve_cover_operation(&state, &game_uid)?;
+    struct OperationGuard<'a> {
+        state: &'a AppState,
+        game_uid: String,
+    }
+    impl<'a> Drop for OperationGuard<'a> {
+        fn drop(&mut self) {
+            release_cover_operation(self.state, &self.game_uid);
+        }
+    }
+    let _guard = OperationGuard {
+        state: &state,
+        game_uid: game_uid.clone(),
+    };
+
+    let (game, games_root_opt, app_data_dir_opt) = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "锁定游戏库数据失败".to_string())?;
+        let game = store
+            .games
+            .iter()
+            .find(|g| g.game_uid == game_uid)
+            .cloned()
+            .ok_or_else(|| "游戏不存在".to_string())?;
+        (
+            game,
+            state.games_root().ok(),
+            app.path().app_data_dir().ok(),
+        )
+    };
+
+    // 1. Clean up managed directory if it exists
+    let managed_path = PathBuf::from(&game.managed_path);
+    if managed_path.exists() {
+        let _ = fs::remove_dir_all(&managed_path);
+    }
+
+    // 2. Clean up versions, covers, update journal, staging
+    if let Some(ref games_root) = games_root_opt {
+        let versions_dir = games_root.join(".versions").join(&game_uid);
+        if versions_dir.exists() {
+            let _ = fs::remove_dir_all(&versions_dir);
+        }
+        let covers_dir = games_root.join("covers").join(&game_uid);
+        if covers_dir.exists() {
+            let _ = fs::remove_dir_all(&covers_dir);
+        }
+        let staging = games_root.join(format!(".{game_uid}.updating"));
+        if staging.exists() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        let journal = GameBodyUpdateService::journal_path(games_root, &game_uid);
+        let _ = GameBodyUpdateService::clear_journal(&journal);
+    }
+
+    // 3. Clean up cached body packages if any
+    if let Some(ref app_data_dir) = app_data_dir_opt {
+        let package_cache = app_data_dir.join("cache").join("body_packages").join(&game_uid);
+        if package_cache.exists() {
+            let _ = fs::remove_dir_all(&package_cache);
+        }
+    }
+
+    // 4. Update store and persist
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "锁定游戏库数据失败".to_string())?;
+    let mut candidate = store.clone();
+    candidate.games.retain(|item| item.game_uid != game_uid);
+    candidate.save_profiles.retain(|item| item.game_uid != game_uid);
+    candidate.save_versions.retain(|item| item.game_uid != game_uid);
+    candidate.body_versions.retain(|item| item.game_uid != game_uid);
+
+    GameRepository::persist(&app, &candidate)?;
+    *store = candidate;
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameDetailView {
+    pub precheck: crate::services::LaunchPrecheck,
+    pub versions: Vec<crate::domain::SaveVersion>,
+    pub runtime: Option<crate::domain::GameRuntime>,
+    pub body_versions: Vec<crate::commands::game_body_commands::GameBodyVersionView>,
+    pub save_profile: Option<crate::domain::SaveProfile>,
+}
+
+pub fn query_game_detail_view(
+    store: &crate::domain::AppStore,
+    running_games: &std::collections::HashMap<String, crate::domain::GameRuntime>,
+    game_uid: &str,
+) -> Result<GameDetailView, String> {
+    let game = GameLibraryService::find(store, game_uid).ok_or_else(|| "游戏不存在".to_string())?;
+    let precheck = crate::services::LaunchService::precheck(store, game_uid)?;
+
+    let mut versions = store
+        .save_versions
+        .iter()
+        .filter(|version| version.game_uid == game_uid)
+        .cloned()
+        .collect::<Vec<_>>();
+    versions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+
+    let mut body_versions = store
+        .body_versions
+        .iter()
+        .filter(|version| {
+            version.game_uid == game_uid
+                && (version
+                    .package_path
+                    .as_deref()
+                    .is_some_and(|path| Path::new(path).is_file())
+                    || (!version.archive_path.trim().is_empty()
+                        && Path::new(&version.archive_path).is_dir()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    body_versions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+
+    let body_version_views = body_versions
+        .into_iter()
+        .map(|version| crate::commands::game_body_commands::GameBodyVersionView {
+            package_size: version
+                .package_path
+                .as_deref()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|metadata| metadata.len()),
+            version,
+        })
+        .collect();
+
+    let save_profile = store
+        .save_profiles
+        .iter()
+        .find(|p| {
+            p.game_uid == game_uid
+                && game.save_profile_id.as_deref() == Some(p.profile_id.as_str())
+                && p.enabled
+        })
+        .cloned();
+
+    let runtime = running_games.get(game_uid).cloned();
+
+    Ok(GameDetailView {
+        precheck,
+        versions,
+        runtime,
+        body_versions: body_version_views,
+        save_profile,
+    })
+}
+
+#[tauri::command]
+pub fn get_game_detail_view(
+    state: State<AppState>,
+    game_uid: String,
+) -> Result<GameDetailView, String> {
+    let game_uid = game_uid.trim();
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "lock GameSaver store failed".to_string())?;
+    let running = state
+        .running_games
+        .lock()
+        .map_err(|_| "lock running game state failed".to_string())?;
+    query_game_detail_view(&store, &running, game_uid)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::validate_game_display_name;
+    use super::{query_game_detail_view, validate_game_display_name};
+    use crate::domain::game::{CloudStatus, LaunchConfig};
+    use crate::domain::{AppStore, Game, GameHealth, GameLifecycle};
+    use std::collections::HashMap;
+
+    #[test]
+    fn query_game_detail_view_fails_when_game_missing() {
+        let store = AppStore::default();
+        let running = HashMap::new();
+        let result = query_game_detail_view(&store, &running, "nonexistent");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "游戏不存在");
+    }
+
+    #[test]
+    fn query_game_detail_view_returns_aggregated_details() {
+        let mut store = AppStore::default();
+        let running = HashMap::new();
+        let game = Game {
+            game_uid: "test-uid-1".to_string(),
+            game_key: "test-key".to_string(),
+            display_name: "Test Game".to_string(),
+            managed_path: "C:\\Games\\Test".to_string(),
+            lifecycle: GameLifecycle::Active,
+            health: GameHealth::Ready,
+            cloud_status: CloudStatus::Disabled,
+            save_profile_id: None,
+            launch: LaunchConfig {
+                executable_relative_path: "test.exe".to_string(),
+                arguments: vec![],
+                working_directory_relative_path: None,
+            },
+            cover: None,
+            last_played_at: None,
+            latest_save_version_id: None,
+        };
+        store.games.push(game);
+
+        let detail = query_game_detail_view(&store, &running, "test-uid-1").unwrap();
+        assert_eq!(detail.precheck.game_uid, "test-uid-1");
+        assert_eq!(detail.versions.len(), 0);
+        assert_eq!(detail.body_versions.len(), 0);
+        assert!(detail.runtime.is_none());
+        assert!(detail.save_profile.is_none());
+    }
 
     #[test]
     fn validates_valid_game_display_name() {

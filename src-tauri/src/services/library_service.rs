@@ -190,7 +190,11 @@ fn rewrite_store_paths(store: &mut AppStore, source: &Path, target: &Path) -> Re
 }
 
 fn rewrite_path(value: &str, source: &Path, target: &Path) -> Result<String, String> {
-    let value = value.replace('/', "\\");
+    let trimmed = value
+        .trim()
+        .trim_start_matches(r"\\?\UNC\")
+        .trim_start_matches(r"\\?\");
+    let value = trimmed.replace('/', "\\");
     let source = normalized(source);
     let target = target
         .to_string_lossy()
@@ -208,7 +212,12 @@ fn rewrite_path(value: &str, source: &Path, target: &Path) -> Result<String, Str
 }
 
 fn normalized(path: &Path) -> String {
-    path.to_string_lossy()
+    let s = path.to_string_lossy();
+    let trimmed = s
+        .trim()
+        .trim_start_matches(r"\\?\UNC\")
+        .trim_start_matches(r"\\?\");
+    trimmed
         .replace('/', "\\")
         .trim_end_matches('\\')
         .to_ascii_lowercase()

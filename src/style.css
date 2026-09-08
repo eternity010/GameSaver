@@ -434,6 +434,7 @@ h1 { margin-bottom: 0; font-size: 30px; letter-spacing: 0; }
 .scope-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .scope-heading-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .scope-heading h2 { max-width: 650px; margin: 5px 0 0; overflow-wrap: anywhere; font-size: 15px; line-height: 1.45; }
+.scope-subtitle { display: block; margin-top: 4px; color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; opacity: 0.85; }
 .scope-type { color: var(--brand); font-size: 12px; font-weight: 700; }
 .policy-badge { margin-left: 8px; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 500; }
 .policy-protect { color: #8ee3a0; background: #1b3826; border: 1px solid #295c3b; }
