@@ -42,6 +42,8 @@ pub struct CloudGameRecord {
     pub save_profile_id: Option<String>,
     #[serde(default)]
     pub last_played_at: Option<String>,
+    #[serde(default)]
+    pub added_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +130,7 @@ impl CloudAccountService {
                 launch: game.launch.clone(),
                 save_profile_id: game.save_profile_id.clone(),
                 last_played_at: game.last_played_at.clone(),
+                added_at: game.added_at.clone(),
             })
             .collect();
         let save_profiles = store

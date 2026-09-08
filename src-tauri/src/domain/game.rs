@@ -103,6 +103,8 @@ pub struct Game {
     pub last_played_at: Option<String>,
     #[serde(default)]
     pub latest_save_version_id: Option<String>,
+    #[serde(default)]
+    pub added_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +150,13 @@ pub enum GameRuntimeStatus {
     Saving,
 }
 
+fn now_epoch_secs() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
 impl Game {
     pub fn derive_game_key(display_name: &str) -> String {
         display_name
@@ -179,6 +188,7 @@ impl Game {
             save_profile_id: None,
             last_played_at: None,
             latest_save_version_id: None,
+            added_at: Some(now_epoch_secs()),
         }
     }
 

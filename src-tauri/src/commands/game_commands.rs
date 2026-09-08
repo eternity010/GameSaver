@@ -769,6 +769,7 @@ mod tests {
             cover: None,
             last_played_at: None,
             latest_save_version_id: None,
+            added_at: None,
         };
         store.games.push(game);
 

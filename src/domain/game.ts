@@ -42,6 +42,7 @@ export interface Game {
   saveProfileId?: string;
   lastPlayedAt?: string;
   latestSaveVersionId?: string;
+  addedAt?: string;
 }
 
 export interface GameRuntime {

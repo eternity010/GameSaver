@@ -4,13 +4,20 @@ use std::path::{Component, Path};
 pub struct GameLibraryService;
 
 impl GameLibraryService {
-    pub fn register_pending(store: &mut AppStore, game: Game) -> Result<(), String> {
+    pub fn register_pending(store: &mut AppStore, mut game: Game) -> Result<(), String> {
         if store
             .games
             .iter()
             .any(|item| item.game_uid == game.game_uid || item.managed_path == game.managed_path)
         {
             return Err("受管游戏已登记".to_string());
+        }
+        if game.added_at.is_none() {
+            let now_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|v| v.as_secs().to_string())
+                .unwrap_or_else(|_| "0".to_string());
+            game.added_at = Some(now_epoch);
         }
         store.games.push(game);
         Ok(())
@@ -20,7 +27,8 @@ impl GameLibraryService {
         store
             .games
             .iter()
-            .filter(|game| {
+            .enumerate()
+            .filter(|(_, game)| {
                 matches!(
                     game.lifecycle,
                     GameLifecycle::PendingSetup
@@ -28,9 +36,12 @@ impl GameLibraryService {
                         | GameLifecycle::NeedsRepair
                 )
             })
-            .map(|game| {
+            .map(|(index, game)| {
                 let mut game = game.clone();
                 game.health = Self::derive_health(store, &game);
+                if game.added_at.is_none() {
+                    game.added_at = Some((1700000000u64 + (index as u64) * 3600).to_string());
+                }
                 game
             })
             .collect()
@@ -232,6 +243,20 @@ mod tests {
         assert_eq!(GameLibraryService::valid_scope_count(&profile), 0);
         profile.scopes[0].include_directories = vec![".".to_string()];
         assert_eq!(GameLibraryService::valid_scope_count(&profile), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn library_populates_added_at_when_missing() {
+        let root = test_root();
+        let mut store = AppStore::default();
+        let mut g = test_game(root.clone());
+        g.added_at = None;
+        store.games.push(g);
+
+        let listed = GameLibraryService::list(&store);
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].added_at.is_some());
         let _ = fs::remove_dir_all(root);
     }
 }

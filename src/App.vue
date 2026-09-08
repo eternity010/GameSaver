@@ -12,14 +12,19 @@ import GameStorePage from "./components/GameStorePage.vue";
 import TransferCenter from "./components/TransferCenter.vue";
 import PlatformSettings from "./components/PlatformSettings.vue";
 
-type LibraryView = "all" | "recent" | "favorites" | "attention";
+type LibraryView = "all" | "attention";
+type LibrarySort = "activity" | "last_played" | "newest_added" | "name_asc" | "oldest_added";
 type AppPage = "library" | "store" | "add" | "detail" | "transfers" | "settings";
+
+const validSorts: LibrarySort[] = ["activity", "last_played", "newest_added", "name_asc", "oldest_added"];
+const savedSort = localStorage.getItem("gamesaver_library_sort") as LibrarySort;
 
 const games = ref<Game[]>([]);
 const cloudGames = ref<CloudGameSummary[]>([]);
 const coverUrls = ref<Record<string, string>>({});
 const activePage = ref<AppPage>("library");
 const activeView = ref<LibraryView>("all");
+const activeSort = ref<LibrarySort>(validSorts.includes(savedSort) ? savedSort : "activity");
 const search = ref("");
 const loading = ref(true);
 const error = ref("");
@@ -50,6 +55,16 @@ let appDisposed = false;
 let gamesLoadGeneration = 0;
 let storeLoadGeneration = 0;
 
+function parseTimestamp(raw?: string): number {
+  if (!raw) return 0;
+  const num = Number(raw);
+  if (Number.isFinite(num) && num > 0) {
+    return num > 1e11 ? num : num * 1000;
+  }
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 const filteredGames = computed(() => {
   const keyword = search.value.trim().toLocaleLowerCase();
   const result = games.value.filter((game) => {
@@ -57,10 +72,61 @@ const filteredGames = computed(() => {
     if (activeView.value === "attention") return game.health !== "ready";
     return true;
   });
-  if (activeView.value === "recent") {
-    return [...result].sort((left, right) => (right.lastPlayedAt || "").localeCompare(left.lastPlayedAt || ""));
-  }
-  return result;
+
+  const orderMap = new Map<string, number>();
+  games.value.forEach((g, idx) => orderMap.set(g.gameUid, idx));
+
+  const getAddedTime = (g: Game): number => {
+    if (g.addedAt) {
+      const t = parseTimestamp(g.addedAt);
+      if (t > 0) return t;
+    }
+    const idx = orderMap.get(g.gameUid) ?? 0;
+    return 1700000000000 + idx * 1000;
+  };
+
+  const getPlayedTime = (g: Game): number => {
+    return parseTimestamp(g.lastPlayedAt);
+  };
+
+  const getActivityTime = (g: Game): number => {
+    return Math.max(getPlayedTime(g), getAddedTime(g));
+  };
+
+  return [...result].sort((a, b) => {
+    switch (activeSort.value) {
+      case "activity": {
+        const diff = getActivityTime(b) - getActivityTime(a);
+        if (diff !== 0) return diff;
+        return (orderMap.get(b.gameUid) ?? 0) - (orderMap.get(a.gameUid) ?? 0);
+      }
+      case "last_played": {
+        const playedA = getPlayedTime(a);
+        const playedB = getPlayedTime(b);
+        if (playedA !== playedB) return playedB - playedA;
+        const addedDiff = getAddedTime(b) - getAddedTime(a);
+        if (addedDiff !== 0) return addedDiff;
+        return (orderMap.get(b.gameUid) ?? 0) - (orderMap.get(a.gameUid) ?? 0);
+      }
+      case "newest_added": {
+        const addedDiff = getAddedTime(b) - getAddedTime(a);
+        if (addedDiff !== 0) return addedDiff;
+        return (orderMap.get(b.gameUid) ?? 0) - (orderMap.get(a.gameUid) ?? 0);
+      }
+      case "oldest_added": {
+        const addedDiff = getAddedTime(a) - getAddedTime(b);
+        if (addedDiff !== 0) return addedDiff;
+        return (orderMap.get(a.gameUid) ?? 0) - (orderMap.get(b.gameUid) ?? 0);
+      }
+      case "name_asc": {
+        const cmp = a.displayName.localeCompare(b.displayName, "zh-CN", { numeric: true });
+        if (cmp !== 0) return cmp;
+        return (orderMap.get(a.gameUid) ?? 0) - (orderMap.get(b.gameUid) ?? 0);
+      }
+      default:
+        return 0;
+    }
+  });
 });
 
 const libraryPageCount = computed(() => Math.max(1, Math.ceil(filteredGames.value.length / LIBRARY_PAGE_SIZE)));
@@ -70,9 +136,12 @@ const pagedGames = computed(() => {
   return filteredGames.value.slice(start, start + LIBRARY_PAGE_SIZE);
 });
 
-const pageTitle = computed(() => activeView.value === "all" ? "游戏库" : activeView.value === "recent" ? "最近游玩" : activeView.value === "favorites" ? "收藏" : "需要处理");
+const pageTitle = computed(() => activeView.value === "all" ? "游戏库" : "需要处理");
 
-watch([search, activeView], () => {
+watch([search, activeView, activeSort], () => {
+  if (activeSort.value) {
+    localStorage.setItem("gamesaver_library_sort", activeSort.value);
+  }
   libraryPage.value = 1;
 });
 
@@ -413,8 +482,20 @@ async function finishAddGame(completedGame?: Game) {
 
       <template v-else-if="activePage === 'library'">
       <div class="library-toolbar" role="tablist" aria-label="游戏库视图">
-        <button v-for="view in ([['all', '全部游戏'], ['recent', '最近游玩'], ['favorites', '收藏'], ['attention', '需要处理']] as const)" :key="view[0]" class="view-tab" :class="{ active: activeView === view[0] }" type="button" @click="activeView = view[0]">{{ view[1] }}</button>
+        <button v-for="view in ([['all', '全部游戏'], ['attention', '需要处理']] as const)" :key="view[0]" class="view-tab" :class="{ active: activeView === view[0] }" type="button" @click="activeView = view[0]">{{ view[1] }}</button>
         <span v-if="filteredGames.length" class="library-count">{{ filteredGames.length }} 个游戏</span>
+
+        <div class="library-sort">
+          <label for="library-sort-select" class="sort-label">排序：</label>
+          <select id="library-sort-select" v-model="activeSort" class="sort-select" aria-label="游戏排序方式">
+            <option value="activity">最近活跃（游玩/添加）</option>
+            <option value="last_played">最近游玩优先</option>
+            <option value="newest_added">最新添加优先</option>
+            <option value="name_asc">游戏名称 (A-Z)</option>
+            <option value="oldest_added">最早添加优先</option>
+          </select>
+        </div>
+
         <button class="refresh-button" type="button" @click="loadGames">刷新</button>
       </div>
 

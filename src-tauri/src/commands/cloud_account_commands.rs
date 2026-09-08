@@ -188,6 +188,9 @@ fn merge_profile(
             local.display_name = cloud_game.display_name.clone();
             local.launch = cloud_game.launch.clone();
             local.last_played_at = cloud_game.last_played_at.clone();
+            if cloud_game.added_at.is_some() && local.added_at.is_none() {
+                local.added_at = cloud_game.added_at.clone();
+            }
             local.cloud_status = CloudStatus::Synced;
             local.game_uid.clone()
         } else {
@@ -202,6 +205,9 @@ fn merge_profile(
             game.launch = cloud_game.launch.clone();
             game.save_profile_id = cloud_game.save_profile_id.clone();
             game.last_played_at = cloud_game.last_played_at.clone();
+            if cloud_game.added_at.is_some() {
+                game.added_at = cloud_game.added_at.clone();
+            }
             game.lifecycle = GameLifecycle::NeedsRepair;
             game.health = GameHealth::Broken;
             game.cloud_status = CloudStatus::Synced;

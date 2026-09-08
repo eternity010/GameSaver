@@ -2112,6 +2112,7 @@ mod tests {
             save_profile_id: None,
             last_played_at: None,
             latest_save_version_id: None,
+            added_at: None,
         };
 
         let hints = super::game_name_hints(&game);
@@ -2237,6 +2238,7 @@ mod tests {
             save_profile_id: None,
             last_played_at: None,
             latest_save_version_id: None,
+            added_at: None,
         };
 
         let hints = super::game_name_hints(&game);

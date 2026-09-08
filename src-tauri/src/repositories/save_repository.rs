@@ -1430,6 +1430,7 @@ mod tests {
             save_profile_id: None,
             last_played_at: None,
             latest_save_version_id: None,
+            added_at: None,
         };
 
         // 1. scope.root_path is exactly managed_path

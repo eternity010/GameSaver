@@ -32,7 +32,7 @@ impl Default for AppStore {
 impl AppStore {
     pub fn normalize(&mut self) {
         self.schema_version = CURRENT_SCHEMA_VERSION;
-        for game in &mut self.games {
+        for (idx, game) in self.games.iter_mut().enumerate() {
             game.game_key = if game.game_key.trim().is_empty() {
                 Game::derive_game_key(&game.display_name)
             } else {
@@ -42,6 +42,9 @@ impl AppStore {
                     .join(" ")
                     .to_lowercase()
             };
+            if game.added_at.is_none() {
+                game.added_at = Some((1700000000u64 + (idx as u64) * 3600).to_string());
+            }
         }
         self.games.retain(|game| {
             !game.game_uid.trim().is_empty()
