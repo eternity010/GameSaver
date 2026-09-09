@@ -35,6 +35,10 @@ pub fn info(message: impl AsRef<str>) {
     write_line("INFO", message.as_ref());
 }
 
+pub fn warn(message: impl AsRef<str>) {
+    write_line("WARN", message.as_ref());
+}
+
 pub fn error(message: impl AsRef<str>) {
     write_line("ERROR", message.as_ref());
 }

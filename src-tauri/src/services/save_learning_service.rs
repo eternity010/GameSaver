@@ -23,15 +23,17 @@ use tauri::AppHandle;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-const MAX_CANDIDATE_FILE_BYTES: u64 = 10 * 1024 * 1024;
-const SAVE_EXTENSIONS: [&str; 4] = ["sav", "save", "db", "sqlite"];
+const MAX_CANDIDATE_FILE_BYTES: u64 = 100 * 1024 * 1024;
+const SAVE_EXTENSIONS: [&str; 10] = [
+    "sav", "save", "db", "sqlite", "es3", "sl2", "ess", "savegame", "state", "vdf",
+];
 const RESOURCE_EXTENSIONS: [&str; 12] = [
     "dll", "exe", "pak", "pdb", "png", "jpg", "jpeg", "webp", "ogg", "wav", "mp3", "ttf",
 ];
-const NAME_HINTS: [&str; 7] = [
-    "save", "slot", "profile", "userdata", "autosave", "progress", "system",
+const NAME_HINTS: [&str; 8] = [
+    "save", "slot", "profile", "userdata", "autosave", "progress", "system", "remote",
 ];
-const SAVE_DIRECTORY_HINTS: [&str; 8] = [
+const SAVE_DIRECTORY_HINTS: [&str; 9] = [
     "save",
     "savedata",
     "saves",
@@ -40,6 +42,7 @@ const SAVE_DIRECTORY_HINTS: [&str; 8] = [
     "profile",
     "profiles",
     "userdata",
+    "remote",
 ];
 const GENERIC_NAME_BLACKLIST: [&str; 38] = [
     "game", "games", "play", "player", "start", "launch", "launcher", "app", "application",
@@ -52,6 +55,34 @@ const GENERIC_NAME_BLACKLIST: [&str; 38] = [
 fn is_generic_hint(token: &str) -> bool {
     let lower = token.trim().to_ascii_lowercase();
     GENERIC_NAME_BLACKLIST.contains(&lower.as_str())
+}
+
+fn is_managed_game_asset_dir(entry_path: &Path) -> bool {
+    let name = match entry_path.file_name().and_then(|s| s.to_str()) {
+        Some(s) => s.to_ascii_lowercase(),
+        None => return false,
+    };
+    matches!(
+        name.as_str(),
+        "assets"
+            | "asset"
+            | "content"
+            | "movies"
+            | "movie"
+            | "audio"
+            | "sound"
+            | "sounds"
+            | "textures"
+            | "texture"
+            | "shaders"
+            | "shader"
+            | "paks"
+            | "pak"
+            | "streamingassets"
+            | "locale"
+            | "locales"
+            | "localization"
+    )
 }
 
 pub struct SaveLearningService;
@@ -142,6 +173,19 @@ impl SaveLearningService {
                 }
             ),
         );
+        on_progress(
+            8,
+            if validation_only {
+                "正在记录待确认存档的保存前快照"
+            } else {
+                "正在记录保存前快照基线"
+            },
+        );
+        let baseline = Some(collect_snapshot(
+            &roots,
+            |progress, message| on_progress(8 + (progress as u32 * 45 / 100) as u8, message),
+            &is_cancelled,
+        )?);
         let session_id = Uuid::new_v4().to_string();
         let mut etw_start_error = None;
         let etw_capture = match try_start_etw_capture(app, &session_id) {
@@ -162,30 +206,13 @@ impl SaveLearningService {
                 None
             }
         };
-        let baseline = if etw_capture.is_some() {
-            None
-        } else {
-            on_progress(
-                8,
-                if validation_only {
-                    "ETW 不可用，正在记录候选范围的保存前快照"
-                } else {
-                    "ETW 不可用，正在记录保存前快照"
-                },
-            );
-            Some(collect_snapshot(
-                &roots,
-                |progress, message| on_progress(8 + progress / 2, message),
-                &is_cancelled,
-            )?)
-        };
         if etw_capture.is_some() {
             on_progress(
                 57,
                 if validation_only {
-                    "ETW-first 验证：只记录已选候选目录"
+                    "ETW 优先验证：同时具备快照基线兜底"
                 } else {
-                    "ETW-first 模式：跳过启动前全量快照"
+                    "ETW 优先模式：同时具备快照基线兜底"
                 },
             );
         }
@@ -288,16 +315,22 @@ impl SaveLearningService {
             tracked_pid_set.extend(dir_pids);
         }
         let tracked_pids = sorted_pids(tracked_pid_set);
+        let any_running = tracked_pids
+            .iter()
+            .any(|&pid| crate::services::process_service::is_process_running(pid));
+        if any_running {
+            crate::logging::info("分析存档时检测到游戏进程仍在运行，等待短缓冲以确保磁盘写入完成...");
+            std::thread::sleep(Duration::from_millis(500));
+        }
         let mut etw_files = HashSet::new();
         let mut etw_operations = Vec::new();
         let mut notes = Vec::new();
         let mut event_capture_mode = "snapshot".to_string();
         if let Some(capture) = active.etw_capture.as_ref() {
             notes.push(if active.validation_only {
-                "再次验证只观察已选候选目录，未执行全量 baseline 扫描".to_string()
+                "再次验证只观察已选候选目录".to_string()
             } else {
-                "ETW-first 模式未执行启动前全量 baseline，候选范围直接依据 ETW 写入证据生成"
-                    .to_string()
+                "ETW 优先模式：依据 ETW 写入证据生成候选范围".to_string()
             });
             match collect_related_files_by_trace(
                 Some(&capture.trace_name),
@@ -315,6 +348,10 @@ impl SaveLearningService {
             let _ = std::fs::remove_file(&capture.etl_path);
         } else if let Some(error) = active.etw_start_error.as_ref() {
             notes.push(format!("ETW 未启动，已使用快照差异：{error}"));
+        }
+        if etw_files.is_empty() {
+            event_capture_mode = "snapshot".to_string();
+            notes.push("未捕获到有效 ETW 文件，已自动使用快照差异比对".to_string());
         }
         if event_capture_mode == "etw" && !active.validation_only {
             let etw_relevant_roots: Vec<_> = active
@@ -647,9 +684,49 @@ fn discover_scan_roots(game: &Game) -> Result<Vec<crate::domain::ScanRoot>, Stri
             }
         }
     }
+    for steam_dir in find_steam_userdata_dirs() {
+        for path in find_candidate_directories(&steam_dir, &hints) {
+            roots.push(crate::domain::ScanRoot {
+                root_type: SaveRootType::Custom,
+                physical_path: path,
+            });
+        }
+    }
     let mut seen = HashSet::new();
     roots.retain(|root| seen.insert(normalize_path(&root.physical_path)));
     Ok(roots)
+}
+
+fn find_steam_userdata_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut candidates = Vec::new();
+
+    if let Some(pf86) = env::var_os("ProgramFiles(x86)") {
+        candidates.push(PathBuf::from(pf86).join("Steam").join("userdata"));
+    }
+    if let Some(pf) = env::var_os("ProgramFiles") {
+        candidates.push(PathBuf::from(pf).join("Steam").join("userdata"));
+    }
+    for letter in b'C'..=b'Z' {
+        let drive = letter as char;
+        candidates.push(PathBuf::from(format!(r"{drive}:\Steam\userdata")));
+        candidates.push(PathBuf::from(format!(r"{drive}:\Games\Steam\userdata")));
+    }
+
+    let mut seen = HashSet::new();
+    for candidate in candidates {
+        if candidate.is_dir() {
+            if let Ok(canonical) = candidate.canonicalize() {
+                let norm = normalize_path(&canonical);
+                if seen.insert(norm) {
+                    dirs.push(strip_verbatim_prefix(&canonical));
+                }
+            } else if seen.insert(normalize_path(&candidate)) {
+                dirs.push(candidate);
+            }
+        }
+    }
+    dirs
 }
 
 fn find_candidate_directories(root: &Path, hints: &[String]) -> Vec<PathBuf> {
@@ -731,6 +808,24 @@ fn infer_scan_root_for_etw_file(
                 root_type: SaveRootType::ManagedGame,
                 physical_path: managed.to_path_buf(),
             });
+        }
+    }
+
+    for ancestor in file_path.ancestors() {
+        if let (Some(app_id_name), Some(parent)) = (ancestor.file_name(), ancestor.parent()) {
+            if let (Some(_account_name), Some(grandparent)) = (parent.file_name(), parent.parent()) {
+                if let Some(user_data_name) = grandparent.file_name() {
+                    if user_data_name.to_string_lossy().eq_ignore_ascii_case("userdata") {
+                        let app_id_str = app_id_name.to_string_lossy();
+                        if app_id_str.chars().all(|c| c.is_ascii_digit()) && app_id_str.len() >= 2 {
+                            return Some(crate::domain::ScanRoot {
+                                root_type: SaveRootType::Custom,
+                                physical_path: ancestor.to_path_buf(),
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1012,7 +1107,7 @@ fn is_save_container_directory(path: &Path) -> bool {
         || norm.contains(r"\codex\")
         || norm.contains(r"\onlinefix\")
     {
-        if name.chars().all(|c| c.is_ascii_digit()) && name.len() >= 4 {
+        if name.chars().all(|c| c.is_ascii_digit()) && name.len() >= 2 {
             return true;
         }
     }
@@ -1029,17 +1124,41 @@ fn collect_snapshot(
         if !root.physical_path.is_dir() {
             continue;
         }
-        for entry in WalkDir::new(&root.physical_path).follow_links(false) {
+        let is_managed = root.root_type == SaveRootType::ManagedGame;
+        let walker = if is_managed {
+            WalkDir::new(&root.physical_path).follow_links(false).max_depth(4)
+        } else {
+            WalkDir::new(&root.physical_path).follow_links(false)
+        };
+        for entry in walker.into_iter().filter_entry(|e| {
+            if is_noise_path(e.path()) {
+                return false;
+            }
+            if is_managed && is_managed_game_asset_dir(e.path()) {
+                return false;
+            }
+            true
+        }) {
             if is_cancelled() {
                 return Err("任务已取消".to_string());
             }
-            let entry = entry.map_err(|err| format!("扫描存档目录失败：{err}"))?;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(err) => {
+                    crate::logging::warn(format!("扫描跳过不可访问路径: {err}"));
+                    continue;
+                }
+            };
             if !entry.file_type().is_file() || is_noise_path(entry.path()) {
                 continue;
             }
-            let metadata = entry
-                .metadata()
-                .map_err(|err| format!("读取存档文件信息失败：{err}"))?;
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if metadata.len() > MAX_CANDIDATE_FILE_BYTES {
+                continue;
+            }
             files.insert(
                 normalize_path(entry.path()),
                 FileFingerprint {
@@ -1102,14 +1221,22 @@ fn infer_scope_drafts(
 ) -> (Vec<String>, Vec<SaveScopeDraft>, Vec<String>) {
     let mut changed = Vec::new();
     if let Some(baseline) = baseline {
-        for (path, fingerprint) in final_snapshot {
-            if baseline.get(path) != Some(fingerprint) {
-                changed.push(path.clone());
+        if etw_files.is_empty() {
+            for (path, fingerprint) in final_snapshot {
+                if baseline.get(path) != Some(fingerprint) {
+                    changed.push(path.clone());
+                }
             }
-        }
-        for path in baseline.keys() {
-            if !final_snapshot.contains_key(path) {
-                changed.push(path.clone());
+            for path in baseline.keys() {
+                if !final_snapshot.contains_key(path) {
+                    changed.push(path.clone());
+                }
+            }
+        } else {
+            for path in etw_files {
+                if final_snapshot.contains_key(path) {
+                    changed.push(path.clone());
+                }
             }
         }
     } else {
@@ -1320,7 +1447,7 @@ fn infer_scope_drafts(
         );
     } else {
         notes.push(
-            "默认只保护 10 MB 以内的存档候选，大文件、日志与噪音缓存已自动排除。".to_string(),
+            "默认只保护 100 MB 以内的存档候选，大文件、日志与噪音缓存已自动排除。".to_string(),
         );
     }
     if ignored_system_noise > 0 {
@@ -1362,7 +1489,7 @@ fn classify_scope_evidence(
         }
     }
 
-    if has_write && (has_close || has_rename) {
+    if (has_write && (has_close || has_rename)) || has_rename {
         return (
             SaveCandidateEvidenceLevel::Strong,
             "ETW 已确认写入并完成关闭或重命名。".to_string(),
@@ -1488,9 +1615,11 @@ fn is_save_candidate(path: &str) -> bool {
     let has_save_container = path_obj
         .parent()
         .is_some_and(path_has_save_container_ancestor);
-    let has_save_path_hint = ["savedata", "savegame", "savegames", "userdata", "profiles"]
-        .iter()
-        .any(|hint| path_has_segment(&path_lower, hint));
+    let has_save_path_hint = [
+        "savedata", "savegame", "savegames", "userdata", "profiles", "remote",
+    ]
+    .iter()
+    .any(|hint| path_has_segment(&path_lower, hint));
     if is_generic_config_file(
         path_obj,
         &path_lower,
@@ -1532,9 +1661,11 @@ fn is_etw_candidate(path: &str) -> bool {
     let has_save_container = path_obj
         .parent()
         .is_some_and(path_has_save_container_ancestor);
-    let has_save_path_hint = ["savedata", "savegame", "savegames", "userdata", "profiles"]
-        .iter()
-        .any(|hint| path_has_segment(&path_lower, hint));
+    let has_save_path_hint = [
+        "savedata", "savegame", "savegames", "userdata", "profiles", "remote",
+    ]
+    .iter()
+    .any(|hint| path_has_segment(&path_lower, hint));
 
     if is_generic_config_file(
         path_obj,
@@ -1804,11 +1935,12 @@ mod tests {
         let save_data = root.join("SaveData");
         fs::create_dir_all(&save_data).expect("create SaveData directory");
         fs::write(save_data.join("PlayerData0.sav"), b"save").expect("write save file");
-        fs::write(
-            save_data.join("large-resource.bin"),
-            vec![0; (MAX_CANDIDATE_FILE_BYTES + 1) as usize],
-        )
-        .expect("write oversized file");
+        let large_file =
+            fs::File::create(save_data.join("large-resource.bin")).expect("create oversized file");
+        large_file
+            .set_len(MAX_CANDIDATE_FILE_BYTES + 1)
+            .expect("set oversized file len");
+        drop(large_file);
         fs::write(root.join("Player.log"), b"log").expect("write loose log");
 
         let files = discover_save_container_files(
@@ -2286,5 +2418,46 @@ mod tests {
         assert!(super::is_noise_path(Path::new(
             r"C:\Users\Player\AppData\Local\rmmz-game\User Data\crashpadmetrics-active.pma"
         )));
+    }
+
+    #[test]
+    fn infer_scan_root_for_etw_file_resolves_steam_userdata() {
+        let steam_file =
+            Path::new(r"C:\Program Files (x86)\Steam\userdata\123456\2456740\remote\slot0.json");
+        let root = super::infer_scan_root_for_etw_file(steam_file, None);
+        assert!(root.is_some());
+        let root = root.unwrap();
+        assert_eq!(root.root_type, SaveRootType::Custom);
+        assert_eq!(
+            super::normalize_path(&root.physical_path),
+            r"c:\program files (x86)\steam\userdata\123456\2456740"
+        );
+    }
+
+    #[test]
+    fn classify_scope_evidence_recognizes_atomic_rename_as_strong() {
+        use crate::services::learning::{FileOperation, FileOperationKind};
+        let scope_root = Path::new(r"C:\Users\Player\AppData\Local\MyGame\Saves");
+        let operations = vec![
+            FileOperation {
+                path: r"C:\Users\Player\AppData\Local\MyGame\Saves\slot.tmp".to_string(),
+                operation: FileOperationKind::Write,
+                file_object_id: Some("0x1234".to_string()),
+                pid: 1234,
+                timestamp_ms: Some(1000),
+            },
+            FileOperation {
+                path: r"C:\Users\Player\AppData\Local\MyGame\Saves\slot.sav".to_string(),
+                operation: FileOperationKind::Rename,
+                file_object_id: Some("0x1234".to_string()),
+                pid: 1234,
+                timestamp_ms: Some(1050),
+            },
+        ];
+        let (level, reason, confidence) =
+            super::classify_scope_evidence(scope_root, 1, false, &operations);
+        assert_eq!(level, SaveCandidateEvidenceLevel::Strong);
+        assert_eq!(confidence, 92);
+        assert!(reason.contains("重命名"));
     }
 }

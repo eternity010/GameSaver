@@ -3,9 +3,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use super::etw_capture::normalize_windows_path;
-use super::etw_capture::should_ignore_snapshot_path;
 use super::etw_capture::{
-    build_device_path_map, resolve_device_path, should_skip_kernel_task, TraceCollectionResult,
+    build_device_path_map, resolve_device_path, should_ignore_event_path,
+    should_skip_kernel_task, TraceCollectionResult,
 };
 use super::transactions::{FileOperation, FileOperationKind};
 
@@ -131,7 +131,7 @@ impl NativeCollector {
             }
         };
         if let Some(path) = path.as_ref() {
-            if should_ignore_snapshot_path(Path::new(path)) {
+            if should_ignore_event_path(Path::new(path)) {
                 self.ignored_paths += 1;
             } else if let Some(object_id) = file_object_id.as_ref() {
                 self.file_object_paths
@@ -140,7 +140,7 @@ impl NativeCollector {
         }
         let operation_path = path
             .clone()
-            .filter(|path| !should_ignore_snapshot_path(Path::new(path)))
+            .filter(|path| !should_ignore_event_path(Path::new(path)))
             .or_else(|| {
                 file_object_id
                     .as_ref()
@@ -158,7 +158,7 @@ impl NativeCollector {
                 file_object_id: file_object_id.clone(),
             });
         }
-        if is_write_related_task(operation_code) {
+        if is_mutation_related_task(operation_code) {
             if let Some(object_id) = file_object_id {
                 self.written_file_objects.insert(object_id);
             }
@@ -421,8 +421,8 @@ fn filetime_to_unix_ms(value: i64) -> Option<i64> {
     (value > 100_000_000_000_000).then(|| value / 10_000 - WINDOWS_TO_UNIX_EPOCH_MS)
 }
 
-fn is_write_related_task(task: u32) -> bool {
-    matches!(task, 16 | 21)
+fn is_mutation_related_task(task: u32) -> bool {
+    matches!(task, 12 | 16 | 19 | 21 | 27 | 28 | 29 | 30)
 }
 
 fn classify_kernel_operation(operation_code: u32) -> Option<FileOperationKind> {
@@ -477,7 +477,7 @@ fn same_guid(left: &windows_sys::core::GUID, right: &windows_sys::core::GUID) ->
 mod tests {
     use super::{
         classify_kernel_operation, decode_property_text, event_schema_key, filetime_to_unix_ms,
-        format_file_object_id, is_write_related_task, kernel_file_operation_code,
+        format_file_object_id, is_mutation_related_task, kernel_file_operation_code,
         needs_direct_path,
     };
     use crate::services::learning::transactions::FileOperationKind;
@@ -508,9 +508,12 @@ mod tests {
 
     #[test]
     fn keeps_only_mutating_file_tasks() {
-        assert!(is_write_related_task(16));
-        assert!(is_write_related_task(21));
-        assert!(!is_write_related_task(15));
+        assert!(is_mutation_related_task(16));
+        assert!(is_mutation_related_task(21));
+        assert!(is_mutation_related_task(12));
+        assert!(is_mutation_related_task(19));
+        assert!(is_mutation_related_task(27));
+        assert!(!is_mutation_related_task(15));
     }
 
     #[test]

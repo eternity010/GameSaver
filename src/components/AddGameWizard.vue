@@ -280,6 +280,9 @@ async function analyze() {
       if (validatingCandidates.value) {
         validatingCandidates.value = false;
         phase.value = "review";
+      } else {
+        session.value = null;
+        phase.value = "ready";
       }
     });
   } catch (reason) {
@@ -424,12 +427,15 @@ async function abandonPendingGame() {
     emit("back");
     return;
   }
-  if (phase.value === "capturing") await cancelSaveLearning(session.value?.sessionId || "");
-  if (phase.value === "capturing" || phase.value === "analyzing") {
-    error.value = "请先结束当前分析任务，再放弃这次添加";
+  if (phase.value === "analyzing") {
+    error.value = "请先等待或取消当前分析任务，再放弃这次添加";
     return;
   }
   try {
+    if (session.value?.sessionId) {
+      await cancelSaveLearning(session.value.sessionId);
+      session.value = null;
+    }
     await discardPendingGame(completedGame.value.gameUid);
     emit("back");
   } catch (reason) {
@@ -443,7 +449,7 @@ onUnmounted(stopPolling);
 <template>
   <section class="wizard-page page-enter">
     <header class="wizard-header">
-      <button class="icon-button" type="button" title="返回游戏库" aria-label="返回游戏库" :disabled="isBusy || phase === 'capturing'" @click="abandonPendingGame"><ArrowLeft :size="18" /></button>
+      <button class="icon-button" type="button" title="返回游戏库" aria-label="返回游戏库" :disabled="isBusy" @click="abandonPendingGame"><ArrowLeft :size="18" /></button>
       <div><p class="eyebrow">添加游戏</p><h1>把游戏加入 GameSaver</h1><p>先复制游戏本体，再确认它的存档保护范围。</p></div>
     </header>
 
@@ -462,10 +468,10 @@ onUnmounted(stopPolling);
     </form>
 
     <section v-else-if="phase === 'ready' || phase === 'capturing'" class="wizard-form">
-      <section class="wizard-section learning-intro"><div class="section-icon"><Gamepad2 :size="22" /></div><div><h2>{{ completedGame?.displayName }} 的存档保护</h2><p>{{ validatingCandidates ? "只验证待确认的候选目录。请在游戏内再次完成一次保存。" : "启动受管游戏，在游戏内完成一次保存。回来后点击分析，GameSaver 会根据变化生成候选范围。" }}</p></div></section>
-      <section class="wizard-section"><div class="task-progress-heading"><span>{{ validatingCandidates ? "再次验证会话" : "学习会话" }}</span><strong v-if="session">PID {{ session.rootPid }}</strong><strong v-else>尚未启动</strong></div><p v-if="phase === 'ready'" class="field-note">只会记录本次学习期间的文件变化，不会立即创建正式存档版本。</p><p v-else class="field-note">完成一次保存后，先退出游戏，再回来分析本次变化。</p><div v-if="phase === 'capturing'" class="capture-state"><span class="loader"></span><strong>{{ validatingCandidates ? "正在验证候选范围" : "正在记录文件变化" }}</strong><span>{{ message }}</span></div></section>
+      <section class="wizard-section learning-intro"><div class="section-icon"><Gamepad2 :size="22" /></div><div><h2>{{ completedGame?.displayName }} 的存档保护</h2><p>{{ validatingCandidates ? "只验证待确认的候选目录。请在游戏内再次完成一次保存。" : "启动受管游戏，在游戏内完成一次保存。建议保存后退出游戏再点击分析，确保数据完整落盘。" }}</p></div></section>
+      <section class="wizard-section"><div class="task-progress-heading"><span>{{ validatingCandidates ? "再次验证会话" : "学习会话" }}</span><strong v-if="session">PID {{ session.rootPid }}</strong><strong v-else>尚未启动</strong></div><p v-if="phase === 'ready'" class="field-note">只会记录本次学习期间的文件变化，不会立即创建正式存档版本。</p><p v-else class="field-note">在游戏内完成一次保存后，建议先退出游戏，再点击分析；也可以直接点击分析。</p><div v-if="phase === 'capturing'" class="capture-state"><span class="loader"></span><strong>{{ validatingCandidates ? "正在验证候选范围" : "正在记录文件变化" }}</strong><span>{{ message }}</span></div></section>
       <p v-if="error" class="error-message" role="alert">{{ error }}</p>
-      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="phase === 'capturing'" @click="abandonPendingGame">放弃添加</button><button v-if="phase === 'capturing'" class="secondary-button" type="button" :disabled="cancelling" @click="cancelTaskOrLearning"><LoaderCircle v-if="cancelling" :size="16" class="spin" /><X v-else :size="16" />{{ cancelling ? "正在停止" : `停止${validatingCandidates ? "验证" : "识别"}` }}</button><button v-if="phase === 'ready'" class="primary-button" type="button" @click="beginLearning"><Gamepad2 :size="17" />启动并开始识别</button><button v-else class="primary-button" type="button" @click="analyze"><Check :size="17" />完成保存，开始{{ validatingCandidates ? "验证" : "分析" }}</button></footer>
+      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="cancelling" @click="abandonPendingGame">放弃添加</button><button v-if="phase === 'capturing'" class="secondary-button" type="button" :disabled="cancelling" @click="cancelTaskOrLearning"><LoaderCircle v-if="cancelling" :size="16" class="spin" /><X v-else :size="16" />{{ cancelling ? "正在停止" : `停止${validatingCandidates ? "验证" : "识别"}` }}</button><button v-if="phase === 'ready'" class="primary-button" type="button" @click="beginLearning"><Gamepad2 :size="17" />启动并开始识别</button><button v-else class="primary-button" type="button" @click="analyze"><Check :size="17" />完成保存，开始{{ validatingCandidates ? "验证" : "分析" }}</button></footer>
     </section>
 
     <section v-else-if="phase === 'analyzing'" class="wizard-form">

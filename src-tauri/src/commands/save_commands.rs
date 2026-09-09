@@ -80,6 +80,18 @@ pub fn start_save_learning_task(
                 if let Ok(mut sessions) = state.learning_sessions.lock() {
                     sessions.insert(view.session_id.clone(), active);
                 }
+                if let Ok(mut running) = state.running_games.lock() {
+                    running.insert(
+                        view.game_uid.clone(),
+                        crate::domain::GameRuntime {
+                            game_uid: view.game_uid.clone(),
+                            pid: Some(view.root_pid),
+                            status: crate::domain::GameRuntimeStatus::Running,
+                            started_at: Some(view.started_at.clone()),
+                            task_id: None,
+                        },
+                    );
+                }
                 TaskService::finish(
                     &state,
                     &task_id_for_thread,
@@ -194,6 +206,18 @@ pub fn start_save_candidate_verification_task(
                 if let Ok(mut sessions) = state.learning_sessions.lock() {
                     sessions.insert(view.session_id.clone(), active);
                 }
+                if let Ok(mut running) = state.running_games.lock() {
+                    running.insert(
+                        view.game_uid.clone(),
+                        crate::domain::GameRuntime {
+                            game_uid: view.game_uid.clone(),
+                            pid: Some(view.root_pid),
+                            status: crate::domain::GameRuntimeStatus::Running,
+                            started_at: Some(view.started_at.clone()),
+                            task_id: None,
+                        },
+                    );
+                }
                 TaskService::finish(
                     &state,
                     &task_id_for_thread,
@@ -270,6 +294,10 @@ pub fn start_finish_save_learning_task(
                 if let Ok(mut sessions) = state.learning_sessions.lock() {
                     sessions.remove(&session_id);
                 }
+                if let Ok(mut running) = state.running_games.lock() {
+                    running.remove(&active.view.game_uid);
+                }
+                cleanup_active_learning(&active);
                 TaskService::finish(
                     &state,
                     &task_id_for_thread,
@@ -280,24 +308,44 @@ pub fn start_finish_save_learning_task(
                     None,
                 );
             }
-            Err(error) if error == "任务已取消" => TaskService::finish(
-                &app_handle.state(),
-                &task_id_for_thread,
-                TaskStatus::Cancelled,
-                100,
-                "已取消存档分析",
-                None,
-                None,
-            ),
-            Err(error) => TaskService::finish(
-                &app_handle.state(),
-                &task_id_for_thread,
-                TaskStatus::Failed,
-                100,
-                "存档分析失败",
-                None,
-                Some(error),
-            ),
+            Err(error) if error == "任务已取消" => {
+                let state: State<AppState> = app_handle.state();
+                if let Ok(mut sessions) = state.learning_sessions.lock() {
+                    sessions.remove(&session_id);
+                }
+                if let Ok(mut running) = state.running_games.lock() {
+                    running.remove(&active.view.game_uid);
+                }
+                cleanup_active_learning(&active);
+                TaskService::finish(
+                    &app_handle.state(),
+                    &task_id_for_thread,
+                    TaskStatus::Cancelled,
+                    100,
+                    "已取消存档分析",
+                    None,
+                    None,
+                );
+            }
+            Err(error) => {
+                let state: State<AppState> = app_handle.state();
+                if let Ok(mut sessions) = state.learning_sessions.lock() {
+                    sessions.remove(&session_id);
+                }
+                if let Ok(mut running) = state.running_games.lock() {
+                    running.remove(&active.view.game_uid);
+                }
+                cleanup_active_learning(&active);
+                TaskService::finish(
+                    &app_handle.state(),
+                    &task_id_for_thread,
+                    TaskStatus::Failed,
+                    100,
+                    "存档分析失败",
+                    None,
+                    Some(error),
+                );
+            }
         }
     });
     Ok(task_id)
@@ -312,6 +360,9 @@ pub fn cancel_save_learning(state: State<AppState>, session_id: String) -> Resul
         .map_err(|_| "lock learning session state failed".to_string())?
         .remove(session_id);
     if let Some(active) = active {
+        if let Ok(mut running) = state.running_games.lock() {
+            running.remove(&active.view.game_uid);
+        }
         cleanup_active_learning(&active);
         crate::logging::info(format!("已取消存档识别会话：session_id={session_id}"));
     } else {
@@ -567,6 +618,16 @@ fn validate_scope(scope: &SaveScope) -> Result<(), String> {
                 .any(|component| matches!(component, std::path::Component::ParentDir))
         {
             return Err(format!("存档范围包含无效相对路径：{value}"));
+        }
+    }
+    let root = Path::new(&scope.root_path);
+    for confirmed in &scope.confirmed_files {
+        let full = root.join(confirmed);
+        if !full.exists() {
+            crate::logging::warn(format!(
+                "存档范围确认文件当前在磁盘上不存在（可能为临时文件或已重命名）：root={} file={}",
+                scope.root_path, confirmed
+            ));
         }
     }
     Ok(())

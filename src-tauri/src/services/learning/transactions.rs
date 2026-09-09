@@ -172,7 +172,23 @@ fn same_transaction_window(
         return false;
     };
     match (previous.timestamp_ms, current.timestamp_ms) {
-        (Some(previous), Some(current)) => current.saturating_sub(previous) <= TRANSACTION_GAP_MS,
+        (Some(prev_ts), Some(curr_ts)) => {
+            if curr_ts.saturating_sub(prev_ts) > TRANSACTION_GAP_MS {
+                return false;
+            }
+            if previous.pid != current.pid {
+                return false;
+            }
+            if previous.file_object_id.is_some()
+                && current.file_object_id.is_some()
+                && previous.file_object_id == current.file_object_id
+            {
+                return true;
+            }
+            let prev_parent = Path::new(&previous.path).parent();
+            let curr_parent = Path::new(&current.path).parent();
+            prev_parent.is_some() && prev_parent == curr_parent
+        }
         _ => false,
     }
 }
@@ -291,6 +307,15 @@ mod tests {
         let result = analyze_save_transactions(vec![
             operation("C:/save/a.sav", FileOperationKind::Write, Some(1_000)),
             operation("C:/save/b.sav", FileOperationKind::Write, Some(4_000)),
+        ]);
+        assert_eq!(result.transaction_count, 2);
+    }
+
+    #[test]
+    fn transactions_split_across_unrelated_directories() {
+        let result = analyze_save_transactions(vec![
+            operation("C:/game/config.ini", FileOperationKind::Write, Some(1_000)),
+            operation("C:/save/slot.sav", FileOperationKind::Write, Some(1_100)),
         ]);
         assert_eq!(result.transaction_count, 2);
     }

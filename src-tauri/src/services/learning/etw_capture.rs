@@ -179,7 +179,7 @@ pub(crate) fn cleanup_stale_captures(app: &AppHandle) {
                     .ok()
                     .and_then(|metadata| metadata.modified().ok())
                     .and_then(|modified| modified.elapsed().ok())
-                    .is_some_and(|age| age > std::time::Duration::from_secs(24 * 60 * 60));
+                    .is_some_and(|age| age > std::time::Duration::from_secs(60 * 60));
                 if is_trace && old_enough {
                     let _ = std::fs::remove_file(path);
                 }
@@ -443,7 +443,7 @@ pub(crate) fn collect_related_files_by_trace(
         });
         let file_object_id = event_file_object_id(&row, user_data_idx);
         if let Some(path) = normalized_path.as_ref() {
-            if !path.is_empty() && !should_ignore_snapshot_path(Path::new(path)) {
+            if !path.is_empty() && !should_ignore_event_path(Path::new(path)) {
                 if let Some(object_id) = file_object_id.as_ref() {
                     file_object_paths.insert(object_id.clone(), path.clone());
                 }
@@ -474,8 +474,8 @@ pub(crate) fn collect_related_files_by_trace(
                 path: path.clone(),
                 operation,
                 timestamp_ms: clock_time_idx
-                    .and_then(|idx| event_field_value(&row, idx))
-                    .and_then(|value| parse_trace_timestamp_ms(value)),
+                .and_then(|idx| event_field_value(&row, idx))
+                .and_then(|value| parse_trace_timestamp_ms(value)),
                 pid,
                 file_object_id: file_object_id.clone(),
             });
@@ -485,7 +485,12 @@ pub(crate) fn collect_related_files_by_trace(
             .and_then(|idx| event_field_value(&row, idx))
             .and_then(|value| parse_u64(value))
             .is_some_and(|keyword| keyword & 0x1E00 != 0);
-        if !is_write_like {
+        let is_mutation = is_write_like
+            || matches!(
+                operation_kind,
+                Some(FileOperationKind::Rename | FileOperationKind::Create)
+            );
+        if !is_mutation {
             continue;
         }
         write_like_rows += 1;
@@ -493,7 +498,7 @@ pub(crate) fn collect_related_files_by_trace(
             written_file_objects.insert(object_id);
         }
         if let Some(path) = operation_path {
-            if !path.is_empty() && !should_ignore_snapshot_path(Path::new(&path)) {
+            if !path.is_empty() && !should_ignore_event_path(Path::new(&path)) {
                 files.insert(path);
             }
         }
@@ -868,13 +873,10 @@ pub(crate) fn normalize_windows_path(path: &str) -> String {
         .to_ascii_lowercase()
 }
 
-pub(crate) fn should_ignore_snapshot_path(path: &Path) -> bool {
+pub(crate) fn should_ignore_event_path(path: &Path) -> bool {
     let text = path.to_string_lossy().to_ascii_lowercase();
     if text.ends_with(".log")
-        || text.ends_with(".tmp")
-        || text.ends_with(".temp")
         || text.ends_with(".dmp")
-        || text.ends_with(".bak")
         || text.ends_with(".etl")
         || text.ends_with(".pma")
         || text.ends_with(".ico.md5")
@@ -949,6 +951,14 @@ pub(crate) fn should_ignore_snapshot_path(path: &Path) -> bool {
     ]
     .iter()
     .any(|fragment| text.contains(fragment))
+}
+
+pub(crate) fn should_ignore_snapshot_path(path: &Path) -> bool {
+    let text = path.to_string_lossy().to_ascii_lowercase();
+    if text.ends_with(".tmp") || text.ends_with(".temp") || text.ends_with(".bak") {
+        return true;
+    }
+    should_ignore_event_path(path)
 }
 
 fn event_logs_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {

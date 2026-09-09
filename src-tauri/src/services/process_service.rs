@@ -84,6 +84,11 @@ impl TrackedProcessHandle {
     }
 }
 
+pub fn is_process_running(pid: u32) -> bool {
+    TrackedProcessHandle::open(pid).map(|h| h.is_alive()).unwrap_or(false)
+}
+
+
 pub fn is_ignored_process_name(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
     let file_name = Path::new(&lower)
