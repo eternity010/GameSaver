@@ -1,6 +1,8 @@
 use crate::{
     app_state::AppState,
-    domain::{GameLifecycle, SaveProfile, SaveVersion, TaskCategory, TaskStatus},
+    domain::{
+        compare_created_at, GameLifecycle, SaveProfile, SaveVersion, TaskCategory, TaskStatus,
+    },
     repositories::{GameRepository, SaveRepository},
     services::{GameLibraryService, TaskService},
 };
@@ -454,9 +456,7 @@ fn versions_to_remove(
         .filter(|version| version.game_uid == game_uid)
         .collect::<Vec<_>>();
     versions.sort_by(|left, right| {
-        right
-            .created_at
-            .cmp(&left.created_at)
+        compare_created_at(&right.created_at, &left.created_at)
             .then(right.version_id.cmp(&left.version_id))
     });
     Ok(versions

@@ -1,6 +1,6 @@
 use crate::{
     app_state::AppState,
-    domain::{CoverCrop, CoverPosition, GameCover},
+    domain::{compare_created_at, CoverCrop, CoverPosition, GameCover},
     repositories::GameRepository,
     services::{CoverCaptureService, GameBodyUpdateService, GameLibraryService},
 };
@@ -659,7 +659,7 @@ pub fn query_game_detail_view(
         .filter(|version| version.game_uid == game_uid)
         .cloned()
         .collect::<Vec<_>>();
-    versions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    versions.sort_by(|left, right| compare_created_at(&right.created_at, &left.created_at));
 
     let mut body_versions = store
         .body_versions
@@ -675,7 +675,7 @@ pub fn query_game_detail_view(
         })
         .cloned()
         .collect::<Vec<_>>();
-    body_versions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    body_versions.sort_by(|left, right| compare_created_at(&right.created_at, &left.created_at));
 
     let body_version_views = body_versions
         .into_iter()

@@ -1,8 +1,8 @@
 use crate::{
     app_state::AppState,
     domain::{
-        GameBodyVersion, GameHealth, GameLifecycle, SaveProfile, SaveVersion, TaskCategory,
-        TaskStatus,
+        compare_created_at, GameBodyVersion, GameHealth, GameLifecycle, SaveProfile, SaveVersion,
+        TaskCategory, TaskStatus,
     },
     repositories::{BaiduConfigRepository, GameRepository, SaveRepository},
     services::{BodyPackageService, GameBodyUpdateService, GameLibraryService, TaskService},
@@ -47,7 +47,7 @@ pub fn list_game_body_versions(
         })
         .cloned()
         .collect::<Vec<_>>();
-    versions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    versions.sort_by(|left, right| compare_created_at(&right.created_at, &left.created_at));
     Ok(versions
         .into_iter()
         .map(|version| GameBodyVersionView {

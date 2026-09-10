@@ -1,6 +1,9 @@
 use crate::{
     app_state::AppState,
-    domain::{AppStore, Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope, SaveVersion},
+    domain::{
+        compare_created_at, AppStore, Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope,
+        SaveVersion,
+    },
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -330,9 +333,7 @@ impl SaveRepository {
                 .cloned()
                 .collect();
             game_versions.sort_by(|left, right| {
-                right
-                    .created_at
-                    .cmp(&left.created_at)
+                compare_created_at(&right.created_at, &left.created_at)
                     .then(right.version_id.cmp(&left.version_id))
             });
             game_versions
@@ -1671,6 +1672,32 @@ mod tests {
             store.games[0].latest_save_version_id.as_deref(),
             Some("a2"),
             "指针指向的 a1 被剪掉后应回退到最新一版"
+        );
+    }
+
+    /// V8 回归：保留策略必须按 `created_at` 的**时间**语义挑最新，而不是按字符串比。
+    ///
+    /// `"9" > "10"` 在字符串比较下成立、在时间语义下不成立。比较一旦退化成 `String::cmp`
+    /// （或哪天 `created_at` 换成别的格式），这条会留下最旧的 a9、丢掉最新的 a10 ——
+    /// 正是 V8 担心的「删掉最新的、留下最旧的」。
+    ///
+    /// 注意这条测的是**调用点**：`compare_created_at` 自己的单测守着它实现正确，
+    /// 但把 `prune_game_save_versions` 里的调用换回 `String::cmp`，那些单测照样全绿。
+    #[test]
+    fn prune_picks_the_newest_by_time_not_by_text() {
+        let mut store = AppStore {
+            save_versions: vec![version("game-a", "a9", "9"), version("game-a", "a10", "10")],
+            ..AppStore::default()
+        };
+
+        let alive = SaveRepository::prune_game_save_versions(&mut store, "game-a", 1)
+            .expect("超出保留数应发生剪枝");
+
+        let ids: Vec<&str> = alive.iter().map(|v| v.version_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["a10"],
+            "created_at=\"10\" 比 \"9\" 新，必须保留 a10"
         );
     }
 

@@ -1,6 +1,7 @@
 use crate::{
     app_state::AppState,
     domain::{
+        compare_optional_created_at,
         game::{CloudStatus, LaunchConfig},
         Game, GameBodyVersion, GameHealth, GameLifecycle, TaskCategory, TaskRetry, TaskStatus,
     },
@@ -321,9 +322,11 @@ pub fn list_cloud_games(
                 let package = packages
                     .iter()
                     .max_by(|left, right| {
-                        left.created_at
-                            .cmp(&right.created_at)
-                            .then_with(|| left.version_id.cmp(&right.version_id))
+                        compare_optional_created_at(
+                            left.created_at.as_deref(),
+                            right.created_at.as_deref(),
+                        )
+                        .then_with(|| left.version_id.cmp(&right.version_id))
                     })
                     .cloned()?;
                 let installed = local.is_some_and(|game| {

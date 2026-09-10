@@ -26,14 +26,14 @@
 | V5 | 中 ✅ 已修复 | 改保留数时未重算 `latest_save_version_id`，指针悬垂后每次退出都会无条件新建版本 | 4 处，见正文 |
 | V6 | 中 ✅ 已修复 | 解压前不校验大小（代码审查报告 P2-2 在存档侧的主路径确认） | `cloud_save_service.rs` `read_zip_entry_bounded` |
 | V7 | 低 ✅ 已修复 | 恢复过程在用户存档目录内留下的 `.gamesaver-restore-*` / `.gamesaver-rollback-*` 无启动清理，且会被下一次提交当成存档收进版本 | `save_repository.rs` `sweep_restore_artifacts` + `lib.rs` 启动钩子 |
-| V8 | 低 | 版本排序按 `created_at` **字符串**比较，改用 ISO 时间后保留策略会删错版本 | 5 处 |
+| V8 | 低 ✅ 已修复 | 版本排序按 `created_at` **字符串**比较，改用 ISO 时间后保留策略会删错版本 | `domain/timestamp.rs` `compare_created_at` |
 | V9 | 低 | `wildcard_matches` 不支持中间通配符且静默失效 | `save_repository.rs:1017-1030` |
 | V10 | 低 | 恢复会删除「当前存在但不属于目标版本」的受保护文件，确认文案未告知 | `save_repository.rs:448-508` |
 
 高置信度：V1 / V2 / V3 / V4 / V6 / V9（纯静态可判）。
 V5 / V7 / V8 / V10 涉及运行时序列，触发条件已在各条正文写明。
 
-**修复进度：V1、V2、V3、V4、V5、V6、V7 已修复（2026-09-10）；剩 V8 / V9 / V10。**
+**修复进度：V1、V2、V3、V4、V5、V6、V7、V8 已修复（2026-09-10）；剩 V9 / V10。**
 
 ---
 
@@ -349,7 +349,7 @@ let rollback = group.root.join(format!(".gamesaver-rollback-{restore_id}"));
 
 ## 3. 低优先级 / 整洁性
 
-### V8 版本排序按 `created_at` 字符串比较 —— 低
+### V8 版本排序按 `created_at` 字符串比较 —— 低 ✅ 已修复（2026-09-10）
 
 以下 5 处都用字符串比较决定版本新旧（进而决定谁被保留、谁被回收）：
 
@@ -366,6 +366,15 @@ let rollback = group.root.join(format!(".gamesaver-rollback-{restore_id}"));
 **但这很脆**：函数名叫 `now_iso`、字段叫 `created_at`、设计文档也按时间语义描述它。一旦有人把它改成真正的 ISO 8601（或带毫秒、或位数变化），字符串比较会与时间顺序脱钩 —— 而这些代码正是用来决定**删除哪个版本**的，删错方向就是「删掉最新的、留下最旧的」。
 
 **修法**：要么明确落成定长数字串并加注释锁死（含跨版本兼容说明），要么解析成 `u64` 再比较。
+
+**修复记录（2026-09-10）**：选了「解析成数字再比较」，并把比较收进一个地方。
+
+- 新增 `domain/timestamp.rs`：`compare_created_at`（两边都能解析成 `u64` 就按数值比，否则退回字符串比较 —— 真正的 ISO 8601 恰好按字典序单调，两条路都不会把时间顺序搞反）与 `compare_optional_created_at`（字段本身是 `Option<String>` 的云端包元数据用，`None` 排在 `Some` 之前，保持 `Option::cmp` 原有次序，只把「有时间戳的那些」换成按时间比）。
+- **实际不止报告中列的 5 处**：grep 全项目，直接按 `created_at` 排序/取极值的地方共 **11 处**，横跨存档版本、本体版本、任务与云端包：`commands/baidu_commands.rs`、`commands/game_body_commands.rs`、`commands/game_commands.rs`（×2）、`commands/launch_commands.rs`、`commands/save_version_commands.rs`、`domain/store.rs`（V5 的 `newest_save_version_id`）、`repositories/save_repository.rs`（`prune_game_save_versions`）、`repositories/task_repository.rs`、`services/cloud_save_service.rs`、`services/task_service.rs`。**全部统一到该比较器**，没有留一半旧写法。
+- **测试必须守住调用点**：`compare_created_at` 自己的单测只保证实现正确 —— 把某个调用点换回 `String::cmp`，那些单测照样全绿（这正是「抽叶子函数守住调用点」这类假安全感）。所以另加两条**调用点级**回归：`prune_picks_the_newest_by_time_not_by_text`（保留策略）与 `newest_version_is_picked_by_time_not_by_text`（悬垂指针回退），都用 `created_at = "9" / "10"` 这一对 —— 字符串比较会认为 `"9"` 更新。
+- **未做**：`now_iso()` 在全项目仍有 9 份拷贝（已知 P3 重复实现项）。比较器不依赖它们，本轮的修复不因此打折；合并属于另一项独立工作（与 `normalize_path`、保留策略的重复一并处理）。
+
+**变异验证（两次，失败集合互不重叠）**：① `prune_game_save_versions` 换回 `String::cmp` → 恰好保留策略那条失败，实际留下 `["a9"]`、丢掉 `a10`；② `newest_save_version_id` 换回 `String::cmp` → 恰好悬垂指针那条失败，实际回退到 `Some("a9")`。两条都精确复现了 V8 描述的「删掉最新的、留下最旧的」。
 
 ### V9 `wildcard_matches` 不支持中间通配符，且静默失效 —— 低
 
@@ -435,7 +444,8 @@ let touched = group.protected_paths.union(&target_paths).cloned().collect();   /
 | 4 | **V2** 墓碑条目跳过 root/scope 前置校验 | ✅ 已完成（2026-09-10）：影响「恢复到底能不能用」，且报错信息误导用户；保留墓碑「让该范围参与清理」的职责，避免「恢复到空」被挡掉 |
 | 5 | **V7** 残留产物排除 + 启动兜底 | ✅ 已完成（2026-09-10）：两道防线 —— 收集侧切断「污染→上传云端」的链条，启动清扫按盘上痕迹「先归位、再清理」。实做时修正了报告原方案的两处：排除**不挂** `is_excluded`（会让历史污染版本不可恢复），清扫**不能**写成「发现残留就删」（备份阶段崩溃时 rollback 里是用户自己的存档） |
 | 6 | **V6** 解压前拦大小 | ✅ 已完成（2026-09-10）：`read_zip_entry_bounded` 把「校验」挪到「读取」之前，并用 `take` 钉死读取量；顺带修掉 `meta.json` 上的同一缺陷 |
-| 7 | V8 / V9 / V10 | 整洁性与文案：`created_at` 排序鲁棒性、`wildcard_matches` 静默失效、恢复删除不告知 |
+| 7 | **V8** `created_at` 比较收口 | ✅ 已完成（2026-09-10）：`domain/timestamp.rs` 的 `compare_created_at` 替代 11 处字符串比较；两条**调用点级**回归测试守着「按时间而非按文本」 |
+| 8 | V9 / V10 | 余下为整洁性与文案：`wildcard_matches` 静默失效、恢复删除不告知 |
 
 ---
 

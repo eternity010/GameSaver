@@ -1,4 +1,4 @@
-use super::{Game, GameBodyVersion, SaveProfile, SaveVersion};
+use super::{compare_created_at, Game, GameBodyVersion, SaveProfile, SaveVersion};
 use serde::{Deserialize, Serialize};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 2;
@@ -107,8 +107,7 @@ impl AppStore {
             .iter()
             .filter(|version| version.game_uid == game_uid)
             .max_by(|left, right| {
-                left.created_at
-                    .cmp(&right.created_at)
+                compare_created_at(&left.created_at, &right.created_at)
                     .then(left.version_id.cmp(&right.version_id))
             })
             .map(|version| version.version_id.clone())
@@ -226,6 +225,28 @@ mod tests {
             store.games[0].latest_save_version_id.as_deref(),
             Some("a3"),
             "悬垂指针应回退到 created_at 最新的一版"
+        );
+    }
+
+    /// V8 回归：挑「最新一版」必须按 `created_at` 的**时间**语义，而不是按字符串比。
+    ///
+    /// `"9" > "10"` 在字符串比较下成立、在时间语义下不成立。这条守着的是调用点 ——
+    /// `compare_created_at` 自己的单测保证实现正确，但把 `newest_save_version_id`
+    /// 换回 `String::cmp`，那些单测照样全绿，而悬垂指针会修到**更旧**的那一版上。
+    #[test]
+    fn newest_version_is_picked_by_time_not_by_text() {
+        let mut store = AppStore {
+            games: vec![game("game-a", Some("gone"))],
+            save_versions: vec![version("game-a", "a9", "9"), version("game-a", "a10", "10")],
+            ..AppStore::default()
+        };
+
+        store.repair_latest_save_version_id("game-a");
+
+        assert_eq!(
+            store.games[0].latest_save_version_id.as_deref(),
+            Some("a10"),
+            "created_at=\"10\" 比 \"9\" 新，悬垂指针应回退到 a10"
         );
     }
 

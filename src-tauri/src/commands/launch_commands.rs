@@ -1,6 +1,6 @@
 use crate::{
     app_state::AppState,
-    domain::{GameRuntime, SaveVersion},
+    domain::{compare_created_at, GameRuntime, SaveVersion},
     services::{LaunchPrecheck, LaunchService},
 };
 use tauri::{AppHandle, State};
@@ -58,6 +58,6 @@ pub fn list_save_versions(
         .filter(|version| version.game_uid == game_uid)
         .cloned()
         .collect::<Vec<_>>();
-    versions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    versions.sort_by(|left, right| compare_created_at(&right.created_at, &left.created_at));
     Ok(versions)
 }

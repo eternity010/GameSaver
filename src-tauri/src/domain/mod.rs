@@ -4,6 +4,7 @@ pub mod save_profile;
 pub mod save_version;
 pub mod store;
 pub mod task;
+pub mod timestamp;
 
 pub use game::{
     CoverCrop, CoverPosition, Game, GameBodyVersion, GameCover, GameHealth, GameLifecycle,
@@ -21,3 +22,4 @@ pub use save_profile::{
 pub use save_version::{SaveFileEntry, SaveVersion};
 pub use store::AppStore;
 pub use task::{AppTask, TaskCategory, TaskRetry, TaskStatus};
+pub use timestamp::{compare_created_at, compare_optional_created_at};

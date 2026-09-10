@@ -1,4 +1,4 @@
-use crate::domain::{AppTask, TaskCategory, TaskStatus};
+use crate::domain::{compare_created_at, AppTask, TaskCategory, TaskStatus};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -64,7 +64,7 @@ impl TaskRepository {
         let mut snapshot = tasks.clone();
         trim(&mut snapshot);
         let mut entries = snapshot.values().cloned().collect::<Vec<_>>();
-        entries.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        entries.sort_by(|left, right| compare_created_at(&left.created_at, &right.created_at));
         let store = TaskStore {
             schema_version: TASK_SCHEMA_VERSION,
             tasks: entries,

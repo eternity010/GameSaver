@@ -1,6 +1,6 @@
 use crate::{
     app_state::AppState,
-    domain::{AppTask, TaskCategory, TaskRetry, TaskStatus},
+    domain::{compare_created_at, AppTask, TaskCategory, TaskRetry, TaskStatus},
     repositories::TaskRepository,
 };
 use uuid::Uuid;
@@ -227,7 +227,7 @@ impl TaskService {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        tasks.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        tasks.sort_by(|left, right| compare_created_at(&right.created_at, &left.created_at));
         Ok(tasks)
     }
 }

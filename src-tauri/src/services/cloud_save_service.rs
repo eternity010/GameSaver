@@ -1,5 +1,5 @@
 use crate::{
-    domain::{Game, SaveFileEntry, SaveProfile, SaveVersion},
+    domain::{compare_created_at, Game, SaveFileEntry, SaveProfile, SaveVersion},
     repositories::{BaiduConfigRepository, GameRepository, SaveRepository},
     services::{BaiduNetdiskClient, RemoteFile},
 };
@@ -563,7 +563,7 @@ impl CloudSaveService {
             .cloned()
             .collect::<Vec<_>>();
         drop(store);
-        local_versions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        local_versions.sort_by(|a, b| compare_created_at(&b.created_at, &a.created_at));
 
         let latest_local = local_versions.first();
         let latest_local_created_at = latest_local.map(|v| v.created_at.clone());
