@@ -297,11 +297,11 @@ Rust 标准库在 Windows 上的 `FileType::is_symlink()` **已经覆盖 `IO_REP
 
 ### P2 — 中等影响
 
-> 共 15 条，截至 2026-09-10：**P2-14 已随 S5 顺带解决**（两处轮询合并为唯一任务流）、**P2-2 已随存档管理审查 V6 解决**（解压改为先校验后读取），其余 13 条未处理。
+> 共 15 条，截至 2026-09-10：**P2-14 已随 S5 顺带解决**（两处轮询合并为唯一任务流）、**P2-2 已随存档管理审查 V6 解决**（解压改为先校验后读取）、**P2-1 已解决**（打包前磁盘预检，并收口三份磁盘探测拷贝），其余 12 条未处理。
 
 | 编号 | 位置 | 问题 |
 | --- | --- | --- |
-| P2-1 | `services/game_body_package_service.rs`（打包入口 `:114`） | 打包**没有磁盘空间预检**。`add_game_service.rs:104` 和 `game_body_update_service.rs:210` 都有 `ensure_available_space`，唯独打包没有——而打包恰恰要额外写出一份与游戏同体积的 ZIP。磁盘满时 7z 写坏 `.tmp` 包再报错 |
+| P2-1 | ~~`services/game_body_package_service.rs`（打包入口 `:114`）~~ | ✅ **已解决（2026-09-10）**：抽出 `services/disk_space.rs` 统一探测与判定，打包前先算「包最多多大」（源文件总量 + 每条目 ZIP 固定开销 + 已存在的同版本包），再要求同样的可用空间加 128 MiB 余量；预检放在创建缓存目录与临时文件**之前**，磁盘不足时直接拒绝，不再让 7z 把 `.tmp` 写坏。顺带把 `add_game_service` / `game_body_update_service` / `library_commands` 三份 `GetDiskFreeSpaceExW` 拷贝收口到同一模块（原先三份探测、两种失败语义） |
 | P2-2 | ~~`services/cloud_save_service.rs:317-323`~~ | ✅ **已解决（2026-09-10，随存档管理审查 V6）**：抽出 `read_zip_entry_bounded`，**校验全部前移到读取之前** —— zip 头部声明值先与版本清单比对（不一致直接拒绝、一个字节都不读），再叠加一道与清单无关的硬上限（数据条目 1 GiB / `meta.json` 32 MiB，后者原先也是裸 `read_to_end`），最后用 `Read::take(declared + 1)` 钉死读取量。本体包（`game_body_package_service.rs`）那条解压路径不属本条：它是**流式写盘 + 1 MiB 缓冲 + 清单长度上限**，不在内存里展开 |
 | P2-3 | `commands/baidu_commands.rs:1165-1171`、`services/cloud_save_service.rs:507` | 远端删除**非原子**：先 `delete_file` 再重建清单。若清单重写失败，文件已删而清单仍引用它。`cloud_save_service.rs:507` 更是 `let _ = client.delete_file(...)` 直接吞掉失败，导致清单剔除版本但远端残留孤立 ZIP |
 | P2-4 | `cover_protocol.rs:49-53` | 封面路径只拒绝绝对路径，**不拒绝 `..`**。`display_path` 若被污染（store 被改 / 数据异常），可读出库目录之外的文件。项目其他地方（`safe_join`、`scope_is_accessible`）都做了 `..` 检查，此处漏了 |
@@ -388,7 +388,7 @@ let sleep_duration = if all_exited {
 | 3 | P1-3 鉴权失败时刷新 token 并重放 | ✅ **已完成（2026-09-10）** | 长任务失败代价高，用户可感知；已同时覆盖 HTTP 401 与百度 `errno` 两种失效表现 |
 | 4 | ~~P1-4 用 reparse point 检测替换 `is_symlink`~~ | ❌ **撤回** | 实测证明 Rust 的 `is_symlink()` 已识别 junction，本条不成立，无需改动 |
 | 5 | P2-2 解压前大小校验 | ✅ **已完成（2026-09-10，随 V6）** | 校验前移到读取之前 + 与清单无关的硬上限；同时补掉 `meta.json` 上的同一缺陷 |
-| 6 | P2-1 打包前空间预检 | ⬜ 待办 | 很便宜，直接消除「磁盘写坏」；同组里只剩这一条 |
+| 6 | P2-1 打包前空间预检 | ✅ **已完成（2026-09-10）** | 顺带收口三份 `GetDiskFreeSpaceExW` 拷贝；打包两条路径共用 `plan_package` 一个入口 |
 | 7 | 清掉 clippy 警告 | ⬜ 待办 | `cargo clippy --fix` 可自动修大部分；`:539` 的死分支需要人工判断原意 |
 | 8 | 合并 `now_iso`/`normalize_path`/保留策略三份重复实现 | ⬜ 待办 | 减少「改一处漏一处」（`normalize_path` 已经出现三份不一致） |
 | 9 | 拆分 `GameDetailPage.vue` | ⬜ 待办 | 长期收益，不急 |
@@ -425,8 +425,10 @@ grep -rn "GameLifecycle::Removing" src-tauri/src
 | P1-2 | `cargo test` / `cargo clippy --all-targets` | 164 passed（新增 3）；clippy 35 条经逐条核对全部为既有项 |
 | P1-3 | `cargo test` / `cargo clippy` / `cargo fmt --check` | **167 passed**（新增 3）；`baidu_netdisk_service.rs` clippy 0 警告、格式干净 |
 | P1-4 | 独立探针 crate 实测 `FileType::is_symlink()` 对 junction 的返回值 | junction 返回 `true` → **本条撤回，未改任何代码** |
+| P2-2 / V6 | `cargo test` / `cargo clippy` / 变异 ×3 | 218 passed（+5）；撤清单比对、撤硬上限、撤 `take` 各自只打掉自己那条测试 |
+| P2-1 | `cargo test` / `cargo clippy` / 变异 ×4 | **223 passed**（+5）；撤预检、改判定边界、去余量、漏算源文件体积各自精确命中；clippy 由 30/34 **降到 28/32**（打包侧重复的参数列随重构消失） |
 
-当前全量 `cargo test`：**167 passed / 0 failed**。
+当前全量 `cargo test`：**223 passed / 0 failed**。
 
 > 关于 P1-4 的方法论提示：涉及平台特定 API 语义的安全结论，应当先用最小可运行程序实测再采纳。本次若照原始结论直改，会引入一次无意义的改动并污染 `safe_join` 的语义。
 
