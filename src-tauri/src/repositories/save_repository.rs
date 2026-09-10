@@ -1444,19 +1444,44 @@ fn normalize_relative(path: &str) -> String {
     }
 }
 
+/// 通配匹配：`*` 匹配任意长度（含空串），`?` 匹配任意单个字符，大小写不敏感。
+///
+/// 早先只认「全匹配 / `*后缀` / `前缀*`」三种形态，`slot*.sav` 这类**中间通配**会掉进
+/// 字面量比较分支 —— 拿路径去跟字符串 `"slot*.sav"` 比，**永远不匹配**。而存档规则编辑器
+/// 允许用户自己加 pattern，写下 `slot*.sav` 只会以为排除了、实际一个都没排除，且排除失效
+/// 的方向是「多备份」而非「少备份」，不会报错也不会丢数据，所以一直没暴露（存档管理审查 V9）。
+///
+/// 双指针 + 单个 `*` 回退点：不递归、不产生指数级回溯，多个 `*` 也只需记住最近一个。
 fn wildcard_matches(value: &str, pattern: &str) -> bool {
-    let value = value.to_ascii_lowercase();
-    let pattern = pattern.to_ascii_lowercase();
-    if pattern == "*" {
-        return true;
+    let value = value.to_ascii_lowercase().chars().collect::<Vec<_>>();
+    let pattern = pattern.to_ascii_lowercase().chars().collect::<Vec<_>>();
+
+    let (mut v, mut p) = (0usize, 0usize);
+    // 最近一个 `*` 在模式里的位置，以及它当时把值匹配到了哪 —— 失配时回到这里让它多吞一个字符。
+    let mut star: Option<usize> = None;
+    let mut star_value = 0usize;
+
+    while v < value.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == value[v]) {
+            v += 1;
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            star_value = v;
+            p += 1;
+        } else if let Some(star_position) = star {
+            star_value += 1;
+            v = star_value;
+            p = star_position + 1;
+        } else {
+            return false;
+        }
     }
-    if let Some(suffix) = pattern.strip_prefix("*") {
-        return value.ends_with(suffix);
+    // 值已耗尽：模式尾部剩余的 `*` 可以匹配空串，其余字符则说明没匹配上。
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
     }
-    if let Some(prefix) = pattern.strip_suffix("*") {
-        return value.starts_with(prefix);
-    }
-    value == pattern
+    p == pattern.len()
 }
 
 fn read_stable_file(path: &Path) -> Result<(Vec<u8>, u64), String> {
@@ -1706,6 +1731,31 @@ mod tests {
         assert!(wildcard_matches("notes.tmp", "*.tmp"));
         assert!(wildcard_matches("cache.bin", "cache*"));
         assert!(!wildcard_matches("save.dat", "*.tmp"));
+    }
+
+    /// V9 回归：中间通配必须真的生效，不能再静默退化成字面量比较。
+    #[test]
+    fn wildcard_patterns_support_middle_wildcards_and_single_character() {
+        // 中间通配 —— 旧实现会拿 "slot1.sav" 去跟字面量 "slot*.sav" 比，永远不匹配。
+        assert!(wildcard_matches("slot1.sav", "slot*.sav"));
+        assert!(wildcard_matches("slot.sav", "slot*.sav"), "`*` 可匹配空串");
+        assert!(!wildcard_matches("slot1.dat", "slot*.sav"));
+
+        // 多个 `*` 需要回溯到最近的那个继续试。
+        assert!(wildcard_matches("_autosave_1.sav", "*save*.sav"));
+        assert!(!wildcard_matches("_autosave_1.dat", "*save*.sav"));
+        assert!(wildcard_matches("a-b-c.dat", "a*c.dat"));
+        assert!(wildcard_matches("abc", "ab**"), "尾部多个 `*` 匹配空串");
+
+        // `?` 匹配任意单个字符。
+        assert!(wildcard_matches("slot1.sav", "slot?.sav"));
+        assert!(!wildcard_matches("slot12.sav", "slot?.sav"));
+
+        // 沿既有行为：大小写不敏感、裸 `*` 全匹配、无通配符按字面量。
+        assert!(wildcard_matches("SLOT1.SAV", "slot*.sav"));
+        assert!(wildcard_matches("anything", "*"));
+        assert!(wildcard_matches("save.dat", "save.dat"));
+        assert!(!wildcard_matches("save.dat", "save.dats"));
     }
 
     #[test]

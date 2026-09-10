@@ -27,13 +27,13 @@
 | V6 | 中 ✅ 已修复 | 解压前不校验大小（代码审查报告 P2-2 在存档侧的主路径确认） | `cloud_save_service.rs` `read_zip_entry_bounded` |
 | V7 | 低 ✅ 已修复 | 恢复过程在用户存档目录内留下的 `.gamesaver-restore-*` / `.gamesaver-rollback-*` 无启动清理，且会被下一次提交当成存档收进版本 | `save_repository.rs` `sweep_restore_artifacts` + `lib.rs` 启动钩子 |
 | V8 | 低 ✅ 已修复 | 版本排序按 `created_at` **字符串**比较，改用 ISO 时间后保留策略会删错版本 | `domain/timestamp.rs` `compare_created_at` |
-| V9 | 低 | `wildcard_matches` 不支持中间通配符且静默失效 | `save_repository.rs:1017-1030` |
+| V9 | 低 ✅ 已修复 | `wildcard_matches` 不支持中间通配符且静默失效 | `save_repository.rs` `wildcard_matches` |
 | V10 | 低 | 恢复会删除「当前存在但不属于目标版本」的受保护文件，确认文案未告知 | `save_repository.rs:448-508` |
 
 高置信度：V1 / V2 / V3 / V4 / V6 / V9（纯静态可判）。
 V5 / V7 / V8 / V10 涉及运行时序列，触发条件已在各条正文写明。
 
-**修复进度：V1、V2、V3、V4、V5、V6、V7、V8 已修复（2026-09-10）；剩 V9 / V10。**
+**修复进度：V1、V2、V3、V4、V5、V6、V7、V8、V9 已修复（2026-09-10）；剩 V10。**
 
 ---
 
@@ -376,7 +376,7 @@ let rollback = group.root.join(format!(".gamesaver-rollback-{restore_id}"));
 
 **变异验证（两次，失败集合互不重叠）**：① `prune_game_save_versions` 换回 `String::cmp` → 恰好保留策略那条失败，实际留下 `["a9"]`、丢掉 `a10`；② `newest_save_version_id` 换回 `String::cmp` → 恰好悬垂指针那条失败，实际回退到 `Some("a9")`。两条都精确复现了 V8 描述的「删掉最新的、留下最旧的」。
 
-### V9 `wildcard_matches` 不支持中间通配符，且静默失效 —— 低
+### V9 `wildcard_matches` 不支持中间通配符，且静默失效 —— 低 ✅ 已修复（2026-09-10）
 
 `save_repository.rs:1017-1030`：
 
@@ -392,6 +392,14 @@ value == pattern
 默认排除项（`domain/save_profile.rs:51-53`）全是 `*.ext` 形态，所以现状没暴露。但存档规则编辑器允许用户自定义 pattern，用户写下 `slot*.sav` 会以为排除了、实际一个都没排除 —— 而排除项失效的方向对存档保护是「多备份」而非「少备份」，所以不会丢数据，只会让版本比预期大。
 
 **修法**：要么实现完整的通配匹配，要么在保存规则时对不支持的形态给出明确错误，别让它静默失效。
+
+**修复记录（2026-09-10）**：选了实现完整通配，而不是报错 —— 前端（`AddGameWizard.vue`）本来就允许用户随手输入 pattern（占位符写的是「输入排除模式，例如 `*.log`」），在这个位置拦用户输入只会让「输入被判非法」比「排除没生效」更困惑；而完整实现把两种行为都收干净。
+
+- `wildcard_matches` 改成通用 glob：`*` 匹配任意长度（含空串）、`?` 匹配任意单个字符，大小写不敏感（沿既有行为）。用**双指针 + 单个 `*` 回退点**实现，不递归、不做指数级回溯 —— 多个 `*` 只需记住最近一个，失配时回到那里让它多吞一个字符。
+- 调用点只有一处（`is_excluded` 的 `exclude_patterns` 分支），且它匹配的是**文件名**而非整条相对路径，所以 `slot*.sav` 这种写法正是用户直觉上的意思。默认排除项（`*.tmp` / `*.log` 等）行为不变。
+- 回归测试覆盖：中间通配、`*` 匹配空串、多个 `*` 的回溯、`?` 单字符、尾部多个 `*`、大小写不敏感、裸 `*`、无通配符时按字面量。
+
+**变异验证**：把 `wildcard_matches` 还原成旧的「只认首尾 `*`」实现 → **恰好**新增那条失败（首个断言 `wildcard_matches("slot1.sav", "slot*.sav")` 落空），而原有的 `wildcard_patterns_match_common_exclusions` 仍然通过 —— 说明新测试守的正是「中间通配」这个增量，没有顺带把旧行为一起钉死。
 
 ### V10 恢复会删除「当前存在但不属于目标版本」的受保护文件 —— 低
 
@@ -445,7 +453,8 @@ let touched = group.protected_paths.union(&target_paths).cloned().collect();   /
 | 5 | **V7** 残留产物排除 + 启动兜底 | ✅ 已完成（2026-09-10）：两道防线 —— 收集侧切断「污染→上传云端」的链条，启动清扫按盘上痕迹「先归位、再清理」。实做时修正了报告原方案的两处：排除**不挂** `is_excluded`（会让历史污染版本不可恢复），清扫**不能**写成「发现残留就删」（备份阶段崩溃时 rollback 里是用户自己的存档） |
 | 6 | **V6** 解压前拦大小 | ✅ 已完成（2026-09-10）：`read_zip_entry_bounded` 把「校验」挪到「读取」之前，并用 `take` 钉死读取量；顺带修掉 `meta.json` 上的同一缺陷 |
 | 7 | **V8** `created_at` 比较收口 | ✅ 已完成（2026-09-10）：`domain/timestamp.rs` 的 `compare_created_at` 替代 11 处字符串比较；两条**调用点级**回归测试守着「按时间而非按文本」 |
-| 8 | V9 / V10 | 余下为整洁性与文案：`wildcard_matches` 静默失效、恢复删除不告知 |
+| 8 | **V9** 通配匹配 | ✅ 已完成（2026-09-10）：`*` / `?` 全面支持，双指针 + 单回退点实现；不再静默失效 |
+| 9 | V10 | 恢复会删除「当前存在但不属于目标版本」的文件，确认文案与任务摘要都没告知 |
 
 ---
 
