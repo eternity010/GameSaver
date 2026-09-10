@@ -297,12 +297,12 @@ Rust 标准库在 Windows 上的 `FileType::is_symlink()` **已经覆盖 `IO_REP
 
 ### P2 — 中等影响
 
-> 共 15 条，截至 2026-09-10：**P2-14 已随 S5 顺带解决**（两处轮询合并为唯一任务流），其余 14 条未处理。
+> 共 15 条，截至 2026-09-10：**P2-14 已随 S5 顺带解决**（两处轮询合并为唯一任务流）、**P2-2 已随存档管理审查 V6 解决**（解压改为先校验后读取），其余 13 条未处理。
 
 | 编号 | 位置 | 问题 |
 | --- | --- | --- |
 | P2-1 | `services/game_body_package_service.rs`（打包入口 `:114`） | 打包**没有磁盘空间预检**。`add_game_service.rs:104` 和 `game_body_update_service.rs:210` 都有 `ensure_available_space`，唯独打包没有——而打包恰恰要额外写出一份与游戏同体积的 ZIP。磁盘满时 7z 写坏 `.tmp` 包再报错 |
-| P2-2 | `services/cloud_save_service.rs:317-323` | `item.read_to_end(&mut data)` 把压缩项一次性读进内存，**大小校验在读取之后**（`:321`）。高度压缩的条目会在校验前先撑爆内存（解压炸弹）。`expected_size` 已知，读取前即可拦截 |
+| P2-2 | ~~`services/cloud_save_service.rs:317-323`~~ | ✅ **已解决（2026-09-10，随存档管理审查 V6）**：抽出 `read_zip_entry_bounded`，**校验全部前移到读取之前** —— zip 头部声明值先与版本清单比对（不一致直接拒绝、一个字节都不读），再叠加一道与清单无关的硬上限（数据条目 1 GiB / `meta.json` 32 MiB，后者原先也是裸 `read_to_end`），最后用 `Read::take(declared + 1)` 钉死读取量。本体包（`game_body_package_service.rs`）那条解压路径不属本条：它是**流式写盘 + 1 MiB 缓冲 + 清单长度上限**，不在内存里展开 |
 | P2-3 | `commands/baidu_commands.rs:1165-1171`、`services/cloud_save_service.rs:507` | 远端删除**非原子**：先 `delete_file` 再重建清单。若清单重写失败，文件已删而清单仍引用它。`cloud_save_service.rs:507` 更是 `let _ = client.delete_file(...)` 直接吞掉失败，导致清单剔除版本但远端残留孤立 ZIP |
 | P2-4 | `cover_protocol.rs:49-53` | 封面路径只拒绝绝对路径，**不拒绝 `..`**。`display_path` 若被污染（store 被改 / 数据异常），可读出库目录之外的文件。项目其他地方（`safe_join`、`scope_is_accessible`）都做了 `..` 检查，此处漏了 |
 | P2-5 | `cover_protocol.rs:182-183` | `percent_decode` 把 `+` 解码成空格（表单语义），但这是**路径**上下文，`+` 应是字面量。当前前端用 `encodeURIComponent` 会编码成 `%2B` 所以不触发，属潜在隐患 |
@@ -387,10 +387,11 @@ let sleep_duration = if all_exited {
 | 2 | P1-2 抽出 `with_store_mut` 并在高风险命令上替换 | ✅ **已完成（2026-09-10）** | 竞态范围广、后果隐蔽（用户以为是偶发 bug），是最容易积累成「诡异故障」的一类；顺带修掉游戏库迁移后内存态不回写的缺陷 |
 | 3 | P1-3 鉴权失败时刷新 token 并重放 | ✅ **已完成（2026-09-10）** | 长任务失败代价高，用户可感知；已同时覆盖 HTTP 401 与百度 `errno` 两种失效表现 |
 | 4 | ~~P1-4 用 reparse point 检测替换 `is_symlink`~~ | ❌ **撤回** | 实测证明 Rust 的 `is_symlink()` 已识别 junction，本条不成立，无需改动 |
-| 5 | P2-1 / P2-2 打包前空间预检、解压前大小校验 | ⬜ 待办 | 都很便宜，直接消除「磁盘写坏」和「内存爆掉」 |
-| 6 | 清掉 clippy 警告 | ⬜ 待办 | `cargo clippy --fix` 可自动修大部分；`:539` 的死分支需要人工判断原意 |
-| 7 | 合并 `now_iso`/`normalize_path`/保留策略三份重复实现 | ⬜ 待办 | 减少「改一处漏一处」（`normalize_path` 已经出现三份不一致） |
-| 8 | 拆分 `GameDetailPage.vue` | ⬜ 待办 | 长期收益，不急 |
+| 5 | P2-2 解压前大小校验 | ✅ **已完成（2026-09-10，随 V6）** | 校验前移到读取之前 + 与清单无关的硬上限；同时补掉 `meta.json` 上的同一缺陷 |
+| 6 | P2-1 打包前空间预检 | ⬜ 待办 | 很便宜，直接消除「磁盘写坏」；同组里只剩这一条 |
+| 7 | 清掉 clippy 警告 | ⬜ 待办 | `cargo clippy --fix` 可自动修大部分；`:539` 的死分支需要人工判断原意 |
+| 8 | 合并 `now_iso`/`normalize_path`/保留策略三份重复实现 | ⬜ 待办 | 减少「改一处漏一处」（`normalize_path` 已经出现三份不一致） |
+| 9 | 拆分 `GameDetailPage.vue` | ⬜ 待办 | 长期收益，不急 |
 
 ---
 
