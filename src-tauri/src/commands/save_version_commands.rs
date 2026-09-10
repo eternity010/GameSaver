@@ -339,22 +339,14 @@ fn delete_versions_task(
         if candidate.save_versions.len() == before {
             return Err("保存版本不存在".to_string());
         }
-        let latest = candidate
-            .save_versions
-            .iter()
-            .filter(|version| version.game_uid == game_uid)
-            .max_by(|left, right| {
-                left.created_at
-                    .cmp(&right.created_at)
-                    .then(left.version_id.cmp(&right.version_id))
-            })
-            .map(|version| version.version_id.clone());
-        let game = candidate
-            .games
-            .iter_mut()
-            .find(|game| game.game_uid == game_uid)
-            .ok_or_else(|| "游戏不存在".to_string())?;
-        game.latest_save_version_id = latest;
+        if !candidate.games.iter().any(|game| game.game_uid == game_uid) {
+            return Err("游戏不存在".to_string());
+        }
+        // 删掉的可能正是 `latest_save_version_id` 指向的那一版。这里用共用方法修复，
+        // 而不是无条件改写成最新一版：指针若仍指向现存版本（典型情形是刚恢复过某个旧
+        // 版本）就应当保留 —— 它代表本地当前内容，改写成最新一版会让下一次游戏退出
+        // 白多出一个版本（存档管理审查 V5 / AppStore::repair_latest_save_version_id）。
+        candidate.repair_latest_save_version_id(game_uid);
         GameRepository::persist(app, candidate)?;
         Ok(candidate.save_versions.clone())
     })?;

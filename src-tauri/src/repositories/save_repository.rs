@@ -256,6 +256,16 @@ impl SaveRepository {
 
     /// 按 `keep_versions` 剪掉某游戏最旧的存档版本，只改内存中的 `store`，**不碰磁盘**。
     ///
+    /// 顺带把 `latest_save_version_id` 指针修好（`AppStore::repair_latest_save_version_id`）：
+    /// 剪枝可能删掉指针指向的那一版，留下悬垂指针，而悬垂指针会让 `commit` 丢掉比对基线，
+    /// 此后每次游戏退出都无条件新建版本（存档管理审查 V5）。
+    ///
+    /// 修复**必须紧跟在保留动作之后**，且**无论是否真的剪掉了版本都要做**：指针悬垂的典型
+    /// 来源恰恰是「保留了旧版本、指针有意指向它」+「这一轮把它剪掉」（见
+    /// `repair_latest_save_version_id` 的说明），只在开头修等于没修；反过来，不剪任何版本时
+    /// 也修一次，是为了让旧版本数据里已经存在的悬垂指针能借下一次剪枝自愈。把这件事绑在唯一
+    /// 的剪枝入口上，调用方就不必记得各自修一次。
+    ///
     /// 返回 `Some(剪枝后的完整版本清单)` 表示确实删掉了版本 —— 调用方应当把它交给
     /// [`Self::collect_garbage`] 回收不再被引用的对象文件；返回 `None` 表示无版本被删除、
     /// 无需回收（也避免了每次调用都做一次全盘扫描）。
@@ -270,33 +280,39 @@ impl SaveRepository {
         game_uid: &str,
         keep_versions: usize,
     ) -> Option<Vec<SaveVersion>> {
-        if keep_versions == 0 {
-            return None;
+        let to_remove: HashSet<String> = if keep_versions == 0 {
+            HashSet::new()
+        } else {
+            let mut game_versions: Vec<_> = store
+                .save_versions
+                .iter()
+                .filter(|version| version.game_uid == game_uid)
+                .cloned()
+                .collect();
+            game_versions.sort_by(|left, right| {
+                right
+                    .created_at
+                    .cmp(&left.created_at)
+                    .then(right.version_id.cmp(&left.version_id))
+            });
+            game_versions
+                .into_iter()
+                .skip(keep_versions)
+                .map(|version| version.version_id)
+                .collect()
+        };
+        if !to_remove.is_empty() {
+            store.save_versions.retain(|version| {
+                !(version.game_uid == game_uid && to_remove.contains(&version.version_id))
+            });
         }
-        let mut game_versions: Vec<_> = store
-            .save_versions
-            .iter()
-            .filter(|version| version.game_uid == game_uid)
-            .cloned()
-            .collect();
-        game_versions.sort_by(|left, right| {
-            right
-                .created_at
-                .cmp(&left.created_at)
-                .then(right.version_id.cmp(&left.version_id))
-        });
-        if game_versions.len() <= keep_versions {
-            return None;
+        // 修复必须紧跟在 retain 之后（理由见函数文档），且在未剪枝时也要执行。
+        store.repair_latest_save_version_id(game_uid);
+        if to_remove.is_empty() {
+            None
+        } else {
+            Some(store.save_versions.clone())
         }
-        let to_remove: HashSet<String> = game_versions
-            .into_iter()
-            .skip(keep_versions)
-            .map(|version| version.version_id)
-            .collect();
-        store.save_versions.retain(|version| {
-            !(version.game_uid == game_uid && to_remove.contains(&version.version_id))
-        });
-        Some(store.save_versions.clone())
     }
 
     pub fn write_object(app: &AppHandle, hash: &str, bytes: &[u8]) -> Result<(), String> {
@@ -422,6 +438,19 @@ fn build_restore_groups(
 ) -> Result<Vec<RestoreGroup>, String> {
     let mut groups = HashMap::<String, RestoreGroup>::new();
     for entry in &version.files {
+        // 墓碑条目（`deleted: true`）只表达「这个文件在该版本里不存在」，它自身没有任何字节
+        // 需要写回磁盘，因此**不能**对它做 root/scope 前置校验：那些校验是为「要写到哪里」
+        // 把关的，而墓碑引用的目录或范围很可能早已被删除、移出存档范围。照常校验的话，一个与
+        // 待恢复内容毫不相干的失效目录就能让整场恢复失败，且报错把用户指向一个他无从修复的
+        // 位置（存档管理审查 V2）。改为：能安全定位到现存目录就登记该范围（好让该范围里多余
+        // 的受保护文件在恢复时被清掉，覆盖「游戏把存档目录整个清空、只剩墓碑」这类版本），
+        // 定位不到就安静跳过。
+        if entry.deleted {
+            if let Some(root) = deleted_entry_restore_root(game, profile, entry) {
+                register_restore_group(game, profile, &mut groups, &root)?;
+            }
+            continue;
+        }
         let relative = validate_relative(&entry.relative_path)?;
         let scope = find_scope_for_entry(profile, entry, &relative)?;
         let root = scope_root(game, scope);
@@ -434,41 +463,23 @@ fn build_restore_groups(
                 root.display()
             ));
         }
-        let key = normalize_path(root.to_string_lossy().as_ref());
-        if !groups.contains_key(&key) {
-            let mut protected_paths = HashSet::new();
-            for candidate in profile.scopes.iter().filter(|candidate| {
-                normalize_path(scope_root(game, candidate).to_string_lossy().as_ref()) == key
-            }) {
-                protected_paths.extend(collect_protected_paths(&root, candidate)?);
-            }
-            groups.insert(
-                key.clone(),
-                RestoreGroup {
-                    root: root.clone(),
-                    entries: Vec::new(),
-                    protected_paths,
-                },
-            );
+        let key = register_restore_group(game, profile, &mut groups, &root)?;
+        let hash = entry
+            .object_hash
+            .clone()
+            .ok_or_else(|| format!("保存版本缺少对象：{}", entry.relative_path))?;
+        let group = groups.get_mut(&key).expect("restore group was inserted");
+        if group
+            .entries
+            .iter()
+            .any(|(existing, existing_hash)| existing == &relative && existing_hash != &hash)
+        {
+            return Err(format!(
+                "保存版本包含冲突的存档文件：{}",
+                entry.relative_path
+            ));
         }
-        if !entry.deleted {
-            let hash = entry
-                .object_hash
-                .clone()
-                .ok_or_else(|| format!("保存版本缺少对象：{}", entry.relative_path))?;
-            let group = groups.get_mut(&key).expect("restore group was inserted");
-            if group
-                .entries
-                .iter()
-                .any(|(existing, existing_hash)| existing == &relative && existing_hash != &hash)
-            {
-                return Err(format!(
-                    "保存版本包含冲突的存档文件：{}",
-                    entry.relative_path
-                ));
-            }
-            group.entries.push((relative, hash));
-        }
+        group.entries.push((relative, hash));
     }
     for group in groups.values_mut() {
         group.entries.sort();
@@ -480,6 +491,69 @@ fn build_restore_groups(
             .cmp(&normalize_path(right.root.to_string_lossy().as_ref()))
     });
     Ok(groups)
+}
+
+/// 登记（必要时创建）某个存档根目录对应的恢复分组，返回该分组的键。
+///
+/// 分组的 `protected_paths` 来自**所有**根目录落在同一物理路径上的范围，因此与「哪个条目
+/// 触发登记」无关 —— 这也是墓碑条目不必做 scope 校验的原因之一。
+fn register_restore_group(
+    game: &Game,
+    profile: &SaveProfile,
+    groups: &mut HashMap<String, RestoreGroup>,
+    root: &Path,
+) -> Result<String, String> {
+    let key = normalize_path(root.to_string_lossy().as_ref());
+    if !groups.contains_key(&key) {
+        let mut protected_paths = HashSet::new();
+        for candidate in profile.scopes.iter().filter(|candidate| {
+            normalize_path(scope_root(game, candidate).to_string_lossy().as_ref()) == key
+        }) {
+            protected_paths.extend(collect_protected_paths(root, candidate)?);
+        }
+        groups.insert(
+            key.clone(),
+            RestoreGroup {
+                root: root.to_path_buf(),
+                entries: Vec::new(),
+                protected_paths,
+            },
+        );
+    }
+    Ok(key)
+}
+
+/// 为一个墓碑条目（`deleted: true`）定位它所属的恢复根目录。
+///
+/// 墓碑对恢复的唯一可能贡献，是让「曾经存有它的那个范围」也参与本轮恢复 —— 这样该范围里
+/// 当前多余的受保护文件才会被清掉。因此这里的取态是**保守**的：
+///
+/// - 只在「条目记录的根路径与某个范围精确吻合」时才认领；老条目没记录根路径时，仅当同类型
+///   范围唯一才认领。删除/清理是有破坏性的动作，**宁可漏清也绝不猜** —— 这与读取侧
+///   [`find_scope_for_read`] 的宽松取向有意相反（读旧文件无害，删错目录是数据损失）。
+/// - 目标路径不存在或不是目录时直接放弃：没有目录就没有需要清理的内容。
+/// - 任何不确定都返回 `None`（调用方跳过该条目），**绝不报错**。
+fn deleted_entry_restore_root(
+    game: &Game,
+    profile: &SaveProfile,
+    entry: &SaveFileEntry,
+) -> Option<PathBuf> {
+    let mut candidates: Vec<&SaveScope> = profile
+        .scopes
+        .iter()
+        .filter(|scope| scope.root_type == entry.root_type)
+        .collect();
+    match entry.root_path.as_deref() {
+        Some(recorded) => {
+            candidates.retain(|scope| normalize_path(recorded) == normalize_path(&scope.root_path))
+        }
+        // 老条目没记录根路径：同类型范围唯一才敢认领，否则无从判断该清哪里。
+        None if candidates.len() != 1 => return None,
+        None => {}
+    }
+    let scope = pick_scope_by_root_path(&candidates, entry)?;
+    let root = scope_root(game, scope);
+    root.is_dir().then_some(root)
 }
 
 fn restore_group(
@@ -1314,6 +1388,34 @@ mod tests {
         assert_eq!(store.save_versions.len(), 2);
     }
 
+    /// V5 回归：剪枝若删掉 `latest_save_version_id` 指向的那一版，指针必须当场修好。
+    ///
+    /// 悬垂指针不会立刻报错，而是让 `commit` 丢掉比对基线 —— 此后每次游戏退出都无条件
+    /// 新建版本，版本库持续无意义膨胀，且违反设计文档「没有变化时不创建新版本」。
+    #[test]
+    fn prune_repairs_a_latest_pointer_it_orphans() {
+        let mut game = Game::new_pending("A", "C:/games/a", "a.exe");
+        game.game_uid = "game-a".to_string();
+        game.latest_save_version_id = Some("a1".to_string());
+        let mut store = AppStore {
+            games: vec![game],
+            save_versions: vec![
+                version("game-a", "a1", "1700000001"),
+                version("game-a", "a2", "1700000002"),
+            ],
+            ..AppStore::default()
+        };
+
+        SaveRepository::prune_game_save_versions(&mut store, "game-a", 1)
+            .expect("超出保留数应发生剪枝");
+
+        assert_eq!(
+            store.games[0].latest_save_version_id.as_deref(),
+            Some("a2"),
+            "指针指向的 a1 被剪掉后应回退到最新一版"
+        );
+    }
+
     #[test]
     fn wildcard_patterns_match_common_exclusions() {
         assert!(wildcard_matches("notes.tmp", "*.tmp"));
@@ -1527,6 +1629,174 @@ mod tests {
             .expect("new machine root is restorable");
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].root, destination);
+    }
+
+    /// V2 回归：墓碑条目（`deleted: true`）不得因「它引用的目录已不存在」而拦住整场恢复。
+    ///
+    /// 墓碑只表示「这个文件在该版本里不存在」，没有任何字节需要写回磁盘，却曾被当作活条目
+    /// 去做 root/scope 前置校验 —— 一个早已被删除、与本次要恢复的内容毫无关系的自定义目录，
+    /// 就足以让整场恢复失败。
+    #[test]
+    fn restore_ignores_a_tombstone_whose_root_no_longer_exists() {
+        let destination = std::env::temp_dir().join(format!(
+            "gamesaver-restore-tombstone-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&destination).expect("create live root");
+        let game = Game::new_pending("Test Game", r"E:\GameSaverGames\games\test", "game.exe");
+        let mut live_scope = SaveScope::new_manual(destination.to_string_lossy().to_string());
+        live_scope.root_type = SaveRootType::Custom;
+        live_scope.confirmed_files = vec!["slot1.sav".to_string()];
+        // 收窄到只保护 slot1.sav：否则 new_manual 默认的 `include_directories = ["."]`
+        // 会让范围匹配一切，墓碑的 scope 解析就不会失败，这条回归就失去意义了。
+        live_scope.include_directories = Vec::new();
+        let profile = SaveProfile::new(
+            game.game_uid.clone(),
+            "hash".to_string(),
+            vec![live_scope],
+            100,
+            "0".to_string(),
+        );
+
+        let version = SaveVersion {
+            version_id: "v1".to_string(),
+            game_uid: game.game_uid.clone(),
+            created_at: "0".to_string(),
+            files: vec![
+                SaveFileEntry {
+                    root_type: SaveRootType::Custom,
+                    root_path: Some(destination.to_string_lossy().to_string()),
+                    relative_path: "slot1.sav".to_string(),
+                    object_hash: Some("a".repeat(64)),
+                    size: 1,
+                    deleted: false,
+                    mtime_ms: None,
+                },
+                SaveFileEntry {
+                    root_type: SaveRootType::Custom,
+                    // 曾存在于一个后来被删掉的自定义目录。
+                    root_path: Some(r"E:\Gone\OldSaveDir".to_string()),
+                    relative_path: "gone.dat".to_string(),
+                    object_hash: None,
+                    size: 0,
+                    deleted: true,
+                    mtime_ms: None,
+                },
+            ],
+            total_bytes: 1,
+        };
+
+        let groups = build_restore_groups(&game, &profile, &version)
+            .expect("墓碑引用的失效目录不得阻断恢复");
+        assert_eq!(groups.len(), 1, "只应登记实际存在的那个根目录");
+        assert_eq!(groups[0].root, destination);
+        assert_eq!(groups[0].entries.len(), 1);
+        let _ = std::fs::remove_dir_all(&destination);
+    }
+
+    /// V2 回归：墓碑所属的范围已被用户从 profile 里移走时，同样不得阻断恢复。
+    #[test]
+    fn restore_ignores_a_tombstone_whose_scope_was_removed() {
+        let destination = std::env::temp_dir().join(format!(
+            "gamesaver-restore-scope-gone-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&destination).expect("create live root");
+        let game = Game::new_pending("Test Game", r"E:\GameSaverGames\games\test", "game.exe");
+        let mut live_scope = SaveScope::new_manual(destination.to_string_lossy().to_string());
+        live_scope.root_type = SaveRootType::Custom;
+        live_scope.confirmed_files = vec!["slot1.sav".to_string()];
+        live_scope.include_directories = Vec::new();
+        let profile = SaveProfile::new(
+            game.game_uid.clone(),
+            "hash".to_string(),
+            vec![live_scope],
+            100,
+            "0".to_string(),
+        );
+
+        let version = SaveVersion {
+            version_id: "v1".to_string(),
+            game_uid: game.game_uid.clone(),
+            created_at: "0".to_string(),
+            files: vec![
+                SaveFileEntry {
+                    root_type: SaveRootType::Custom,
+                    root_path: Some(destination.to_string_lossy().to_string()),
+                    relative_path: "slot1.sav".to_string(),
+                    object_hash: Some("a".repeat(64)),
+                    size: 1,
+                    deleted: false,
+                    mtime_ms: None,
+                },
+                SaveFileEntry {
+                    // 墓碑所属的范围类型（Documents）已不在 profile 里。
+                    root_type: SaveRootType::Documents,
+                    root_path: Some(r"C:\Users\Bob\Documents\Gone".to_string()),
+                    relative_path: "gone.dat".to_string(),
+                    object_hash: None,
+                    size: 0,
+                    deleted: true,
+                    mtime_ms: None,
+                },
+            ],
+            total_bytes: 1,
+        };
+
+        let groups = build_restore_groups(&game, &profile, &version)
+            .expect("墓碑所属范围被移除后不得阻断恢复");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].root, destination);
+        let _ = std::fs::remove_dir_all(&destination);
+    }
+
+    /// V2 行为保留：只剩墓碑、但目标目录仍在（典型场景是游戏把存档目录整个清空）时，该范围
+    /// **仍须**参与恢复 —— 否则「恢复到空」这个合法操作会被「保存版本没有可恢复的存档文件」
+    /// 挡掉。这条专门钉住「墓碑不能一刀切跳过」这个边界，防止用一个更粗暴的写法把能力改没。
+    #[test]
+    fn restore_registers_a_root_that_only_tombstones_reference() {
+        let destination = std::env::temp_dir().join(format!(
+            "gamesaver-restore-all-deleted-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&destination).expect("create root");
+        let game = Game::new_pending("Test Game", r"E:\GameSaverGames\games\test", "game.exe");
+        let mut scope = SaveScope::new_manual(destination.to_string_lossy().to_string());
+        scope.root_type = SaveRootType::Custom;
+        scope.confirmed_files = vec!["slot1.sav".to_string()];
+        let profile = SaveProfile::new(
+            game.game_uid.clone(),
+            "hash".to_string(),
+            vec![scope],
+            100,
+            "0".to_string(),
+        );
+
+        let version = SaveVersion {
+            version_id: "v1".to_string(),
+            game_uid: game.game_uid.clone(),
+            created_at: "0".to_string(),
+            files: vec![SaveFileEntry {
+                root_type: SaveRootType::Custom,
+                root_path: Some(destination.to_string_lossy().to_string()),
+                relative_path: "slot1.sav".to_string(),
+                object_hash: None,
+                size: 0,
+                deleted: true,
+                mtime_ms: None,
+            }],
+            total_bytes: 0,
+        };
+
+        let groups =
+            build_restore_groups(&game, &profile, &version).expect("只剩墓碑的版本仍应指向其范围");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].root, destination);
+        assert!(
+            groups[0].entries.is_empty(),
+            "墓碑本身不提供任何要写入的文件"
+        );
+        let _ = std::fs::remove_dir_all(&destination);
     }
 
     #[test]
