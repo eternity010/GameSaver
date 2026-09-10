@@ -1,3 +1,4 @@
+use crate::services::disk_space;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -101,7 +102,7 @@ impl AddGameService {
                 format_size(total_bytes)
             ));
         }
-        ensure_available_space(games_root, total_bytes)?;
+        disk_space::ensure_available_space(games_root, total_bytes)?;
         on_progress(5, &format!("已扫描 {} 个文件", files.len()));
         fs::create_dir_all(&staging_path).map_err(|err| format!("创建游戏暂存目录失败：{err}"))?;
 
@@ -144,48 +145,6 @@ impl AddGameService {
         }
         result
     }
-}
-
-fn ensure_available_space(target_root: &Path, required_bytes: u64) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-        let mut probe = target_root.to_path_buf();
-        while !probe.exists() {
-            if !probe.pop() {
-                break;
-            }
-        }
-        let wide = probe
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        let mut available = 0u64;
-        let result = unsafe {
-            GetDiskFreeSpaceExW(
-                wide.as_ptr(),
-                &mut available,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        if result == 0 {
-            return Err("无法确认 GameSaver 游戏库所在磁盘的可用空间".to_string());
-        }
-        let required_with_headroom = required_bytes.saturating_add(128 * 1024 * 1024);
-        if available < required_with_headroom {
-            return Err(format!(
-                "游戏库磁盘空间不足，需要至少 {} MB，可用 {} MB",
-                required_with_headroom / 1024 / 1024,
-                available / 1024 / 1024
-            ));
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    let _ = (target_root, required_bytes);
-    Ok(())
 }
 
 #[cfg(test)]

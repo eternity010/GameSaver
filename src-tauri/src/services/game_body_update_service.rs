@@ -1,4 +1,5 @@
 use crate::domain::{Game, GameBodyVersion};
+use crate::services::disk_space;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -207,7 +208,7 @@ impl GameBodyUpdateService {
         if file_count == 0 {
             return Err("新版游戏目录中没有可复制的文件".to_string());
         }
-        ensure_available_space(managed, total_bytes)?;
+        disk_space::ensure_available_space(managed, total_bytes)?;
         Ok(UpdatePlan {
             source,
             executable_relative_path: relative,
@@ -492,48 +493,6 @@ fn normalize_path(path: &Path) -> String {
         .replace('/', "\\")
         .trim_end_matches('\\')
         .to_ascii_lowercase()
-}
-
-fn ensure_available_space(target: &Path, required_bytes: u64) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-        let mut probe = target.to_path_buf();
-        while !probe.exists() {
-            if !probe.pop() {
-                break;
-            }
-        }
-        let wide = probe
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        let mut available = 0u64;
-        if unsafe {
-            GetDiskFreeSpaceExW(
-                wide.as_ptr(),
-                &mut available,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        } == 0
-        {
-            return Err("无法确认游戏库磁盘可用空间".to_string());
-        }
-        let required = required_bytes.saturating_add(128 * 1024 * 1024);
-        if available < required {
-            return Err(format!(
-                "游戏库磁盘空间不足，需要至少 {} MB，可用 {} MB",
-                required / 1024 / 1024,
-                available / 1024 / 1024
-            ));
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    let _ = (target, required_bytes);
-    Ok(())
 }
 
 #[cfg(test)]

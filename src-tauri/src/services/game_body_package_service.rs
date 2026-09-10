@@ -1,3 +1,4 @@
+use crate::services::disk_space;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -16,6 +17,8 @@ use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
 const MANIFEST_PATH: &str = ".gamesaver/body-manifest.json";
 const PACKAGE_FORMAT_VERSION: u32 = 1;
+/// 单个 ZIP 条目在包里的固定开销（本地头 + 中央目录 + 文件名），用于把「包最多多大」估得保守些。
+const ZIP_ENTRY_OVERHEAD_BYTES: u64 = 256;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BodyPackageFile {
@@ -39,6 +42,19 @@ pub struct BodyPackageResult {
     pub package_path: PathBuf,
     pub manifest: BodyPackageManifest,
     pub sha256: String,
+}
+
+/// 一次打包的全部输入。由 `BodyPackageService::plan_package` 算好，两条打包路径（7-Zip /
+/// Rust zip 回退）共用同一份 —— 「发现文件 + 定位包路径 + 磁盘预检」因此只有一个入口，
+/// 不会出现「主路径没查、回退路径查了」这种不对称。
+struct PackagePlan {
+    source_root: PathBuf,
+    files: Vec<BodyPackageFile>,
+    package_path: PathBuf,
+    parent: PathBuf,
+    game_uid: String,
+    version_id: String,
+    protected_paths: Vec<String>,
 }
 
 pub struct BodyPackageService;
@@ -121,7 +137,7 @@ impl BodyPackageService {
         on_progress: impl Fn(u8, &str),
         is_cancelled: impl Fn() -> bool + Sync,
     ) -> Result<BodyPackageResult, String> {
-        match Self::create_package_with_7zip(
+        let plan = Self::plan_package(
             source_root,
             cache_root,
             game_uid,
@@ -129,26 +145,21 @@ impl BodyPackageService {
             executable_relative_path,
             protected_paths,
             &on_progress,
-            &is_cancelled,
-        ) {
-            Ok(result) => Ok(result),
-            Err(error) if error.starts_with("7ZIP_UNAVAILABLE:") => {
-                Self::create_package_with_rust_zip(
-                    source_root,
-                    cache_root,
-                    game_uid,
-                    version_id,
-                    executable_relative_path,
-                    protected_paths,
-                    on_progress,
-                    is_cancelled,
-                )
+        )?;
+        match find_bundled_7zip() {
+            Some(archiver) => {
+                Self::create_package_with_7zip(&plan, &archiver, &on_progress, &is_cancelled)
             }
-            Err(error) => Err(error),
+            None => Self::create_package_with_rust_zip(&plan, &on_progress, &is_cancelled),
         }
     }
 
-    fn create_package_with_7zip(
+    /// 打包前的一次性准备：定位源目录与包路径、算出「包最多会占多大」并做磁盘预检。
+    ///
+    /// 预检必须发生在创建缓存目录与临时文件**之前** —— 磁盘满时 7z 会先把 `.tmp` 写坏，
+    /// 然后报一个离真实原因很远的错（代码审查 P2-1）。判定交给
+    /// `disk_space::ensure_available_space`，这里只负责算出「要多少」。
+    fn plan_package(
         source_root: &Path,
         cache_root: &Path,
         game_uid: &str,
@@ -156,10 +167,7 @@ impl BodyPackageService {
         executable_relative_path: &str,
         protected_paths: &[String],
         on_progress: &impl Fn(u8, &str),
-        is_cancelled: &(impl Fn() -> bool + Sync),
-    ) -> Result<BodyPackageResult, String> {
-        let archiver =
-            find_bundled_7zip().ok_or_else(|| "7ZIP_UNAVAILABLE:未找到内置 7-Zip".to_string())?;
+    ) -> Result<PackagePlan, String> {
         let source_root = source_root
             .canonicalize()
             .map_err(|err| format!("解析游戏本体目录失败：{err}"))?;
@@ -179,7 +187,37 @@ impl BodyPackageService {
         let package_path = Self::package_path(cache_root, game_uid, version_id);
         let parent = package_path
             .parent()
-            .ok_or_else(|| "本体包路径无父目录".to_string())?;
+            .ok_or_else(|| "本体包路径无父目录".to_string())?
+            .to_path_buf();
+        let existing = fs::metadata(&package_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        disk_space::ensure_available_space(&parent, package_space_requirement(&files, existing))?;
+        Ok(PackagePlan {
+            source_root,
+            files,
+            package_path,
+            parent,
+            game_uid: game_uid.to_string(),
+            version_id: version_id.to_string(),
+            protected_paths: protected_paths.to_vec(),
+        })
+    }
+
+    fn create_package_with_7zip(
+        plan: &PackagePlan,
+        archiver: &Path,
+        on_progress: &impl Fn(u8, &str),
+        is_cancelled: &(impl Fn() -> bool + Sync),
+    ) -> Result<BodyPackageResult, String> {
+        let PackagePlan {
+            source_root,
+            files,
+            package_path,
+            parent,
+            version_id,
+            ..
+        } = plan;
         fs::create_dir_all(parent).map_err(|err| format!("创建本体包缓存目录失败：{err}"))?;
         let temporary = parent.join(format!(".{version_id}.zip.tmp-{}", Uuid::new_v4().simple()));
         let list_path = parent.join(format!(
@@ -194,7 +232,7 @@ impl BodyPackageService {
             if is_cancelled() {
                 return Err("任务已取消".to_string());
             }
-            for file in &files {
+            for file in files {
                 if file.relative_path.contains(['\r', '\n']) {
                     return Err(format!(
                         "游戏文件路径包含不支持的换行符：{}",
@@ -215,8 +253,8 @@ impl BodyPackageService {
 
             on_progress(8, "正在使用 7-Zip 压缩游戏本体");
             run_7zip(
-                &archiver,
-                &source_root,
+                archiver,
+                source_root,
                 [
                     "a".to_string(),
                     "-tzip".to_string(),
@@ -242,7 +280,7 @@ impl BodyPackageService {
             }
             on_progress(90, "正在生成本体包清单");
             let manifest_files = read_archive_file_index(&temporary)?;
-            if !same_relative_paths(&files, &manifest_files) {
+            if !same_relative_paths(files, &manifest_files) {
                 return Err("7-Zip 输出的文件列表与源目录不一致".to_string());
             }
             let total_bytes = manifest_files
@@ -250,11 +288,12 @@ impl BodyPackageService {
                 .fold(0u64, |total, file| total.saturating_add(file.size));
             let manifest = BodyPackageManifest {
                 format_version: PACKAGE_FORMAT_VERSION,
-                game_uid: game_uid.to_string(),
-                version_id: version_id.to_string(),
+                game_uid: plan.game_uid.clone(),
+                version_id: plan.version_id.clone(),
                 file_count: manifest_files.len(),
                 total_bytes,
-                excluded_items: protected_paths
+                excluded_items: plan
+                    .protected_paths
                     .iter()
                     .map(|path| format!("存档范围：{path}"))
                     .collect(),
@@ -270,7 +309,7 @@ impl BodyPackageService {
             sync_file(&temporary, "刷新 7-Zip 本体包")?;
             on_progress(92, "正在写入本体包清单");
             run_7zip(
-                &archiver,
+                archiver,
                 &manifest_root,
                 [
                     "a".to_string(),
@@ -293,14 +332,14 @@ impl BodyPackageService {
             sync_file(&temporary, "刷新本体包清单")?;
             on_progress(98, "正在校验本体 ZIP");
             let package_hash = hash_file(&temporary)?;
-            fs::rename(&temporary, &package_path)
+            fs::rename(&temporary, package_path)
                 .map_err(|err| format!("提交本体 ZIP 缓存失败：{err}"))?;
             on_progress(
                 100,
                 &format!("本体 ZIP 已生成，{} 个文件", manifest.file_count),
             );
             Ok(BodyPackageResult {
-                package_path,
+                package_path: package_path.clone(),
                 manifest,
                 sha256: package_hash,
             })
@@ -314,35 +353,18 @@ impl BodyPackageService {
     }
 
     fn create_package_with_rust_zip(
-        source_root: &Path,
-        cache_root: &Path,
-        game_uid: &str,
-        version_id: &str,
-        executable_relative_path: &str,
-        protected_paths: &[String],
+        plan: &PackagePlan,
         on_progress: impl Fn(u8, &str),
         is_cancelled: impl Fn() -> bool,
     ) -> Result<BodyPackageResult, String> {
-        let source_root = source_root
-            .canonicalize()
-            .map_err(|err| format!("解析游戏本体目录失败：{err}"))?;
-        if !source_root.is_dir() {
-            return Err("游戏本体目录不存在或不可访问".to_string());
-        }
-        let files = collect_files(&source_root, protected_paths)?;
-        if files.is_empty() {
-            return Err("游戏本体目录中没有可打包的文件".to_string());
-        }
-        let executable = normalize_relative(executable_relative_path)?;
-        if !files.iter().any(|file| file.relative_path == executable) {
-            return Err("游戏启动程序被排除或不存在，无法创建本体包".to_string());
-        }
-        on_progress(5, &format!("已发现 {} 个本体文件", files.len()));
-
-        let package_path = Self::package_path(cache_root, game_uid, version_id);
-        let parent = package_path
-            .parent()
-            .ok_or_else(|| "本体包路径无父目录".to_string())?;
+        let PackagePlan {
+            source_root,
+            files,
+            package_path,
+            parent,
+            version_id,
+            ..
+        } = plan;
         fs::create_dir_all(parent).map_err(|err| format!("创建本体包缓存目录失败：{err}"))?;
         let temporary = parent.join(format!(".{version_id}.zip.tmp-{}", Uuid::new_v4().simple()));
         let result = (|| -> Result<BodyPackageResult, String> {
@@ -402,11 +424,12 @@ impl BodyPackageService {
             }
             let manifest = BodyPackageManifest {
                 format_version: PACKAGE_FORMAT_VERSION,
-                game_uid: game_uid.to_string(),
-                version_id: version_id.to_string(),
+                game_uid: plan.game_uid.clone(),
+                version_id: plan.version_id.clone(),
                 file_count: manifest_files.len(),
                 total_bytes,
-                excluded_items: protected_paths
+                excluded_items: plan
+                    .protected_paths
                     .iter()
                     .map(|path| format!("存档范围：{path}"))
                     .collect(),
@@ -433,14 +456,14 @@ impl BodyPackageService {
             drop(output);
             on_progress(98, "正在校验本体 ZIP");
             let package_hash = hash_file(&temporary)?;
-            fs::rename(&temporary, &package_path)
+            fs::rename(&temporary, package_path)
                 .map_err(|err| format!("提交本体 ZIP 缓存失败：{err}"))?;
             on_progress(
                 100,
                 &format!("本体 ZIP 已生成，{} 个文件", manifest.file_count),
             );
             Ok(BodyPackageResult {
-                package_path,
+                package_path: package_path.clone(),
                 manifest,
                 sha256: package_hash,
             })
@@ -927,6 +950,19 @@ fn latest_7zip_percent(bytes: &[u8]) -> Option<u8> {
     result
 }
 
+/// 打包需要预留的字节数上界。
+///
+/// 压缩只会让体积变小，所以「源文件总量」本身已经是一个上界；另外两项是让这个上界在两种情形下
+/// 依然成立：几十万个小文件（每个条目在 ZIP 里还有固定开销），以及同一版本重复打包（上一次的包
+/// 还在原处，新的临时包要并排写到它旁边）。
+fn package_space_requirement(files: &[BodyPackageFile], existing_package_bytes: u64) -> u64 {
+    files.iter().fold(existing_package_bytes, |total, file| {
+        total
+            .saturating_add(file.size)
+            .saturating_add(ZIP_ENTRY_OVERHEAD_BYTES)
+    })
+}
+
 fn collect_files(root: &Path, protected_paths: &[String]) -> Result<Vec<BodyPackageFile>, String> {
     let mut files = Vec::new();
     for entry in WalkDir::new(root).follow_links(false) {
@@ -1108,8 +1144,11 @@ use std::io::Seek;
 
 #[cfg(test)]
 mod tests {
-    use super::{latest_7zip_percent, normalize_relative, path_key, BodyPackageService};
-    use std::{collections::HashSet, fs};
+    use super::{
+        latest_7zip_percent, normalize_relative, package_space_requirement, path_key,
+        BodyPackageFile, BodyPackageService, ZIP_ENTRY_OVERHEAD_BYTES,
+    };
+    use std::{collections::HashSet, fs, path::PathBuf};
     use uuid::Uuid;
 
     #[test]
@@ -1288,5 +1327,70 @@ mod tests {
         assert!(!cache.join("game-1/.version.zip.tmp-test").exists());
         assert!(cache.join("game-1/real.zip").is_file());
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn space_requirement_covers_source_bytes_entry_overhead_and_existing_package() {
+        let files = vec![
+            BodyPackageFile {
+                relative_path: "game.exe".to_string(),
+                size: 10,
+            },
+            BodyPackageFile {
+                relative_path: "data/big.bin".to_string(),
+                size: 5,
+            },
+        ];
+        // 源文件总量 + 每条目的 ZIP 固定开销 + 已存在的同版本包。
+        assert_eq!(
+            package_space_requirement(&files, 7),
+            10 + 5 + 7 + 2 * ZIP_ENTRY_OVERHEAD_BYTES
+        );
+        // 空目录也要求预留旧包与余量，不能算出 0。
+        assert_eq!(package_space_requirement(&[], 7), 7);
+    }
+
+    /// 打包前必须真的查磁盘，而且要查在**创建任何东西之前**。
+    ///
+    /// 这里把缓存目录放到一个没有映射的盘符上：预检会因「探不到盘」而拒绝，报的是磁盘相关的
+    /// 错误；若预检被删掉（或挪到建目录之后），错误就会变成"创建本体包缓存目录失败"。
+    #[test]
+    fn packaging_checks_free_space_before_writing_anything() {
+        let root = std::env::temp_dir().join(format!("gamesaver-body-space-{}", Uuid::new_v4()));
+        let source = root.join("source");
+        fs::create_dir_all(&source).expect("create source");
+        fs::write(source.join("game.exe"), b"exe").expect("write executable");
+
+        let error = match BodyPackageService::create_package_with_exclusions(
+            &source,
+            &unmapped_volume_path(),
+            "game-1",
+            "version-1",
+            "game.exe",
+            &[],
+            |_, _| {},
+            || false,
+        ) {
+            Ok(_) => panic!("探不到磁盘时必须拒绝打包，而不是硬着头皮写下去"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("磁盘"), "实际错误：{error}");
+        assert!(
+            !error.contains("创建本体包缓存目录失败"),
+            "预检必须发生在创建缓存目录之前，实际错误：{error}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// 当前没有映射的盘符下的一个路径 —— 用来稳定复现「探不到磁盘」，不必注入探测。
+    fn unmapped_volume_path() -> PathBuf {
+        for letter in 'Q'..='Z' {
+            let root = PathBuf::from(format!("{letter}:/"));
+            if !root.exists() {
+                return root.join("gamesaver-probe-cache");
+            }
+        }
+        PathBuf::from("Z:/gamesaver-probe-cache")
     }
 }

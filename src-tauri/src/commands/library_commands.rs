@@ -2,7 +2,7 @@ use crate::{
     app_state::AppState,
     domain::{TaskCategory, TaskStatus},
     repositories::{GameRepository, LibraryConfig, LibraryConfigRepository},
-    services::{LibraryService, TaskService},
+    services::{disk_space, LibraryService, TaskService},
 };
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, State};
@@ -36,7 +36,8 @@ pub fn get_library_settings(state: State<AppState>) -> Result<LibrarySettingsVie
         body_packages_bytes: usage.body_packages_bytes,
         saves_bytes: usage.saves_bytes,
         file_count: usage.file_count,
-        free_bytes: disk_free_bytes(&root),
+        // 探不到盘时报告 0（前端按"未知"处理），这是本视图原有的约定。
+        free_bytes: disk_space::available_space(&root).unwrap_or(0),
     })
 }
 
@@ -76,7 +77,8 @@ pub fn start_set_library_root_task(
         .map_err(|_| "读取游戏库记录失败".to_string())?
         .clone();
     let usage = LibraryService::usage(&source)?;
-    let free_bytes = disk_free_bytes(&target);
+    // 迁移沿用原来的语义：探不到盘就不做空间判断（宁愿让复制自己失败，也不因为探测失败拦住迁移）。
+    let free_bytes = disk_space::available_space(&target).unwrap_or(0);
     if free_bytes > 0 && usage.total_bytes() > free_bytes {
         return Err(format!(
             "新游戏库所在磁盘空间不足：需要 {}，可用 {}",
@@ -240,33 +242,4 @@ fn same_path(left: &Path, right: &Path) -> bool {
                 .replace('/', "\\")
                 .trim_end_matches('\\'),
         )
-}
-
-fn disk_free_bytes(path: &Path) -> u64 {
-    #[cfg(windows)]
-    {
-        use std::{ffi::OsStr, mem::MaybeUninit, os::windows::ffi::OsStrExt};
-        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-        let mut root = path.to_path_buf();
-        while !root.exists() {
-            if !root.pop() {
-                return 0;
-            }
-        }
-        let mut wide = OsStr::new(&root).encode_wide().collect::<Vec<_>>();
-        wide.push(0);
-        let mut available = MaybeUninit::uninit();
-        let result = unsafe {
-            GetDiskFreeSpaceExW(
-                wide.as_ptr(),
-                available.as_mut_ptr(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        if result != 0 {
-            return unsafe { available.assume_init() };
-        }
-    }
-    0
 }
