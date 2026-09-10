@@ -8,7 +8,7 @@ mod repositories;
 mod services;
 
 use app_state::AppState;
-use repositories::{GameRepository, LibraryConfigRepository, TaskRepository};
+use repositories::{GameRepository, LibraryConfigRepository, SaveRepository, TaskRepository};
 use services::{
     learning::cleanup_stale_captures, BodyPackageService, CoverCaptureService,
     GameBodyUpdateService, InstanceService, LaunchService,
@@ -165,6 +165,13 @@ pub fn run() {
             ) {
                 logging::error(format!("清理历史游戏本体失败：{error}"));
                 eprintln!("GameSaver 清理历史游戏本体失败：{error}");
+            }
+            // 存档恢复被强杀会在用户的存档目录里留下工作目录（`.gamesaver-restore-*` /
+            // `.gamesaver-rollback-*`）。这里清的是上一次进程留下的，此刻还没进入运行期、
+            // 没有恢复任务在跑，不存在与进行中的恢复抢文件。
+            if let Err(error) = SaveRepository::recover_interrupted_restores(&store.save_profiles) {
+                logging::error(format!("存档恢复残留清理失败：{error}"));
+                eprintln!("GameSaver 存档恢复残留清理失败：{error}");
             }
             if let Err(error) = GameRepository::persist(app.handle(), &store) {
                 logging::error(format!("清理历史游戏本体记录失败：{error}"));

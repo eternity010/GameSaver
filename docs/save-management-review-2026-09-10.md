@@ -25,13 +25,15 @@
 | V4 | 中 ✅ 已修复 | 打包时只按 `root_type` 选存档范围，忽略 `root_path`，多范围同类型时会读错目录 | `cloud_save_service.rs:736-746` |
 | V5 | 中 ✅ 已修复 | 改保留数时未重算 `latest_save_version_id`，指针悬垂后每次退出都会无条件新建版本 | 4 处，见正文 |
 | V6 | 中 | 解压前不校验大小（代码审查报告 P2-2 在存档侧的主路径确认） | `cloud_save_service.rs:317-323` |
-| V7 | 低 | 恢复过程在用户存档目录内留下的 `.gamesaver-restore-*` / `.gamesaver-rollback-*` 无启动清理，且会被下一次提交当成存档收进版本 | `save_repository.rs:446-447` |
+| V7 | 低 ✅ 已修复 | 恢复过程在用户存档目录内留下的 `.gamesaver-restore-*` / `.gamesaver-rollback-*` 无启动清理，且会被下一次提交当成存档收进版本 | `save_repository.rs` `sweep_restore_artifacts` + `lib.rs` 启动钩子 |
 | V8 | 低 | 版本排序按 `created_at` **字符串**比较，改用 ISO 时间后保留策略会删错版本 | 5 处 |
 | V9 | 低 | `wildcard_matches` 不支持中间通配符且静默失效 | `save_repository.rs:1017-1030` |
 | V10 | 低 | 恢复会删除「当前存在但不属于目标版本」的受保护文件，确认文案未告知 | `save_repository.rs:448-508` |
 
 高置信度：V1 / V2 / V3 / V4 / V6 / V9（纯静态可判）。
 V5 / V7 / V8 / V10 涉及运行时序列，触发条件已在各条正文写明。
+
+**修复进度：V1、V2、V3、V4、V5、V7 已修复（2026-09-10）；剩 V6 / V8 / V9 / V10。**
 
 ---
 
@@ -295,7 +297,7 @@ if data.len() as u64 != *expected_size || hash != *expected_hash {   // :321  �
 
 `expected_entries` 在循环之前就已构建完成（`:297`），`relative → (hash, size)` 里带着期望大小；zip 条目头部本身也带 `item.size()`。**读取之前就能拦截**，不必先分配内存。
 
-### V7 恢复产物残留在用户存档目录里，且会被下一次提交当成存档收进版本 —— 低
+### V7 恢复产物残留在用户存档目录里，且会被下一次提交当成存档收进版本 —— 低 ✅ 已修复（2026-09-10）
 
 `restore_group` 把两个工作目录建在**用户真实存档根目录内**（`save_repository.rs:445-447`）：
 
@@ -316,8 +318,22 @@ let rollback = group.root.join(format!(".gamesaver-rollback-{restore_id}"));
 
 **修法**（按优先级）：
 
-1. 最低限度：在 `is_excluded` / 收集阶段拒绝 `.gamesaver-restore-` / `.gamesaver-rollback-` 前缀，保证垃圾不会进版本；
+1. 最低限度：在收集阶段拒绝 `.gamesaver-restore-` / `.gamesaver-rollback-` 前缀，保证垃圾不会进版本；
 2. 更完整：启动时扫描各 scope 根目录，发现残留的 rollback 目录则执行一次回滚恢复（这正是「恢复中途崩溃」应有的语义），再清理残留。
+
+**修复记录（2026-09-10）** —— 实做时对上面第 1、2 条各有一处修正：
+
+- **第 1 条不能挂在 `is_excluded` 上**。`is_excluded` 除收集之外，还被 `scope_matches_entry_exact` / `scope_matches_entry_loose` 用来判「条目属于哪个范围」。挂上去会让**修复前就已经把产物收进去的历史版本**在恢复时找不到范围，整场报「保存版本中的文件不属于当前存档范围」—— 用新 bug 换旧 bug，正是 V2 那个失败模式，只是换了个诱因（已用变异验证：撤掉 `build_restore_groups` 里的跳过，该测试就精确复现了这条报错）。因此改为独立的 `path_is_restore_artifact`，只接在两个真正的入口：`add_candidate`（收进版本的唯一漏斗）与 `is_protected_file`（决定「恢复时先把哪些文件搬走」，不接的话残留只是换个位置呆着）。
+- **匹配写成「前缀 + 32 位十六进制」，不是裸前缀**。用户真有一个叫 `.gamesaver-restore-notes.txt` 的存档时，裸前缀会把它一起当垃圾排除，等于替用户丢文件。判据取**任一路径分量**而非首段：范围根可以嵌套，内层范围的产物在外层看来是二级目录。
+- **第 2 条的关键是「先归位、再清理」，不能写成「发现残留就删」**。崩溃若落在「把现有存档搬进 rollback」之后，用户存档目录里那些位置是**空的**，真身躺在 rollback 里 —— 直接删就是把用户的存档删了。（三个调用点都在 `restore()` 之前先 `commit()` 保护了当前存档，所以严格说不算永久丢数据，但用户得自己意识到并手动恢复那一版，等于把崩溃窗口转嫁给他。）实现上归位**全部成功才返回 `Ok`**，只要有一个文件没归位就保留回滚副本不删，下次启动继续重试 —— 宁可留着垃圾，也不能弄丢用户自己写的文件。
+- **归位语义在第 ④ 段（文件装好、只差 finalize）会「放弃这次恢复」**，这是有意的且自洽：`latest_save_version_id` 是 `commit` 的比对基线而非「最新一版」（见 V5），本地内容与它不一致只会让下一次 `commit` 记出一个新版本。
+- **安全闸门**：只处理范围根的**直接子目录**且名字严格匹配；`symlink_metadata` 确认是**真目录**且不是重解析点 —— `FileType::is_symlink` 在 Windows 上是否覆盖目录联接依赖 std 实现细节，所以额外查一次 `FILE_ATTRIBUTE_REPARSE_POINT`，两道都过才敢动 `remove_dir_all`（目录联接能指向别处，顺着删就删到范围外了）；归位路径一律过 `safe_join`。失败只写日志、不阻断启动，与 `GameBodyUpdateService::recover_pending_updates` 一致。
+- **不动历史数据**：已经在库里的「被污染版本」不做迁移，只在读取侧「不再采集 + 恢复时不回写」。无法判断当初那些文件是否真是残留，改库的风险大于收益，让它随剪枝自然淘汰。
+- **接在 `lib.rs` setup 里 `recover_pending_updates` 附近**，靠 `store.save_profiles[].scopes[].root_path` 拿到全部范围根（去重、跳过不存在的），只做**顶层** `read_dir` 不递归。
+
+回归测试（`save_repository.rs` 新增 7 条）：产物名必须带 32 位十六进制 id（含嵌套分量、以及「同名用户文件不得被误判」）；`collect_profile_files` 不收产物（借助 `new_manual` 默认的 `include_directories = ["."]` 让递归扫描真正扫到 staging）；只剩 staging 时直接删且用户存档不动；**有 rollback 时先归位再清理**（含嵌套路径与「半成品被原档覆盖」）；**归位失败时回滚副本必须保留**（把归位目标做成同名目录制造失败）；历史污染版本恢复时跳过产物条目。
+
+**变异验证（三次，失败集合互不重叠）**：① 撤掉 `add_candidate` 的剔除 → 恰好收集测试失败，收集结果多出 `.gamesaver-restore-<id>/slot1.sav`；② 让清扫跳过归位直接删 → 恰好「先归位」与「归位失败要保留」两条失败，而「只删 staging」「同名不误删」仍通过；③ 撤掉 `build_restore_groups` 的跳过 → 恰好历史污染那条失败，且报错正是「保存版本中的文件不属于当前存档范围」。三条各守一角，说明「不进版本」「归位优先且失败即保留」「历史版本不炸」都被独立钉住了。
 
 ---
 
@@ -407,7 +423,7 @@ let touched = group.protected_paths.union(&target_paths).cloned().collect();   /
 | 2 | **V3 + V4** 打包路径补哈希校验、修 scope 选择 | ✅ 已完成（2026-09-10）：两者叠加才会产生「错内容被静默上传」，是云端备份可信度的地基 |
 | 3 | **V5** 剪枝后重算 `latest_save_version_id` | ✅ 已完成（2026-09-10）：做成 `AppStore` 的数据不变量并嵌在唯一的剪枝入口上，顺带覆盖 `delete_versions_task` 与载入时的 `normalize` |
 | 4 | **V2** 墓碑条目跳过 root/scope 前置校验 | ✅ 已完成（2026-09-10）：影响「恢复到底能不能用」，且报错信息误导用户；保留墓碑「让该范围参与清理」的职责，避免「恢复到空」被挡掉 |
-| 5 | **V7** 残留产物排除 + 启动兜底 | 需要设计崩溃恢复语义，工作量最大，但存档目录被污染会一路传到云端 |
+| 5 | **V7** 残留产物排除 + 启动兜底 | ✅ 已完成（2026-09-10）：两道防线 —— 收集侧切断「污染→上传云端」的链条，启动清扫按盘上痕迹「先归位、再清理」。实做时修正了报告原方案的两处：排除**不挂** `is_excluded`（会让历史污染版本不可恢复），清扫**不能**写成「发现残留就删」（备份阶段崩溃时 rollback 里是用户自己的存档） |
 | 6 | V6 / V8 / V9 / V10 | V6 随代码审查报告 P2-2 一并处理；其余为整洁性与文案 |
 
 ---

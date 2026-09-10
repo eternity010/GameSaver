@@ -203,6 +203,46 @@ impl SaveRepository {
         }
     }
 
+    /// 启动清扫：收掉上一次存档恢复被强制中断（进程被杀 / 断电）留下的产物目录。
+    ///
+    /// `restore_group` 把两个工作目录建在**用户的存档根目录内**：`.gamesaver-restore-<id>`
+    /// 是目标版本的完整副本，`.gamesaver-rollback-<id>` 是恢复前的原存档。正常路径由
+    /// `finalize_restore` / `rollback_restore` 清理；恢复中途被杀则两者都留在用户的存档目录
+    /// 里 —— 而 `collect_profile_files` 会把它们当成正常存档收进下一个版本、随后上传云端，
+    /// 并且每崩一次多一份（存档管理审查 V7）。
+    ///
+    /// **处置顺序必须是「先归位、再清理」，不能直接删。** 崩溃若落在「把现有存档搬进
+    /// rollback」这一步之后，用户存档目录里那些位置是空的，真身躺在 rollback 里，直接删掉
+    /// 等于把用户的存档删了。归位不完整时保留 rollback 目录不删，下次启动继续重试 —— 宁可
+    /// 留着垃圾，也不能弄丢用户自己写的文件。
+    ///
+    /// 逐范围根处理，单个范围出错只记录、不中断其余范围（与
+    /// `GameBodyUpdateService::recover_pending_updates` 一致）。
+    pub fn recover_interrupted_restores(profiles: &[SaveProfile]) -> Result<(), String> {
+        let mut roots = Vec::new();
+        let mut seen = HashSet::new();
+        for profile in profiles {
+            for scope in &profile.scopes {
+                let root = strip_verbatim_prefix(Path::new(&scope.root_path));
+                // 同一物理目录可能被多个范围指向，去重避免重复清扫。
+                if seen.insert(normalize_path(root.to_string_lossy().as_ref())) && root.is_dir() {
+                    roots.push(root);
+                }
+            }
+        }
+        let mut errors = Vec::new();
+        for root in roots {
+            if let Err(error) = sweep_restore_artifacts(&root) {
+                errors.push(error);
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("；"))
+        }
+    }
+
     pub fn collect_garbage(app: &AppHandle, versions: &[SaveVersion]) -> Result<usize, String> {
         let lock = REPOSITORY_LOCK.get_or_init(|| Mutex::new(()));
         let _guard = lock.lock().map_err(|_| "存档仓库锁定失败".to_string())?;
@@ -438,6 +478,13 @@ fn build_restore_groups(
 ) -> Result<Vec<RestoreGroup>, String> {
     let mut groups = HashMap::<String, RestoreGroup>::new();
     for entry in &version.files {
+        // 修复前的版本可能已经把恢复产物收了进去（那时没有任何地方拦得住它）。这类条目在
+        // 这里直接跳过：既不回写垃圾、也不因为「条目落在哪个范围」而去报错。跳过而不是报错
+        // 是刻意的 —— 一个内部工作目录不该让整个版本变成不可恢复（存档管理审查 V7）。
+        // 历史数据不做迁移：无法判断当初那些文件是不是真残留，让它随剪枝自然淘汰。
+        if path_is_restore_artifact(&entry.relative_path) {
+            continue;
+        }
         // 墓碑条目（`deleted: true`）只表达「这个文件在该版本里不存在」，它自身没有任何字节
         // 需要写回磁盘，因此**不能**对它做 root/scope 前置校验：那些校验是为「要写到哪里」
         // 把关的，而墓碑引用的目录或范围很可能早已被删除、移出存档范围。照常校验的话，一个与
@@ -731,6 +778,153 @@ fn cleanup_restore_artifacts(undo: &RestoreUndo) {
     let _ = fs::remove_dir_all(&undo.rollback);
 }
 
+/// 清扫单个存档根目录下的恢复产物：先把 rollback 里的原存档归位，再删产物目录。
+///
+/// 只扫**顶层**（不递归）—— 产物就建在范围根下，递归进去反而容易碰到用户自己的同名目录。
+/// 逐项验证后才动手：名字必须严格匹配 `.gamesaver-{restore,rollback}-<32位十六进制>`，
+/// 且必须是**真目录**（符号链接 / 目录联接一律跳过，见 `is_reparse_point`）。
+fn sweep_restore_artifacts(root: &Path) -> Result<(), String> {
+    // 用 `BTreeMap` 而不是 `HashMap`：万一同一个范围里躺着两轮崩溃留下的产物，处理顺序
+    // 至少是可复现的，不会每次启动换个结果。
+    let mut staging = BTreeMap::new();
+    let mut rollback = BTreeMap::new();
+    for entry in fs::read_dir(root).map_err(|err| format!("读取存档目录失败：{err}"))? {
+        let path = entry
+            .map_err(|err| format!("读取存档目录失败：{err}"))?
+            .path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let (bucket, suffix) = if let Some(suffix) = name.strip_prefix(RESTORE_STAGING_PREFIX) {
+            (&mut staging, suffix)
+        } else if let Some(suffix) = name.strip_prefix(RESTORE_ROLLBACK_PREFIX) {
+            (&mut rollback, suffix)
+        } else {
+            continue;
+        };
+        if !is_restore_artifact_id(suffix) {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+            continue;
+        }
+        bucket.insert(suffix.to_string(), path);
+    }
+
+    let mut errors = Vec::new();
+    for (id, rollback_dir) in &rollback {
+        // 同 id 的 staging 只是目标版本副本，不含用户数据，无论归位成功与否都可以清掉。
+        let staged = staging.remove(id);
+        match restore_rollback_contents(root, rollback_dir) {
+            Ok(()) => {
+                remove_artifact_dir(rollback_dir, "存档回滚副本", &mut errors);
+                if let Some(staged) = staged {
+                    remove_artifact_dir(&staged, "存档恢复暂存目录", &mut errors);
+                }
+            }
+            Err(error) => {
+                errors.push(error);
+                if let Some(staged) = staged {
+                    remove_artifact_dir(&staged, "存档恢复暂存目录", &mut errors);
+                }
+            }
+        }
+    }
+    // 剩下的 staging 都没有配对的 rollback，说明崩溃发生在「还没动用户文件」之前 ——
+    // 这类残留可以直接删。
+    for staged in staging.values() {
+        remove_artifact_dir(staged, "存档恢复暂存目录", &mut errors);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
+}
+
+fn remove_artifact_dir(path: &Path, label: &str, errors: &mut Vec<String>) {
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => errors.push(format!("清理{label}失败：{}：{error}", path.display())),
+    }
+}
+
+/// 把回滚目录里的原存档按相对路径搬回存档根目录。
+///
+/// **全部成功才返回 `Ok`** —— 只要有一个文件没归位，调用方就不该删回滚目录，否则那个文件
+/// 就永远找不回来了。
+fn restore_rollback_contents(root: &Path, rollback: &Path) -> Result<(), String> {
+    let mut errors = Vec::new();
+    let mut moves: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for entry in WalkDir::new(rollback).follow_links(false) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(format!("扫描存档回滚副本失败：{error}"));
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(rollback) else {
+            errors.push(format!("存档回滚副本路径异常：{}", entry.path().display()));
+            continue;
+        };
+        let relative = match validate_relative(relative.to_string_lossy().as_ref()) {
+            Ok(relative) => relative,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
+        let destination = match safe_join(root, &relative) {
+            Ok(destination) => destination,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
+        // 本次恢复可能已经把同名文件写到这个位置了，文件直接覆盖即可（std 的 rename 在
+        // Windows 上带 MOVEFILE_REPLACE_EXISTING）。若是目录则不擅自删除：报错并把回滚副本
+        // 留着，用户还能自己把文件捞回去。
+        if destination.is_dir() {
+            errors.push(format!("存档回滚目标被目录占用：{}", destination.display()));
+            continue;
+        }
+        moves.push((entry.path().to_path_buf(), destination));
+    }
+    // 全部列完才开始搬：`WalkDir` 在 Windows 上走的是 `FindNextFile` 语义，边遍历边把条目
+    // rename 走，可能让枚举漏掉后面的文件 —— 而漏掉的文件会连同回滚副本一起被删掉。
+    for (source, destination) in moves {
+        if let Some(parent) = destination.parent() {
+            if let Err(error) = ensure_parent_is_directory(parent) {
+                errors.push(error);
+                continue;
+            }
+            if let Err(error) = fs::create_dir_all(parent) {
+                errors.push(format!("创建存档目录失败：{error}"));
+                continue;
+            }
+        }
+        if let Err(error) = fs::rename(&source, &destination) {
+            errors.push(format!(
+                "恢复原存档 {} 失败：{error}",
+                destination.display()
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
+}
+
 fn collect_protected_paths(root: &Path, scope: &SaveScope) -> Result<HashSet<String>, String> {
     let mut paths = HashSet::new();
     for relative in &scope.confirmed_files {
@@ -770,6 +964,9 @@ fn collect_protected_paths(root: &Path, scope: &SaveScope) -> Result<HashSet<Str
 fn is_protected_file(path: &Path, relative: &str, scope: &SaveScope) -> bool {
     path.is_file()
         && !is_excluded(relative, scope)
+        // 恢复产物不算受保护文件。它的职责是「恢复前把这些文件搬进 rollback 目录」，
+        // 而把上一次的残留搬走只会让垃圾换个位置呆着，清不出存档目录（存档管理审查 V7）。
+        && !path_is_restore_artifact(relative)
         && scope
             .max_file_bytes
             .map(|limit| {
@@ -1086,6 +1283,17 @@ fn add_candidate(
     if is_excluded(&relative_path, scope) {
         return Ok(());
     }
+    // 恢复产物绝不进版本。它是 `restore_group` 的工作目录，正常情况下早已被清掉；能走到
+    // 这里说明上一次恢复被强杀、残留还留在存档目录里。收进版本之后它还会一路被上传云端，
+    // 将来恢复那一版时再把垃圾铺回存档目录，且每崩一次多一份（存档管理审查 V7）。
+    //
+    // 这道判定刻意不塞进 `is_excluded`：`is_excluded` 还被
+    // `scope_matches_entry_exact` / `scope_matches_entry_loose` 用来判「条目属于哪个
+    // 范围」，挂上去会让**历史上已被污染**的版本在恢复时找不到范围而整场失败 —— 那是
+    // V2 那个失败模式，只是换了个诱因。
+    if path_is_restore_artifact(&relative_path) {
+        return Ok(());
+    }
     let metadata = fs::metadata(&path).map_err(|err| format!("读取存档文件信息失败：{err}"))?;
     if scope
         .max_file_bytes
@@ -1136,6 +1344,55 @@ fn is_excluded(relative_path: &str, scope: &SaveScope) -> bool {
             .exclude_patterns
             .iter()
             .any(|pattern| wildcard_matches(file_name, pattern))
+}
+
+/// `restore_group` 在用户存档根目录里建的两个工作目录（存档管理审查 V7）。
+const RESTORE_STAGING_PREFIX: &str = ".gamesaver-restore-";
+const RESTORE_ROLLBACK_PREFIX: &str = ".gamesaver-rollback-";
+
+/// 名字后缀是不是 `restore_group` 拼出来的那个 id（`Uuid::simple()`，32 位十六进制）。
+///
+/// 要求「非空且全为十六进制」而不是「非空即可」：用户完全可能真有一个叫
+/// `.gamesaver-restore-notes.txt` 的文件，只认前缀会把它一起当产物排除 —— 等于替用户丢掉
+/// 一个存档。严格一点的代价只是极少数畸形残留要靠启动清扫之外的路径处理。
+fn is_restore_artifact_id(suffix: &str) -> bool {
+    !suffix.is_empty() && suffix.chars().all(|value| value.is_ascii_hexdigit())
+}
+
+/// 单个路径分量是否为恢复产物目录名。
+fn is_restore_artifact_name(name: &str) -> bool {
+    [RESTORE_STAGING_PREFIX, RESTORE_ROLLBACK_PREFIX]
+        .iter()
+        .filter_map(|prefix| name.strip_prefix(prefix))
+        .any(is_restore_artifact_id)
+}
+
+/// 相对路径里**任一分量**是恢复产物即为真。
+///
+/// 取分量而不是只看首段：范围根可以嵌套（外层范围根里就含内层范围根），内层范围留下的
+/// 产物在外层看来就是二级目录。
+fn path_is_restore_artifact(relative_path: &str) -> bool {
+    normalize_relative(relative_path)
+        .split('/')
+        .any(is_restore_artifact_name)
+}
+
+/// 目录项是不是重解析点（符号链接 / 目录联接）。
+///
+/// 单独抽出来是因为要动 `remove_dir_all`：目录联接能指向别的目录，顺着删就会删到范围
+/// 之外去。`FileType::is_symlink` 在 Windows 上是否覆盖目录联接依赖于 std 的实现细节，
+/// 所以这里额外查一次 `FILE_ATTRIBUTE_REPARSE_POINT`，两道都过才认为是真目录。
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
 }
 
 fn scope_includes_relative(relative_path: &str, scope: &SaveScope) -> bool {
@@ -1322,7 +1579,8 @@ fn now_iso() -> String {
 mod tests {
     use super::{
         build_restore_groups, entry_belongs_to_profile, find_scope_for_entry, find_scope_for_read,
-        is_excluded, same_entries, wildcard_matches, SaveRepository,
+        is_excluded, is_restore_artifact_name, path_is_restore_artifact, same_entries,
+        sweep_restore_artifacts, wildcard_matches, SaveRepository,
     };
     use crate::domain::{
         AppStore, Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope, SaveVersion,
@@ -2081,5 +2339,228 @@ mod tests {
         assert!(find_scope_for_read(&profile, &entry).is_ok());
         // ……恢复侧（restore）仍严格拒绝落在范围外的条目。
         assert!(find_scope_for_entry(&profile, &entry, "Config/settings.ini").is_err());
+    }
+
+    fn temp_root(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("gamesaver-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        root
+    }
+
+    /// V7 回归：产物目录名必须带 `restore_group` 拼出来的那个 id（32 位十六进制）。
+    ///
+    /// 只认前缀是不够的 —— 用户真有一个叫 `.gamesaver-restore-notes.txt` 的存档时会被一起
+    /// 当垃圾排除，等于替用户丢掉一个文件。
+    #[test]
+    fn restore_artifact_names_require_a_hex_id() {
+        let id = "0f8b2c1d4e5a6b7c8d9e0f1a2b3c4d5e";
+        assert!(is_restore_artifact_name(&format!(
+            ".gamesaver-restore-{id}"
+        )));
+        assert!(is_restore_artifact_name(&format!(
+            ".gamesaver-rollback-{id}"
+        )));
+        // 嵌套在子目录里同样算产物（范围根可以嵌套，内层范围的产物在外层看来是二级目录）。
+        assert!(path_is_restore_artifact(&format!(
+            "slot\\.gamesaver-rollback-{id}\\save.dat"
+        )));
+
+        assert!(!is_restore_artifact_name(".gamesaver-restore-notes.txt"));
+        assert!(!is_restore_artifact_name(".gamesaver-restore-"));
+        assert!(!is_restore_artifact_name("gamesaver-restore-0f8b"));
+        assert!(!path_is_restore_artifact("saves/slot1.sav"));
+    }
+
+    /// V7 回归（防线 1）：恢复产物绝不进版本。
+    ///
+    /// 收进版本之后它会一路被上传云端，将来恢复那一版时再把垃圾铺回用户的存档目录，而且每
+    /// 崩一次多一份。
+    #[test]
+    fn collect_profile_files_skips_restore_artifacts() {
+        let root = temp_root("v7-collect");
+        std::fs::write(root.join("slot1.sav"), b"real save").expect("write save");
+        let id = "0f8b2c1d4e5a6b7c8d9e0f1a2b3c4d5e";
+        let staging = root.join(format!(".gamesaver-restore-{id}"));
+        std::fs::create_dir_all(&staging).expect("create staging");
+        std::fs::write(staging.join("slot1.sav"), b"target copy").expect("write staged");
+
+        // `new_manual` 默认 `include_directories = ["."]`，会递归扫整个根目录 —— 没有这道
+        // 剔除，staging 里的副本就会被当成存档收进来。
+        let mut scope = SaveScope::new_manual(root.to_string_lossy().to_string());
+        scope.root_type = SaveRootType::Custom;
+        let profile = SaveProfile::new(
+            "g1".to_string(),
+            "hash".to_string(),
+            vec![scope],
+            100,
+            "2026-01-01".to_string(),
+        );
+
+        let collected = super::collect_profile_files(&profile).expect("collect");
+        let relatives: Vec<&str> = collected
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        assert_eq!(relatives, vec!["slot1.sav"], "只应收集真实存档");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// V7 回归（防线 2）：只有 staging 残留，说明崩溃发生在「还没动用户文件」之前 ——
+    /// 直接删掉残留即可，用户存档一个字节都不该动。
+    #[test]
+    fn sweep_deletes_a_staging_only_leftover() {
+        let root = temp_root("v7-sweep-staging");
+        std::fs::write(root.join("slot1.sav"), b"real save").expect("write save");
+        let id = "0f8b2c1d4e5a6b7c8d9e0f1a2b3c4d5e";
+        let staging = root.join(format!(".gamesaver-restore-{id}"));
+        std::fs::create_dir_all(&staging).expect("create staging");
+        std::fs::write(staging.join("slot1.sav"), b"target copy").expect("write staged");
+
+        sweep_restore_artifacts(&root).expect("sweep");
+
+        assert!(!staging.exists(), "staging 残留应被清掉");
+        assert_eq!(
+            std::fs::read(root.join("slot1.sav")).expect("read save"),
+            b"real save",
+            "用户存档不得被动过"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// V7 回归（防线 2 的核心不变量）：崩溃落在「把现有存档搬进 rollback」之后时，用户存档
+    /// 目录里那些位置是空的、真身躺在 rollback 里 —— 清扫必须**先归位、再清理**。
+    ///
+    /// 直接删残留就会把用户的存档删掉，所以这条钉的是顺序。
+    #[test]
+    fn sweep_restores_the_rollback_copy_before_cleaning() {
+        let root = temp_root("v7-sweep-rollback");
+        let id = "0f8b2c1d4e5a6b7c8d9e0f1a2b3c4d5e";
+        let rollback = root.join(format!(".gamesaver-rollback-{id}"));
+        std::fs::create_dir_all(rollback.join("nested")).expect("create rollback");
+        std::fs::write(rollback.join("slot1.sav"), b"original").expect("write rollback");
+        std::fs::write(rollback.join("nested").join("deep.dat"), b"deep").expect("write deep");
+        // 本次恢复已经装进去的文件（半成品）：归位时应当被原档覆盖。
+        std::fs::write(root.join("slot1.sav"), b"half restored").expect("write half");
+
+        sweep_restore_artifacts(&root).expect("sweep");
+
+        assert!(!rollback.exists(), "归位完成后回滚副本应被清掉");
+        assert_eq!(
+            std::fs::read(root.join("slot1.sav")).expect("read save"),
+            b"original",
+            "原存档应覆盖半成品"
+        );
+        assert_eq!(
+            std::fs::read(root.join("nested").join("deep.dat")).expect("read deep"),
+            b"deep",
+            "嵌套路径也要按原样建目录并归位"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// V7 回归（防线 2 的反面）：只要有**一个**文件没能归位，回滚副本就必须留着。
+    ///
+    /// 删掉它等于把用户的存档删了。这里把归位目标做成同名目录来制造失败 —— 不敢覆盖目录，
+    /// 只能报错并保留副本。
+    #[test]
+    fn sweep_keeps_the_rollback_when_a_file_cannot_be_restored() {
+        let root = temp_root("v7-sweep-keep");
+        let id = "0f8b2c1d4e5a6b7c8d9e0f1a2b3c4d5e";
+        let rollback = root.join(format!(".gamesaver-rollback-{id}"));
+        std::fs::create_dir_all(&rollback).expect("create rollback");
+        std::fs::write(rollback.join("slot1.sav"), b"original").expect("write rollback");
+        std::fs::create_dir_all(root.join("slot1.sav")).expect("occupy destination");
+
+        let error = sweep_restore_artifacts(&root).expect_err("应报错而不是默默丢档");
+
+        assert!(rollback.is_dir(), "归位失败时回滚副本必须保留");
+        assert_eq!(
+            std::fs::read(rollback.join("slot1.sav")).expect("read rollback"),
+            b"original"
+        );
+        assert!(
+            error.contains("slot1.sav"),
+            "错误信息应指出是哪个文件：{error}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// V7 回归：只是「长得像」产物的用户文件与目录不能被误删 —— 严格匹配 id 的意义就在这里。
+    #[test]
+    fn sweep_leaves_lookalike_entries_alone() {
+        let root = temp_root("v7-sweep-lookalike");
+        std::fs::write(root.join(".gamesaver-restore-notes.txt"), b"mine").expect("write notes");
+        let fake = root.join(".gamesaver-restore-nothex");
+        std::fs::create_dir_all(&fake).expect("create fake");
+
+        sweep_restore_artifacts(&root).expect("sweep");
+
+        assert!(
+            root.join(".gamesaver-restore-notes.txt").is_file(),
+            "同名用户文件不得被删"
+        );
+        assert!(fake.is_dir(), "后缀不是十六进制的目录不得被删");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// V7 回归：修复前已经收进了产物的历史版本，恢复时跳过那些条目 —— 既不回写垃圾，也不
+    /// 因为「条目落在哪个范围」而让整个版本变成不可恢复。
+    #[test]
+    fn restore_skips_polluted_entries_from_an_older_version() {
+        let root = temp_root("v7-polluted");
+        let game = Game::new_pending("Test Game", r"E:\GameSaverGames\games\test", "game.exe");
+        let mut scope = SaveScope::new_manual(root.to_string_lossy().to_string());
+        scope.root_type = SaveRootType::Custom;
+        // 收窄到只认 slot1.sav：否则默认的 `include_directories = ["."]` 会匹配一切，
+        // 产物条目也能解析到范围，这条回归就失去意义了。
+        scope.confirmed_files = vec!["slot1.sav".to_string()];
+        scope.include_directories = Vec::new();
+        let profile = SaveProfile::new(
+            game.game_uid.clone(),
+            "hash".to_string(),
+            vec![scope],
+            100,
+            "0".to_string(),
+        );
+
+        let id = "0f8b2c1d4e5a6b7c8d9e0f1a2b3c4d5e";
+        let root_path = root.to_string_lossy().to_string();
+        let version = SaveVersion {
+            version_id: "v1".to_string(),
+            game_uid: game.game_uid.clone(),
+            created_at: "0".to_string(),
+            files: vec![
+                SaveFileEntry {
+                    root_type: SaveRootType::Custom,
+                    root_path: Some(root_path.clone()),
+                    relative_path: "slot1.sav".to_string(),
+                    object_hash: Some("a".repeat(64)),
+                    size: 1,
+                    deleted: false,
+                    mtime_ms: None,
+                },
+                SaveFileEntry {
+                    root_type: SaveRootType::Custom,
+                    root_path: Some(root_path),
+                    relative_path: format!(".gamesaver-restore-{id}/slot1.sav"),
+                    object_hash: Some("b".repeat(64)),
+                    size: 1,
+                    deleted: false,
+                    mtime_ms: None,
+                },
+            ],
+            total_bytes: 2,
+        };
+
+        let groups = build_restore_groups(&game, &profile, &version)
+            .expect("历史污染不得让版本变成不可恢复");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].entries.len(),
+            1,
+            "产物条目应被跳过，只恢复真实存档"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
