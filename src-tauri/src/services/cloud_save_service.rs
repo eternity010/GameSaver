@@ -19,6 +19,18 @@ use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 const MANIFEST_VERSION: u32 = 1;
 const REMOTE_SAVES_ROOT: &str = "/apps/GameSaver/saves";
 
+/// 解压单个存档条目时的硬上限。
+///
+/// 正常的收集侧默认限制是 `max_file_bytes = 10 MiB`（`SaveProfile`），这里取值远超它、
+/// 也远超任何正常游戏的单个存档文件；它的作用不是「限制正常存档」，而是在云端清单本身
+/// 不可信时兜底 —— 远端清单缺少 `package_sha256` 时不再有哈希锚点，`meta.json` 里的
+/// 声明大小可以被随意伪造，没有这道闸门就无法阻止伪造值把内存撑爆。
+const MAX_SAVE_PACKAGE_ENTRY_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// `meta.json` 的解压上限。它是条目清单，体量随文件数线性增长，32 MiB 足够容纳
+/// 数万个条目，同时把伪造的巨物挡在分配之前。
+const MAX_SAVE_PACKAGE_META_BYTES: u64 = 32 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudSaveManifest {
@@ -280,10 +292,14 @@ impl CloudSaveService {
             let mut meta_file = archive
                 .by_name("meta.json")
                 .map_err(|err| format!("存档压缩包缺少 meta.json：{err}"))?;
-            let mut meta_raw = Vec::new();
-            meta_file
-                .read_to_end(&mut meta_raw)
-                .map_err(|err| format!("读取 meta.json 失败：{err}"))?;
+            let declared = meta_file.size();
+            let meta_raw = read_zip_entry_bounded(
+                &mut meta_file,
+                declared,
+                None,
+                MAX_SAVE_PACKAGE_META_BYTES,
+                "meta.json",
+            )?;
             drop(meta_file);
             let meta: CloudSavePackageMeta = serde_json::from_slice(&meta_raw)
                 .map_err(|err| format!("解析 meta.json 失败：{err}"))?;
@@ -309,11 +325,18 @@ impl CloudSaveService {
                 if !imported_paths.insert(relative.clone()) {
                     return Err(format!("存档压缩包包含重复文件：{relative}"));
                 }
-                let mut data = Vec::new();
-                item.read_to_end(&mut data)
-                    .map_err(|err| format!("解压文件项失败：{err}"))?;
+                // 先按「zip 头部声明大小 + 版本清单大小」双重拦截，再读字节：高度压缩的条目
+                // 会在大小/哈希校验之前先把内存吃光（解压炸弹），而这两个大小此刻都已知道。
+                let declared = item.size();
+                let data = read_zip_entry_bounded(
+                    &mut item,
+                    declared,
+                    Some(*expected_size),
+                    MAX_SAVE_PACKAGE_ENTRY_BYTES,
+                    &relative,
+                )?;
                 let hash = sha256_hex(&data);
-                if data.len() as u64 != *expected_size || hash != *expected_hash {
+                if hash != *expected_hash {
                     return Err(format!("存档压缩包中的文件校验失败：{relative}"));
                 }
                 SaveRepository::write_object(app, &hash, &data)?;
@@ -674,6 +697,48 @@ fn normalize_package_relative_path(path: &str) -> Result<String, String> {
     Ok(path.replace('\\', "/").trim_start_matches('/').to_string())
 }
 
+/// 读取一个压缩项，并把读取量硬性限制在其声明大小之内。
+///
+/// **大小校验必须发生在读取之前**：高度压缩的条目会先把内存吃光，之后才轮到大小/哈希
+/// 校验 —— 而这两个大小在读取前都已经知道（zip 头部 + 版本清单）。所以这里先比对
+/// `declared_size`（zip 头部）与 `expected_size`（清单）再决定要不要读，接着用
+/// `Read::take` 把实际读取量钉死：即便压缩包头部谎报了大小，也不可能读出超过声明值的
+/// 字节（多读一个字节就会被 `take` 截断，随即在这里报错）。
+///
+/// `declared_size` 本身也来自压缩包，因此还需要 `max_size` 这道与清单无关的闸门
+/// （代码审查 P2-2 / 存档管理审查 V6）。
+fn read_zip_entry_bounded(
+    item: &mut dyn Read,
+    declared_size: u64,
+    expected_size: Option<u64>,
+    max_size: u64,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    if declared_size > max_size {
+        return Err(format!(
+            "{label} 过大（声明 {declared_size} 字节，上限 {max_size} 字节）"
+        ));
+    }
+    if let Some(expected) = expected_size {
+        if declared_size != expected {
+            return Err(format!(
+                "{label} 大小与清单不一致（压缩包声明 {declared_size} 字节，清单 {expected} 字节）"
+            ));
+        }
+    }
+    let mut data = Vec::new();
+    item.take(declared_size.saturating_add(1))
+        .read_to_end(&mut data)
+        .map_err(|err| format!("解压 {label} 失败：{err}"))?;
+    if data.len() as u64 != declared_size {
+        return Err(format!(
+            "{label} 实际大小与声明不一致（声明 {declared_size} 字节，实际 {} 字节）",
+            data.len()
+        ));
+    }
+    Ok(data)
+}
+
 struct TemporaryFileGuard(PathBuf);
 
 impl Drop for TemporaryFileGuard {
@@ -1009,5 +1074,102 @@ mod tests {
         assert!(ensure_bytes_match_hash(&bytes, &hash, "save.dat").is_ok());
         assert!(ensure_bytes_match_hash(&bytes, &hash.to_ascii_uppercase(), "save.dat").is_ok());
         assert!(ensure_bytes_match_hash(&bytes, &"0".repeat(64), "save.dat").is_err());
+    }
+
+    /// 记录 `read` 调用次数的读取器，用来证明「大小校验发生在读取之前」。
+    struct ProbeReader {
+        data: Vec<u8>,
+        position: usize,
+        read_calls: usize,
+    }
+
+    impl ProbeReader {
+        fn new(data: &[u8]) -> Self {
+            Self {
+                data: data.to_vec(),
+                position: 0,
+                read_calls: 0,
+            }
+        }
+    }
+
+    impl Read for ProbeReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.read_calls += 1;
+            let remaining = &self.data[self.position..];
+            let take = remaining.len().min(buf.len());
+            buf[..take].copy_from_slice(&remaining[..take]);
+            self.position += take;
+            Ok(take)
+        }
+    }
+
+    #[test]
+    fn bounded_read_rejects_size_mismatch_without_reading_any_byte() {
+        // 压缩包头部声明 8 字节，版本清单写的是 4 字节 —— 在校验之前就该被拦下。
+        let mut reader = ProbeReader::new(b"abcdefgh");
+        let result = read_zip_entry_bounded(&mut reader, 8, Some(4), 1024, "slot1.sav");
+        let error = result.expect_err("大小与清单不一致时必须拒绝");
+        assert!(error.contains("大小与清单不一致"), "实际错误：{error}");
+        assert_eq!(
+            reader.read_calls, 0,
+            "拒绝必须发生在读取之前，不能先分配内存"
+        );
+    }
+
+    #[test]
+    fn bounded_read_rejects_oversized_entry_without_reading() {
+        // 与清单无关的最后一道闸门：压缩包自称的大小超过上限。
+        let mut reader = ProbeReader::new(b"");
+        let result = read_zip_entry_bounded(
+            &mut reader,
+            MAX_SAVE_PACKAGE_ENTRY_BYTES + 1,
+            None,
+            MAX_SAVE_PACKAGE_ENTRY_BYTES,
+            "slot1.sav",
+        );
+        let error = result.expect_err("超过硬上限时必须拒绝");
+        assert!(error.contains("过大"), "实际错误：{error}");
+        assert_eq!(reader.read_calls, 0, "拒绝必须发生在读取之前");
+    }
+
+    #[test]
+    fn bounded_read_stops_at_declared_size_when_the_header_lies() {
+        // 头部声明 4 字节，实际解压流有 6 字节 —— `take` 截断，长度校验随即失败，
+        // 而不是把 6 字节全读进内存。
+        let mut reader = ProbeReader::new(b"abcdef");
+        let result = read_zip_entry_bounded(&mut reader, 4, Some(4), 1024, "slot1.sav");
+        let error = result.expect_err("实际长度超出声明时必须拒绝");
+        assert!(error.contains("实际大小与声明不一致"), "实际错误：{error}");
+        // 关键：不是「读完再发现超了」，而是读取量本身被钉在声明值上（最多多读 1 字节
+        // 用来判定超出）。少了 `take`，这里会读到 6 字节。
+        assert!(
+            reader.position <= 5,
+            "读取量必须被截断在声明大小附近，实际读了 {} 字节",
+            reader.position
+        );
+    }
+
+    #[test]
+    fn bounded_read_returns_exact_bytes_when_sizes_agree() {
+        let mut reader = ProbeReader::new(b"abcdef");
+        let bytes = read_zip_entry_bounded(&mut reader, 6, Some(6), 1024, "slot1.sav")
+            .expect("应当读取成功");
+        assert_eq!(bytes, b"abcdef");
+    }
+
+    #[test]
+    fn bounded_read_without_a_manifest_size_only_applies_the_cap() {
+        // meta.json 没有清单可对，只受上限约束。
+        let mut reader = ProbeReader::new(b"{}");
+        let bytes = read_zip_entry_bounded(
+            &mut reader,
+            2,
+            None,
+            MAX_SAVE_PACKAGE_META_BYTES,
+            "meta.json",
+        )
+        .expect("应当读取成功");
+        assert_eq!(bytes, b"{}");
     }
 }

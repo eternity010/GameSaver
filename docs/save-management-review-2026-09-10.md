@@ -24,7 +24,7 @@
 | V3 | 中 ✅ 已修复 | 打包上传的兜底读取不校验内容哈希，却能上传成功 —— 产出一份「看着在、永远还原不了」的云端备份 | `cloud_save_service.rs:130-136` |
 | V4 | 中 ✅ 已修复 | 打包时只按 `root_type` 选存档范围，忽略 `root_path`，多范围同类型时会读错目录 | `cloud_save_service.rs:736-746` |
 | V5 | 中 ✅ 已修复 | 改保留数时未重算 `latest_save_version_id`，指针悬垂后每次退出都会无条件新建版本 | 4 处，见正文 |
-| V6 | 中 | 解压前不校验大小（代码审查报告 P2-2 在存档侧的主路径确认） | `cloud_save_service.rs:317-323` |
+| V6 | 中 ✅ 已修复 | 解压前不校验大小（代码审查报告 P2-2 在存档侧的主路径确认） | `cloud_save_service.rs` `read_zip_entry_bounded` |
 | V7 | 低 ✅ 已修复 | 恢复过程在用户存档目录内留下的 `.gamesaver-restore-*` / `.gamesaver-rollback-*` 无启动清理，且会被下一次提交当成存档收进版本 | `save_repository.rs` `sweep_restore_artifacts` + `lib.rs` 启动钩子 |
 | V8 | 低 | 版本排序按 `created_at` **字符串**比较，改用 ISO 时间后保留策略会删错版本 | 5 处 |
 | V9 | 低 | `wildcard_matches` 不支持中间通配符且静默失效 | `save_repository.rs:1017-1030` |
@@ -33,7 +33,7 @@
 高置信度：V1 / V2 / V3 / V4 / V6 / V9（纯静态可判）。
 V5 / V7 / V8 / V10 涉及运行时序列，触发条件已在各条正文写明。
 
-**修复进度：V1、V2、V3、V4、V5、V7 已修复（2026-09-10）；剩 V6 / V8 / V9 / V10。**
+**修复进度：V1、V2、V3、V4、V5、V6、V7 已修复（2026-09-10）；剩 V8 / V9 / V10。**
 
 ---
 
@@ -280,7 +280,7 @@ game.latest_save_version_id = latest;
 
 **变异验证**：① 去掉「仍能解析则保留」的早返回（退化成无条件改写）→ 只有 `repair_keeps_a_pointer_that_still_resolves_even_when_it_is_not_the_newest` 失败；② 把 `prune_game_save_versions` 里的修复改成「仅当未剪枝时执行」→ 只有 `prune_repairs_a_latest_pointer_it_orphans` 失败。**两处各只打掉对应那一条，其余全绿**，还原后已复跑确认干净。
 
-### V6 解压前不校验大小（P2-2 在存档主路径上的确认） —— 中
+### V6 解压前不校验大小（P2-2 在存档主路径上的确认） —— 中 ✅ 已修复（2026-09-10）
 
 已登记在 `docs/code-review-2026-09-10.md` 的 P2-2，这里确认它落在**存档导入的主路径**上，而不只是理论边界。
 
@@ -296,6 +296,16 @@ if data.len() as u64 != *expected_size || hash != *expected_hash {   // :321  �
 ```
 
 `expected_entries` 在循环之前就已构建完成（`:297`），`relative → (hash, size)` 里带着期望大小；zip 条目头部本身也带 `item.size()`。**读取之前就能拦截**，不必先分配内存。
+
+**修复记录（2026-09-10）**：抽出 `read_zip_entry_bounded(item, declared_size, expected_size, max_size, label)`，读取前先比大小、读取量再用 `Read::take` 钉死。三处要点：
+
+- **两道与读取量有关的闸门，缺一不可。** ①`declared_size`（zip 头部）与 `expected_size`（版本清单）不一致就拒绝 —— 拦经典解压炸弹，**一个字节都不读**；②`declared_size > max_size` 是**与清单无关**的硬上限，因为 `declared_size` 本身也来自压缩包。③实际读取用 `take(declared_size + 1)`：即便头部谎报，读取量也不会超过声明值（多读的那 1 字节专门用来判定「超出」，随即报错），而不是「读完再发现超了」。
+- **为什么还需要与清单无关的硬上限**：`expected_size` 来自压缩包内的 `meta.json`。而远端清单在「由网盘文件列表重建」这条路径上 `package_sha256` 是 `None`（`cloud_save_service.rs:450`），此时第 265 行的哈希校验被跳过、`meta.json` **没有可信锚点** —— 只有硬上限能挡住伪造的巨物。上限取 1 GiB（正常收集侧默认 `max_file_bytes = 10 MiB`，两者相差百倍），`meta.json` 单独取 32 MiB。
+- **同一个缺陷也修在 `meta.json` 上**：它原本同样是裸 `read_to_end`，而它自己的大小同样由压缩包声明。
+
+回归测试 5 条（`cloud_save_service.rs`）：大小不一致拒绝且 `read_calls == 0`（证明校验发生在读取之前）、超硬上限拒绝且 `read_calls == 0`、**头部谎报时读取量被截断**（断言实际读取位置 ≤ 声明值 + 1）、正常读取返回精确字节、`meta.json` 路径只受上限约束。
+
+**变异验证（三次，失败集合互不重叠）**：① 撤掉「与清单比对大小」→ 恰好第一条失败；② 撤掉硬上限 → 恰好第二条失败；③ 撤掉 `take` → 恰好「头部谎报」那条失败，且报错正是「读取量必须被截断在声明大小附近，实际读了 6 字节」（首次写测试时只断言了错误类型，变异验证证明那样**拦不住**第 ③ 条，遂补上读取量断言）。
 
 ### V7 恢复产物残留在用户存档目录里，且会被下一次提交当成存档收进版本 —— 低 ✅ 已修复（2026-09-10）
 
@@ -424,7 +434,8 @@ let touched = group.protected_paths.union(&target_paths).cloned().collect();   /
 | 3 | **V5** 剪枝后重算 `latest_save_version_id` | ✅ 已完成（2026-09-10）：做成 `AppStore` 的数据不变量并嵌在唯一的剪枝入口上，顺带覆盖 `delete_versions_task` 与载入时的 `normalize` |
 | 4 | **V2** 墓碑条目跳过 root/scope 前置校验 | ✅ 已完成（2026-09-10）：影响「恢复到底能不能用」，且报错信息误导用户；保留墓碑「让该范围参与清理」的职责，避免「恢复到空」被挡掉 |
 | 5 | **V7** 残留产物排除 + 启动兜底 | ✅ 已完成（2026-09-10）：两道防线 —— 收集侧切断「污染→上传云端」的链条，启动清扫按盘上痕迹「先归位、再清理」。实做时修正了报告原方案的两处：排除**不挂** `is_excluded`（会让历史污染版本不可恢复），清扫**不能**写成「发现残留就删」（备份阶段崩溃时 rollback 里是用户自己的存档） |
-| 6 | V6 / V8 / V9 / V10 | V6 随代码审查报告 P2-2 一并处理；其余为整洁性与文案 |
+| 6 | **V6** 解压前拦大小 | ✅ 已完成（2026-09-10）：`read_zip_entry_bounded` 把「校验」挪到「读取」之前，并用 `take` 钉死读取量；顺带修掉 `meta.json` 上的同一缺陷 |
+| 7 | V8 / V9 / V10 | 整洁性与文案：`created_at` 排序鲁棒性、`wildcard_matches` 静默失效、恢复删除不告知 |
 
 ---
 
