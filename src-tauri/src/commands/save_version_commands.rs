@@ -46,15 +46,28 @@ pub fn restore_save_version(
         let state = app_handle.state::<AppState>();
         release_maintenance(&state, &game_uid);
         match result {
-            Ok(summary) => TaskService::finish(
-                &state,
-                &task_id_for_thread,
-                TaskStatus::Success,
-                100,
-                "保存版本恢复完成",
-                Some(summary),
-                None,
-            ),
+            Ok(summary) => {
+                // 移除了当前存在、但该版本里没有的存档文件时，在终态文案里说出来；
+                // 数量为 0 就不加这句，免得每条恢复任务都拖着「移除了 0 个文件」。
+                let removed = summary
+                    .get("removedFileCount")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                let message = if removed == 0 {
+                    "保存版本恢复完成".to_string()
+                } else {
+                    format!("保存版本恢复完成，移除了 {removed} 个该版本不包含的存档文件")
+                };
+                TaskService::finish(
+                    &state,
+                    &task_id_for_thread,
+                    TaskStatus::Success,
+                    100,
+                    &message,
+                    Some(summary),
+                    None,
+                )
+            }
             Err(error) => TaskService::finish(
                 &state,
                 &task_id_for_thread,
@@ -290,6 +303,10 @@ fn restore_version_task(
             None,
         );
     })?;
+    // 恢复会把「当前存在、但目标版本里没有」的受保护文件移除掉（见 `RestoreReceipt`）。
+    // 在 receipt 被 move 进闭包之前先把数量取出来，交给任务摘要与终态文案 —— 别让它静默
+    // 发生（存档管理审查 V10）。
+    let removed_file_count = receipt.removed_paths().len();
     state.with_store_mut(|candidate| {
         let Some(game_record) = candidate
             .games
@@ -313,7 +330,11 @@ fn restore_version_task(
         SaveRepository::finalize_restore(receipt);
         Ok(())
     })?;
-    Ok(serde_json::json!({ "versionId": version.version_id, "createdAt": version.created_at }))
+    Ok(serde_json::json!({
+        "versionId": version.version_id,
+        "createdAt": version.created_at,
+        "removedFileCount": removed_file_count,
+    }))
 }
 
 fn delete_versions_task(

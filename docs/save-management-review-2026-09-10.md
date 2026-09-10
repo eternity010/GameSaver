@@ -28,12 +28,12 @@
 | V7 | 低 ✅ 已修复 | 恢复过程在用户存档目录内留下的 `.gamesaver-restore-*` / `.gamesaver-rollback-*` 无启动清理，且会被下一次提交当成存档收进版本 | `save_repository.rs` `sweep_restore_artifacts` + `lib.rs` 启动钩子 |
 | V8 | 低 ✅ 已修复 | 版本排序按 `created_at` **字符串**比较，改用 ISO 时间后保留策略会删错版本 | `domain/timestamp.rs` `compare_created_at` |
 | V9 | 低 ✅ 已修复 | `wildcard_matches` 不支持中间通配符且静默失效 | `save_repository.rs` `wildcard_matches` |
-| V10 | 低 | 恢复会删除「当前存在但不属于目标版本」的受保护文件，确认文案未告知 | `save_repository.rs:448-508` |
+| V10 | 低 ✅ 已修复 | 恢复会删除「当前存在但不属于目标版本」的受保护文件，确认文案未告知 | `RestoreReceipt::removed_paths` + `GameDetailPage.vue` 确认文案 |
 
 高置信度：V1 / V2 / V3 / V4 / V6 / V9（纯静态可判）。
 V5 / V7 / V8 / V10 涉及运行时序列，触发条件已在各条正文写明。
 
-**修复进度：V1、V2、V3、V4、V5、V6、V7、V8、V9 已修复（2026-09-10）；剩 V10。**
+**修复进度：V1-V10 全部已修复（2026-09-10）。**
 
 ---
 
@@ -401,7 +401,7 @@ value == pattern
 
 **变异验证**：把 `wildcard_matches` 还原成旧的「只认首尾 `*`」实现 → **恰好**新增那条失败（首个断言 `wildcard_matches("slot1.sav", "slot*.sav")` 落空），而原有的 `wildcard_patterns_match_common_exclusions` 仍然通过 —— 说明新测试守的正是「中间通配」这个增量，没有顺带把旧行为一起钉死。
 
-### V10 恢复会删除「当前存在但不属于目标版本」的受保护文件 —— 低
+### V10 恢复会删除「当前存在但不属于目标版本」的受保护文件 —— 低 ✅ 已修复（2026-09-10）
 
 `restore_group`（`save_repository.rs:448-508`）：
 
@@ -419,6 +419,17 @@ let touched = group.protected_paths.union(&target_paths).cloned().collect();   /
 用户的真实场景：游戏有 3 个存档槽，恢复到只有 2 个槽的版本 → 第 3 个槽被静默删除。虽然它在 rollback 目录里存在过，但 `finalize_restore` 会把它一并删掉。
 
 **修法**：确认文案里讲清楚该版本包含哪些存档、会移除哪些当前文件；或在任务摘要里报告删除数量。
+
+**修复记录（2026-09-10）**：语义不动（「回到快照」是对的），把**说明**补上。两条建议都做了：
+
+- **回执带上被移除的文件**：`RestoreReceipt` 新增 `removed_paths`，取「被搬进回滚目录、却没有被装回去」的差集（`backed_up_paths − installed_paths`）—— 这正是 `finalize_restore` 会真正删掉的那批。为避免「抽了叶子函数却守不住调用点」，计算抽成纯函数 `removed_relative_paths(&[RestoreUndo])` 单独测（`restore` 依赖 `AppHandle`，单测进不去），并断言排序结果。
+- **任务摘要与终态文案报数量**：`restore_version_task` 的摘要加 `removedFileCount`，`restore_save_version` 的成功文案由固定串改为「移除了 N 个该版本不包含的存档文件」；N 为 0 时保持原文案，免得每条恢复任务都拖着「移除了 0 个文件」。
+- **确认文案改成先讲清后果**：手动恢复与云端还原两处 `window.confirm`（`GameDetailPage.vue` 的 `restoreVersion` / `restoreCloudSave`）都补上「恢复/还原后存档目录会回到该版本的状态：当前存在、但该版本里没有的存档文件会被移除」，时间线脚注同步改写。**这一条比事后报数量更重要** —— 破坏性动作应在用户点下去之前就说清楚，而不是做完再报告。
+- **安全网照旧**：三个恢复调用点都在 `restore()` 之前先 `commit()` 保护当前存档，所以被移除的文件仍能从「恢复前自动保护」的那一版里找回来。
+
+**变异验证**：把差集方向反过来（`installed − backed_up`）→ 恰好 `removed_paths_are_the_backed_up_ones_that_never_came_back` 失败，实际把目标版本里的 `Config/settings.ini` 误报成被移除。方向搞反比不说更糟，这条测试就是防止它。
+
+**未覆盖**：云端还原走 `sync_cloud_save` 任务（`restore_save_worker` → `finish_sync` 用固定成功文案），没有把 `removedFileCount` 透传进去 —— 那需要改动 `finish_sync` 的签名；它的确认文案已经说明后果，回执里的清单也随时可再接上。另 `restore` 作为整体仍无端到端单测（依赖 `AppHandle`），本次只覆盖到抽出的纯函数与文案。
 
 ### 其它整洁性问题
 
@@ -454,7 +465,9 @@ let touched = group.protected_paths.union(&target_paths).cloned().collect();   /
 | 6 | **V6** 解压前拦大小 | ✅ 已完成（2026-09-10）：`read_zip_entry_bounded` 把「校验」挪到「读取」之前，并用 `take` 钉死读取量；顺带修掉 `meta.json` 上的同一缺陷 |
 | 7 | **V8** `created_at` 比较收口 | ✅ 已完成（2026-09-10）：`domain/timestamp.rs` 的 `compare_created_at` 替代 11 处字符串比较；两条**调用点级**回归测试守着「按时间而非按文本」 |
 | 8 | **V9** 通配匹配 | ✅ 已完成（2026-09-10）：`*` / `?` 全面支持，双指针 + 单回退点实现；不再静默失效 |
-| 9 | V10 | 恢复会删除「当前存在但不属于目标版本」的文件，确认文案与任务摘要都没告知 |
+| 9 | **V10** 恢复删除的告知 | ✅ 已完成（2026-09-10）：回执暴露被移除清单 + 任务摘要与终态文案报数量 + 确认文案改成先讲清后果 |
+
+V1-V10 至此全部处理完毕。剩余可选项（非本次审查范围）：`now_iso` 的 9 份拷贝、`read_file_from_scope` 未经 `safe_join` 拼路径等已登记在 `docs/code-review-2026-09-10.md` 的 P3。
 
 ---
 

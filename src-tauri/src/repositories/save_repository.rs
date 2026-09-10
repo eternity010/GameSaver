@@ -176,7 +176,11 @@ impl SaveRepository {
             }
         }
         on_progress(100, "存档版本恢复完成");
-        Ok(RestoreReceipt { undo_groups })
+        let removed_paths = removed_relative_paths(&undo_groups);
+        Ok(RestoreReceipt {
+            undo_groups,
+            removed_paths,
+        })
     }
 
     pub fn finalize_restore(receipt: RestoreReceipt) {
@@ -470,6 +474,34 @@ struct RestoreUndo {
 
 pub struct RestoreReceipt {
     undo_groups: Vec<RestoreUndo>,
+    removed_paths: Vec<String>,
+}
+
+impl RestoreReceipt {
+    /// 本次恢复中「当前存在、但不属于目标版本」而被移除的受保护文件（相对路径，已排序）。
+    ///
+    /// 只有在 `finalize_restore` 之后才成立：走 `rollback_restore` 时这些文件会被放回原处。
+    pub fn removed_paths(&self) -> &[String] {
+        &self.removed_paths
+    }
+}
+
+/// 从各范围的回滚记录里算出「被移除的文件」：**被搬进回滚目录、但没有被装回去**的那些。
+///
+/// 恢复是让受保护范围精确回到该版本的状态，而不是与当前内容合并，所以当前存在、目标版本
+/// 里却没有的受保护文件会被备份后丢弃。语义是对的，但用户必须能知道 —— `restore` 本身
+/// 依赖 `AppHandle`、单测进不去，所以把这段判定抽出来单独测（存档管理审查 V10）。
+fn removed_relative_paths(undo_groups: &[RestoreUndo]) -> Vec<String> {
+    let mut removed: Vec<String> = undo_groups
+        .iter()
+        .flat_map(|undo| {
+            undo.backed_up_paths
+                .difference(&undo.installed_paths)
+                .cloned()
+        })
+        .collect();
+    removed.sort();
+    removed
 }
 
 fn build_restore_groups(
@@ -1605,8 +1637,8 @@ fn now_iso() -> String {
 mod tests {
     use super::{
         build_restore_groups, entry_belongs_to_profile, find_scope_for_entry, find_scope_for_read,
-        is_excluded, is_restore_artifact_name, path_is_restore_artifact, same_entries,
-        sweep_restore_artifacts, wildcard_matches, SaveRepository,
+        is_excluded, is_restore_artifact_name, path_is_restore_artifact, removed_relative_paths,
+        same_entries, sweep_restore_artifacts, wildcard_matches, RestoreUndo, SaveRepository,
     };
     use crate::domain::{
         AppStore, Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope, SaveVersion,
@@ -2579,6 +2611,55 @@ mod tests {
         );
         assert!(fake.is_dir(), "后缀不是十六进制的目录不得被删");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn undo_with(backed_up: &[&str], installed: &[&str]) -> RestoreUndo {
+        RestoreUndo {
+            root: std::path::PathBuf::from("C:/saves/game"),
+            staging: std::path::PathBuf::from(".gamesaver-restore-test"),
+            rollback: std::path::PathBuf::from(".gamesaver-rollback-test"),
+            backed_up_paths: backed_up.iter().map(|value| value.to_string()).collect(),
+            installed_paths: installed.iter().map(|value| value.to_string()).collect(),
+        }
+    }
+
+    /// V10 回归：恢复会删掉「当前存在、但目标版本里没有」的受保护文件，这个清单必须算对。
+    ///
+    /// 取的是「被搬进回滚目录、却没有被装回去」的差集。方向搞反（用 installed 减 backed_up）
+    /// 就会把目标版本里的文件误报成被移除，反而比不说更糟。
+    #[test]
+    fn removed_paths_are_the_backed_up_ones_that_never_came_back() {
+        let removed = removed_relative_paths(&[
+            // slot1 是目标版本里的（备份后又装回），slot3 只在当前存在 → slot3 被移除。
+            undo_with(
+                &["SaveData/slot1.sav", "SaveData/slot3.sav"],
+                &["SaveData/slot1.sav"],
+            ),
+            // 目标版本里有、但当前不存在的文件（没被备份）不算移除。
+            undo_with(&[], &["Config/settings.ini"]),
+            // 跨范围的结果应当排好序，方便展示与断言。
+            undo_with(&["SaveData/b.sav"], &[]),
+            undo_with(&["SaveData/a.sav"], &[]),
+        ]);
+
+        assert_eq!(
+            removed,
+            vec![
+                "SaveData/a.sav".to_string(),
+                "SaveData/b.sav".to_string(),
+                "SaveData/slot3.sav".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn removed_paths_is_empty_when_nothing_disappears() {
+        assert!(removed_relative_paths(&[]).is_empty());
+        assert!(removed_relative_paths(&[undo_with(
+            &["SaveData/slot1.sav"],
+            &["SaveData/slot1.sav"]
+        )])
+        .is_empty());
     }
 
     /// V7 回归：修复前已经收进了产物的历史版本，恢复时跳过那些条目 —— 既不回写垃圾，也不

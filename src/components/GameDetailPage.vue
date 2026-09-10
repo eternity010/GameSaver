@@ -331,7 +331,12 @@ async function openCloudSaveDrawer() {
 
 async function restoreCloudSave(cloudVersion: CloudSaveManifestVersion) {
   if (busy.value || runtime.value) return;
-  if (!window.confirm(`从百度网盘还原 ${formatDate(cloudVersion.createdAt)} 的存档。\n还原前会先保护当前本地存档，确定继续吗？`)) return;
+  if (
+    !window.confirm(
+      `从百度网盘还原 ${formatDate(cloudVersion.createdAt)} 的存档。\n还原后存档目录会回到该云端版本的状态：当前存在、但该版本里没有的存档文件会被移除。\n还原前会先保护当前本地存档，确定继续吗？`
+    )
+  )
+    return;
   busy.value = true;
   error.value = "";
   message.value = "正在从云端还原存档";
@@ -572,7 +577,12 @@ function handleTaskChanged(payload: { taskId?: string; gameUid?: string } | unde
 
 async function restoreVersion(version: SaveVersion) {
   if (busy.value || runtime.value) return;
-  if (!window.confirm("恢复前会先保护当前存档，确定恢复这个版本吗？")) return;
+  if (
+    !window.confirm(
+      "恢复后存档目录会回到该版本的状态：当前存在、但该版本里没有的存档文件会被移除。\n恢复前会先保护当前存档，确定恢复这个版本吗？"
+    )
+  )
+    return;
   busy.value = true;
   error.value = "";
   message.value = "准备恢复保存版本";
@@ -1282,7 +1292,7 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <p class="timeline-caption">游戏退出后自动提交，恢复前会先保护当前存档</p>
+        <p class="timeline-caption">游戏退出后自动提交；恢复前会先保护当前存档，恢复后不属于该版本的存档文件会被移除</p>
         <div v-if="loading && !precheck" class="timeline-empty">
           <span class="loader"></span>
           <p>正在载入保存历史...</p>
