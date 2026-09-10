@@ -16,6 +16,9 @@ pub const SPACE_HEADROOM_BYTES: u64 = 128 * 1024 * 1024;
 ///
 /// `target` 可以尚不存在 —— 会先向上找到最近的存在祖先（打包缓存目录就是这么用的：预检发生在
 /// 目录创建之前）。无法确认时返回 `Err`，调用方**不要**把它当成 0 或当成"空间充足"。
+///
+/// 唯一的例外是非 Windows：本项目只支持 Windows，那里直接返回 `u64::MAX`（等于不预检），
+/// 以沿用各调用点原来「不因无法探测而阻断操作」的行为。
 pub fn available_space(target: &Path) -> Result<u64, String> {
     #[cfg(target_os = "windows")]
     {
