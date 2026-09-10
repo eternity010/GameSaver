@@ -1,0 +1,407 @@
+# 存档管理专项审查（2026-09-10）
+
+审查对象：存档管理链路 —— 本地 CAS 存档版本、保留策略、恢复/回滚、以及存档的云端打包上传与下载导入。
+
+范围文件：
+
+| 文件 | 行数 | 角色 |
+| --- | --- | --- |
+| `repositories/save_repository.rs` | 1559 | 本地 CAS 主库：提交、恢复、回收 |
+| `services/cloud_save_service.rs` | 916 | 存档打包、上传、下载导入、恢复 |
+| `commands/save_version_commands.rs` | 524 | 恢复 / 删除 / 清理的对外命令 |
+| `commands/save_commands.rs` | 918 | 存档范围与保留数配置 |
+| `services/launch_service.rs` | — | 游戏退出后提交版本（最常走的路径） |
+| `components/GameDetailPage.vue` | — | 保存版本时间线 + 云端存档抽屉 |
+
+---
+
+## 0. 结论摘要
+
+| 编号 | 严重度 | 一句话 | 位置 |
+| --- | --- | --- | --- |
+| V1 | **高** ✅ 已修复 | 存档对象回收（GC）发生在持久化**之前**，写盘失败会让磁盘上的版本指向已被删除的对象，变成静默不可恢复 | 3 处，见正文 |
+| V2 | 中 | 恢复的前置校验把「已删除文件」的墓碑条目当成活条目，墓碑引用的目录一失效就整场恢复失败 | `save_repository.rs:379-391` |
+| V3 | 中 ✅ 已修复 | 打包上传的兜底读取不校验内容哈希，却能上传成功 —— 产出一份「看着在、永远还原不了」的云端备份 | `cloud_save_service.rs:130-136` |
+| V4 | 中 ✅ 已修复 | 打包时只按 `root_type` 选存档范围，忽略 `root_path`，多范围同类型时会读错目录 | `cloud_save_service.rs:736-746` |
+| V5 | 中 | 改保留数时未重算 `latest_save_version_id`，指针悬垂后每次退出都会无条件新建版本 | `save_commands.rs:714-735` |
+| V6 | 中 | 解压前不校验大小（代码审查报告 P2-2 在存档侧的主路径确认） | `cloud_save_service.rs:317-323` |
+| V7 | 低 | 恢复过程在用户存档目录内留下的 `.gamesaver-restore-*` / `.gamesaver-rollback-*` 无启动清理，且会被下一次提交当成存档收进版本 | `save_repository.rs:446-447` |
+| V8 | 低 | 版本排序按 `created_at` **字符串**比较，改用 ISO 时间后保留策略会删错版本 | 5 处 |
+| V9 | 低 | `wildcard_matches` 不支持中间通配符且静默失效 | `save_repository.rs:1017-1030` |
+| V10 | 低 | 恢复会删除「当前存在但不属于目标版本」的受保护文件，确认文案未告知 | `save_repository.rs:448-508` |
+
+高置信度：V1 / V2 / V3 / V4 / V6 / V9（纯静态可判）。
+V5 / V7 / V8 / V10 涉及运行时序列，触发条件已在各条正文写明。
+
+---
+
+## 1. 高优先级
+
+### V1 存档对象回收发生在持久化之前，写盘失败即产生「不可恢复的版本」—— 高 ✅ 已修复（2026-09-10）
+
+**相同的形状出现在三处**，其中第一处是每次游戏退出都会走的主路径：
+
+| 位置 | 剪枝 | 回收 | 持久化 |
+| --- | --- | --- | --- |
+| `services/launch_service.rs` | `:410-412` | `:413` | `:426` |
+| `commands/save_commands.rs`（改保留数） | `:731-733` | `:734` | `:737` |
+| `commands/save_version_commands.rs`（恢复前保护） | `:256-258` | `:259` | `:271` |
+
+三处都是同一个模式：
+
+```rust
+state.with_store_mut(|candidate| {
+    candidate.save_versions.retain(/* 剪掉超出保留数的旧版本 */);
+    let _ = SaveRepository::collect_garbage(app, &candidate.save_versions); // ← 先删对象
+    ...
+    GameRepository::persist(app, candidate)?;                                // ← 后写盘
+    Ok(())
+})
+```
+
+**为什么是 bug**：
+
+- `AppState::with_store_mut`（`app_state.rs:77-89`）的契约是「闭包返回 `Err` 时不提交，内存态保持原样」，并且有专门的测试 `with_store_mut_discards_the_mutation_on_error` 守着这条契约（`app_state.rs:254-267`）。
+- `GameRepository::persist`（`game_repository.rs:57-78`）走 `atomic_replace`，**失败即返回 `Err`，磁盘上仍是旧内容**。
+- 于是 `persist` 一旦失败：`collect_garbage` 已经按「剪枝后的版本集」把对象文件删了，而磁盘 `store.json` 仍然列着那些被剪掉的版本。
+
+**后果**：重启后这些版本照常出现在「保存版本」列表里，点「恢复」必然失败（`restore_group` 里 `save_repository.rs:464` 的 `sha256_file(&object) != hash` 判定 → 「存档对象校验失败」）。用户看不到任何异常，只是某一天发现几个历史版本"坏了"。
+
+注意触发窗口恰好与剪枝同时发生 —— 也就是**只有真的存在要被回收的版本时，才有东西可丢**。
+
+**同文件已有正确写法可对照**：`delete_versions_task`（`save_version_commands.rs:344-386`）把 `persist` 放在闭包内、**把 GC 放在 `with_store_mut` 返回之后**，用返回值里的版本列表去回收：
+
+```rust
+let versions = state.with_store_mut(|candidate| {
+    candidate.save_versions.retain(...);
+    GameRepository::persist(app, candidate)?;
+    Ok(candidate.save_versions.clone())     // ← 把结果带出来
+})?;
+SaveRepository::collect_garbage(app, &versions)   // ← 落盘成功后才回收
+```
+
+**修法**：把三处统一成 `delete_versions_task` 的形状 —— 从闭包返回剪枝后的 `save_versions`，持久化成功后再调 `collect_garbage`。
+
+**兼带问题**：`collect_garbage` 是「遍历整个 CAS 目录」的全盘扫描，却被放在持有全局 `store` 锁的闭包里执行，**违反 `with_store_mut` 自己的文档约定**（`app_state.rs:75-76`：「也应避免在其中做长耗时的网络请求或多轮全盘扫描，否则会阻塞其他读写者」）。改成上面的形状后，GC 自然移到锁外，这个问题一并消失。
+
+**修复记录（2026-09-10）**
+
+新增 `SaveRepository::prune_game_save_versions(store, game_uid, keep_versions)`（`repositories/save_repository.rs`，紧邻 `collect_garbage`），把三处逐字重复的剪枝逻辑收进一个纯函数：**只改内存、不碰磁盘**，返回 `Some(剪枝后的存活集)` 或 `None`（无版本被删）。三处调用点统一改为「闭包内剪枝 → 持久化 → 闭包返回成功之后再回收」：
+
+| 位置 | 改法 |
+| --- | --- |
+| `services/launch_service.rs`（会话提交主路径） | 闭包返回 `(summary, 剪枝存活集)`；`collect_garbage` 移到 `with_store_mut` 返回之后 |
+| `commands/save_commands.rs`（改保留数） | 剪枝与持久化收进独立作用域，`collect_garbage` 放在作用域之外 |
+| `commands/save_version_commands.rs`（恢复前保护） | 闭包返回剪枝存活集，仅在 `Ok` 分支落盘后才回收 |
+
+顺带修掉两个同源问题：
+
+1. `launch_service` 中「游戏记录不存在」提前 `return Err` 的路径，此前也会先执行 GC 删掉对象，现已不会（对象删除一律发生在落盘成功之后）。
+2. 三处 GC 都不再在持有 `store` 锁期间做 CAS 全盘扫描 —— 交给纯函数后，回收点自然落在锁外。
+
+回归测试：`save_repository.rs` 新增 2 条纯函数测试（剪枝只保留最新 N 条且不动其他游戏；未超限/`keep=0` 时必须返回 `None` 以免触发无谓全盘扫描），`save_commands.rs` 原有剪枝测试改为直接调用真实函数（此前是在测试里重抄一遍排序）。`cargo test --lib` **183 passed / 0 failed**；`cargo fmt` 干净；`cargo clippy` 保持 **lib 30 / lib test 34**，新增代码零告警。
+
+> **覆盖度说明**：单测环境**无法**构造 `AppHandle`（会让测试二进制因 GUI 依赖启动失败），而 `persist` / `collect_garbage` 都依赖它 —— 因此「先持久化、后回收」这个**顺序**本身没有被自动化测试直接覆盖，测试覆盖的是抽出的纯函数契约（存活集正确、无谓调用被抑制）。顺序的正确性由代码结构保证：GC 调用点物理上位于 `with_store_mut` / 守卫块之外。
+
+---
+
+## 2. 中优先级
+
+### V2 恢复被「已删除文件」的墓碑条目阻断 —— 中
+
+`build_restore_groups`（`save_repository.rs:373-438`）对版本里的**每一条** entry 都执行 scope 解析与 root 校验：
+
+```rust
+for entry in &version.files {
+    let relative = validate_relative(&entry.relative_path)?;
+    let scope = find_scope_for_entry(profile, entry, &relative)?;   // :381
+    let root = scope_root(game, scope);
+    if root.exists() && !root.is_dir() { return Err(...); }
+    if !root.exists() && !can_create_missing_restore_root(scope.root_type) {
+        return Err(format!("存档范围不存在，请先创建或重新选择：{}", root.display()));  // :386-391
+    }
+    ...
+    if !entry.deleted { /* 只有非 deleted 才进入恢复列表 */ }        // :409
+}
+```
+
+但 `deleted: true` 的条目只用来表达「这个文件在那个版本里不存在」，它**不需要 root 存在、也不需要 scope 能解析**。当前实现却对它一视同仁。
+
+**触发**：某个 tombstone 引用的自定义目录（`custom` / `managed_game`）后来被删除，或该 scope 被用户从 profile 里移走。此时：
+
+- root 不存在 → 报「存档范围不存在，请先创建或重新选择」；
+- scope 已移除 → `find_scope_for_entry` 报「保存版本中的文件不属于当前存档范围」（`:718-721`）。
+
+两种情况下**整场恢复直接失败**，而报错指向的路径与用户真正想恢复的存档内容毫无关系 —— 用户无从修复，因为那个目录本来就不该存在。
+
+**修法**：`deleted` 条目跳过 root/scope 前置校验，只在「恢复时把该路径删掉」的判定中使用。
+
+**同一家族的问题**：`find_scope_for_entry` 对非删除条目也是硬失败。用户通过「更改存档目录」把范围改窄之后，旧版本里落在范围外的文件会让该版本从此无法恢复 —— 而 UI 上这些版本照常列出、按钮照常可点（`GameDetailPage.vue:1292-1301`），没有任何「此版本不可恢复」的标记。
+
+### V3 打包上传的兜底读取不校验哈希，云端包会自校验失败 —— 中 ✅ 已修复（2026-09-10）
+
+`package_save_version`（`cloud_save_service.rs:96-159`）为每个非删除条目取字节：
+
+```rust
+let bytes = if let Some(hash) = &entry.object_hash {
+    SaveRepository::read_object(app, hash)
+        .or_else(|_| read_file_from_scope(game, profile, entry))?   // :131-133
+} else {
+    read_file_from_scope(game, profile, entry)?                     // :135
+};
+```
+
+`read_object` 自带 SHA-256 校验；而**回退分支 `read_file_from_scope` 读的是磁盘上的活文件，没有校验读到的字节是否等于 `entry.object_hash`**。
+
+同时包内 meta 写的是原样克隆的版本（`:115-121` `version: version.clone()`），也就是**旧的哈希**。而下载侧的校验正是拿 meta 里的哈希去比对数据项：
+
+- `validate_downloaded_save_meta`（`:623-655`）从 `meta.version.files` 构建 `relative → (hash, size)`；
+- `download_and_import_save_version`（`:317-323`）逐项 `sha256_hex(&data) != *expected_hash` 即报错。
+
+**后果**：只要 CAS 对象缺失或损坏过（而磁盘上的存档文件已经变化），上传会**成功**、云端清单会**列出该版本**，但还原时包内数据与声明哈希对不上 → 校验失败。这是一份「看着存在、永远还原不了」的备份 —— 恰恰是备份最不该有的失败形态。
+
+**修法**：回退读取后立即校验 `sha256(bytes) == entry.object_hash`，不一致就直接报错（宁可上传失败，也不要留下一份假备份）；或者承认要按磁盘现状打包，那就同步把 meta 里该条 entry 的 `object_hash` / `size` 改写成实际读到的值。
+
+**修复记录（2026-09-10）** —— 采用前者（宁可失败）：
+
+`package_save_version` 里内联的取值分支抽成 `read_entry_bytes` + `resolve_entry_bytes` + `ensure_bytes_match_hash` 三个函数（`services/cloud_save_service.rs`，紧邻 `read_file_from_scope`）：
+
+```rust
+let Some(hash) = hash else { return read_fallback(); };
+match object {
+    Some(Ok(bytes)) => Ok(bytes),                     // CAS 命中，read_object 已自带校验
+    Some(Err(object_error)) => {
+        let bytes = read_fallback().map_err(...)?;
+        ensure_bytes_match_hash(&bytes, hash, relative_path)?;   // ← V3 的修复点
+        Ok(bytes)
+    }
+    None => read_fallback(),
+}
+```
+
+把「回退必须复算哈希」这条规则落在一个**纯函数**上，是因为对象读取本身依赖 `AppHandle`（单测里构造不出来）。这样测试可以完整驱动「对象缺失 → 回退 → 内容漂移 → 必须报错」这条路径，而不只是测一个孤立的比较函数。错误文案同时带上了期望哈希与实际哈希，便于用户定位是哪个文件漂移。
+
+### V4 打包时只按 `root_type` 选范围，忽略 `root_path` —— 中 ✅ 已修复（2026-09-10）
+
+`read_file_from_scope`（`cloud_save_service.rs:736-750`）：
+
+```rust
+let scope = profile
+    .scopes
+    .iter()
+    .find(|s| s.root_type == entry.root_type)      // ← 只比 root_type，取第一个
+    .ok_or_else(|| format!("未找到匹配的作用域：{:?}", entry.root_type))?;
+let root = crate::repositories::save_repository::scope_root(game, scope);
+let file_path = root.join(&entry.relative_path);
+```
+
+同一个 `root_type` 下存在多个 scope 是**常态**——恢复侧为此专门实现了三级消歧（`find_scope_for_entry`，`save_repository.rs:694-740`：精确物理路径 → `root_type` + 相对路径 → 尾段路径匹配），打包侧却退化成「按 `root_type` 取第一个」。
+
+**后果**：`Documents\StudioA\GameX` 与 `Documents\StudioB\GameY` 两个 scope 都是 `documents` 时，如果条目本属 B 而 A 排在前面，读到的就是 `Documents\StudioA\GameX\<相对路径>` —— 一个不相干的文件。配合 V3 的无校验兜底，这个错文件会被静默打进包并上传。
+
+**修法**：复用 `find_scope_for_entry` 的消歧逻辑（它对 entry 的 `root_path` 已有完整处理），或至少先按 `root_path` 精确匹配、失败再退回 `root_type`。
+
+**修复记录（2026-09-10）**
+
+消歧的核心抽成 `pick_scope_by_root_path(candidates, entry)`（`repositories/save_repository.rs`）：候选唯一时直接返回，多个时**先按 `root_path` 精确匹配、再按路径尾段匹配**，都无法唯一确定就返回 `None`（调用方报错，绝不猜一个）。
+
+- **恢复侧** `find_scope_for_entry` 原来的 tier-3 内联消歧改为调用它 —— 顺带修好一个此前会误报的角落：两个范围尾段同名（如 `…\StudioA\GameX` 与 `…\StudioB\GameX`）而条目 `root_path` 精确指向其一，旧代码只看尾段 → 判为歧义报错；现在先做精确匹配，能正确解析。
+- **打包侧** 新增 `find_scope_for_read(profile, entry)`，`read_file_from_scope` 改用它，不再 `find(|s| s.root_type == entry.root_type)` 取第一个。
+
+`find_scope_for_read` 与恢复侧的 `find_scope_for_entry` **有意不同**：它**不**要求条目仍落在当前启用、未被排除的范围内 —— 用户收窄存档范围或改动存档目录后，旧版本里落在范围外的文件本应仍可读取并上传（它们就来自这台机器）。因此它只按 `root_type` 取候选、再用 `root_path` 消歧；候选唯一时行为与旧代码完全一致（无回归），只有「多个同类型范围且无法消歧」才报错 —— 而这恰好是旧代码会静默读错文件的情形。
+
+**回归测试**：新增 5 条（`save_repository.rs` 3 条 + `cloud_save_service.rs` 2 条）—— 同类型多范围时按 `root_path` 选中正确范围；条目缺 `root_path` 时必须报错而非猜一个；范围收窄后打包侧仍可读、恢复侧仍拒绝（用一对断言把这个**有意的不一致**钉住）；对象缺失时回退内容漂移必须报错；哈希比较忽略大小写。`cargo test --lib` **188 passed / 0 failed**（183 → 188）；`cargo fmt --check` 干净；`cargo clippy` 保持 **lib 30 / lib test 34**，新增代码零告警。
+
+**变异验证**：把两处修复分别改回旧行为后重跑 —— ① 去掉回退前的 `ensure_bytes_match_hash` 调用 → `resolve_entry_bytes_verifies_the_fallback_against_the_recorded_hash` 失败；② 把 `find_scope_for_read` 改回「取第一个候选」→ `find_scope_for_read_picks_the_scope_matching_the_entry_root_path` 与 `…refuses_to_guess_between_same_type_scopes` 精确失败。**恰好这 3 条失败，其余全绿**，说明测试确实钉在修复点上。
+
+> **覆盖度说明**：与 V1 同样的限制 —— 单测无法构造 `AppHandle`，所以 `read_entry_bytes` 里「真的去调 `read_object`／真的去读盘」这一步没有端到端覆盖，覆盖的是它背后可注入的决策函数 `resolve_entry_bytes`；`read_file_from_scope` 的 scope 选择则通过 `find_scope_for_read` 被完全覆盖（纯函数，不依赖 `AppHandle`）。
+
+### V5 改保留数时 `latest_save_version_id` 会悬垂 —— 中
+
+`update_save_profile_keep_versions`（`save_commands.rs:686-740`）剪枝旧版本时**只 retain，不重算** `game.latest_save_version_id`：
+
+```rust
+candidate.save_versions.retain(|v| !(v.game_uid == game_uid && to_remove.contains(&v.version_id)));  // :731-733
+let _ = SaveRepository::collect_garbage(&app, &candidate.save_versions);                              // :734
+GameRepository::persist(&app, &candidate)?;                                                            // :737
+```
+
+对照 `delete_versions_task`（`save_version_commands.rs:353-368`）——那里是**显式重算**的：
+
+```rust
+let latest = candidate.save_versions.iter()
+    .filter(|v| v.game_uid == game_uid)
+    .max_by(|l, r| l.created_at.cmp(&r.created_at).then(l.version_id.cmp(&r.version_id)))
+    .map(|v| v.version_id.clone());
+game.latest_save_version_id = latest;
+```
+
+**具体触发序列**（两步，都走 UI）：
+
+1. 用户在版本时间线里点「恢复」某个**旧**版本 → `latest_save_version_id` 被指向那个旧版本（`save_version_commands.rs:313`；云端还原路径同理会写 `cloud_save_service.rs:384`）。
+   注意剪枝排序用的是 `created_at`，被恢复的旧版本 `created_at` 最小，排在最末。
+2. 用户把「保留」下拉改成 1（`GameDetailPage.vue:1224` → `changeKeepVersions`）→ 剪枝恰好把刚恢复的那个版本删掉，而 `latest_save_version_id` 仍指着它。
+
+**后果**：`load_version_context`（`save_version_commands.rs:427-436`）解析出的 `latest` 为 `None` → `commit(app, game, profile, latest=None, ...)` 失去「与最新版本比对」的能力 → **此后每次游戏退出都会无条件新建一个版本**，即使存档一个字节都没变。这直接违反设计文档的「没有变化时不创建新版本」（`docs/gamesaver-new-architecture.md:317`），并加速版本膨胀与后续回收。
+
+`cloud_save_service.rs:696-713` 的 `protect_current_save_version` 也依赖同一个指针来取 `latest`，同样受影响。
+
+**修法**：把 `delete_versions_task` 里那段重算抽成共用函数，在 `update_save_profile_keep_versions` 剪枝后一并调用。
+
+### V6 解压前不校验大小（P2-2 在存档主路径上的确认） —— 中
+
+已登记在 `docs/code-review-2026-09-10.md` 的 P2-2，这里确认它落在**存档导入的主路径**上，而不只是理论边界。
+
+`download_and_import_save_version`（`cloud_save_service.rs:304-326`）：
+
+```rust
+let mut data = Vec::new();
+item.read_to_end(&mut data).map_err(...)?;      // :317-319  先整项读进内存
+let hash = sha256_hex(&data);
+if data.len() as u64 != *expected_size || hash != *expected_hash {   // :321  后校验大小
+    return Err(...);
+}
+```
+
+`expected_entries` 在循环之前就已构建完成（`:297`），`relative → (hash, size)` 里带着期望大小；zip 条目头部本身也带 `item.size()`。**读取之前就能拦截**，不必先分配内存。
+
+### V7 恢复产物残留在用户存档目录里，且会被下一次提交当成存档收进版本 —— 低
+
+`restore_group` 把两个工作目录建在**用户真实存档根目录内**（`save_repository.rs:445-447`）：
+
+```rust
+let staging  = group.root.join(format!(".gamesaver-restore-{restore_id}"));
+let rollback = group.root.join(format!(".gamesaver-rollback-{restore_id}"));
+```
+
+它们的清理只发生在 `cleanup_restore_artifacts` / `finalize_restore` / `rollback_restore` 三条正常路径上。全项目 grep 确认：**没有任何启动清理**（`.gamesaver-restore-*` / `.gamesaver-rollback-*` 只在上面两行出现）。
+
+**后果**（恢复过程中进程被强杀 / 断电）：
+
+1. `.gamesaver-restore-<id>\` 留在存档目录里，里面是目标版本的完整副本；`.gamesaver-rollback-<id>\` 里是用户恢复前的存档。
+2. 下一次游戏退出时 `collect_profile_files`（`save_repository.rs:859-894`）会 `WalkDir` 扫描 `include_directories`，**把这些残留目录当成正常存档文件**收进新版本。它们不匹配任何 `exclude_patterns`（默认只有 `*.tmp` / `*.log` 等），也不是被排除的目录名。
+3. 于是垃圾进了本地版本、随后被上传到云端；将来恢复该版本时，这些 `.gamesaver-restore-*` 路径会被**重新写回**存档目录，并且每崩一次多一份。
+
+这与项目自身的标准（`store_file` 的 `.tmp-*` / `.bak-*` 崩溃窗口兜底）不一致 —— 存档侧同样存在崩溃窗口，却没有兜底。
+
+**修法**（按优先级）：
+
+1. 最低限度：在 `is_excluded` / 收集阶段拒绝 `.gamesaver-restore-` / `.gamesaver-rollback-` 前缀，保证垃圾不会进版本；
+2. 更完整：启动时扫描各 scope 根目录，发现残留的 rollback 目录则执行一次回滚恢复（这正是「恢复中途崩溃」应有的语义），再清理残留。
+
+---
+
+## 3. 低优先级 / 整洁性
+
+### V8 版本排序按 `created_at` 字符串比较 —— 低
+
+以下 5 处都用字符串比较决定版本新旧（进而决定谁被保留、谁被回收）：
+
+| 位置 | 用途 |
+| --- | --- |
+| `commands/save_commands.rs:720` | 改保留数时选待删版本 |
+| `commands/save_version_commands.rs:245` | 恢复前保护时剪枝 |
+| `commands/save_version_commands.rs:475` | 清理命令选待删版本 |
+| `services/launch_service.rs:399` | 退出提交时剪枝 |
+| `services/cloud_save_service.rs:214` | 云端清单排序 |
+
+目前 `now_iso()`（`save_repository.rs:1142-1147`、`save_commands.rs:858-863` 等多份拷贝）实际返回的是 **10 位 unix 秒字符串**，等长所以字符串比较碰巧等于数值比较。
+
+**但这很脆**：函数名叫 `now_iso`、字段叫 `created_at`、设计文档也按时间语义描述它。一旦有人把它改成真正的 ISO 8601（或带毫秒、或位数变化），字符串比较会与时间顺序脱钩 —— 而这些代码正是用来决定**删除哪个版本**的，删错方向就是「删掉最新的、留下最旧的」。
+
+**修法**：要么明确落成定长数字串并加注释锁死（含跨版本兼容说明），要么解析成 `u64` 再比较。
+
+### V9 `wildcard_matches` 不支持中间通配符，且静默失效 —— 低
+
+`save_repository.rs:1017-1030`：
+
+```rust
+if pattern == "*" { return true; }
+if let Some(suffix) = pattern.strip_prefix("*") { return value.ends_with(suffix); }
+if let Some(prefix) = pattern.strip_suffix("*") { return value.starts_with(prefix); }
+value == pattern
+```
+
+只支持「全匹配 / `*后缀` / `前缀*`」三种形态。`slot*.sav` 这类**中间通配**会直接落到 `value == pattern` 分支 —— 与字面量 `"slot*.sav"` 比较，**永远不匹配**。
+
+默认排除项（`domain/save_profile.rs:51-53`）全是 `*.ext` 形态，所以现状没暴露。但存档规则编辑器允许用户自定义 pattern，用户写下 `slot*.sav` 会以为排除了、实际一个都没排除 —— 而排除项失效的方向对存档保护是「多备份」而非「少备份」，所以不会丢数据，只会让版本比预期大。
+
+**修法**：要么实现完整的通配匹配，要么在保存规则时对不支持的形态给出明确错误，别让它静默失效。
+
+### V10 恢复会删除「当前存在但不属于目标版本」的受保护文件 —— 低
+
+`restore_group`（`save_repository.rs:448-508`）：
+
+```rust
+let touched = group.protected_paths.union(&target_paths).cloned().collect();   // :453-457
+// 1. 把 touched 中所有当前存在的路径 rename 进 rollback 目录                    // :483-495
+// 2. 只把 target_paths 里的条目装回去                                          // :496-508
+// 3. finalize_restore 删掉整个 rollback 目录                                    // :610-613
+```
+
+即：**恢复 = 让受保护范围精确回到该版本的状态**，当前多出来的受保护文件会被删除（而不是保留）。
+
+这个语义本身可以接受 —— 恢复是「回到快照」而不是「合并」。问题在于**它没有被说明**：前端确认文案是「恢复前会先保护当前存档，确定恢复这个版本吗？」（`GameDetailPage.vue:575`），既没提「当前多出的存档文件会被删除」，恢复完成后 `restore` 返回的 `RestoreReceipt` 也没把删除清单暴露到任务摘要里（`save_version_commands.rs:325` 只回 `versionId` 与 `createdAt`）。
+
+用户的真实场景：游戏有 3 个存档槽，恢复到只有 2 个槽的版本 → 第 3 个槽被静默删除。虽然它在 rollback 目录里存在过，但 `finalize_restore` 会把它一并删掉。
+
+**修法**：确认文案里讲清楚该版本包含哪些存档、会移除哪些当前文件；或在任务摘要里报告删除数量。
+
+### 其它整洁性问题
+
+- **`latest_save_version_id` 的设置方式脆弱**：`game_body_commands.rs:958-964` 用 `candidate.save_versions.last().filter(|v| v.game_uid == ...)` 来取「刚刚保护的那个版本」。`save_versions` 是跨游戏的全局数组，`.last()` + uid 过滤拿到的是「该游戏最后被追加的一条」，而不是「最新的那条」。当前因为追加顺序 = 创建顺序所以等价，但它表达的不是作者的意图，改法应是直接用被 push 的那个 `protected.version_id`（该函数里 `protected` 变量就在作用域内，只是被 move 了）。
+- **`now_iso()` 有 4 份拷贝**：`save_repository.rs:1142`、`save_commands.rs:858`、`cloud_save_service.rs:780`、`launch_service.rs`，实现完全一致。这已在代码审查报告 P3「重复实现」中登记，此处只是补充存档侧的相关位置。
+- **`read_file_from_scope` 缺少对 `entry.relative_path` 的越界校验**：直接把 `relative_path` join 到 root 上（`:747`），没有走 `validate_relative` / `safe_join`。目前 `relative_path` 由 `collect_profile_files` 产生（已经过 `strip_prefix(root)` 保证在 root 内），所以现状安全；但它是全项目唯一一处不经 `safe_join` 就拼存档路径的地方，与 `save_repository.rs` 里其他所有写入路径的处理方式不一致，值得统一。
+
+---
+
+## 4. 检查中确认「做对了」的部分
+
+避免只报问题，以下几条经核查是正确的：
+
+- **锁序无环，不存在死锁**。`commit` / `restore` / `collect_garbage` 只持有 `REPOSITORY_LOCK`（GC 另加 `PENDING_OBJECTS`），全程不碰 `store` 锁；而三处 GC 调用点都是「先持 `store` 锁 → 再取 `REPOSITORY_LOCK`」。全项目没有「持 `REPOSITORY_LOCK` 再去取 `store` 锁」的路径，因此不会交叉持锁。V1 的修法（把 GC 移到锁外）也继续保持这个方向。
+- **待提交对象的保护窗口配对完整**。`protect_pending_objects` 只在 `commit` 成功产出版本时登记（`save_repository.rs:120`），四处 `commit` 调用点的 `release_pending_objects` 都逐一核对过：`save_version_commands.rs:274-283`、`launch_service.rs:441-450`、`cloud_save_service.rs:719-733` 都在成功与失败两条路径上释放；`game_body_commands.rs` 的 6 处释放覆盖了取消、写 journal 失败、swap 失败、persist 失败与正常收尾（该函数用原始 store 锁 + `rollback_update` 辅助函数，结构比其它三处复杂，但释放点齐全）。
+- **CAS 写入是幂等且拒绝覆盖的**。`write_object_locked`（`save_repository.rs:286-315`）在目标已存在时比对长度，长度不同直接报错而**不覆盖** —— 同一哈希对应同一内容，这个判断是可靠的；临时文件 + `sync_all` + rename 的写法也正确。
+- **恢复的对象在物化前逐个校验**。`restore_group:462-471` 对每个对象先 `sha256_file(&object) != hash` 再复制，不是「先拷后验」。
+- **恢复失败会整体回滚**。`restore`（`:151-174`）在某一组失败时，对已完成的组逆序 `rollback_group`，并把回滚失败信息追加进错误（`append_rollback_errors`），不会留下「一半新一半旧」的静默状态。
+- **`deleted` 条目的归属判定是必要的**。`entry_belongs_to_profile`（`:983-994`）在提交时用当前 profile 判断旧条目是否还该保留为 tombstone —— 范围外的旧条目被丢弃而不是记成删除，方向正确（否则改窄范围会导致下次提交误删用户文件）。
+- **恢复前先保护当前存档的顺序正确**。本地恢复（`save_version_commands.rs:221-230`）、云端还原（`cloud_save_service.rs:366-371`）、本体更新（`game_body_commands.rs:815-834` 在 swap 之前）三条路径都是「先 commit 当前存档 → 再覆盖」，符合设计文档「不得无提示覆盖本地存档」。
+
+---
+
+## 5. 建议处理顺序
+
+| 顺序 | 事项 | 理由 |
+| --- | --- | --- |
+| 1 | **V1** 三处 GC 移到持久化之后 | ✅ 已完成（2026-09-10）：改动小（照抄 `delete_versions_task` 已有形状），消除「静默不可恢复版本」，顺带解掉锁内全盘扫描 |
+| 2 | **V3 + V4** 打包路径补哈希校验、修 scope 选择 | ✅ 已完成（2026-09-10）：两者叠加才会产生「错内容被静默上传」，是云端备份可信度的地基 |
+| 3 | **V5** 剪枝后重算 `latest_save_version_id` | 抽出共用函数即可；不修会让版本库持续无意义膨胀 |
+| 4 | **V2** 墓碑条目跳过 root/scope 前置校验 | 影响「恢复到底能不能用」，且报错信息误导用户 |
+| 5 | **V7** 残留产物排除 + 启动兜底 | 需要设计崩溃恢复语义，工作量最大，但存档目录被污染会一路传到云端 |
+| 6 | V6 / V8 / V9 / V10 | V6 随代码审查报告 P2-2 一并处理；其余为整洁性与文案 |
+
+---
+
+## 附：本次审查使用的验证手段
+
+```bash
+# 提交 / 回收 / 释放三者的全部调用点（用于核对配对与写序）
+grep -rn "SaveRepository::commit" src-tauri/src
+grep -rn "release_pending_objects" src-tauri/src
+grep -rn "collect_garbage" src-tauri/src
+
+# latest_save_version_id 的全部读写点（用于找悬垂引用）
+grep -rn "latest_save_version_id" src-tauri/src
+
+# 确认恢复产物没有启动清理（仅两处出现，均为构造处）
+grep -rn "gamesaver-restore\|gamesaver-rollback" src-tauri/src
+
+# 确认默认排除项形态（全部为 *.ext，未暴露 V9 的中间通配问题）
+grep -rn "DEFAULT_EXCLUDE_PATTERNS" -A 3 src-tauri/src/domain/save_profile.rs
+
+# 确认 with_store_mut 的失败语义与持久化的原子性
+#   app_state.rs:77-89 + 测试 with_store_mut_discards_the_mutation_on_error
+#   game_repository.rs:57-78（atomic_replace）
+```
+
+> 说明：本报告基于静态代码阅读 + 上述实际执行的验证命令。所有行号来自当前工作区（含未提交改动）的文件快照。V5 / V7 / V8 / V10 涉及运行时序列，判断依据已在正文逐条写明触发条件；V1 / V2 / V3 / V4 / V6 / V9 为纯静态可判。

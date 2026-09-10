@@ -3,3 +3,6 @@ dist/
 .vite/
 src-tauri/target/
 *.log
+
+# 本地工作记忆（每日工作日志 / 项目长期笔记），会持续变动，不入库
+.workbuddy/
