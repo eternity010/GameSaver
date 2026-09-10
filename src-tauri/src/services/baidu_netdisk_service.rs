@@ -154,9 +154,22 @@ struct OAuthTokenResponse {
     error_description: Option<String>,
 }
 
+/// 在 access token 失效时重新走 OAuth 刷新所需的凭据。
+///
+/// 故意不实现 `Debug`，避免 AppKey/SecretKey 被格式化进日志或错误信息。
+#[derive(Clone)]
+struct RefreshContext {
+    token_path: PathBuf,
+    app_key: String,
+    secret_key: String,
+}
+
 pub struct BaiduNetdiskClient {
     client: Client,
-    token: BaiduToken,
+    /// access token 可在运行期刷新，因此用 `Mutex` 包裹以支持 `&self` 访问。
+    token: Mutex<BaiduToken>,
+    app_data_dir: PathBuf,
+    refresh_context: Option<RefreshContext>,
 }
 
 impl BaiduNetdiskClient {
@@ -169,42 +182,28 @@ impl BaiduNetdiskClient {
         app_key: Option<&str>,
         secret_key: Option<&str>,
     ) -> Result<Self, String> {
-        let (mut token_path, token) = read_token(app_data_dir)?;
-        let mut client = Self::new(token)?;
-        if !token_needs_refresh(client.token.expires_at) {
-            return Ok(client);
-        }
-
-        let has_credentials = app_key.is_some_and(|value| !value.trim().is_empty())
-            && secret_key.is_some_and(|value| !value.trim().is_empty());
-        if !has_credentials {
-            if client
-                .token
-                .expires_at
-                .is_some_and(|expires_at| expires_at <= now_millis())
+        let (token_path, token) = read_token(app_data_dir)?;
+        let refresh_context = match (app_key, secret_key) {
+            (Some(app_key), Some(secret_key))
+                if !app_key.trim().is_empty() && !secret_key.trim().is_empty() =>
             {
-                return Err(
-                    "百度网盘授权已过期，请先配置 AppKey 和 SecretKey 后重新授权".to_string(),
-                );
+                Some(RefreshContext {
+                    token_path,
+                    app_key: app_key.to_string(),
+                    secret_key: secret_key.to_string(),
+                })
             }
+            _ => None,
+        };
+        let client = Self::from_parts(token, app_data_dir.to_path_buf(), refresh_context)?;
+        if !client.token_is_stale() || client.refresh_token(false)? {
             return Ok(client);
         }
-
-        let lock = TOKEN_REFRESH_LOCK.get_or_init(|| Mutex::new(()));
-        let _guard = lock
-            .lock()
-            .map_err(|_| "百度网盘 Token 刷新锁不可用".to_string())?;
-        let (latest_path, latest_token) = read_token(app_data_dir)?;
-        if !token_needs_refresh(latest_token.expires_at) {
-            return Self::new(latest_token);
+        // 没有刷新凭据，且磁盘上也没有更新的授权：只有在已完全过期时才报错，
+        // 距离过期尚有时间时保持原来的「可用」判断。
+        if client.access_token_expired() {
+            return Err("百度网盘授权已过期，请先配置 AppKey 和 SecretKey 后重新授权".to_string());
         }
-        token_path.clone_from(&latest_path);
-        client = Self::new(latest_token)?;
-        client.refresh_access_token(
-            &token_path,
-            app_key.expect("credentials checked above"),
-            secret_key.expect("credentials checked above"),
-        )?;
         Ok(client)
     }
 
@@ -254,7 +253,17 @@ impl BaiduNetdiskClient {
         save_token_at(&app_data_dir.join(TOKEN_FILE_NAME), token)
     }
 
+    /// 仅用于单元测试：构造一个不具备刷新能力、不落盘的客户端。
+    #[cfg(test)]
     pub fn new(token: BaiduToken) -> Result<Self, String> {
+        Self::from_parts(token, PathBuf::new(), None)
+    }
+
+    fn from_parts(
+        token: BaiduToken,
+        app_data_dir: PathBuf,
+        refresh_context: Option<RefreshContext>,
+    ) -> Result<Self, String> {
         if token.access_token.trim().is_empty() {
             return Err("百度网盘授权信息缺少 access token".to_string());
         }
@@ -265,29 +274,106 @@ impl BaiduNetdiskClient {
             .user_agent("pan.baidu.com")
             .build()
             .map_err(|err| format!("创建百度网盘网络客户端失败：{err}"))?;
-        Ok(Self { client, token })
+        Ok(Self {
+            client,
+            token: Mutex::new(token),
+            app_data_dir,
+            refresh_context,
+        })
     }
 
-    fn refresh_access_token(
-        &mut self,
-        token_path: &Path,
-        app_key: &str,
-        secret_key: &str,
-    ) -> Result<(), String> {
-        let refresh_token = self
+    fn access_token(&self) -> Result<String, String> {
+        Ok(self
             .token
-            .refresh_token
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| "百度网盘授权即将过期，但没有 refresh token，请重新授权".to_string())?;
+            .lock()
+            .map_err(|_| "百度网盘授权状态不可用".to_string())?
+            .access_token
+            .clone())
+    }
+
+    /// access token 是否已进入刷新窗口（距过期不足 5 分钟）或已过期。
+    fn token_is_stale(&self) -> bool {
+        self.token
+            .lock()
+            .map(|token| token_needs_refresh(token.expires_at))
+            .unwrap_or(true)
+    }
+
+    fn access_token_expired(&self) -> bool {
+        self.token
+            .lock()
+            .map(|token| {
+                token
+                    .expires_at
+                    .is_some_and(|expires_at| expires_at <= now_millis())
+            })
+            .unwrap_or(true)
+    }
+
+    fn store_token(&self, token: BaiduToken) -> Result<(), String> {
+        *self
+            .token
+            .lock()
+            .map_err(|_| "百度网盘授权状态不可用".to_string())? = token;
+        Ok(())
+    }
+
+    /// 刷新 access token，返回 `true` 表示授权已可用。
+    ///
+    /// - 未进入刷新窗口且 `force` 为假时直接返回 `true`（无需刷新）。
+    /// - 持锁后会重读磁盘，别的进程已刷新并落盘时直接沿用，避免重复刷新。
+    /// - 没有刷新凭据且磁盘上也没有更新时返回 `false`。
+    /// - `force` 用于服务端明确回报鉴权失败的场景，此时跳过「即将过期」的判断。
+    fn refresh_token(&self, force: bool) -> Result<bool, String> {
+        if !force && !self.token_is_stale() {
+            return Ok(true);
+        }
+        let lock = TOKEN_REFRESH_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock
+            .lock()
+            .map_err(|_| "百度网盘 Token 刷新锁不可用".to_string())?;
+
+        let current = self.access_token()?;
+        if let Ok((_, disk_token)) = read_token(&self.app_data_dir) {
+            if !disk_token.access_token.trim().is_empty() && disk_token.access_token != current {
+                self.store_token(disk_token)?;
+                return Ok(true);
+            }
+        }
+        if !force && !self.token_is_stale() {
+            return Ok(true);
+        }
+        let Some(context) = self.refresh_context.clone() else {
+            return Ok(false);
+        };
+        self.refresh_access_token(&context)?;
+        Ok(true)
+    }
+
+    fn refresh_access_token(&self, context: &RefreshContext) -> Result<(), String> {
+        let (refresh_token, fallback_expires_at, fallback_refresh_token) = {
+            let token = self
+                .token
+                .lock()
+                .map_err(|_| "百度网盘授权状态不可用".to_string())?;
+            let refresh_token = token
+                .refresh_token
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    "百度网盘授权即将过期，但没有 refresh token，请重新授权".to_string()
+                })?
+                .to_string();
+            (refresh_token, token.expires_at, token.refresh_token.clone())
+        };
         let response = self
             .client
             .get(OAUTH_TOKEN_URL)
             .query(&[
                 ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token),
-                ("client_id", app_key),
-                ("client_secret", secret_key),
+                ("refresh_token", refresh_token.as_str()),
+                ("client_id", context.app_key.as_str()),
+                ("client_secret", context.secret_key.as_str()),
             ])
             .send()
             .map_err(|error| format!("请求百度 Token 刷新失败：{error}"))?;
@@ -320,15 +406,14 @@ impl BaiduNetdiskClient {
             expires_at: parsed
                 .expires_in
                 .map(|seconds| now_millis().saturating_add(seconds.saturating_mul(1000)))
-                .or(self.token.expires_at),
+                .or(fallback_expires_at),
             refresh_token: parsed
                 .refresh_token
                 .filter(|value| !value.trim().is_empty())
-                .or_else(|| self.token.refresh_token.clone()),
+                .or(fallback_refresh_token),
         };
-        save_token_at(token_path, next_token.clone())?;
-        self.token = next_token;
-        Ok(())
+        save_token_at(&context.token_path, next_token.clone())?;
+        self.store_token(next_token)
     }
 
     pub fn list(&self, remote_dir: &str) -> Result<Vec<RemoteFile>, String> {
@@ -353,10 +438,9 @@ impl BaiduNetdiskClient {
         limit: usize,
     ) -> Result<RemoteFilePage, String> {
         let url = format!("{API_BASE}/rest/2.0/xpan/file");
-        let token = self.token.access_token.clone();
         let limit = limit.clamp(1, 1000);
-        let response = self.send_with_retry(
-            |client| {
+        let body: FileListResponse = self.request_json(
+            |client, token| {
                 client
                     .get(&url)
                     .query(&[
@@ -367,13 +451,12 @@ impl BaiduNetdiskClient {
                         ("limit", &limit.to_string()),
                         ("web", "1"),
                         ("folder", "0"),
-                        ("access_token", token.as_str()),
+                        ("access_token", token),
                     ])
                     .send()
             },
-            "请求百度网盘文件列表",
+            "读取百度网盘文件列表",
         )?;
-        let body: FileListResponse = parse_json(response, "读取百度网盘文件列表")?;
         Ok(RemoteFilePage {
             files: body
                 .list
@@ -393,21 +476,19 @@ impl BaiduNetdiskClient {
     }
 
     pub fn quota(&self) -> Result<BaiduQuota, String> {
-        let token = self.token.access_token.clone();
-        let response = self.send_with_retry(
-            |client| {
+        let body: QuotaResponse = self.request_json(
+            |client, token| {
                 client
                     .get(format!("{API_BASE}/api/quota"))
                     .query(&[
-                        ("access_token", token.as_str()),
+                        ("access_token", token),
                         ("checkfree", "1"),
                         ("checkexpire", "1"),
                     ])
                     .send()
             },
-            "查询百度网盘空间",
+            "读取百度网盘空间",
         )?;
-        let body: QuotaResponse = parse_json(response, "读取百度网盘空间")?;
         Ok(BaiduQuota {
             total: body.total,
             used: body.used,
@@ -419,22 +500,20 @@ impl BaiduNetdiskClient {
     pub fn delete_file(&self, remote_path: &str) -> Result<(), String> {
         let filelist = serde_json::to_string(&[remote_path])
             .map_err(|error| format!("生成百度删除请求失败：{error}"))?;
-        let token = self.token.access_token.clone();
-        let response = self.send_with_retry(
-            |client| {
+        let _: serde_json::Value = self.request_json(
+            |client, token| {
                 client
                     .post(format!("{API_BASE}/rest/2.0/xpan/file"))
                     .query(&[
                         ("method", "filemanager"),
                         ("opera", "delete"),
-                        ("access_token", token.as_str()),
+                        ("access_token", token),
                     ])
                     .form(&[("async", "0"), ("filelist", filelist.as_str())])
                     .send()
             },
             "删除百度网盘本体包",
         )?;
-        let _: serde_json::Value = parse_json(response, "删除百度网盘本体包")?;
         Ok(())
     }
 
@@ -454,22 +533,16 @@ impl BaiduNetdiskClient {
                 Err(_) => {}
             }
             let url = format!("{API_BASE}/rest/2.0/xpan/file");
-            let token = self.token.access_token.clone();
-            let response = self.send_with_retry(
-                |client| {
+            let value = self.request_json_value(
+                |client, token| {
                     client
                         .post(&url)
-                        .query(&[("method", "create"), ("access_token", token.as_str())])
+                        .query(&[("method", "create"), ("access_token", token)])
                         .form(&[("path", current.as_str()), ("isdir", "1"), ("rtype", "3")])
                         .send()
                 },
                 "创建百度网盘目录",
             )?;
-            let body = response
-                .text()
-                .map_err(|err| format!("创建百度网盘目录读取响应失败：{err}"))?;
-            let value = serde_json::from_str::<serde_json::Value>(&body)
-                .map_err(|err| format!("创建百度网盘目录返回非 JSON：{err}"))?;
             if value.get("errno").and_then(serde_json::Value::as_i64) == Some(-8) {
                 continue;
             }
@@ -494,49 +567,41 @@ impl BaiduNetdiskClient {
         let block_list = serde_json::to_string(&block_md5)
             .map_err(|err| format!("生成百度分片清单失败：{err}"))?;
         let url = format!("{API_BASE}/rest/2.0/xpan/file");
-        let token = self.token.access_token.clone();
-        let precreate: PrecreateResponse = parse_json(
-            self.send_with_retry(
-                |client| {
-                    client
-                        .post(&url)
-                        .query(&[("method", "precreate"), ("access_token", token.as_str())])
-                        .form(&[
-                            ("path", remote_path),
-                            ("size", &total_size.to_string()),
-                            ("isdir", "0"),
-                            ("autoinit", "1"),
-                            ("block_list", &block_list),
-                            ("rtype", "3"),
-                        ])
-                        .send()
-                },
-                "请求百度预创建",
-            )?,
+        let precreate: PrecreateResponse = self.request_json(
+            |client, token| {
+                client
+                    .post(&url)
+                    .query(&[("method", "precreate"), ("access_token", token)])
+                    .form(&[
+                        ("path", remote_path),
+                        ("size", &total_size.to_string()),
+                        ("isdir", "0"),
+                        ("autoinit", "1"),
+                        ("block_list", &block_list),
+                        ("rtype", "3"),
+                    ])
+                    .send()
+            },
             "百度预创建",
         )?;
         let upload_id = precreate
             .uploadid
             .ok_or_else(|| "百度预创建未返回 uploadid".to_string())?;
         let url = format!("{UPLOAD_API_BASE}/rest/2.0/pcs/file");
-        let token = self.token.access_token.clone();
-        let located: LocateResponse = parse_json(
-            self.send_with_retry(
-                |client| {
-                    client
-                        .get(&url)
-                        .query(&[
-                            ("method", "locateupload"),
-                            ("appid", "250528"),
-                            ("access_token", token.as_str()),
-                            ("path", remote_path),
-                            ("uploadid", upload_id.as_str()),
-                            ("upload_version", "2.0"),
-                        ])
-                        .send()
-                },
-                "定位百度上传服务器",
-            )?,
+        let located: LocateResponse = self.request_json(
+            |client, token| {
+                client
+                    .get(&url)
+                    .query(&[
+                        ("method", "locateupload"),
+                        ("appid", "250528"),
+                        ("access_token", token),
+                        ("path", remote_path),
+                        ("uploadid", upload_id.as_str()),
+                        ("upload_version", "2.0"),
+                    ])
+                    .send()
+            },
             "定位百度上传服务器",
         )?;
         let host = located
@@ -600,9 +665,9 @@ impl BaiduNetdiskClient {
                         }
 
                         let upload_url = format!("{host}/rest/2.0/pcs/superfile2");
-                        let token = self.token.access_token.clone();
-                        let upload_result = self.send_with_retry(
-                            |client| {
+                        let operation = format!("上传百度本体包分片 {}/{}", index + 1, chunk_count);
+                        let upload_result: Result<serde_json::Value, String> = self.request_json(
+                            |client, token| {
                                 let form = multipart::Form::new().part(
                                     "file",
                                     multipart::Part::bytes(bytes.clone()).file_name("package.zip"),
@@ -611,7 +676,7 @@ impl BaiduNetdiskClient {
                                     .post(&upload_url)
                                     .query(&[
                                         ("method", "upload"),
-                                        ("access_token", token.as_str()),
+                                        ("access_token", token),
                                         ("type", "tmpfile"),
                                         ("path", remote_path),
                                         ("uploadid", upload_id.as_str()),
@@ -621,24 +686,10 @@ impl BaiduNetdiskClient {
                                     .multipart(form)
                                     .send()
                             },
-                            &format!("上传百度本体包分片 {}/{}", index + 1, chunk_count),
+                            &operation,
                         );
 
-                        let response = match upload_result {
-                            Ok(res) => res,
-                            Err(err) => {
-                                aborted.store(true, Ordering::Relaxed);
-                                let mut err_guard = first_error.lock().unwrap();
-                                if err_guard.is_none() {
-                                    *err_guard = Some(err);
-                                }
-                                break;
-                            }
-                        };
-
-                        if let Err(err) =
-                            parse_json::<serde_json::Value>(response, "上传百度本体包分片")
-                        {
+                        if let Err(err) = upload_result {
                             aborted.store(true, Ordering::Relaxed);
                             let mut err_guard = first_error.lock().unwrap();
                             if err_guard.is_none() {
@@ -672,26 +723,22 @@ impl BaiduNetdiskClient {
             return Err(err);
         }
         let url = format!("{API_BASE}/rest/2.0/xpan/file");
-        let token = self.token.access_token.clone();
-        let created: CreatedFileResponse = parse_json(
-            self.send_with_retry(
-                |client| {
-                    client
-                        .post(&url)
-                        .query(&[("method", "create"), ("access_token", token.as_str())])
-                        .form(&[
-                            ("path", remote_path),
-                            ("size", &total_size.to_string()),
-                            ("isdir", "0"),
-                            ("uploadid", upload_id.as_str()),
-                            ("block_list", &block_list),
-                            ("rtype", "3"),
-                            ("is_revision", "1"),
-                        ])
-                        .send()
-                },
-                "提交百度本体包",
-            )?,
+        let created: CreatedFileResponse = self.request_json(
+            |client, token| {
+                client
+                    .post(&url)
+                    .query(&[("method", "create"), ("access_token", token)])
+                    .form(&[
+                        ("path", remote_path),
+                        ("size", &total_size.to_string()),
+                        ("isdir", "0"),
+                        ("uploadid", upload_id.as_str()),
+                        ("block_list", &block_list),
+                        ("rtype", "3"),
+                        ("is_revision", "1"),
+                    ])
+                    .send()
+            },
             "提交百度本体包",
         )?;
         if let Ok(cb) = progress_callback.lock() {
@@ -716,22 +763,18 @@ impl BaiduNetdiskClient {
         let fsids = serde_json::to_string(&[remote.fs_id])
             .map_err(|err| format!("生成百度下载请求失败：{err}"))?;
         let url = format!("{API_BASE}/rest/2.0/xpan/multimedia");
-        let token = self.token.access_token.clone();
-        let metadata: MetaResponse = parse_json(
-            self.send_with_retry(
-                |client| {
-                    client
-                        .get(&url)
-                        .query(&[
-                            ("method", "filemetas"),
-                            ("access_token", token.as_str()),
-                            ("fsids", fsids.as_str()),
-                            ("dlink", "1"),
-                        ])
-                        .send()
-                },
-                "请求百度本体包下载地址",
-            )?,
+        let metadata: MetaResponse = self.request_json(
+            |client, token| {
+                client
+                    .get(&url)
+                    .query(&[
+                        ("method", "filemetas"),
+                        ("access_token", token),
+                        ("fsids", fsids.as_str()),
+                        ("dlink", "1"),
+                    ])
+                    .send()
+            },
             "读取百度本体包下载地址",
         )?;
         let dlink = metadata
@@ -739,14 +782,8 @@ impl BaiduNetdiskClient {
             .and_then(|list| list.into_iter().next())
             .and_then(|item| item.dlink)
             .ok_or_else(|| "百度未返回本体包下载地址".to_string())?;
-        let token = self.token.access_token.clone();
-        let mut response = self.send_with_retry(
-            |client| {
-                client
-                    .get(&dlink)
-                    .query(&[("access_token", token.as_str())])
-                    .send()
-            },
+        let mut response = self.send_raw(
+            |client, token| client.get(&dlink).query(&[("access_token", token)]).send(),
             "下载百度本体包",
         )?;
         if !response.status().is_success() {
@@ -810,13 +847,18 @@ impl BaiduNetdiskClient {
         Ok(sha256_hex)
     }
 
-    fn send_with_retry<F>(&self, mut request: F, operation: &str) -> Result<Response, String>
+    fn send_with_retry<F>(
+        &self,
+        mut request: F,
+        token: &str,
+        operation: &str,
+    ) -> Result<Response, String>
     where
-        F: FnMut(&Client) -> Result<Response, reqwest::Error>,
+        F: FnMut(&Client, &str) -> Result<Response, reqwest::Error>,
     {
         let mut last_error = None;
         for attempt in 0..MAX_REQUEST_ATTEMPTS {
-            match request(&self.client) {
+            match request(&self.client, token) {
                 Ok(response)
                     if response.status().is_success()
                         || !is_retryable_status(response.status()) =>
@@ -843,10 +885,90 @@ impl BaiduNetdiskClient {
             last_error.unwrap_or_else(|| "未知网络错误".to_string())
         ))
     }
+
+    /// 发送请求并返回 JSON 响应体（不做 errno 校验）。
+    ///
+    /// 遇到鉴权失败（HTTP 401 或百度返回的鉴权类 `errno`）时刷新授权后重放一次，
+    /// 让长任务不会因为 access token 中途到期而整体失败。
+    fn request_json_value<F>(
+        &self,
+        mut build: F,
+        operation: &str,
+    ) -> Result<serde_json::Value, String>
+    where
+        F: FnMut(&Client, &str) -> Result<Response, reqwest::Error>,
+    {
+        let mut refreshed = false;
+        loop {
+            let token = self.access_token()?;
+            let response = self.send_with_retry(&mut build, &token, operation)?;
+            let status = response.status();
+            let body = response
+                .text()
+                .map_err(|error| format!("{operation}读取响应失败：{error}"))?;
+            let value = serde_json::from_str::<serde_json::Value>(&body)
+                .map_err(|_| format!("{operation}返回非 JSON：HTTP {status}"))?;
+            if !refreshed && is_auth_failure(status, &value) {
+                refreshed = true;
+                if matches!(self.refresh_token(true), Ok(true)) {
+                    continue;
+                }
+            }
+            return Ok(value);
+        }
+    }
+
+    fn request_json<T, F>(&self, build: F, operation: &str) -> Result<T, String>
+    where
+        T: for<'de> Deserialize<'de>,
+        F: FnMut(&Client, &str) -> Result<Response, reqwest::Error>,
+    {
+        let value = self.request_json_value(build, operation)?;
+        parse_value(value, operation)
+    }
+
+    /// 发送不解析 JSON 的请求（例如直链下载）；遇到 HTTP 401 会刷新授权后重放一次。
+    fn send_raw<F>(&self, mut build: F, operation: &str) -> Result<Response, String>
+    where
+        F: FnMut(&Client, &str) -> Result<Response, reqwest::Error>,
+    {
+        let mut refreshed = false;
+        loop {
+            let token = self.access_token()?;
+            let response = self.send_with_retry(&mut build, &token, operation)?;
+            if response.status().as_u16() == 401 && !refreshed {
+                refreshed = true;
+                if matches!(self.refresh_token(true), Ok(true)) {
+                    continue;
+                }
+            }
+            return Ok(response);
+        }
+    }
 }
 
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error()
+}
+
+/// 判断响应是否表示「授权失效」——这类失败只有在刷新 token 后重放才可能成功。
+///
+/// 百度网盘的接口在 token 失效时不一定返回 401：常见的是 HTTP 200 配合
+/// `errno` 为 `-6`（无权限）、`110`（token 无效）或 `111`（token 已过期）。
+fn is_auth_failure(status: reqwest::StatusCode, value: &serde_json::Value) -> bool {
+    if status.as_u16() == 401 {
+        return true;
+    }
+    if matches!(
+        value.get("errno").and_then(serde_json::Value::as_i64),
+        Some(-6) | Some(110) | Some(111)
+    ) {
+        return true;
+    }
+    matches!(
+        value.get("error").and_then(serde_json::Value::as_str),
+        Some("invalid_token") | Some("expired_token")
+    )
 }
 
 fn token_paths(app_data_dir: &Path) -> Vec<std::path::PathBuf> {
@@ -933,19 +1055,6 @@ fn block_md5_list(path: &Path, total_size: u64) -> Result<Vec<String>, String> {
         remaining -= length as u64;
     }
     Ok(result)
-}
-
-fn parse_json<T: for<'de> Deserialize<'de>>(
-    response: reqwest::blocking::Response,
-    operation: &str,
-) -> Result<T, String> {
-    let status = response.status();
-    let body = response
-        .text()
-        .map_err(|err| format!("{operation}读取响应失败：{err}"))?;
-    let value = serde_json::from_str::<serde_json::Value>(&body)
-        .map_err(|_| format!("{operation}返回非 JSON：HTTP {status}"))?;
-    parse_value(value, operation)
 }
 
 fn parse_value<T: for<'de> Deserialize<'de>>(
@@ -1059,7 +1168,92 @@ fn md5_hex(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{md5_hex, token_needs_refresh, BaiduNetdiskClient, BaiduToken};
+    use super::{is_auth_failure, md5_hex, token_needs_refresh, BaiduNetdiskClient, BaiduToken};
+    use std::fs;
+
+    /// 建一个独立的双层临时目录，避免命中 legacy 路径下真实存在的 token。
+    fn test_token_dir() -> (std::path::PathBuf, std::path::PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("gamesaver-token-test-{}", uuid::Uuid::new_v4()));
+        let app_data = base.join("app-data");
+        fs::create_dir_all(&app_data).expect("create temp token dir");
+        (base, app_data)
+    }
+
+    fn token(access: &str, expires_at: Option<u64>) -> BaiduToken {
+        BaiduToken {
+            access_token: access.to_string(),
+            expires_at,
+            refresh_token: Some("refresh".to_string()),
+        }
+    }
+
+    #[test]
+    fn auth_failure_detection_covers_http_and_errno() {
+        let ok = reqwest::StatusCode::OK;
+        for errno in [-6i64, 110, 111] {
+            assert!(
+                is_auth_failure(ok, &serde_json::json!({ "errno": errno })),
+                "errno {errno} 应判为鉴权失败"
+            );
+        }
+        for error in ["invalid_token", "expired_token"] {
+            assert!(
+                is_auth_failure(ok, &serde_json::json!({ "error": error })),
+                "{error} 应判为鉴权失败"
+            );
+        }
+        assert!(is_auth_failure(
+            reqwest::StatusCode::UNAUTHORIZED,
+            &serde_json::json!({ "errno": 0 })
+        ));
+        // 普通业务错误不应触发刷新重放。
+        assert!(!is_auth_failure(ok, &serde_json::json!({ "errno": 0 })));
+        assert!(!is_auth_failure(ok, &serde_json::json!({ "errno": -9 })));
+        assert!(!is_auth_failure(ok, &serde_json::json!({})));
+    }
+
+    #[test]
+    fn refresh_without_credentials_reports_unavailable() {
+        let (base, app_data) = test_token_dir();
+        let client = BaiduNetdiskClient::from_parts(
+            token("stale", Some(super::now_millis().saturating_sub(1))),
+            app_data,
+            None,
+        )
+        .expect("client");
+        assert!(
+            !client.refresh_token(true).expect("refresh call"),
+            "没有凭据且磁盘无更新时应报告无法刷新"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn refresh_picks_up_token_written_by_another_process() {
+        let (base, app_data) = test_token_dir();
+        let path = app_data.join(super::TOKEN_FILE_NAME);
+        let stale = token(
+            "stale-token",
+            Some(super::now_millis().saturating_sub(1000)),
+        );
+        super::save_token_at(&path, stale.clone()).expect("seed token");
+        let client = BaiduNetdiskClient::from_parts(stale, app_data, None).expect("client");
+
+        // 模拟另一个进程刷新后落盘。
+        super::save_token_at(
+            &path,
+            token(
+                "fresh-token",
+                Some(super::now_millis().saturating_add(3_600_000)),
+            ),
+        )
+        .expect("write refreshed token");
+
+        assert!(client.refresh_token(true).expect("refresh call"));
+        assert_eq!(client.access_token().expect("access token"), "fresh-token");
+        let _ = fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn client_requires_access_token() {

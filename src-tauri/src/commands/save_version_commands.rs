@@ -1,6 +1,6 @@
 use crate::{
     app_state::AppState,
-    domain::{GameLifecycle, SaveProfile, SaveVersion, TaskStatus},
+    domain::{GameLifecycle, SaveProfile, SaveVersion, TaskCategory, TaskStatus},
     repositories::{GameRepository, SaveRepository},
     services::{GameLibraryService, TaskService},
 };
@@ -20,6 +20,7 @@ pub fn restore_save_version(
     let task_id = match TaskService::create(
         &state,
         "restore_save_version",
+        TaskCategory::SaveRestore,
         Some(game_uid.clone()),
         "准备恢复保存版本",
     ) {
@@ -80,6 +81,7 @@ pub fn delete_save_version(
     let task_id = match TaskService::create(
         &state,
         "delete_save_version",
+        TaskCategory::Maintenance,
         Some(game_uid.clone()),
         "准备删除保存版本",
     ) {
@@ -150,6 +152,7 @@ pub fn prune_save_versions(
     let task_id = match TaskService::create(
         &state,
         "prune_save_versions",
+        TaskCategory::Maintenance,
         Some(game_uid.clone()),
         "准备清理旧保存版本",
     ) {
@@ -227,65 +230,42 @@ fn restore_version_task(
     })?;
     let pending_protected = protected.clone();
     if let Some(protected) = protected {
-        let mut candidate = match state.store.lock() {
-            Ok(store) => store.clone(),
-            Err(_) => {
+        let result = state.with_store_mut(|candidate| {
+            let protected_id = protected.version_id.clone();
+            candidate.save_versions.push(protected);
+
+            let pruned = SaveRepository::prune_game_save_versions(
+                candidate,
+                &game.game_uid,
+                profile.keep_versions,
+            );
+
+            let Some(game_record) = candidate
+                .games
+                .iter_mut()
+                .find(|item| item.game_uid == game.game_uid)
+            else {
+                return Err("游戏记录不存在".to_string());
+            };
+            game_record.latest_save_version_id = Some(protected_id);
+            GameRepository::persist(app, candidate)?;
+            Ok(pruned)
+        });
+        match result {
+            // 持久化已成功，此时回收旧对象才安全；顺序不可颠倒，见
+            // SaveRepository::prune_game_save_versions。
+            Ok(pruned) => {
+                if let Some(versions) = pruned.as_ref() {
+                    let _ = SaveRepository::collect_garbage(app, versions);
+                }
+            }
+            Err(error) => {
                 if let Some(version) = pending_protected.as_ref() {
                     crate::repositories::release_pending_objects(version);
                 }
-                return Err("读取 GameSaver 存储失败".to_string());
-            }
-        };
-        let protected_id = protected.version_id.clone();
-        candidate.save_versions.push(protected);
-
-        let keep_versions = profile.keep_versions;
-        if keep_versions > 0 {
-            let mut game_versions: Vec<_> = candidate
-                .save_versions
-                .iter()
-                .filter(|v| v.game_uid == game.game_uid)
-                .cloned()
-                .collect();
-            game_versions.sort_by(|a, b| {
-                b.created_at
-                    .cmp(&a.created_at)
-                    .then(b.version_id.cmp(&a.version_id))
-            });
-            if game_versions.len() > keep_versions {
-                let to_remove: std::collections::HashSet<String> = game_versions
-                    .into_iter()
-                    .skip(keep_versions)
-                    .map(|v| v.version_id)
-                    .collect();
-                candidate.save_versions.retain(|v| {
-                    !(v.game_uid == game.game_uid && to_remove.contains(&v.version_id))
-                });
-                let _ = SaveRepository::collect_garbage(app, &candidate.save_versions);
+                return Err(error);
             }
         }
-
-        let Some(game_record) = candidate
-            .games
-            .iter_mut()
-            .find(|item| item.game_uid == game.game_uid)
-        else {
-            if let Some(version) = pending_protected.as_ref() {
-                crate::repositories::release_pending_objects(version);
-            }
-            return Err("游戏记录不存在".to_string());
-        };
-        game_record.latest_save_version_id = Some(protected_id);
-        if let Err(error) = GameRepository::persist(app, &candidate) {
-            if let Some(version) = pending_protected.as_ref() {
-                crate::repositories::release_pending_objects(version);
-            }
-            return Err(error);
-        }
-        *state
-            .store
-            .lock()
-            .map_err(|_| "lock GameSaver store failed".to_string())? = candidate;
     }
     if let Some(version) = pending_protected.as_ref() {
         crate::repositories::release_pending_objects(version);
@@ -308,36 +288,29 @@ fn restore_version_task(
             None,
         );
     })?;
-    let mut candidate = state
-        .store
-        .lock()
-        .map_err(|_| "lock GameSaver store failed".to_string())?
-        .clone();
-    let Some(game_record) = candidate
-        .games
-        .iter_mut()
-        .find(|item| item.game_uid == game.game_uid)
-    else {
-        let rollback = SaveRepository::rollback_restore(receipt);
-        return Err(match rollback {
-            Ok(()) => "游戏记录不存在，已回滚存档恢复".to_string(),
-            Err(error) => format!("游戏记录不存在，且存档回滚失败：{error}"),
-        });
-    };
-    game_record.latest_save_version_id = Some(version.version_id.clone());
-    if let Err(error) = GameRepository::persist(app, &candidate) {
-        return match SaveRepository::rollback_restore(receipt) {
-            Ok(()) => Err(format!("保存恢复结果失败，已回滚存档：{error}")),
-            Err(rollback_error) => Err(format!(
-                "保存恢复结果失败，且存档回滚失败：{error}；{rollback_error}"
-            )),
+    state.with_store_mut(|candidate| {
+        let Some(game_record) = candidate
+            .games
+            .iter_mut()
+            .find(|item| item.game_uid == game.game_uid)
+        else {
+            return Err(match SaveRepository::rollback_restore(receipt) {
+                Ok(()) => "游戏记录不存在，已回滚存档恢复".to_string(),
+                Err(error) => format!("游戏记录不存在，且存档回滚失败：{error}"),
+            });
         };
-    }
-    SaveRepository::finalize_restore(receipt);
-    *state
-        .store
-        .lock()
-        .map_err(|_| "lock GameSaver store failed".to_string())? = candidate;
+        game_record.latest_save_version_id = Some(version.version_id.clone());
+        if let Err(error) = GameRepository::persist(app, candidate) {
+            return Err(match SaveRepository::rollback_restore(receipt) {
+                Ok(()) => format!("保存恢复结果失败，已回滚存档：{error}"),
+                Err(rollback_error) => {
+                    format!("保存恢复结果失败，且存档回滚失败：{error}；{rollback_error}")
+                }
+            });
+        }
+        SaveRepository::finalize_restore(receipt);
+        Ok(())
+    })?;
     Ok(serde_json::json!({ "versionId": version.version_id, "createdAt": version.created_at }))
 }
 
@@ -357,39 +330,34 @@ fn delete_versions_task(
         "正在更新保存版本清单",
         None,
     );
-    let mut candidate = state
-        .store
-        .lock()
-        .map_err(|_| "lock GameSaver store failed".to_string())?
-        .clone();
-    let before = candidate.save_versions.len();
-    candidate.save_versions.retain(|version| {
-        !(version.game_uid == game_uid && version_ids.iter().any(|id| id == &version.version_id))
-    });
-    if candidate.save_versions.len() == before {
-        return Err("保存版本不存在".to_string());
-    }
-    let latest = candidate
-        .save_versions
-        .iter()
-        .filter(|version| version.game_uid == game_uid)
-        .max_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then(left.version_id.cmp(&right.version_id))
-        })
-        .map(|version| version.version_id.clone());
-    let game = candidate
-        .games
-        .iter_mut()
-        .find(|game| game.game_uid == game_uid)
-        .ok_or_else(|| "游戏不存在".to_string())?;
-    game.latest_save_version_id = latest;
-    GameRepository::persist(app, &candidate)?;
-    *state
-        .store
-        .lock()
-        .map_err(|_| "lock GameSaver store failed".to_string())? = candidate.clone();
+    let versions = state.with_store_mut(|candidate| {
+        let before = candidate.save_versions.len();
+        candidate.save_versions.retain(|version| {
+            !(version.game_uid == game_uid
+                && version_ids.iter().any(|id| id == &version.version_id))
+        });
+        if candidate.save_versions.len() == before {
+            return Err("保存版本不存在".to_string());
+        }
+        let latest = candidate
+            .save_versions
+            .iter()
+            .filter(|version| version.game_uid == game_uid)
+            .max_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then(left.version_id.cmp(&right.version_id))
+            })
+            .map(|version| version.version_id.clone());
+        let game = candidate
+            .games
+            .iter_mut()
+            .find(|game| game.game_uid == game_uid)
+            .ok_or_else(|| "游戏不存在".to_string())?;
+        game.latest_save_version_id = latest;
+        GameRepository::persist(app, candidate)?;
+        Ok(candidate.save_versions.clone())
+    })?;
     TaskService::update(
         &state,
         task_id,
@@ -400,7 +368,7 @@ fn delete_versions_task(
     );
     let mut summary =
         serde_json::json!({ "removedVersions": version_ids.len(), "removedObjects": 0 });
-    match SaveRepository::collect_garbage(app, &candidate.save_versions) {
+    match SaveRepository::collect_garbage(app, &versions) {
         Ok(removed_objects) => summary["removedObjects"] = serde_json::json!(removed_objects),
         Err(error) => summary["garbageCollectionError"] = serde_json::json!(error),
     }

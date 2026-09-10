@@ -104,6 +104,17 @@ impl LibraryService {
         result
     }
 
+    /// 就地把仓库里所有指向 `source` 的路径改写为 `target`。
+    /// 供游戏库迁移在**持有 store 锁**的状态下刷新内存态使用：
+    /// 迁移耗时可能很长，落盘时必须基于当前的 store 而不是迁移开始时的快照。
+    pub fn rewrite_paths_in_place(
+        store: &mut AppStore,
+        source: &Path,
+        target: &Path,
+    ) -> Result<(), String> {
+        rewrite_store_paths(store, source, target)
+    }
+
     pub fn cleanup_source(source: &Path) -> Result<(), String> {
         for directory in ["games", "body-packages", "saves"] {
             let path = source.join(directory);

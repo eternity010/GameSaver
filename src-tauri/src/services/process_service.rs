@@ -8,8 +8,8 @@ use windows_sys::Win32::{
         TH32CS_SNAPPROCESS,
     },
     System::Threading::{
-        GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+        WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     },
 };
 
@@ -68,6 +68,14 @@ impl Drop for TrackedProcessHandle {
     }
 }
 
+// Windows 句柄是**进程范围**的内核对象，不属于创建它的线程。把句柄的独占所有权交给
+// 另一个线程（`Send` 的语义）是安全的 —— 跨重启接手的会话正是这么用的：在启动线程里
+// 认领游戏进程，再把等待交给会话线程。
+//
+// 没有一并引入 `Sync`：句柄只被独占使用，不会被多线程共享。
+#[cfg(target_os = "windows")]
+unsafe impl Send for TrackedProcessHandle {}
+
 #[cfg(not(target_os = "windows"))]
 pub struct TrackedProcessHandle {
     pub pid: u32,
@@ -85,9 +93,43 @@ impl TrackedProcessHandle {
 }
 
 pub fn is_process_running(pid: u32) -> bool {
-    TrackedProcessHandle::open(pid).map(|h| h.is_alive()).unwrap_or(false)
+    TrackedProcessHandle::open(pid)
+        .map(|h| h.is_alive())
+        .unwrap_or(false)
 }
 
+/// 强制终止一个进程。
+///
+/// 与 [`TrackedProcessHandle`] 分开实现是刻意的：那个句柄只申请查询权限，被
+/// [`is_process_running`] 用来探测**任意** PID。若把 `PROCESS_TERMINATE` 并进
+/// 它的打开权限，一部分受限进程会从「能读到退出状态」退化成「打开失败」，
+/// 于是被静默判定成「不在运行」——取消启动任务的收尾会因此漏掉真正的子进程。
+///
+/// 本函数按 PID 重新打开句柄，理论上存在 PID 复用风险；但调用方（游戏会话的
+/// 进程跟踪）始终持有 [`TrackedProcessHandle`]，句柄未关闭时 Windows 不会回收
+/// 该 PID，因此该风险不成立。
+///
+/// 拒绝终止自身与 PID 0（System Idle Process）：前者是自杀，后者必然失败。
+#[cfg(target_os = "windows")]
+pub fn terminate_process(pid: u32) -> bool {
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let terminated = TerminateProcess(handle, 1) != 0;
+        CloseHandle(handle);
+        terminated
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn terminate_process(_pid: u32) -> bool {
+    false
+}
 
 pub fn is_ignored_process_name(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
@@ -253,5 +295,37 @@ mod tests {
         let path = path.unwrap();
         assert!(path.exists());
         assert!(path.to_string_lossy().ends_with(".exe"));
+    }
+
+    /// 取消游戏会话的收尾全靠这条能力：`TrackedProcessHandle` 只有查询权限，
+    /// 想停掉被跟踪的子进程必须走独立的 `terminate_process`。
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_terminate_process_kills_a_live_child() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn helper process");
+        let pid = child.id();
+        assert!(is_process_running(pid), "辅助进程应处于运行状态");
+
+        assert!(terminate_process(pid), "终止调用应报告成功");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while is_process_running(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!is_process_running(pid), "被终止的进程不应仍然存活");
+        let _ = child.wait();
+    }
+
+    /// 自身与 PID 0 必须被拒绝：前者是自杀，后者必然失败。
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_terminate_process_refuses_self_and_idle() {
+        assert!(!terminate_process(0));
+        assert!(!terminate_process(std::process::id()));
     }
 }

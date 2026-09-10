@@ -14,6 +14,9 @@ const props = defineProps<{
   installError: string;
   installNotice: string;
   page: number;
+  pageSize?: number;
+  totalCount: number;
+  totalPages: number;
   hasMore: boolean;
 }>();
 
@@ -27,9 +30,36 @@ const emit = defineEmits<{
 
 const visibleGames = computed(() => {
   const keyword = props.search.trim().toLocaleLowerCase();
+  if (!keyword) return props.games;
   return props.games.filter((game) => {
-    return !keyword || game.displayName.toLocaleLowerCase().includes(keyword);
+    return (
+      game.displayName.toLocaleLowerCase().includes(keyword) ||
+      (game.gameKey && game.gameKey.toLocaleLowerCase().includes(keyword))
+    );
   });
+});
+
+const pageItems = computed(() => {
+  const current = props.page;
+  const total = Math.max(1, props.totalPages);
+  if (total <= 7) {
+    return Array.from({ length: total }, (_, i) => i + 1);
+  }
+  const items: (number | string)[] = [];
+  items.push(1);
+  if (current > 3) {
+    items.push("...");
+  }
+  const start = Math.max(2, current - 1);
+  const end = Math.min(total - 1, current + 1);
+  for (let i = start; i <= end; i++) {
+    items.push(i);
+  }
+  if (current < total - 2) {
+    items.push("...");
+  }
+  items.push(total);
+  return items;
 });
 
 const selectedGame = ref<CloudGameSummary | null>(null);
@@ -162,15 +192,24 @@ onUnmounted(() => {
         <h1>游戏商店</h1>
         <p>从云端下载游戏本体，安装完成后它会出现在游戏库。</p>
       </div>
-      <div class="store-header-actions"><div class="store-count"><CloudUpload :size="18" /><span>第 {{ page }} 页 · {{ visibleGames.length }} 个云端游戏</span></div><button class="refresh-button store-refresh-button" type="button" :disabled="loading" title="刷新云端游戏列表" @click="emit('refresh')"><RefreshCw :size="16" :class="{ spin: loading }" />刷新</button></div>
+      <div class="store-header-actions">
+        <div class="store-count">
+          <CloudUpload :size="18" />
+          <span v-if="search.trim()">搜索结果：{{ totalCount }} 个云端游戏 · 第 {{ page }} / {{ totalPages }} 页</span>
+          <span v-else>共 {{ totalCount }} 个云端游戏 · 第 {{ page }} / {{ totalPages }} 页</span>
+        </div>
+        <button class="refresh-button store-refresh-button" type="button" :disabled="loading" title="刷新云端游戏列表" @click="emit('refresh')">
+          <RefreshCw :size="16" :class="{ spin: loading }" />刷新
+        </button>
+      </div>
     </header>
 
     <div v-if="loading" class="state-panel store-empty"><span class="loader"></span><strong>正在读取云端游戏</strong></div>
     <div v-else-if="loadError" class="state-panel error-state store-empty"><strong>云端游戏读取失败</strong><p>{{ loadError }}</p><button type="button" @click="emit('retry')">重试</button></div>
     <div v-else-if="!visibleGames.length" class="state-panel empty-state store-empty">
       <div class="empty-icon"><Gamepad2 :size="28" /></div>
-      <strong>{{ games.length ? "没有匹配的云端游戏" : "还没有可下载的游戏" }}</strong>
-      <p>{{ games.length ? "调整搜索关键词后重试。" : "完成百度网盘授权并上传游戏本体后，云端游戏会显示在这里。" }}</p>
+      <strong>{{ totalCount ? "没有匹配的云端游戏" : "还没有可下载的游戏" }}</strong>
+      <p>{{ totalCount ? "调整搜索关键词后重试。" : "完成百度网盘授权并上传游戏本体后，云端游戏会显示在这里。" }}</p>
     </div>
 
     <div v-else class="store-grid">
@@ -199,10 +238,46 @@ onUnmounted(() => {
     </div>
     <p v-if="installNotice" class="notice-message store-install-notice" role="status">{{ installNotice }}</p>
     <p v-if="installError" class="error-message store-install-error" role="alert">{{ installError }}</p>
-    <nav v-if="!loading && !loadError" class="store-pagination" aria-label="云端游戏分页">
-      <button class="icon-button" type="button" :disabled="page <= 1" title="上一页" aria-label="上一页" @click="emit('pageChange', page - 1)"><ChevronLeft :size="18" /></button>
-      <span>第 {{ page }} 页</span>
-      <button class="icon-button" type="button" :disabled="!hasMore" title="下一页" aria-label="下一页" @click="emit('pageChange', page + 1)"><ChevronRight :size="18" /></button>
+    <nav v-if="!loadError && totalCount > 0" class="store-pagination" aria-label="云端游戏分页">
+      <button
+        class="pagination-btn"
+        type="button"
+        :disabled="loading || page <= 1"
+        title="上一页"
+        aria-label="上一页"
+        @click="emit('pageChange', page - 1)"
+      >
+        <ChevronLeft :size="18" />
+      </button>
+      <div class="pagination-pages">
+        <template v-for="(item, idx) in pageItems" :key="idx">
+          <span v-if="item === '...'" class="pagination-ellipsis">…</span>
+          <button
+            v-else
+            type="button"
+            class="pagination-num"
+            :class="{ active: item === page }"
+            :disabled="loading || item === page"
+            :title="`前往第 ${item} 页`"
+            @click="emit('pageChange', Number(item))"
+          >
+            {{ item }}
+          </button>
+        </template>
+      </div>
+      <button
+        class="pagination-btn"
+        type="button"
+        :disabled="loading || page >= totalPages || !hasMore"
+        title="下一页"
+        aria-label="下一页"
+        @click="emit('pageChange', page + 1)"
+      >
+        <ChevronRight :size="18" />
+      </button>
+      <span class="pagination-summary">
+        第 {{ page }} / {{ totalPages }} 页（共 {{ totalCount }} 项）
+      </span>
     </nav>
   </section>
 

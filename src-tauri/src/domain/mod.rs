@@ -20,4 +20,4 @@ pub use save_profile::{
 };
 pub use save_version::{SaveFileEntry, SaveVersion};
 pub use store::AppStore;
-pub use task::{AppTask, TaskRetry, TaskStatus};
+pub use task::{AppTask, TaskCategory, TaskRetry, TaskStatus};

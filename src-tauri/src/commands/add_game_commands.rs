@@ -1,6 +1,6 @@
 use crate::{
     app_state::AppState,
-    domain::{Game, TaskStatus},
+    domain::{Game, TaskCategory, TaskStatus},
     repositories::GameRepository,
     services::{AddGameService, GameLibraryService, TaskService},
 };
@@ -92,7 +92,13 @@ pub fn start_add_game_task(
             return Err("受管游戏目录已存在".to_string());
         }
     }
-    let task_id = TaskService::create(&state, "add_game", Some(game_uid.clone()), "准备添加游戏")?;
+    let task_id = TaskService::create(
+        &state,
+        "add_game",
+        TaskCategory::Maintenance,
+        Some(game_uid.clone()),
+        "准备添加游戏",
+    )?;
     let app_handle = app.clone();
     let task_id_for_thread = task_id.clone();
     let games_root_for_cleanup = games_root.clone();

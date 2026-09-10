@@ -21,7 +21,8 @@ pub use baidu_netdisk_service::{
 };
 pub use cloud_account_service::{CloudAccountProfile, CloudAccountService};
 pub use cloud_manifest_service::{
-    CloudGamePage, CloudGameSummary, CloudManifestService, RemoteBodyPackageList,
+    CachedEntry, CloudGameCatalog, CloudGamePage, CloudGameSummary, CloudManifestService,
+    RemoteBodyPackageList,
 };
 pub use cloud_save_service::{
     CloudSaveManifestVersion, CloudSaveOverview, CloudSaveService, CloudSaveSyncStatusView,

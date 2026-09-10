@@ -2,10 +2,11 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { AlertTriangle, ChevronLeft, ChevronRight, CloudDownload, CloudUpload, Gamepad2, Library, Plus, Settings, Search, ShieldCheck } from "@lucide/vue";
-import { deleteRemoteBodyPackage, discardGameCoverCapture, getElevationStatus, getGameCoverUrl, getTask, installCloudGame, launchGame, listCloudGames, listGames, listTasks, restartAsAdmin } from "./api";
+import { confirmAppExit, deleteRemoteBodyPackage, discardGameCoverCapture, getElevationStatus, getGameCoverUrl, getGameRuntime, getTask, installCloudGame, launchGame, listCloudGames, listGames, restartAsAdmin } from "./api";
 import type { AppTask, ElevationStatus } from "./api";
 import type { CloudGameSummary, CloudGameVersion } from "./api";
 import { gameStatusLabel, type Game } from "./domain/game";
+import { taskPolicyOf, useTaskFeed } from "./taskFeed";
 import AddGameWizard from "./components/AddGameWizard.vue";
 import GameDetailPage from "./components/GameDetailPage.vue";
 import GameStorePage from "./components/GameStorePage.vue";
@@ -40,6 +41,8 @@ const storeLoading = ref(false);
 const storeError = ref("");
 const storeLoaded = ref(false);
 const storePage = ref(1);
+const storeTotalCount = ref(0);
+const storeTotalPages = ref(1);
 const storeHasMore = ref(false);
 const STORE_PAGE_SIZE = 9;
 const LIBRARY_PAGE_SIZE = 9;
@@ -47,11 +50,58 @@ const libraryPage = ref(1);
 const elevationStatus = ref<ElevationStatus | null>(null);
 const elevationLoading = ref(false);
 const elevationError = ref("");
-const activeTransferCount = ref(0);
+/**
+ * 任务列表由全应用共享的任务流提供：后端推送 `task-changed`，定时轮询只作兜底。
+ * 这里把它派生成三个信号——角标计数、「该游戏是否在运行」、「云存档未同步」。
+ *
+ * 分流依据一律取自后端的 `category`（策略表在 `taskFeed.ts`）。前端不再维护任务
+ * 类型白名单：那份白名单此前写了两份、且只覆盖 20 个任务类型里的 6 个。
+ */
+const taskFeed = useTaskFeed();
+const tasks = taskFeed.tasks;
+
+const isActiveTask = (task: AppTask) => task.status === "pending" || task.status === "running";
+
+const activeTransferCount = computed(
+  () => tasks.value.filter((task) => isActiveTask(task) && taskPolicyOf(task).badge).length,
+);
+
+// launch_game 的生命周期 == 整场游戏会话，所以它就是「该游戏是否在运行」在这个
+// 列表里现成的信号，与详情页的 runtime 同源（后端都会在会话结束时清掉）。
+const runningGameUids = computed(
+  () =>
+    new Set(
+      tasks.value
+        .filter((task) => task.category === "session" && isActiveTask(task) && task.gameUid)
+        .map((task) => task.gameUid as string),
+    ),
+);
+
+// 自动同步是后台静默触发的，唯一的「响」就落在失败信号 + 传输中心的重试入口上。
+// 同一游戏可能堆着多条历史同步记录，只有「最近一条」才代表当前状态——否则一次
+// 早先的失败会永远钉在卡片上，哪怕后来已经同步成功。
+const unsyncedSyncTasks = computed(() => {
+  const latestSyncByGame = new Map<string, AppTask>();
+  for (const task of tasks.value) {
+    if (task.category !== "cloud_save_sync" || !task.gameUid) continue;
+    const current = latestSyncByGame.get(task.gameUid);
+    if (!current || parseTimestamp(task.createdAt) >= parseTimestamp(current.createdAt)) {
+      latestSyncByGame.set(task.gameUid, task);
+    }
+  }
+  return [...latestSyncByGame.values()].filter(
+    (task) => task.status === "failed" || task.status === "interrupted",
+  );
+});
+const unsyncedGameUids = computed(
+  () => new Set(unsyncedSyncTasks.value.map((task) => task.gameUid as string)),
+);
+const syncAttentionCount = computed(() => unsyncedSyncTasks.value.length);
 let cloudInstallTimer: ReturnType<typeof setTimeout> | undefined;
-let transferCountTimer: ReturnType<typeof setTimeout> | undefined;
 let stopCoverCaptureRoute: UnlistenFn | undefined;
+let stopExitGuard: UnlistenFn | undefined;
 let appDisposed = false;
+let exitPromptOpen = false;
 let gamesLoadGeneration = 0;
 let storeLoadGeneration = 0;
 
@@ -69,8 +119,9 @@ const filteredGames = computed(() => {
   const keyword = search.value.trim().toLocaleLowerCase();
   const result = games.value.filter((game) => {
     if (keyword && !game.displayName.toLocaleLowerCase().includes(keyword)) return false;
-    if (activeView.value === "attention") return game.health !== "ready";
-    return true;
+    const needsAttention = gameStatusLabel(game) !== "可启动";
+    if (activeView.value === "attention") return needsAttention;
+    return !needsAttention;
   });
 
   const orderMap = new Map<string, number>();
@@ -136,13 +187,63 @@ const pagedGames = computed(() => {
   return filteredGames.value.slice(start, start + LIBRARY_PAGE_SIZE);
 });
 
+const libraryPageItems = computed(() => {
+  const current = libraryPage.value;
+  const total = libraryPageCount.value;
+  if (total <= 7) {
+    return Array.from({ length: total }, (_, i) => i + 1);
+  }
+  const items: (number | string)[] = [];
+  items.push(1);
+  if (current > 3) {
+    items.push("...");
+  }
+  const start = Math.max(2, current - 1);
+  const end = Math.min(total - 1, current + 1);
+  for (let i = start; i <= end; i++) {
+    items.push(i);
+  }
+  if (current < total - 2) {
+    items.push("...");
+  }
+  items.push(total);
+  return items;
+});
+
 const pageTitle = computed(() => activeView.value === "all" ? "游戏库" : "需要处理");
+const readyGameCount = computed(() => games.value.filter((game) => gameStatusLabel(game) === "可启动").length);
+const libraryEmptyTitle = computed(() => {
+  if (!games.value.length) return "还没有加入游戏";
+  if (search.value.trim()) return "没有匹配的游戏";
+  if (activeView.value === "attention") return "没有需要处理的游戏";
+  return readyGameCount.value ? "没有匹配的游戏" : "当前没有可启动的游戏";
+});
+const libraryEmptyDescription = computed(() => {
+  if (!games.value.length) return "添加游戏本体后，它会出现在这里。";
+  if (search.value.trim()) return "调整搜索关键词，或切换到另一个视图。";
+  if (activeView.value === "attention") return "所有游戏当前都可以启动。";
+  return readyGameCount.value
+    ? "调整搜索关键词，或切换到另一个视图。"
+    : "待处理的游戏会显示在「需要处理」中。完成设置后即可在这里启动。";
+});
+
+let storeSearchTimer: ReturnType<typeof setTimeout> | undefined;
 
 watch([search, activeView, activeSort], () => {
   if (activeSort.value) {
     localStorage.setItem("gamesaver_library_sort", activeSort.value);
   }
   libraryPage.value = 1;
+});
+
+watch(search, (val) => {
+  if (activePage.value === "store") {
+    if (storeSearchTimer) clearTimeout(storeSearchTimer);
+    storeSearchTimer = setTimeout(() => {
+      storePage.value = 1;
+      void loadStore(true, 1, val);
+    }, 280);
+  }
 });
 
 function loadGameCovers(list: Game[]) {
@@ -183,22 +284,33 @@ async function loadGames() {
   }
 }
 
-async function loadStore(force = false, page = 1) {
+function scrollToContentTop() {
+  const container = document.querySelector(".content-area");
+  if (container) {
+    container.scrollTo({ top: 0, behavior: "smooth" });
+  }
+}
+
+async function loadStore(force = false, page = storePage.value, keyword = search.value) {
   if ((!force && storeLoading.value) || (!force && storeLoaded.value && page === storePage.value)) return;
   const generation = ++storeLoadGeneration;
   storeLoading.value = true;
   storeError.value = "";
   try {
-    const result = await listCloudGames(page, STORE_PAGE_SIZE);
+    const result = await listCloudGames(page, STORE_PAGE_SIZE, keyword);
     if (generation !== storeLoadGeneration) return;
     cloudGames.value = result.games;
     storePage.value = result.page;
+    storeTotalCount.value = result.totalCount;
+    storeTotalPages.value = result.totalPages;
     storeHasMore.value = result.hasMore;
     storeLoaded.value = true;
   } catch (reason) {
     if (generation !== storeLoadGeneration) return;
     if (page === 1) {
       cloudGames.value = [];
+      storeTotalCount.value = 0;
+      storeTotalPages.value = 1;
       storeHasMore.value = false;
     }
     storeError.value = String(reason);
@@ -210,17 +322,20 @@ async function loadStore(force = false, page = 1) {
 }
 
 function refreshStore() {
-  void loadStore(true, 1);
+  void loadStore(true, storePage.value, search.value);
 }
 
 function changeStorePage(page: number) {
-  if (page < 1 || (page > storePage.value && !storeHasMore.value)) return;
-  void loadStore(true, page);
+  if (page < 1 || page > storeTotalPages.value || page === storePage.value) return;
+  void loadStore(true, page, search.value).then(() => {
+    scrollToContentTop();
+  });
 }
 
 function changeLibraryPage(page: number) {
-  if (page < 1 || page > libraryPageCount.value) return;
+  if (page < 1 || page > libraryPageCount.value || page === libraryPage.value) return;
   libraryPage.value = page;
+  scrollToContentTop();
 }
 
 async function loadElevationStatus() {
@@ -242,22 +357,28 @@ async function restartWithAdmin() {
   }
 }
 
-async function updateTransferCount() {
+/**
+ * 后端在「有游戏运行中却收到关闭请求」时会拦截关闭，并推送此事件。
+ *
+ * 这次确认是唯一能阻止「静默丢失本次存档」的关口：用户一旦确认退出，
+ * 承载游戏会话的线程随进程消亡，本次游玩的存档不会被提交。
+ */
+async function handleExitBlocked(payload: { runningCount?: number } | undefined) {
+  if (exitPromptOpen) return;
+  exitPromptOpen = true;
   try {
-    const tasks = await listTasks();
-    const isTransfer = (task: AppTask) =>
-      task.taskType === "upload_game_body_package" ||
-      task.taskType === "download_game_body_package" ||
-      task.taskType === "install_cloud_game" ||
-      task.taskType === "delete_remote_body_package" ||
-      task.taskType === "repair_cloud_body_manifest";
-    const active = tasks.filter((task) => isTransfer(task) && (task.status === "pending" || task.status === "running")).length;
-    activeTransferCount.value = active;
-    if (transferCountTimer) clearTimeout(transferCountTimer);
-    transferCountTimer = setTimeout(() => void updateTransferCount(), active > 0 ? 1000 : 3500);
-  } catch {
-    if (transferCountTimer) clearTimeout(transferCountTimer);
-    transferCountTimer = setTimeout(() => void updateTransferCount(), 5000);
+    const count = payload?.runningCount ?? 1;
+    const confirmed = window.confirm(
+      `有 ${count} 个游戏正在运行。\n\n` +
+        "现在关闭 GameSaver，本次游玩的存档将不会被自动提交，也不会生成新的存档版本。\n\n" +
+        "仍要关闭吗？",
+    );
+    if (!confirmed) return;
+    await confirmAppExit();
+  } catch (reason) {
+    console.error("确认退出失败", reason);
+  } finally {
+    exitPromptOpen = false;
   }
 }
 
@@ -265,7 +386,6 @@ onMounted(() => {
   void loadGames();
   void loadElevationStatus();
   void loadStore();
-  void updateTransferCount();
   void listen<{ captureId: string; gameUid: string }>("cover-capture-ready", async (event) => {
     if (activePage.value === "detail" && selectedGame.value?.gameUid === event.payload.gameUid) return;
     let game = games.value.find((item) => item.gameUid === event.payload.gameUid);
@@ -287,12 +407,21 @@ onMounted(() => {
   }).catch((reason) => {
     console.error("监听封面截图跳转事件失败", reason);
   });
+  void listen<{ runningCount: number }>("app-exit-blocked", (event) => {
+    void handleExitBlocked(event.payload);
+  }).then((unlisten) => {
+    if (appDisposed) unlisten();
+    else stopExitGuard = unlisten;
+  }).catch((reason) => {
+    console.error("监听退出拦截事件失败", reason);
+  });
 });
 onUnmounted(() => {
   appDisposed = true;
   stopCoverCaptureRoute?.();
+  stopExitGuard?.();
+  taskFeed.release();
   if (cloudInstallTimer) clearTimeout(cloudInstallTimer);
-  if (transferCountTimer) clearTimeout(transferCountTimer);
   coverUrls.value = {};
 });
 
@@ -320,6 +449,16 @@ async function quickLaunch(game: Game) {
   if (game.lifecycle !== "active") {
     openGame(game);
     return;
+  }
+  // 已在运行的游戏绝不再拉起第二个实例：后端最终也会拒绝，但先跳到详情页更符合
+  // 预期 —— 那里能看到「运行中」和本次会话的提交进度。
+  try {
+    if (await getGameRuntime(game.gameUid)) {
+      openGame(game);
+      return;
+    }
+  } catch {
+    // runtime 查询失败不阻断启动，交给后端做最终判定
   }
   try {
     await launchGame(game.gameUid);
@@ -438,6 +577,7 @@ async function finishAddGame(completedGame?: Game) {
           <CloudUpload :size="18" />
           <span>传输中心</span>
           <span v-if="activeTransferCount > 0" class="nav-badge">{{ activeTransferCount }}</span>
+          <span v-else-if="syncAttentionCount > 0" class="nav-badge nav-badge-alert" :title="`${syncAttentionCount} 个游戏的存档未能同步到网盘，可在传输中心重试`">{{ syncAttentionCount }}</span>
         </button>
       </nav>
       <div class="sidebar-bottom">
@@ -475,14 +615,14 @@ async function finishAddGame(completedGame?: Game) {
       </header>
 
       <AddGameWizard v-if="activePage === 'add'" @back="activePage = 'library'" @completed="finishAddGame" />
-      <GameDetailPage v-else-if="activePage === 'detail' && selectedGame" :game="selectedGame" :cover-url="selectedGame ? coverUrls[selectedGame.gameUid] : ''" :initial-error="selectedGameError" :pending-cover-capture="pendingCoverCapture" @back="activePage = 'library'" @settings="activePage = 'settings'" @refresh="loadGames" @capture-handled="finishPendingCoverCapture" />
-      <GameStorePage v-else-if="activePage === 'store'" :games="cloudGames" :search="search" :loading="storeLoading" :load-error="storeError" :install-uid="cloudInstallUid" :install-progress="cloudInstallProgress" :install-message="cloudInstallMessage" :install-error="cloudInstallError" :install-notice="cloudInstallNotice" :page="storePage" :has-more="storeHasMore" @install="installAndLaunch" @delete-version="deleteCloudVersion" @retry="refreshStore" @refresh="refreshStore" @page-change="changeStorePage" />
+      <GameDetailPage v-else-if="activePage === 'detail' && selectedGame" :key="selectedGame.gameUid" :game="selectedGame" :cover-url="selectedGame ? coverUrls[selectedGame.gameUid] : ''" :initial-error="selectedGameError" :pending-cover-capture="pendingCoverCapture" @back="activePage = 'library'" @settings="activePage = 'settings'" @refresh="loadGames" @capture-handled="finishPendingCoverCapture" />
+      <GameStorePage v-else-if="activePage === 'store'" :games="cloudGames" :search="search" :loading="storeLoading" :load-error="storeError" :install-uid="cloudInstallUid" :install-progress="cloudInstallProgress" :install-message="cloudInstallMessage" :install-error="cloudInstallError" :install-notice="cloudInstallNotice" :page="storePage" :page-size="STORE_PAGE_SIZE" :total-count="storeTotalCount" :total-pages="storeTotalPages" :has-more="storeHasMore" @install="installAndLaunch" @delete-version="deleteCloudVersion" @retry="refreshStore" @refresh="refreshStore" @page-change="changeStorePage" />
       <TransferCenter v-else-if="activePage === 'transfers'" :games="games" :cloud-games="cloudGames" />
       <PlatformSettings v-else-if="activePage === 'settings'" />
 
       <template v-else-if="activePage === 'library'">
       <div class="library-toolbar" role="tablist" aria-label="游戏库视图">
-        <button v-for="view in ([['all', '全部游戏'], ['attention', '需要处理']] as const)" :key="view[0]" class="view-tab" :class="{ active: activeView === view[0] }" type="button" @click="activeView = view[0]">{{ view[1] }}</button>
+        <button v-for="view in ([['all', '可启动'], ['attention', '需要处理']] as const)" :key="view[0]" class="view-tab" :class="{ active: activeView === view[0] }" type="button" @click="activeView = view[0]">{{ view[1] }}</button>
         <span v-if="filteredGames.length" class="library-count">{{ filteredGames.length }} 个游戏</span>
 
         <div class="library-sort">
@@ -501,20 +641,56 @@ async function finishAddGame(completedGame?: Game) {
 
       <div v-if="loading" class="state-panel"><span class="loader"></span><strong>正在加载游戏库</strong></div>
       <div v-else-if="error" class="state-panel error-state"><strong>游戏库加载失败</strong><p>{{ error }}</p><button type="button" @click="loadGames">重试</button></div>
-      <div v-else-if="!filteredGames.length" class="state-panel empty-state"><div class="empty-icon"><Gamepad2 :size="28" /></div><strong>{{ games.length ? "没有匹配的游戏" : "还没有加入游戏" }}</strong><p>{{ games.length ? "调整搜索或筛选条件。" : "添加游戏本体后，它会出现在这里。" }}</p><button class="primary-button" type="button" @click="openAddGame"><Plus :size="17" /> 添加游戏</button></div>
+      <div v-else-if="!filteredGames.length" class="state-panel empty-state"><div class="empty-icon"><Gamepad2 :size="28" /></div><strong>{{ libraryEmptyTitle }}</strong><p>{{ libraryEmptyDescription }}</p><button v-if="!games.length || activeView === 'all'" class="primary-button" type="button" @click="openAddGame"><Plus :size="17" /> 添加游戏</button><button v-else-if="activeView === 'attention' && readyGameCount > 0" type="button" @click="activeView = 'all'">查看可启动游戏</button></div>
       <div v-else class="game-grid">
         <article v-for="game in pagedGames" :key="game.gameUid" class="game-card" tabindex="0" @click="openGame(game)" @keyup.enter="openGame(game)">
           <div class="game-card-cover">
             <img v-if="coverUrls[game.gameUid]" :src="coverUrls[game.gameUid]" :alt="`${game.displayName} 封面`" loading="lazy" @error="delete coverUrls[game.gameUid]" />
             <div v-else class="cover-placeholder"><Gamepad2 :size="34" /></div>
           </div>
-          <div class="game-card-body"><div><h2>{{ game.displayName }}</h2><span class="status-label">{{ gameStatusLabel(game) }}</span></div><button class="launch-button" type="button" :disabled="game.lifecycle !== 'active'" @click.stop="quickLaunch(game)">启动</button></div>
+          <div class="game-card-body"><div><h2>{{ game.displayName }}</h2><span class="status-label">{{ gameStatusLabel(game) }}</span><span v-if="unsyncedGameUids.has(game.gameUid)" class="status-label status-label-warn" title="最近一次自动同步存档失败，可在传输中心重试">存档未同步</span></div><button class="launch-button" type="button" :disabled="game.lifecycle !== 'active' || runningGameUids.has(game.gameUid)" @click.stop="quickLaunch(game)">{{ runningGameUids.has(game.gameUid) ? "运行中" : "启动" }}</button></div>
         </article>
       </div>
       <nav v-if="filteredGames.length" class="library-pagination" aria-label="游戏库分页">
-        <button class="icon-button" type="button" :disabled="libraryPage <= 1" title="上一页" aria-label="上一页" @click="changeLibraryPage(libraryPage - 1)"><ChevronLeft :size="18" /></button>
-        <span>第 {{ libraryPage }} / {{ libraryPageCount }} 页</span>
-        <button class="icon-button" type="button" :disabled="libraryPage >= libraryPageCount" title="下一页" aria-label="下一页" @click="changeLibraryPage(libraryPage + 1)"><ChevronRight :size="18" /></button>
+        <button
+          class="pagination-btn"
+          type="button"
+          :disabled="libraryPage <= 1"
+          title="上一页"
+          aria-label="上一页"
+          @click="changeLibraryPage(libraryPage - 1)"
+        >
+          <ChevronLeft :size="18" />
+        </button>
+        <div class="pagination-pages">
+          <template v-for="(item, idx) in libraryPageItems" :key="idx">
+            <span v-if="item === '...'" class="pagination-ellipsis">…</span>
+            <button
+              v-else
+              type="button"
+              class="pagination-num"
+              :class="{ active: item === libraryPage }"
+              :disabled="item === libraryPage"
+              :title="`前往第 ${item} 页`"
+              @click="changeLibraryPage(Number(item))"
+            >
+              {{ item }}
+            </button>
+          </template>
+        </div>
+        <button
+          class="pagination-btn"
+          type="button"
+          :disabled="libraryPage >= libraryPageCount"
+          title="下一页"
+          aria-label="下一页"
+          @click="changeLibraryPage(libraryPage + 1)"
+        >
+          <ChevronRight :size="18" />
+        </button>
+        <span class="pagination-summary">
+          第 {{ libraryPage }} / {{ libraryPageCount }} 页（共 {{ filteredGames.length }} 项）
+        </span>
       </nav>
       </template>
     </section>

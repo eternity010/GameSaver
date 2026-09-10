@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -37,6 +37,7 @@ const baiduConfig = ref<BaiduConfigView | null>(null);
 const cloudConnectionLoading = ref(true);
 const loading = ref(true);
 const busy = ref(false);
+const launchPending = ref(false);
 const error = ref(props.initialError || "");
 const message = ref("");
 const taskProgress = ref(0);
@@ -133,10 +134,25 @@ let coverPointerX = 0;
 let coverPointerY = 0;
 let stopCoverCaptureReady: UnlistenFn | undefined;
 let stopCoverCaptureFailed: UnlistenFn | undefined;
-let captureListenersDisposed = false;
+let stopRuntimeChanged: UnlistenFn | undefined;
+let stopTaskChanged: UnlistenFn | undefined;
+let detailListenersDisposed = false;
 const COVER_STAGE_WIDTH = 640;
 const COVER_STAGE_HEIGHT = 360;
+/**
+ * 会话跟踪的兜底周期。
+ *
+ * 正常情况下会话状态由后端推送（`runtime-changed` / `task-changed`）驱动，这里
+ * 只在事件丢失时才生效。此前是整场游戏会话 700ms 不息轮询，而一场会话里真正
+ * 有意义的变化只有三次（开始运行 / 游戏退出 / 存档提交完成）。
+ */
+const TASK_POLL_FALLBACK_MS = 5000;
+/** 连续到达的任务变化事件合并成一个复核窗口。 */
+const TASK_EVENT_DEBOUNCE_MS = 120;
 let pollTimer: ReturnType<typeof setTimeout> | undefined;
+let taskEventTimer: ReturnType<typeof setTimeout> | undefined;
+// 当前正在轮询的任务 id。用于「同一场会话不重复接回」，也让 reattach 不会死循环。
+let watchedTaskId: string | undefined;
 let refreshGeneration = 0;
 let cloudOverviewPromise: Promise<void> | null = null;
 let cloudOverviewGameUid = "";
@@ -191,9 +207,21 @@ async function refresh() {
   const generation = ++refreshGeneration;
   loading.value = true;
   error.value = "";
-  cloudSaveLoaded.value = false;
   cloudSaveError.value = "";
-  cloudConnectionLoading.value = true;
+  // 云端总览必须重新读取：它含一份「本地 ↔ 云端」的对比状态，而本页每一条会导致
+  // refresh() 的路径都可能改动本地存档——连「改保留数」都会按新上限删掉多余版本
+  // （见 update_save_profile_keep_versions），所以不能靠缓存跳过这次复查。
+  //
+  // 但「重新读取」不等于「先清空」：清空会让「同步最新」变灰、版本计数消失、状态
+  // 徽标闪回「查询中」，而这期间用户看到的只是同一份数据的旧快照。已有本游戏摘要
+  // 时保留它，把「不许基于过期 syncState 操作」交给按钮的 cloudSaveLoading 条件。
+  if (!cloudSaveLoaded.value || cloudOverviewGameUid !== gameUid) {
+    cloudSaveLoaded.value = false;
+    cloudConnectionLoading.value = true;
+  }
+  // 同步置位而不是等 loadCloudSaveOverview：refreshCloudState 在它之前还要先读两次
+  // 连接状态，这几毫秒里若不置位，「同步最新」会短暂可点并基于旧 syncState 下手。
+  cloudSaveLoading.value = true;
   void refreshCloudState(gameUid, generation, true);
   try {
     const detail = await getGameDetailView(gameUid);
@@ -201,6 +229,8 @@ async function refresh() {
     precheck.value = detail.precheck;
     versions.value = detail.versions;
     runtime.value = detail.runtime;
+    // 会话可能从组件卸载期间延续下来：拿到 runtime 就立刻接回轮询。
+    reattachRuntimeTask();
     bodyVersions.value = detail.bodyVersions;
     saveProfile.value = detail.saveProfile;
     if (detail.saveProfile?.keepVersions) {
@@ -232,12 +262,15 @@ async function refreshCloudState(gameUid: string, generation: number, forceOverv
       cloudSaveStatus.value = null;
       cloudSaveVersions.value = [];
       cloudSaveLoaded.value = true;
+      // 没走 loadCloudSaveOverview，它不会替我们收尾（refresh() 已先置位）。
+      cloudSaveLoading.value = false;
     }
   } catch (reason) {
     if (generation !== refreshGeneration || gameUid !== props.game.gameUid) return;
     cloudConnectionLoading.value = false;
     cloudSaveError.value = String(reason);
     cloudSaveLoaded.value = true;
+    cloudSaveLoading.value = false;
   }
 }
 
@@ -343,7 +376,8 @@ async function syncLatestSave() {
 }
 
 function cloudSaveStatusText(): string {
-  if (cloudConnectionLoading.value || cloudSaveLoading.value) return "查询中...";
+  // 只有还没有任何摘要时才报「查询中」；已有摘要时不因一次后台复查把徽标刷掉。
+  if (!cloudSaveStatus.value && (cloudConnectionLoading.value || cloudSaveLoading.value)) return "查询中...";
   if (!baiduReady()) return "网盘未连接";
   if (cloudSaveError.value) return "读取失败";
   if (!cloudSaveStatus.value) return "等待查询";
@@ -380,25 +414,71 @@ function cloudSaveStatusBadgeClass(): string {
   }
 }
 
+/**
+ * 启动按钮的文案与可用性由 `runtime` 决定 —— 它才是「游戏是否在运行」的唯一真相源。
+ *
+ * 此前只看 `busy`：一旦离开详情页再回来，`busy` 归 false 而游戏仍在运行，
+ * 按钮就显示成「启动游戏」且可点，点下去才由后端报「游戏已经在运行」。
+ * `launchPending` 只覆盖「命令已发出、后端 runtime 尚未反映」的短窗口，
+ * 不用 `busy` 是为了避免把上传/还原等其它任务的 busy 误读成"正在启动"。
+ */
+const launchButton = computed<{ label: string; disabled: boolean; spinning: boolean }>(() => {
+  const status = runtime.value?.status;
+  const spinning =
+    status === "launching" ||
+    status === "saving" ||
+    launchPending.value ||
+    (loading.value && !precheck.value);
+  let label = "启动游戏";
+  if (status) label = runtimeLabel(status);
+  else if (launchPending.value) label = "正在启动游戏";
+  else if (loading.value && !precheck.value) label = "检测中...";
+  return {
+    label,
+    disabled: !!runtime.value || busy.value || !precheck.value?.canLaunch,
+    spinning,
+  };
+});
+
 async function start() {
-  if (busy.value || !precheck.value?.canLaunch) return;
+  // runtime 是唯一真相源：只要后端报告有 runtime，就绝不再拉起。
+  if (busy.value || runtime.value || !precheck.value?.canLaunch) return;
+  const gameUid = props.game.gameUid;
   busy.value = true;
+  launchPending.value = true;
   error.value = "";
   message.value = "正在启动游戏";
   try {
-    const taskId = await launchGame(props.game.gameUid);
-    await watchTask(taskId);
+    await watchTask(await launchGame(gameUid));
   } catch (reason) {
-    error.value = String(reason);
-    busy.value = false;
+    if (gameUid === props.game.gameUid) error.value = String(reason);
+  } finally {
+    // 这场会话可能跨越「用户切到了别的游戏」：只有仍然是同一场时才回收这些 UI
+    // 状态，否则会把新游戏的进度面板一起清掉。
+    if (gameUid === props.game.gameUid) {
+      launchPending.value = false;
+      busy.value = false;
+    }
   }
 }
 
-async function watchTask(taskId: string) {
+async function watchTask(taskId: string, gameUid: string = props.game.gameUid) {
+  // 会话属于某个具体游戏：组件已经切到别的游戏时不再跟踪，否则上一场的
+  // message / 进度条会被写进当前页面。回到该游戏时 refresh() 会重新接回。
+  if (gameUid !== props.game.gameUid) {
+    // 组件已切到别的游戏：静默结束本场轮询。切换时的 watcher 已经停过定时器，
+    // 这里**不能**再 stopPolling —— 那会误杀新游戏刚建立的轮询。
+    if (watchedTaskId === taskId) watchedTaskId = undefined;
+    return;
+  }
   stopPolling();
+  watchedTaskId = taskId;
+  busy.value = true;
   try {
     const task = await getTask(taskId);
-    runtime.value = await getGameRuntime(props.game.gameUid);
+    if (gameUid !== props.game.gameUid) return;
+    runtime.value = await getGameRuntime(gameUid);
+    if (gameUid !== props.game.gameUid) return;
     message.value = task.message;
     taskProgress.value = task.progress;
     if (task.status === "success") {
@@ -414,11 +494,80 @@ async function watchTask(taskId: string) {
       error.value = failure;
       return;
     }
-    pollTimer = setTimeout(() => void watchTask(taskId), 700);
+    pollTimer = setTimeout(() => void watchTask(taskId, gameUid), TASK_POLL_FALLBACK_MS);
   } catch (reason) {
+    if (watchedTaskId === taskId) watchedTaskId = undefined;
+    if (gameUid !== props.game.gameUid) return;
     busy.value = false;
     error.value = String(reason);
   }
+}
+
+/**
+ * 会话可能在组件卸载期间仍在延续（用户离开详情页又回来）。刷新时若后端仍报告
+ * runtime，就用它自带的 taskId 接回轮询，让「运行中」与退出后的提交进度重新可见。
+ *
+ * 已处理过的 taskId 记在 `watchedTaskId` 上不再重复接回，避免失败任务造成死循环。
+ */
+function reattachRuntimeTask() {
+  const taskId = runtime.value?.taskId;
+  if (!taskId || taskId === watchedTaskId) return;
+  void watchTask(taskId, props.game.gameUid);
+}
+
+/**
+ * 后端推送「运行时状态变化」时的即时复核。
+ *
+ * 已在跟踪本场会话时直接复核任务进度（`watchTask` 会顺带刷新 runtime）；否则
+ * 重新读一次 runtime —— 可能是别处（存档分析等）挂上的会话，也可能是会话结束。
+ */
+async function syncRuntimeFromEvent(gameUid: string) {
+  if (gameUid !== props.game.gameUid) return;
+  if (watchedTaskId) {
+    await watchTask(watchedTaskId, gameUid);
+    return;
+  }
+  try {
+    const next = await getGameRuntime(gameUid);
+    if (gameUid !== props.game.gameUid) return;
+    runtime.value = next;
+    reattachRuntimeTask();
+  } catch {
+    // 事件只是提示：读不到就交给兜底轮询，不打断页面。
+  }
+}
+
+function handleRuntimeChanged(payload: { gameUid?: string } | undefined) {
+  if (!payload?.gameUid) return;
+  void syncRuntimeFromEvent(payload.gameUid);
+}
+
+/**
+ * 后端推送「任务变化」时的即时复核。
+ *
+ * 匹配规则刻意收紧：
+ * - 正在跟踪某场会话时，**只认任务 ID 相符**的变化。光看 `gameUid` 会把「游戏退出
+ *   后的自动云同步」也算进来——那是一条独立任务，让它触发本场会话的复核，会导致
+ *   错误地重读一个早已结束的任务、并连带整页刷新。
+ * - 尚未跟踪任务时，才退回按 `gameUid` 判断：可能是本游戏刚被（从库页启动后）
+ *   挂上会话，需要复核一次 runtime 决定是否接回。
+ *
+ * 短窗口合并连续事件：存档提交阶段进度会连续推进，后端已按 2% 粒度节流，这里
+ * 再合并一次，避免把节流后的多次变化放大成多次 IPC。
+ */
+function handleTaskChanged(payload: { taskId?: string; gameUid?: string } | undefined) {
+  if (!payload) return;
+  if (watchedTaskId) {
+    if (payload.taskId !== watchedTaskId) return;
+  } else if (payload.gameUid !== props.game.gameUid) {
+    return;
+  }
+  if (taskEventTimer) clearTimeout(taskEventTimer);
+  taskEventTimer = setTimeout(() => {
+    taskEventTimer = undefined;
+    if (watchedTaskId) void watchTask(watchedTaskId, props.game.gameUid);
+    else void syncRuntimeFromEvent(props.game.gameUid);
+  }, TASK_EVENT_DEBOUNCE_MS);
 }
 
 async function restoreVersion(version: SaveVersion) {
@@ -599,6 +748,8 @@ function baiduActionLabel(): string {
 function stopPolling() {
   if (pollTimer) clearTimeout(pollTimer);
   pollTimer = undefined;
+  if (taskEventTimer) clearTimeout(taskEventTimer);
+  taskEventTimer = undefined;
 }
 
 function formatBytes(bytes: number): string {
@@ -854,7 +1005,10 @@ function loadCover() {
   }
   if (props.game.cover) {
     coverDisplayUrl.value = getGameCoverUrl(props.game.gameUid, Date.now());
+    return;
   }
+  // 两个来源都没有时必须显式清空：否则上一张封面会留在 ref 里，显示成新游戏的封面。
+  coverDisplayUrl.value = "";
 }
 
 watch(() => props.coverUrl, (value) => {
@@ -865,10 +1019,10 @@ watch(() => props.initialError, (value) => {
   if (value) error.value = value;
 });
 
-watch(() => props.game.gameUid, () => {
-  void refresh();
-  void loadCover();
-});
+// 这里原先有一个 watch(() => props.game.gameUid) 用来在切换游戏时手工清理上一场的
+// 会话跟踪、进度与消息。父级现在用 :key="gameUid" 渲染本组件，切换游戏会直接重建
+// 实例，局部状态天然是新局，该 watcher 再也不会触发。保留这段说明是因为**不要**
+// 再退回逐项手工清理：此前它总是漏掉一两项（封面、保留数都曾残留到下一个游戏）。
 
 watch(coverZoom, clampCoverPosition);
 
@@ -878,23 +1032,38 @@ onMounted(() => {
   void listen<{ captureId: string; gameUid: string }>("cover-capture-ready", (event) => {
     void handleCoverCaptureReady(event.payload);
   }).then((unlisten) => {
-    if (captureListenersDisposed) unlisten();
+    if (detailListenersDisposed) unlisten();
     else stopCoverCaptureReady = unlisten;
   });
   void listen<{ captureId: string; gameUid: string; message: string }>("cover-capture-failed", (event) => {
     handleCoverCaptureFailed(event.payload);
   }).then((unlisten) => {
-    if (captureListenersDisposed) unlisten();
+    if (detailListenersDisposed) unlisten();
     else stopCoverCaptureFailed = unlisten;
+  });
+  // 会话状态改由后端推送驱动，轮询退化为 5s 兜底。
+  void listen<{ gameUid?: string }>("runtime-changed", (event) => {
+    handleRuntimeChanged(event.payload);
+  }).then((unlisten) => {
+    if (detailListenersDisposed) unlisten();
+    else stopRuntimeChanged = unlisten;
+  });
+  void listen<{ taskId?: string; gameUid?: string }>("task-changed", (event) => {
+    handleTaskChanged(event.payload);
+  }).then((unlisten) => {
+    if (detailListenersDisposed) unlisten();
+    else stopTaskChanged = unlisten;
   });
   if (props.pendingCoverCapture) {
     void handleCoverCaptureReady(props.pendingCoverCapture);
   }
 });
 onUnmounted(() => {
-  captureListenersDisposed = true;
+  detailListenersDisposed = true;
   stopCoverCaptureReady?.();
   stopCoverCaptureFailed?.();
+  stopRuntimeChanged?.();
+  stopTaskChanged?.();
   if (coverCaptureId.value) void discardGameCoverCapture(coverCaptureId.value);
   stopPolling();
   releaseCoverSource();
@@ -976,11 +1145,10 @@ onUnmounted(() => {
           <span class="status-label">{{ runtime ? runtimeLabel(runtime.status) : (precheck ? (precheck.canLaunch ? "可启动" : "需要处理") : gameStatusLabel(game)) }}</span>
           <h2>{{ precheck ? (precheck.canLaunch ? "准备就绪" : "启动前需要处理") : (game.lifecycle === 'pending_setup' ? '需要完成设置' : (game.health !== 'ready' ? '需要处理' : '环境检测中...')) }}</h2>
           <p>{{ message || (precheck ? (precheck.canLaunch ? "游戏本体和存档保护配置均可用。" : "完成下方检查后才能启动游戏。") : "正在核对启动程序与存档保护配置...") }}</p>
-          <button class="primary-button detail-launch" type="button" :disabled="busy || !precheck?.canLaunch" @click="start">
-            <LoaderCircle v-if="busy" :size="17" class="spin" />
-            <LoaderCircle v-else-if="loading && !precheck" :size="17" class="spin" />
+          <button class="primary-button detail-launch" type="button" :disabled="launchButton.disabled" @click="start">
+            <LoaderCircle v-if="launchButton.spinning" :size="17" class="spin" />
             <Play v-else :size="17" />
-            {{ busy ? "游戏运行中" : (loading && !precheck ? "检测中..." : "启动游戏") }}
+            {{ launchButton.label }}
           </button>
         </div>
       </section>
@@ -1106,7 +1274,7 @@ onUnmounted(() => {
             </div>
           </div>
           <div v-if="baiduReady()" class="cloud-save-actions">
-            <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime || !cloudSaveLoaded" title="立即与云端同步" @click="syncLatestSave"><RefreshCw :size="14" />同步最新</button>
+            <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime || !cloudSaveLoaded || cloudSaveLoading" title="立即与云端同步" @click="syncLatestSave"><RefreshCw :size="14" />同步最新</button>
             <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" title="查看百度网盘上的所有历史存档" @click="openCloudSaveDrawer"><FolderOpen :size="14" />云端存档<template v-if="cloudSaveLoaded"> ({{ cloudSaveVersions.length }})</template></button>
           </div>
           <div v-else-if="!cloudConnectionLoading" class="cloud-save-actions">

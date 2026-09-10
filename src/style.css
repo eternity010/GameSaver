@@ -32,6 +32,8 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--focus-ring)
 .nav-item:hover, .nav-item.active { color: var(--text-primary); background: var(--surface-raised); }
 .nav-item.active { box-shadow: inset 3px 0 var(--brand); }
 .nav-badge { margin-left: auto; padding: 2px 7px; border-radius: 999px; color: #162033; background: var(--brand); font-size: 11px; font-weight: 700; line-height: 1.2; }
+.nav-badge-alert { color: #2a1418; background: var(--danger); }
+.status-label-warn { margin-left: 8px; color: var(--danger); }
 .disabled-nav { cursor: not-allowed; opacity: .45; }
 .local-status { padding: 0 12px; color: #7f8897; font-size: 12px; }
 .local-status i { display: inline-block; width: 7px; height: 7px; margin-right: 5px; border-radius: 50%; background: var(--success); }
@@ -77,6 +79,8 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--focus-ring)
 .transfer-copy p { margin: 5px 0 2px; color: var(--text-secondary); font-size: 12px; }
 .transfer-copy small { display: block; overflow-wrap: anywhere; color: #7f8897; font-size: 11px; }
 .transfer-error { color: var(--danger) !important; }
+/* 进行中但无法安全取消的任务：明确告知，避免用户以为界面漏了取消按钮。 */
+.transfer-locked { color: var(--text-secondary); font-size: 12px; white-space: nowrap; }
 .transfer-progress { display: grid; gap: 7px; }
 .transfer-progress strong { color: var(--text-primary); font-size: 13px; text-align: right; }
 .transfer-progress .progress-track { width: 100%; }
@@ -116,8 +120,17 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--focus-ring)
 .store-empty { min-height: 420px; }
 .store-install-error { margin-top: 16px; }
 .store-install-notice { margin-top: 16px; }
-.store-pagination { display: flex; align-items: center; justify-content: center; gap: 16px; margin-top: 28px; color: var(--text-secondary); font-size: 12px; }
-.store-pagination .icon-button { display: inline-grid; place-items: center; width: 34px; height: 34px; }
+.store-pagination, .library-pagination { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 10px; margin-top: 32px; color: var(--text-secondary); font-size: 13px; }
+.store-pagination .pagination-btn, .library-pagination .pagination-btn { display: inline-grid; place-items: center; width: 34px; height: 34px; border-radius: 6px; border: 1px solid #303744; background: var(--surface-panel); color: var(--text-primary); transition: all 0.15s ease; }
+.store-pagination .pagination-btn:hover:not(:disabled), .library-pagination .pagination-btn:hover:not(:disabled) { background: var(--surface-raised); border-color: #434e62; color: #fff; }
+.store-pagination .pagination-btn:disabled, .library-pagination .pagination-btn:disabled { opacity: 0.35; cursor: not-allowed; border-color: transparent; }
+.pagination-pages { display: flex; align-items: center; gap: 6px; }
+.pagination-num { display: inline-grid; place-items: center; min-width: 34px; height: 34px; padding: 0 8px; border-radius: 6px; border: 1px solid #303744; background: var(--surface-panel); color: var(--text-secondary); font-size: 13px; font-weight: 500; transition: all 0.15s ease; }
+.pagination-num:hover:not(:disabled) { background: var(--surface-raised); border-color: #455268; color: var(--text-primary); }
+.pagination-num.active { background: var(--brand); border-color: var(--brand); color: #121824; font-weight: 700; cursor: default; }
+.pagination-ellipsis { display: inline-grid; place-items: center; width: 22px; height: 34px; color: #647083; user-select: none; }
+.pagination-summary { margin-left: 8px; color: #8792a2; font-size: 12px; }
+
 .store-detail-overlay { position: fixed; z-index: 50; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(7, 10, 15, .74); backdrop-filter: blur(4px); }
 .store-detail-dialog { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; width: min(820px, 100%); max-height: min(760px, calc(100vh - 48px)); overflow: hidden; border: 1px solid #3a4658; border-radius: 8px; background: #171c24; box-shadow: 0 24px 80px rgba(0, 0, 0, .45); }
 .store-detail-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 22px 24px 18px; border-bottom: 1px solid #303948; }
@@ -238,8 +251,6 @@ h1 { margin-bottom: 0; font-size: 30px; letter-spacing: 0; }
 .launch-button { min-width: 56px; padding: 8px 11px; color: #152033; background: var(--brand); }
 .launch-button:disabled { cursor: not-allowed; opacity: .4; }
 .primary-button { padding: 11px 16px; color: #152033; background: var(--brand); }
-.library-pagination { display: flex; align-items: center; justify-content: center; gap: 16px; max-width: 1320px; margin: 28px auto 0; color: var(--text-secondary); font-size: 12px; }
-.library-pagination .icon-button { display: inline-grid; place-items: center; width: 34px; height: 34px; }
 .state-panel { display: grid; place-items: center; min-height: 360px; gap: 10px; color: var(--text-secondary); text-align: center; }
 .state-panel strong { color: var(--text-primary); font-size: 16px; }
 .state-panel p { max-width: 420px; margin-bottom: 5px; overflow-wrap: anywhere; }

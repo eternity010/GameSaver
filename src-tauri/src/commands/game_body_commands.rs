@@ -1,6 +1,9 @@
 use crate::{
     app_state::AppState,
-    domain::{GameBodyVersion, GameHealth, GameLifecycle, SaveProfile, SaveVersion, TaskStatus},
+    domain::{
+        GameBodyVersion, GameHealth, GameLifecycle, SaveProfile, SaveVersion, TaskCategory,
+        TaskStatus,
+    },
     repositories::{BaiduConfigRepository, GameRepository, SaveRepository},
     services::{BodyPackageService, GameBodyUpdateService, GameLibraryService, TaskService},
 };
@@ -77,6 +80,7 @@ pub fn update_game_body(
     let task_id = match TaskService::create(
         &state,
         "update_game_body",
+        TaskCategory::BodyTransfer,
         Some(game_uid.clone()),
         "准备更新游戏本体",
     ) {
@@ -161,6 +165,7 @@ pub fn package_game_body(
     let task_id = match TaskService::create(
         &state,
         "package_game_body",
+        TaskCategory::BodyTransfer,
         Some(game_uid.clone()),
         "准备创建游戏本体包",
     ) {
@@ -241,6 +246,7 @@ pub fn delete_game_body_package(
     let task_id = match TaskService::create(
         &state,
         "delete_game_body_package",
+        TaskCategory::BodyTransfer,
         Some(game_uid.clone()),
         "准备删除本地本体包",
     ) {
@@ -299,6 +305,7 @@ pub fn uninstall_game_body(
     let task_id = match TaskService::create(
         &state,
         "uninstall_game_body",
+        TaskCategory::BodyTransfer,
         Some(game_uid.clone()),
         "准备卸载游戏本体",
     ) {
@@ -464,25 +471,18 @@ fn same_normalized_path(left: &Path, right: &Path) -> bool {
 }
 
 fn mark_game_uninstalled(app: &AppHandle, state: &AppState, game_uid: &str) -> Result<(), String> {
-    let mut candidate = state
-        .store
-        .lock()
-        .map_err(|_| "读取游戏记录失败".to_string())?
-        .clone();
-    let game = candidate
-        .games
-        .iter_mut()
-        .find(|game| game.game_uid == game_uid)
-        .ok_or_else(|| "游戏记录不存在".to_string())?;
-    game.lifecycle = GameLifecycle::NeedsRepair;
-    game.health = crate::domain::GameHealth::Broken;
-    GameRepository::persist(app, &candidate)
-        .map_err(|error| format!("保存卸载状态失败：{error}"))?;
-    *state
-        .store
-        .lock()
-        .map_err(|_| "更新游戏记录失败".to_string())? = candidate;
-    Ok(())
+    state.with_store_mut(|candidate| {
+        let game = candidate
+            .games
+            .iter_mut()
+            .find(|game| game.game_uid == game_uid)
+            .ok_or_else(|| "游戏记录不存在".to_string())?;
+        game.lifecycle = GameLifecycle::NeedsRepair;
+        game.health = crate::domain::GameHealth::Broken;
+        GameRepository::persist(app, candidate)
+            .map_err(|error| format!("保存卸载状态失败：{error}"))?;
+        Ok(())
+    })
 }
 
 fn directory_size(root: &Path) -> Result<u64, String> {
@@ -517,35 +517,29 @@ fn delete_game_body_package_task(
         "正在更新本体版本记录",
         None,
     );
-    let mut candidate = state
-        .store
-        .lock()
-        .map_err(|_| "读取游戏本体包记录失败".to_string())?
-        .clone();
-    let Some(record) = candidate.body_versions.iter_mut().find(|item| {
-        item.game_uid == game.game_uid
-            && item.version_id == version.version_id
-            && item.package_path.is_some()
-    }) else {
-        return Err("游戏本体包版本不存在".to_string());
-    };
-    let keeps_archive = !record.archive_path.trim().is_empty();
-    if keeps_archive {
-        record.package_path = None;
-        record.sha256 = None;
-        record.excluded_items.clear();
-        record.upload_status = None;
-    } else {
-        candidate
-            .body_versions
-            .retain(|item| item.version_id != version.version_id);
-    }
-    GameRepository::persist(app, &candidate)
-        .map_err(|error| format!("保存本体版本记录失败：{error}"))?;
-    *state
-        .store
-        .lock()
-        .map_err(|_| "更新游戏本体包记录失败".to_string())? = candidate;
+    let keeps_archive = state.with_store_mut(|candidate| {
+        let Some(record) = candidate.body_versions.iter_mut().find(|item| {
+            item.game_uid == game.game_uid
+                && item.version_id == version.version_id
+                && item.package_path.is_some()
+        }) else {
+            return Err("游戏本体包版本不存在".to_string());
+        };
+        let keeps_archive = !record.archive_path.trim().is_empty();
+        if keeps_archive {
+            record.package_path = None;
+            record.sha256 = None;
+            record.excluded_items.clear();
+            record.upload_status = None;
+        } else {
+            candidate
+                .body_versions
+                .retain(|item| item.version_id != version.version_id);
+        }
+        GameRepository::persist(app, candidate)
+            .map_err(|error| format!("保存本体版本记录失败：{error}"))?;
+        Ok(keeps_archive)
+    })?;
     TaskService::update(
         &state,
         task_id,
@@ -605,20 +599,14 @@ fn package_game_body_task(
         remote_fs_id: None,
         remote_size: None,
     };
-    let mut candidate = state
-        .store
-        .lock()
-        .map_err(|_| "读取游戏本体包记录失败".to_string())?
-        .clone();
-    candidate.body_versions.push(body_version);
-    if let Err(error) = GameRepository::persist(app, &candidate) {
-        let _ = std::fs::remove_file(&result.package_path);
-        return Err(format!("保存游戏本体包记录失败：{error}"));
-    }
-    *state
-        .store
-        .lock()
-        .map_err(|_| "更新游戏本体包记录失败".to_string())? = candidate;
+    state.with_store_mut(|candidate| {
+        candidate.body_versions.push(body_version);
+        if let Err(error) = GameRepository::persist(app, candidate) {
+            let _ = std::fs::remove_file(&result.package_path);
+            return Err(format!("保存游戏本体包记录失败：{error}"));
+        }
+        Ok(())
+    })?;
     Ok(serde_json::json!({
         "versionId": version_id,
         "packagePath": result.package_path,
@@ -932,8 +920,10 @@ fn update_game_body_task(
         remote_fs_id: None,
         remote_size: None,
     };
-    let mut candidate = match state.store.lock() {
-        Ok(store) => store.clone(),
+    // 全程持有 store 锁：此前是「取快照 → 释放锁 → 落盘 → 覆盖写回」，
+    // 两次加锁之间若有并发写入（例如游戏退出提交存档），会被这里整块覆盖掉。
+    let mut guard = match state.store.lock() {
+        Ok(store) => store,
         Err(_) => {
             return rollback_update(
                 game,
@@ -945,6 +935,7 @@ fn update_game_body_task(
             )
         }
     };
+    let mut candidate = guard.clone();
     if let Some(protected) = protected {
         candidate.save_versions.push(protected);
     }
@@ -954,6 +945,7 @@ fn update_game_body_task(
         .iter_mut()
         .find(|item| item.game_uid == game.game_uid)
     else {
+        drop(guard);
         return rollback_update(
             game,
             &swap,
@@ -973,6 +965,7 @@ fn update_game_body_task(
     game_record.lifecycle = GameLifecycle::Active;
     game_record.health = GameHealth::Ready;
     if let Err(error) = GameRepository::persist(app, &candidate) {
+        drop(guard);
         let save_rollback = receipt.map(SaveRepository::rollback_restore);
         let body_rollback = GameBodyUpdateService::rollback(Path::new(&game.managed_path), &swap);
         if let Some(version) = pending_protected.as_ref() {
@@ -993,35 +986,35 @@ fn update_game_body_task(
     if let Some(receipt) = receipt {
         SaveRepository::finalize_restore(receipt);
     }
-    *state
-        .store
-        .lock()
-        .map_err(|_| "lock GameSaver store failed".to_string())? = candidate;
+    *guard = candidate;
+    drop(guard);
     if let Some(version) = pending_protected.as_ref() {
         crate::repositories::release_pending_objects(version);
     }
-    let mut cleaned = state
-        .store
-        .lock()
-        .map_err(|_| "读取游戏更新清理记录失败".to_string())?
-        .clone();
-    let archive_cleanup = GameBodyUpdateService::cleanup_archived_body_versions(
-        &games_root,
-        &mut cleaned.body_versions,
-    );
-    let old_body_cleanup_pending = archive_cleanup.is_err();
-    if archive_cleanup.is_ok() {
+    // 收尾：清理已经没有归档目录的本体版本记录。整段放进一次加锁，
+    // 避免与并发写入互相覆盖；持久化失败时不提交内存态。
+    let mut old_body_cleanup_pending = false;
+    let cleanup_result = state.with_store_mut(|candidate| {
+        let mut cleaned = candidate.clone();
+        GameBodyUpdateService::cleanup_archived_body_versions(
+            &games_root,
+            &mut cleaned.body_versions,
+        )?;
         if let Err(error) = GameRepository::persist(app, &cleaned) {
             crate::logging::error(format!("旧游戏本体已清理，但更新记录清理失败：{error}"));
-        } else {
-            *state
-                .store
-                .lock()
-                .map_err(|_| "更新游戏清理记录失败".to_string())? = cleaned;
+            return Ok(());
         }
-        let _ = GameBodyUpdateService::clear_journal(&journal_path);
-    } else if let Err(error) = archive_cleanup {
-        crate::logging::error(error);
+        *candidate = cleaned;
+        Ok(())
+    });
+    match cleanup_result {
+        Ok(()) => {
+            let _ = GameBodyUpdateService::clear_journal(&journal_path);
+        }
+        Err(error) => {
+            old_body_cleanup_pending = true;
+            crate::logging::error(error);
+        }
     }
     Ok(
         serde_json::json!({ "fileCount": plan.file_count, "totalBytes": plan.total_bytes, "oldBodyCleanupPending": old_body_cleanup_pending }),

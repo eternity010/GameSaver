@@ -57,25 +57,19 @@ pub fn rename_game(
     let game_uid = game_uid.trim().to_string();
     let new_name = validate_game_display_name(&new_display_name)?;
 
-    let mut candidate = state
-        .store
-        .lock()
-        .map_err(|_| "读取游戏记录失败".to_string())?
-        .clone();
-    let game = candidate
-        .games
-        .iter_mut()
-        .find(|game| game.game_uid == game_uid)
-        .ok_or_else(|| "游戏不存在".to_string())?;
+    let updated_game = state.with_store_mut(|candidate| {
+        let game = candidate
+            .games
+            .iter_mut()
+            .find(|game| game.game_uid == game_uid)
+            .ok_or_else(|| "游戏不存在".to_string())?;
 
-    game.display_name = new_name.to_string();
-    let updated_game = game.clone();
+        game.display_name = new_name.to_string();
+        let updated_game = game.clone();
 
-    GameRepository::persist(&app, &candidate)?;
-    *state
-        .store
-        .lock()
-        .map_err(|_| "更新游戏记录失败".to_string())? = candidate;
+        GameRepository::persist(&app, candidate)?;
+        Ok(updated_game)
+    })?;
 
     maybe_sync_catalog_to_cloud_async(app, updated_game.clone());
 
@@ -329,28 +323,20 @@ fn save_game_cover_files(
             crop,
             position,
         };
-        let mut candidate = {
-            let store = state
-                .store
-                .lock()
-                .map_err(|_| "读取游戏记录失败".to_string())?;
-            store.clone()
-        };
-        let game = candidate
-            .games
-            .iter_mut()
-            .find(|game| game.game_uid == game_uid)
-            .ok_or_else(|| "游戏不存在".to_string())?;
-        game.cover = Some(cover.clone());
-        let game_key = game.game_key.clone();
-        if let Err(error) = GameRepository::persist(app, &candidate) {
-            let _ = fs::remove_dir_all(&final_dir);
-            return Err(format!("保存游戏封面记录失败：{error}"));
-        }
-        *state
-            .store
-            .lock()
-            .map_err(|_| "更新游戏封面记录失败".to_string())? = candidate;
+        let game_key = state.with_store_mut(|candidate| {
+            let game = candidate
+                .games
+                .iter_mut()
+                .find(|game| game.game_uid == game_uid)
+                .ok_or_else(|| "游戏不存在".to_string())?;
+            game.cover = Some(cover.clone());
+            let game_key = game.game_key.clone();
+            if let Err(error) = GameRepository::persist(app, candidate) {
+                let _ = fs::remove_dir_all(&final_dir);
+                return Err(format!("保存游戏封面记录失败：{error}"));
+            }
+            Ok(game_key)
+        })?;
         cleanup_old_cover(&root, game_uid, old_cover.as_ref(), &cover);
         maybe_sync_cover_to_cloud_async(app.clone(), game_key, display_bytes.to_vec());
         Ok(cover)
@@ -617,7 +603,10 @@ pub fn remove_game_from_library(
 
     // 3. Clean up cached body packages if any
     if let Some(ref app_data_dir) = app_data_dir_opt {
-        let package_cache = app_data_dir.join("cache").join("body_packages").join(&game_uid);
+        let package_cache = app_data_dir
+            .join("cache")
+            .join("body_packages")
+            .join(&game_uid);
         if package_cache.exists() {
             let _ = fs::remove_dir_all(&package_cache);
         }
@@ -630,9 +619,15 @@ pub fn remove_game_from_library(
         .map_err(|_| "锁定游戏库数据失败".to_string())?;
     let mut candidate = store.clone();
     candidate.games.retain(|item| item.game_uid != game_uid);
-    candidate.save_profiles.retain(|item| item.game_uid != game_uid);
-    candidate.save_versions.retain(|item| item.game_uid != game_uid);
-    candidate.body_versions.retain(|item| item.game_uid != game_uid);
+    candidate
+        .save_profiles
+        .retain(|item| item.game_uid != game_uid);
+    candidate
+        .save_versions
+        .retain(|item| item.game_uid != game_uid);
+    candidate
+        .body_versions
+        .retain(|item| item.game_uid != game_uid);
 
     GameRepository::persist(&app, &candidate)?;
     *store = candidate;
@@ -684,14 +679,16 @@ pub fn query_game_detail_view(
 
     let body_version_views = body_versions
         .into_iter()
-        .map(|version| crate::commands::game_body_commands::GameBodyVersionView {
-            package_size: version
-                .package_path
-                .as_deref()
-                .and_then(|path| std::fs::metadata(path).ok())
-                .map(|metadata| metadata.len()),
-            version,
-        })
+        .map(
+            |version| crate::commands::game_body_commands::GameBodyVersionView {
+                package_size: version
+                    .package_path
+                    .as_deref()
+                    .and_then(|path| std::fs::metadata(path).ok())
+                    .map(|metadata| metadata.len()),
+                version,
+            },
+        )
         .collect();
 
     let save_profile = store

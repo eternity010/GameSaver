@@ -128,12 +128,7 @@ impl CloudSaveService {
             .map_err(|err| format!("写入 meta.json 内容失败：{err}"))?;
 
         for entry in version.files.iter().filter(|f| !f.deleted) {
-            let bytes = if let Some(hash) = &entry.object_hash {
-                SaveRepository::read_object(app, hash)
-                    .or_else(|_| read_file_from_scope(game, profile, entry))?
-            } else {
-                read_file_from_scope(game, profile, entry)?
-            };
+            let bytes = read_entry_bytes(app, game, profile, entry)?;
 
             let zip_entry_name = format!("data/{}", entry.relative_path.trim_start_matches('/'));
             zip.start_file(zip_entry_name, options)
@@ -332,18 +327,17 @@ impl CloudSaveService {
         let _ = fs::remove_file(&target_zip);
 
         let state = app.state::<crate::app_state::AppState>();
-        let mut store = state
-            .store
-            .lock()
-            .map_err(|_| "锁定本地存储失败".to_string())?;
-        if !store
-            .save_versions
-            .iter()
-            .any(|v| v.version_id == imported_version.version_id && v.game_uid == game.game_uid)
-        {
-            store.save_versions.push(imported_version.clone());
-            GameRepository::persist(app, &store)?;
-        }
+        state.with_store_mut(|store| {
+            if !store
+                .save_versions
+                .iter()
+                .any(|v| v.version_id == imported_version.version_id && v.game_uid == game.game_uid)
+            {
+                store.save_versions.push(imported_version.clone());
+                GameRepository::persist(app, store)?;
+            }
+            Ok(())
+        })?;
 
         on_progress(95, "存档已成功导入本地版本库");
         Ok(imported_version)
@@ -371,35 +365,29 @@ impl CloudSaveService {
             let _ = on_progress(90 + (pct as f32 * 0.1) as u8, msg);
         })?;
         let state = app.state::<crate::app_state::AppState>();
-        let mut candidate = state
-            .store
-            .lock()
-            .map_err(|_| "锁定本地存储失败".to_string())?
-            .clone();
-        let Some(game_record) = candidate
-            .games
-            .iter_mut()
-            .find(|candidate_game| candidate_game.game_uid == game.game_uid)
-        else {
-            return match SaveRepository::rollback_restore(receipt) {
-                Ok(()) => Err("游戏记录不存在，已回滚云端存档恢复".to_string()),
-                Err(error) => Err(format!("游戏记录不存在，且云端存档回滚失败：{error}")),
+        state.with_store_mut(|candidate| {
+            let Some(game_record) = candidate
+                .games
+                .iter_mut()
+                .find(|candidate_game| candidate_game.game_uid == game.game_uid)
+            else {
+                return Err(match SaveRepository::rollback_restore(receipt) {
+                    Ok(()) => "游戏记录不存在，已回滚云端存档恢复".to_string(),
+                    Err(error) => format!("游戏记录不存在，且云端存档回滚失败：{error}"),
+                });
             };
-        };
-        game_record.latest_save_version_id = Some(imported.version_id.clone());
-        if let Err(error) = GameRepository::persist(app, &candidate) {
-            return match SaveRepository::rollback_restore(receipt) {
-                Ok(()) => Err(format!("保存云端存档恢复结果失败，已回滚存档：{error}")),
-                Err(rollback_error) => Err(format!(
-                    "保存云端存档恢复结果失败，且存档回滚失败：{error}；{rollback_error}"
-                )),
-            };
-        }
-        SaveRepository::finalize_restore(receipt);
-        *state
-            .store
-            .lock()
-            .map_err(|_| "锁定本地存储失败".to_string())? = candidate;
+            game_record.latest_save_version_id = Some(imported.version_id.clone());
+            if let Err(error) = GameRepository::persist(app, candidate) {
+                return Err(match SaveRepository::rollback_restore(receipt) {
+                    Ok(()) => format!("保存云端存档恢复结果失败，已回滚存档：{error}"),
+                    Err(rollback_error) => format!(
+                        "保存云端存档恢复结果失败，且存档回滚失败：{error}；{rollback_error}"
+                    ),
+                });
+            }
+            SaveRepository::finalize_restore(receipt);
+            Ok(())
+        })?;
         on_progress(100, "云端存档已成功还原");
         Ok(imported)
     }
@@ -724,12 +712,7 @@ fn protect_current_save_version(
     };
 
     let pending = protected.clone();
-    let result = (|| -> Result<(), String> {
-        let mut candidate = state
-            .store
-            .lock()
-            .map_err(|_| "锁定本地存储失败".to_string())?
-            .clone();
+    let result = state.with_store_mut(|candidate| {
         let protected_id = protected.version_id.clone();
         candidate.save_versions.push(protected);
         let game_record = candidate
@@ -738,15 +721,72 @@ fn protect_current_save_version(
             .find(|candidate_game| candidate_game.game_uid == game.game_uid)
             .ok_or_else(|| "游戏记录不存在".to_string())?;
         game_record.latest_save_version_id = Some(protected_id);
-        GameRepository::persist(app, &candidate)?;
-        *state
-            .store
-            .lock()
-            .map_err(|_| "锁定本地存储失败".to_string())? = candidate;
+        GameRepository::persist(app, candidate)?;
         Ok(())
-    })();
+    });
     crate::repositories::release_pending_objects(&pending);
     result
+}
+
+/// 取出版本中某个条目的字节，并保证返回的字节与条目记录的哈希一致。
+///
+/// 优先读内容寻址存储（`read_object` 自带 SHA-256 校验）。对象缺失或损坏时回退读磁盘上的
+/// 活文件 —— 但**必须复算哈希**：包内清单写的是条目原哈希（`version.clone()`），下载侧
+/// 正是拿它逐项校验，这里若放行一份内容不符的数据，就会产出一份「看着存在、永远还原不了」
+/// 的云端备份。宁可让上传失败，也不要留下假备份。
+fn read_entry_bytes(
+    app: &AppHandle,
+    game: &Game,
+    profile: &SaveProfile,
+    entry: &SaveFileEntry,
+) -> Result<Vec<u8>, String> {
+    let hash = entry.object_hash.as_deref();
+    let object = hash.map(|hash| SaveRepository::read_object(app, hash));
+    resolve_entry_bytes(hash, &entry.relative_path, object, || {
+        read_file_from_scope(game, profile, entry)
+    })
+}
+
+/// 依据「对象读取结果」决定最终采用的字节，并保证结果与记录哈希一致。
+///
+/// 抽成纯函数是为了让「回退必须复算哈希」这条规则可以被测试守住 —— 对象读取本身依赖
+/// `AppHandle`，单测里构造不出来。
+///
+/// - `hash`：条目记录的哈希；`None` 表示旧条目没有记录哈希（如 `deleted: true` 的墓碑）。
+/// - `object`：`read_object` 的结果；`None` 表示没有记录哈希、无需读对象。
+/// - `read_fallback`：回退读取磁盘活文件。
+fn resolve_entry_bytes(
+    hash: Option<&str>,
+    relative_path: &str,
+    object: Option<Result<Vec<u8>, String>>,
+    read_fallback: impl FnOnce() -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    let Some(hash) = hash else {
+        return read_fallback();
+    };
+    match object {
+        Some(Ok(bytes)) => Ok(bytes),
+        Some(Err(object_error)) => {
+            let bytes = read_fallback().map_err(|read_error| {
+                format!("读取存档对象失败（{object_error}），回退读取磁盘存档也失败：{read_error}")
+            })?;
+            ensure_bytes_match_hash(&bytes, hash, relative_path)?;
+            Ok(bytes)
+        }
+        None => read_fallback(),
+    }
+}
+
+fn ensure_bytes_match_hash(bytes: &[u8], hash: &str, relative_path: &str) -> Result<(), String> {
+    let expected = hash.to_ascii_lowercase();
+    let actual = sha256_hex(bytes);
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "存档文件内容与版本记录不一致，已中止上传以免留下无法还原的云端备份：{relative_path}（记录 {expected}，实际 {actual}）"
+        ))
+    }
 }
 
 fn read_file_from_scope(
@@ -754,11 +794,7 @@ fn read_file_from_scope(
     profile: &SaveProfile,
     entry: &SaveFileEntry,
 ) -> Result<Vec<u8>, String> {
-    let scope = profile
-        .scopes
-        .iter()
-        .find(|s| s.root_type == entry.root_type)
-        .ok_or_else(|| format!("未找到匹配的作用域：{:?}", entry.root_type))?;
+    let scope = crate::repositories::save_repository::find_scope_for_read(profile, entry)?;
     let root = crate::repositories::save_repository::scope_root(game, scope);
     let file_path = root.join(&entry.relative_path);
     fs::read(&file_path)
@@ -928,5 +964,50 @@ mod tests {
         assert_eq!(status.sync_state, "local_ahead");
         assert_eq!(status.local_version_count, 1);
         assert_eq!(status.cloud_version_count, 1);
+    }
+
+    #[test]
+    fn resolve_entry_bytes_verifies_the_fallback_against_the_recorded_hash() {
+        let bytes = b"save-data".to_vec();
+        let hash = sha256_hex(&bytes);
+
+        // 对象还在 → 直接用对象字节，不该回退读盘。
+        let from_object =
+            resolve_entry_bytes(Some(&hash), "save.dat", Some(Ok(bytes.clone())), || {
+                panic!("对象可用时不应回退读盘")
+            });
+        assert_eq!(from_object.expect("对象可用应当成功"), bytes);
+
+        // 对象缺失 + 磁盘内容与记录一致 → 允许回退。
+        let recovered = resolve_entry_bytes(
+            Some(&hash),
+            "save.dat",
+            Some(Err("存档对象不存在".to_string())),
+            || Ok(bytes.clone()),
+        );
+        assert_eq!(recovered.expect("磁盘内容一致应当回退成功"), bytes);
+
+        // 对象缺失 + 磁盘内容已漂移 → 必须失败，绝不能打包出一份假备份。
+        let drifted = b"save-data-after-drift".to_vec();
+        let result = resolve_entry_bytes(
+            Some(&hash),
+            "save.dat",
+            Some(Err("存档对象不存在".to_string())),
+            || Ok(drifted.clone()),
+        );
+        assert!(result.is_err(), "磁盘内容与记录不符时必须中止上传");
+
+        // 旧条目没有记录哈希（无对象可读）→ 直接读盘。
+        let legacy = resolve_entry_bytes(None, "save.dat", None, || Ok(bytes.clone()));
+        assert_eq!(legacy.expect("无哈希条目应当直接读盘"), bytes);
+    }
+
+    #[test]
+    fn recorded_hash_comparison_ignores_letter_case() {
+        let bytes = b"save-data".to_vec();
+        let hash = sha256_hex(&bytes);
+        assert!(ensure_bytes_match_hash(&bytes, &hash, "save.dat").is_ok());
+        assert!(ensure_bytes_match_hash(&bytes, &hash.to_ascii_uppercase(), "save.dat").is_ok());
+        assert!(ensure_bytes_match_hash(&bytes, &"0".repeat(64), "save.dat").is_err());
     }
 }

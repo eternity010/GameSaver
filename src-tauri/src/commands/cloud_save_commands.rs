@@ -1,6 +1,6 @@
 use crate::{
     app_state::AppState,
-    domain::{Game, SaveProfile, SaveVersion, TaskStatus},
+    domain::{Game, SaveProfile, SaveVersion, TaskCategory, TaskRetry, TaskStatus},
     repositories::BaiduConfigRepository,
     services::{
         BaiduNetdiskClient, CloudSaveManifestVersion, CloudSaveOverview, CloudSaveService,
@@ -136,6 +136,14 @@ pub fn start_upload_save_version_task(
             result,
             &format!("【{}】游戏存档已成功同步至百度网盘", game.display_name),
             &format!("【{}】游戏存档云端同步失败", game.display_name),
+            TaskRetry {
+                operation: "sync_cloud_save".to_string(),
+                game_uid: game.game_uid.clone(),
+                game_key: None,
+                version_id: Some(version.version_id.clone()),
+                remote_path: None,
+                remote_fs_id: None,
+            },
         );
     });
 
@@ -212,6 +220,14 @@ pub fn start_restore_cloud_save_task(
             result,
             &format!("【{}】云端存档已成功还原至本地", game.display_name),
             &format!("【{}】云端存档还原失败", game.display_name),
+            TaskRetry {
+                operation: "restore_cloud_save".to_string(),
+                game_uid: game.game_uid.clone(),
+                game_key: None,
+                version_id: Some(remote_version.version_id.clone()),
+                remote_path: None,
+                remote_fs_id: None,
+            },
         );
     });
 
@@ -312,7 +328,13 @@ fn restore_save_worker(
 }
 
 fn begin_sync(state: &AppState, title: &str, game_uid: &str) -> Result<String, String> {
-    let task_id = TaskService::create(state, "sync_cloud_save", Some(game_uid.to_string()), title)?;
+    let task_id = TaskService::create(
+        state,
+        "sync_cloud_save",
+        TaskCategory::CloudSaveSync,
+        Some(game_uid.to_string()),
+        title,
+    )?;
     TaskService::update(state, &task_id, TaskStatus::Running, 0, "任务已创建", None);
     Ok(task_id)
 }
@@ -323,26 +345,34 @@ fn finish_sync(
     result: Result<(), String>,
     success_message: &str,
     failed_prefix: &str,
+    retry: TaskRetry,
 ) {
     let state = app.state::<AppState>();
     match result {
         Ok(_) => {
-            TaskService::update(
+            // 必须用 finish 而不是 update：update 只改内存、不落盘，任务终态和 error
+            // 永远写不进 tasks.json。重启后加载兜底会把它标成「异常中断」——一次成功的
+            // 同步看起来像故障，一次真实的失败则连原因都丢了。
+            TaskService::finish(
                 &state,
                 task_id,
                 TaskStatus::Success,
                 100,
                 success_message,
                 None,
+                None,
             );
         }
         Err(error) => {
-            TaskService::update(
+            // 只在失败时补重试参数，让传输中心的「重试」按钮有东西可点。
+            let _ = TaskService::set_retry(&state, task_id, retry);
+            TaskService::finish(
                 &state,
                 task_id,
                 TaskStatus::Failed,
                 100,
-                &format!("{failed_prefix}：{error}"),
+                format!("{failed_prefix}：{error}"),
+                None,
                 Some(error),
             );
         }

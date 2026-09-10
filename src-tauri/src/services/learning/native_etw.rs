@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use super::etw_capture::normalize_windows_path;
 use super::etw_capture::{
-    build_device_path_map, resolve_device_path, should_ignore_event_path,
-    should_skip_kernel_task, TraceCollectionResult,
+    build_device_path_map, resolve_device_path, should_ignore_event_path, should_skip_kernel_task,
+    TraceCollectionResult,
 };
 use super::transactions::{FileOperation, FileOperationKind};
 

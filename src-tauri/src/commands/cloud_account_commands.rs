@@ -1,7 +1,8 @@
 use crate::{
     app_state::AppState,
     domain::{
-        game::CloudStatus, Game, GameHealth, GameLifecycle, SaveProfile, SaveScope, TaskStatus,
+        game::CloudStatus, Game, GameHealth, GameLifecycle, SaveProfile, SaveScope, TaskCategory,
+        TaskStatus,
     },
     repositories::{BaiduConfigRepository, GameRepository},
     services::{BaiduNetdiskClient, CloudAccountProfile, CloudAccountService, TaskService},
@@ -132,22 +133,23 @@ fn download_account(app: &AppHandle, task_id: &str) -> Result<(), String> {
         None,
     );
     let cloud_auto_upload = profile.settings.auto_upload_body;
-    let (candidate, imported_games) = merge_profile(app, &state, profile)?;
+    // games_root 需要锁 library_root，先取出来，避免在 store 锁内嵌套加锁。
+    let games_root = state.games_root()?;
     let old_config = BaiduConfigRepository::load(&data_dir)?;
-    if let Some(mut config) = old_config.clone() {
-        config.auto_upload_body = cloud_auto_upload;
-        BaiduConfigRepository::save(&data_dir, config)?;
-    }
-    if let Err(error) = GameRepository::persist(app, &candidate) {
-        if let Some(config) = old_config {
-            let _ = BaiduConfigRepository::save(&data_dir, config);
+    let imported_games = state.with_store_mut(|store| {
+        let imported_games = merge_profile(store, &games_root, profile)?;
+        if let Some(mut config) = old_config.clone() {
+            config.auto_upload_body = cloud_auto_upload;
+            BaiduConfigRepository::save(&data_dir, config)?;
         }
-        return Err(format!("保存云端游戏库失败：{error}"));
-    }
-    *state
-        .store
-        .lock()
-        .map_err(|_| "更新本地游戏库失败".to_string())? = candidate;
+        if let Err(error) = GameRepository::persist(app, store) {
+            if let Some(config) = old_config.clone() {
+                let _ = BaiduConfigRepository::save(&data_dir, config);
+            }
+            return Err(format!("保存云端游戏库失败：{error}"));
+        }
+        Ok(imported_games)
+    })?;
     TaskService::update(
         &state,
         task_id,
@@ -159,16 +161,14 @@ fn download_account(app: &AppHandle, task_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 把云端档案合并进 `store`。调用方需在持有 store 锁的情况下调用
+/// （见 `AppState::with_store_mut`），合并失败时不做任何提交。
 fn merge_profile(
-    _app: &AppHandle,
-    state: &AppState,
+    store: &mut crate::domain::AppStore,
+    games_root: &std::path::Path,
     profile: CloudAccountProfile,
-) -> Result<(crate::domain::AppStore, usize), String> {
-    let mut candidate = state
-        .store
-        .lock()
-        .map_err(|_| "读取本地游戏库失败".to_string())?
-        .clone();
+) -> Result<usize, String> {
+    let candidate = store;
     let mut imported_games = 0;
     let mut cloud_uid_to_local_uid = HashMap::new();
     let mut cloud_uid_to_game_key = HashMap::new();
@@ -197,7 +197,7 @@ fn merge_profile(
             let local_uid = Uuid::new_v4().to_string();
             let mut game = Game::new_pending(
                 &cloud_game.display_name,
-                state.games_root()?.join(&local_uid).to_string_lossy(),
+                games_root.join(&local_uid).to_string_lossy(),
                 &cloud_game.launch.executable_relative_path,
             );
             game.game_uid = local_uid.clone();
@@ -291,7 +291,7 @@ fn merge_profile(
         }
     }
     candidate.normalize();
-    Ok((candidate, imported_games))
+    Ok(imported_games)
 }
 
 pub(crate) fn resolve_scope(
@@ -356,7 +356,13 @@ fn begin_sync(state: &AppState, message: &str) -> Result<String, String> {
         return Err("已有云端账号同步任务正在进行".to_string());
     }
     *syncing = true;
-    match TaskService::create(state, "cloud_account_sync", None, message) {
+    match TaskService::create(
+        state,
+        "cloud_account_sync",
+        TaskCategory::Maintenance,
+        None,
+        message,
+    ) {
         Ok(task_id) => Ok(task_id),
         Err(error) => {
             *syncing = false;

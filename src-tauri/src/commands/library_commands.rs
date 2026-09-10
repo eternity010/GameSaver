@@ -1,6 +1,6 @@
 use crate::{
     app_state::AppState,
-    domain::TaskStatus,
+    domain::{TaskCategory, TaskStatus},
     repositories::{GameRepository, LibraryConfig, LibraryConfigRepository},
     services::{LibraryService, TaskService},
 };
@@ -94,8 +94,13 @@ pub fn start_set_library_root_task(
         }
         *migrating = true;
     }
-    let task_id = match TaskService::create(&state, "set_library_root", None, "准备迁移游戏库")
-    {
+    let task_id = match TaskService::create(
+        &state,
+        "set_library_root",
+        TaskCategory::Maintenance,
+        None,
+        "准备迁移游戏库",
+    ) {
         Ok(task_id) => task_id,
         Err(error) => {
             if let Ok(mut migrating) = state.library_migration.lock() {
@@ -159,7 +164,7 @@ fn migrate_library(
         "正在迁移游戏库文件",
         None,
     );
-    let candidate = LibraryService::migrate(source, target, store, |progress, message| {
+    LibraryService::migrate(source, target, store, |progress, message| {
         TaskService::update(
             &state,
             task_id,
@@ -177,17 +182,25 @@ fn migrate_library(
         .path()
         .app_data_dir()
         .map_err(|error| format!("解析 GameSaver 数据目录失败：{error}"))?;
-    if let Err(error) = GameRepository::persist(app, &candidate) {
-        let _ = std::fs::remove_dir_all(target);
-        return Err(format!("保存迁移后的游戏记录失败：{error}"));
-    }
+    // 迁移耗时可能很长，落盘时不能再用开始时取的快照，否则会把期间的
+    // 并发改动整块回退掉（旧快照里还带着旧的 managed_path）。
+    // 改为在同一次加锁内基于**当前** store 改写路径并落盘。
+    state.with_store_mut(|current| {
+        LibraryService::rewrite_paths_in_place(current, source, target)?;
+        GameRepository::persist(app, current)?;
+        Ok(())
+    })?;
     if let Err(error) = LibraryConfigRepository::save(
         &data_dir,
         &LibraryConfig {
             library_root: Some(target.to_string_lossy().to_string()),
         },
     ) {
-        let _ = GameRepository::persist(app, store);
+        // 回滚：把内存态路径改回 source 并落盘，与磁盘上文件的实际位置对齐。
+        let _ = state.with_store_mut(|current| {
+            let _ = LibraryService::rewrite_paths_in_place(current, target, source);
+            GameRepository::persist(app, current)
+        });
         let _ = std::fs::remove_dir_all(target);
         return Err(format!("保存游戏库配置失败：{error}"));
     }

@@ -110,6 +110,8 @@ pub struct CloudGamePage {
     pub games: Vec<CloudGameSummary>,
     pub page: usize,
     pub page_size: usize,
+    pub total_count: usize,
+    pub total_pages: usize,
     pub has_more: bool,
 }
 

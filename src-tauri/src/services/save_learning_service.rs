@@ -45,11 +45,44 @@ const SAVE_DIRECTORY_HINTS: [&str; 9] = [
     "remote",
 ];
 const GENERIC_NAME_BLACKLIST: [&str; 38] = [
-    "game", "games", "play", "player", "start", "launch", "launcher", "app", "application",
-    "main", "run", "runner", "client", "test", "demo", "patch", "update", "edition",
-    "version", "ver", "setup", "install", "installer", "steam", "epic", "gog", "final",
-    "release", "debug", "unity", "unreal", "shipping", "win64", "win32", "windows",
-    "x64", "x86", "default",
+    "game",
+    "games",
+    "play",
+    "player",
+    "start",
+    "launch",
+    "launcher",
+    "app",
+    "application",
+    "main",
+    "run",
+    "runner",
+    "client",
+    "test",
+    "demo",
+    "patch",
+    "update",
+    "edition",
+    "version",
+    "ver",
+    "setup",
+    "install",
+    "installer",
+    "steam",
+    "epic",
+    "gog",
+    "final",
+    "release",
+    "debug",
+    "unity",
+    "unreal",
+    "shipping",
+    "win64",
+    "win32",
+    "windows",
+    "x64",
+    "x86",
+    "default",
 ];
 
 fn is_generic_hint(token: &str) -> bool {
@@ -319,7 +352,9 @@ impl SaveLearningService {
             .iter()
             .any(|&pid| crate::services::process_service::is_process_running(pid));
         if any_running {
-            crate::logging::info("分析存档时检测到游戏进程仍在运行，等待短缓冲以确保磁盘写入完成...");
+            crate::logging::info(
+                "分析存档时检测到游戏进程仍在运行，等待短缓冲以确保磁盘写入完成...",
+            );
             std::thread::sleep(Duration::from_millis(500));
         }
         let mut etw_files = HashSet::new();
@@ -813,9 +848,13 @@ fn infer_scan_root_for_etw_file(
 
     for ancestor in file_path.ancestors() {
         if let (Some(app_id_name), Some(parent)) = (ancestor.file_name(), ancestor.parent()) {
-            if let (Some(_account_name), Some(grandparent)) = (parent.file_name(), parent.parent()) {
+            if let (Some(_account_name), Some(grandparent)) = (parent.file_name(), parent.parent())
+            {
                 if let Some(user_data_name) = grandparent.file_name() {
-                    if user_data_name.to_string_lossy().eq_ignore_ascii_case("userdata") {
+                    if user_data_name
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case("userdata")
+                    {
                         let app_id_str = app_id_name.to_string_lossy();
                         if app_id_str.chars().all(|c| c.is_ascii_digit()) && app_id_str.len() >= 2 {
                             return Some(crate::domain::ScanRoot {
@@ -1126,7 +1165,9 @@ fn collect_snapshot(
         }
         let is_managed = root.root_type == SaveRootType::ManagedGame;
         let walker = if is_managed {
-            WalkDir::new(&root.physical_path).follow_links(false).max_depth(4)
+            WalkDir::new(&root.physical_path)
+                .follow_links(false)
+                .max_depth(4)
         } else {
             WalkDir::new(&root.physical_path).follow_links(false)
         };
@@ -1616,7 +1657,12 @@ fn is_save_candidate(path: &str) -> bool {
         .parent()
         .is_some_and(path_has_save_container_ancestor);
     let has_save_path_hint = [
-        "savedata", "savegame", "savegames", "userdata", "profiles", "remote",
+        "savedata",
+        "savegame",
+        "savegames",
+        "userdata",
+        "profiles",
+        "remote",
     ]
     .iter()
     .any(|hint| path_has_segment(&path_lower, hint));
@@ -1662,7 +1708,12 @@ fn is_etw_candidate(path: &str) -> bool {
         .parent()
         .is_some_and(path_has_save_container_ancestor);
     let has_save_path_hint = [
-        "savedata", "savegame", "savegames", "userdata", "profiles", "remote",
+        "savedata",
+        "savegame",
+        "savegames",
+        "userdata",
+        "profiles",
+        "remote",
     ]
     .iter()
     .any(|hint| path_has_segment(&path_lower, hint));

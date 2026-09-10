@@ -2,6 +2,7 @@ mod app_state;
 mod commands;
 mod cover_protocol;
 mod domain;
+mod events;
 mod logging;
 mod repositories;
 mod services;
@@ -10,13 +11,13 @@ use app_state::AppState;
 use repositories::{GameRepository, LibraryConfigRepository, TaskRepository};
 use services::{
     learning::cleanup_stale_captures, BodyPackageService, CoverCaptureService,
-    GameBodyUpdateService, InstanceService,
+    GameBodyUpdateService, InstanceService, LaunchService,
 };
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
 };
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -30,6 +31,34 @@ pub fn run() {
     }
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .on_window_event(|window, event| {
+            // 只有「用户点击关闭」这一条路径需要拦截。运行中关闭 GameSaver
+            // 会让承载游戏会话的线程随进程消亡，而游戏进程仍活着——本次游玩
+            // 的存档将永远不会被提交。这里把静默失败变成一次显式确认。
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            let app = window.app_handle();
+            let Some(state) = app.try_state::<AppState>() else {
+                // setup 尚未注册状态时无从判断，保守放行。
+                return;
+            };
+            if state.exit_confirmed() {
+                return;
+            }
+            let running = state.running_game_count();
+            if running == 0 {
+                return;
+            }
+            api.prevent_close();
+            logging::info(format!(
+                "拦截关闭请求：仍有 {running} 个游戏正在运行，等待用户确认"
+            ));
+            let _ = app.emit(
+                "app-exit-blocked",
+                serde_json::json!({ "runningCount": running }),
+            );
+        })
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             if let Err(error) = logging::init(&data_dir) {
@@ -147,6 +176,28 @@ pub fn run() {
                 tasks,
                 PathBuf::from(tasks_path),
             ));
+            // 注入事件推送器：此后任务与游戏运行时状态的变化会主动推给前端，
+            // 各组件的高频轮询因此得以降级为低频兜底。
+            //
+            // 推送器构造成装箱函数指针而不是把 `AppHandle` 存进 `AppState`：后者会让
+            // 链接器把整条 Tauri 窗口运行时拉进单元测试二进制，测试直接启动失败。
+            if let Some(state) = app.try_state::<AppState>() {
+                let handle = app.handle().clone();
+                state.attach_event_emitter(Box::new(move |event, payload| {
+                    if let Err(error) = handle.emit(event, payload) {
+                        logging::error(format!("推送事件 {event} 失败：{error}"));
+                    }
+                }));
+            }
+            // 接回上次仍在运行的游戏会话：应用退出不会带走游戏进程，重启后若不接手，
+            // 用户会以为可以再次启动，同一份存档于是被两个进程同时写；而这场游玩结束
+            // 时也不会再有人提交存档版本。
+            //
+            // 必须晚于推送器注入 —— 重建会改写运行标记与任务记录，前端正是靠这些事件
+            // 才知道「这个游戏其实还在跑」。返回的 uid 列表只对测试有意义，此处忽略。
+            if let Some(state) = app.try_state::<AppState>() {
+                LaunchService::restore_running_sessions(app.handle(), &state);
+            }
             if let Err(error) = CoverCaptureService::start_global_listener(app.handle().clone()) {
                 logging::error(format!("全局截图快捷键初始化失败：{error}"));
             }
@@ -211,6 +262,7 @@ pub fn run() {
             commands::baidu_commands::get_baidu_quota,
             commands::baidu_commands::delete_remote_body_package,
             commands::diagnostics_commands::report_frontend_error,
+            commands::app_commands::confirm_app_exit,
             commands::admin_commands::get_elevation_status,
             commands::admin_commands::restart_as_admin,
             commands::library_commands::get_library_settings,

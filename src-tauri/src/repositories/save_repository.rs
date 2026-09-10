@@ -1,6 +1,6 @@
 use crate::{
     app_state::AppState,
-    domain::{Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope, SaveVersion},
+    domain::{AppStore, Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope, SaveVersion},
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -252,6 +252,51 @@ impl SaveRepository {
             let _ = fs::remove_dir(&prefix);
         }
         Ok(removed)
+    }
+
+    /// 按 `keep_versions` 剪掉某游戏最旧的存档版本，只改内存中的 `store`，**不碰磁盘**。
+    ///
+    /// 返回 `Some(剪枝后的完整版本清单)` 表示确实删掉了版本 —— 调用方应当把它交给
+    /// [`Self::collect_garbage`] 回收不再被引用的对象文件；返回 `None` 表示无版本被删除、
+    /// 无需回收（也避免了每次调用都做一次全盘扫描）。
+    ///
+    /// **顺序契约（不可调换）**：回收必须发生在 `GameRepository::persist` **成功之后**。
+    /// `collect_garbage` 会真删磁盘上的对象文件，而 `persist` 失败时磁盘上的版本清单仍是
+    /// 旧的。若先回收再持久化，一旦 `persist` 失败，磁盘清单会继续列出那些对象已被删除的
+    /// 版本 —— 它们从此「在列表里看得见、点恢复却永远失败」。所以这里刻意只做内存剪枝，
+    /// 把「回收」这一步留给调用方，且只能在落盘成功之后执行（见存档管理审查 V1）。
+    pub(crate) fn prune_game_save_versions(
+        store: &mut AppStore,
+        game_uid: &str,
+        keep_versions: usize,
+    ) -> Option<Vec<SaveVersion>> {
+        if keep_versions == 0 {
+            return None;
+        }
+        let mut game_versions: Vec<_> = store
+            .save_versions
+            .iter()
+            .filter(|version| version.game_uid == game_uid)
+            .cloned()
+            .collect();
+        game_versions.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then(right.version_id.cmp(&left.version_id))
+        });
+        if game_versions.len() <= keep_versions {
+            return None;
+        }
+        let to_remove: HashSet<String> = game_versions
+            .into_iter()
+            .skip(keep_versions)
+            .map(|version| version.version_id)
+            .collect();
+        store.save_versions.retain(|version| {
+            !(version.game_uid == game_uid && to_remove.contains(&version.version_id))
+        });
+        Some(store.save_versions.clone())
     }
 
     pub fn write_object(app: &AppHandle, hash: &str, bytes: &[u8]) -> Result<(), String> {
@@ -691,6 +736,43 @@ fn trailing_path_components_match(a: &str, b: &str) -> bool {
     false
 }
 
+/// 在一组同类型候选范围中，按条目记录的 `root_path` 选出唯一匹配者。
+///
+/// 先按物理路径精确匹配（同机、路径未改动），再按路径尾段匹配（跨设备或存档目录被改动
+/// 过）。候选只有一个时直接返回；无法唯一确定时返回 `None` —— 调用方据此报错，绝不
+/// 「随便挑一个」。
+fn pick_scope_by_root_path<'a>(
+    candidates: &[&'a SaveScope],
+    entry: &SaveFileEntry,
+) -> Option<&'a SaveScope> {
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
+        return Some(candidates[0]);
+    }
+
+    let entry_root = entry.root_path.as_deref()?;
+    let exact: Vec<&'a SaveScope> = candidates
+        .iter()
+        .copied()
+        .filter(|scope| normalize_path(entry_root) == normalize_path(&scope.root_path))
+        .collect();
+    if exact.len() == 1 {
+        return Some(exact[0]);
+    }
+
+    let trailing: Vec<&'a SaveScope> = candidates
+        .iter()
+        .copied()
+        .filter(|scope| trailing_path_components_match(entry_root, &scope.root_path))
+        .collect();
+    if trailing.len() == 1 {
+        return Some(trailing[0]);
+    }
+    None
+}
+
 fn find_scope_for_entry<'a>(
     profile: &'a SaveProfile,
     entry: &SaveFileEntry,
@@ -719,24 +801,40 @@ fn find_scope_for_entry<'a>(
             "保存版本中的文件不属于当前存档范围：{}",
             entry.relative_path
         )),
-        multi => {
-            // If multiple scopes match by root_type, disambiguate by trailing subpath
-            if let Some(entry_root) = entry.root_path.as_deref() {
-                let subpath_matches: Vec<&'a SaveScope> = multi
-                    .iter()
-                    .copied()
-                    .filter(|scope| trailing_path_components_match(entry_root, &scope.root_path))
-                    .collect();
-                if subpath_matches.len() == 1 {
-                    return Ok(subpath_matches[0]);
-                }
-            }
-            Err(format!(
+        _ => pick_scope_by_root_path(&loose_matches, entry).ok_or_else(|| {
+            format!(
                 "保存版本缺少存档范围路径，无法安全恢复：{}",
                 entry.relative_path
-            ))
-        }
+            )
+        }),
     }
+}
+
+/// 为「读取条目对应的磁盘文件」挑选存档范围 —— 打包上传路径使用。
+///
+/// 与恢复侧的 [`find_scope_for_entry`] 有意不同：这里**不**要求条目仍落在当前启用、
+/// 未被排除的范围内。用户收窄存档范围或改动存档目录之后，旧版本里那些落在范围外的文件
+/// 仍应能被读取并上传（它们本来就来自这台机器）。因此只按 `root_type` 取候选，再用
+/// `root_path` 消歧；候选唯一时直接返回，存在多个同类型范围且无法唯一确定时**报错而不是
+/// 猜一个** —— 猜错会把不相干的文件静默打进备份。
+pub(crate) fn find_scope_for_read<'a>(
+    profile: &'a SaveProfile,
+    entry: &SaveFileEntry,
+) -> Result<&'a SaveScope, String> {
+    let candidates: Vec<&SaveScope> = profile
+        .scopes
+        .iter()
+        .filter(|scope| scope.root_type == entry.root_type)
+        .collect();
+    if candidates.is_empty() {
+        return Err(format!("未找到匹配的作用域：{:?}", entry.root_type));
+    }
+    pick_scope_by_root_path(&candidates, entry).ok_or_else(|| {
+        format!(
+            "存在多个同类型存档范围，无法确定该文件的位置：{}",
+            entry.relative_path
+        )
+    })
 }
 
 pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
@@ -1149,12 +1247,72 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_restore_groups, entry_belongs_to_profile, find_scope_for_entry, is_excluded,
-        same_entries, wildcard_matches,
+        build_restore_groups, entry_belongs_to_profile, find_scope_for_entry, find_scope_for_read,
+        is_excluded, same_entries, wildcard_matches, SaveRepository,
     };
     use crate::domain::{
-        Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope, SaveVersion, UnknownFilePolicy,
+        AppStore, Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope, SaveVersion,
+        UnknownFilePolicy,
     };
+
+    fn version(game_uid: &str, version_id: &str, created_at: &str) -> SaveVersion {
+        SaveVersion {
+            version_id: version_id.to_string(),
+            game_uid: game_uid.to_string(),
+            created_at: created_at.to_string(),
+            files: Vec::new(),
+            total_bytes: 0,
+        }
+    }
+
+    /// V1 回归：剪枝只返回「存活集」，必须剔除该游戏最旧的版本、且绝不动其他游戏。
+    ///
+    /// 返回值是调用方在**持久化成功之后**执行 GC 的依据，所以它必须精确等于剪枝后的
+    /// store 内容 —— 任何多留/少留都会让 GC 删错对象或漏删。
+    #[test]
+    fn prune_keeps_newest_versions_and_leaves_other_games_alone() {
+        let mut store = AppStore {
+            save_versions: vec![
+                version("game-a", "a1", "1700000001"),
+                version("game-a", "a2", "1700000002"),
+                version("game-a", "a3", "1700000003"),
+                version("game-b", "b1", "1700000001"),
+            ],
+            ..AppStore::default()
+        };
+
+        let alive = SaveRepository::prune_game_save_versions(&mut store, "game-a", 2)
+            .expect("超出保留数应发生剪枝");
+
+        let ids: Vec<&str> = alive.iter().map(|v| v.version_id.as_str()).collect();
+        assert!(ids.contains(&"a3") && ids.contains(&"a2"), "应保留最新两条");
+        assert!(!ids.contains(&"a1"), "最旧的 a1 必须被剔除");
+        assert!(ids.contains(&"b1"), "其他游戏的版本不得被剪掉");
+        assert_eq!(alive.len(), 3);
+        assert_eq!(store.save_versions.len(), 3, "store 应与返回的存活集一致");
+    }
+
+    /// 没有超出保留数时不得返回存活集 —— 否则每次游戏退出都会触发一次 CAS 全盘扫描。
+    #[test]
+    fn prune_is_a_noop_within_the_keep_limit_or_with_zero_keep() {
+        let mut store = AppStore {
+            save_versions: vec![
+                version("game-a", "a1", "1700000001"),
+                version("game-a", "a2", "1700000002"),
+            ],
+            ..AppStore::default()
+        };
+
+        assert!(
+            SaveRepository::prune_game_save_versions(&mut store, "game-a", 2).is_none(),
+            "未超出保留数不应触发回收"
+        );
+        assert!(
+            SaveRepository::prune_game_save_versions(&mut store, "game-a", 0).is_none(),
+            "keep=0 表示不剪枝，与旧行为一致"
+        );
+        assert_eq!(store.save_versions.len(), 2);
+    }
 
     #[test]
     fn wildcard_patterns_match_common_exclusions() {
@@ -1555,5 +1713,103 @@ mod tests {
             resolved.unwrap().root_path,
             r"C:\Users\Bob\Documents\StudioA\GameX"
         );
+    }
+
+    #[test]
+    fn find_scope_for_read_picks_the_scope_matching_the_entry_root_path() {
+        let mut scope_a =
+            SaveScope::new_manual(r"C:\Users\Bob\Documents\StudioA\GameX".to_string());
+        scope_a.root_type = SaveRootType::Documents;
+        scope_a.confirmed_files = vec!["save.dat".to_string()];
+
+        let mut scope_b =
+            SaveScope::new_manual(r"C:\Users\Bob\Documents\StudioB\GameY".to_string());
+        scope_b.root_type = SaveRootType::Documents;
+        scope_b.confirmed_files = vec!["save.dat".to_string()];
+
+        let profile = SaveProfile::new(
+            "g1".to_string(),
+            "hash".to_string(),
+            vec![scope_a, scope_b],
+            100,
+            "2026-01-01".to_string(),
+        );
+
+        // 条目实际属于 B，但 A 排在前面 —— 旧实现按 root_type 取第一个会读到 A。
+        let entry = SaveFileEntry {
+            root_type: SaveRootType::Documents,
+            root_path: Some(r"C:\Users\Bob\Documents\StudioB\GameY".to_string()),
+            relative_path: "save.dat".to_string(),
+            object_hash: Some("mock_hash".to_string()),
+            size: 100,
+            deleted: false,
+            mtime_ms: None,
+        };
+
+        let resolved = find_scope_for_read(&profile, &entry).expect("应当解析出 B");
+        assert_eq!(resolved.root_path, r"C:\Users\Bob\Documents\StudioB\GameY");
+    }
+
+    #[test]
+    fn find_scope_for_read_refuses_to_guess_between_same_type_scopes() {
+        let mut scope_a =
+            SaveScope::new_manual(r"C:\Users\Bob\Documents\StudioA\GameX".to_string());
+        scope_a.root_type = SaveRootType::Documents;
+        let mut scope_b =
+            SaveScope::new_manual(r"C:\Users\Bob\Documents\StudioB\GameY".to_string());
+        scope_b.root_type = SaveRootType::Documents;
+
+        let profile = SaveProfile::new(
+            "g1".to_string(),
+            "hash".to_string(),
+            vec![scope_a, scope_b],
+            100,
+            "2026-01-01".to_string(),
+        );
+
+        // 条目没有记录 root_path（老版本条目），两个同类型范围无法区分 —— 必须报错而不是取第一个。
+        let entry = SaveFileEntry {
+            root_type: SaveRootType::Documents,
+            root_path: None,
+            relative_path: "save.dat".to_string(),
+            object_hash: Some("mock_hash".to_string()),
+            size: 100,
+            deleted: false,
+            mtime_ms: None,
+        };
+
+        assert!(find_scope_for_read(&profile, &entry).is_err());
+    }
+
+    #[test]
+    fn find_scope_for_read_still_reads_files_outside_a_narrowed_scope() {
+        let mut scope = SaveScope::new_manual(r"C:\Users\Bob\Documents\Game".to_string());
+        scope.root_type = SaveRootType::Documents;
+        scope.confirmed_files = vec!["SaveData/slot1.sav".to_string()];
+        // 用户把范围收窄到只保留 SaveData，之后旧版本里落在范围外的文件仍应可读可传。
+        scope.include_directories = vec!["SaveData".to_string()];
+
+        let profile = SaveProfile::new(
+            "g1".to_string(),
+            "hash".to_string(),
+            vec![scope],
+            100,
+            "2026-01-01".to_string(),
+        );
+
+        let entry = SaveFileEntry {
+            root_type: SaveRootType::Documents,
+            root_path: Some(r"C:\Users\Bob\Documents\Game".to_string()),
+            relative_path: "Config/settings.ini".to_string(),
+            object_hash: Some("mock_hash".to_string()),
+            size: 100,
+            deleted: false,
+            mtime_ms: None,
+        };
+
+        // 打包侧（read）不因范围收窄而失败……
+        assert!(find_scope_for_read(&profile, &entry).is_ok());
+        // ……恢复侧（restore）仍严格拒绝落在范围外的条目。
+        assert!(find_scope_for_entry(&profile, &entry, "Config/settings.ini").is_err());
     }
 }

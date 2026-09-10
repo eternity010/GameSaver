@@ -710,10 +710,15 @@ mod tests {
 
     #[test]
     fn swap_succeeds_when_managed_path_does_not_exist() {
-        let root = std::env::temp_dir().join(format!("gamesaver-missing-body-swap-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("gamesaver-missing-body-swap-{}", Uuid::new_v4()));
         let managed = root.join("games").join("game-1");
         let staging = root.join("games").join(".game-1.updating");
-        let archive = root.join("games").join(".versions").join("game-1").join("version-1");
+        let archive = root
+            .join("games")
+            .join(".versions")
+            .join("game-1")
+            .join("version-1");
         fs::create_dir_all(&staging).expect("create staging");
         fs::write(staging.join("game.exe"), b"new game").expect("write new game");
 
@@ -724,7 +729,10 @@ mod tests {
         assert!(managed.join("game.exe").is_file());
         assert!(!archive.exists());
         assert!(!staging.exists());
-        assert_eq!(fs::read(managed.join("game.exe")).expect("read new"), b"new game");
+        assert_eq!(
+            fs::read(managed.join("game.exe")).expect("read new"),
+            b"new game"
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -2,6 +2,7 @@ pub mod baidu_config_repository;
 pub mod game_repository;
 pub mod library_config_repository;
 pub mod save_repository;
+pub(crate) mod store_file;
 pub mod task_repository;
 
 pub use baidu_config_repository::{BaiduConfig, BaiduConfigRepository, BaiduConfigView};

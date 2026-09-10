@@ -1,13 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::{
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-};
-use uuid::Uuid;
+use std::path::{Path, PathBuf};
+
+use super::store_file::{atomic_replace, load_with_recovery};
 
 const CONFIG_FILE: &str = "baidu-netdisk-config.json";
 const CONFIG_VERSION: u32 = 1;
+const CONFIG_LABEL: &str = "百度网盘配置";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,22 +58,12 @@ impl BaiduConfigRepository {
 
     pub fn load(app_data_dir: &Path) -> Result<Option<BaiduConfig>, String> {
         let path = Self::path(app_data_dir);
-        if !path.is_file() {
+        let Some(raw) =
+            load_with_recovery(&path, CONFIG_LABEL, |bytes: &[u8]| decode(bytes).is_ok())?
+        else {
             return Ok(None);
-        }
-        let raw = fs::read(&path).map_err(|error| format!("读取百度网盘应用配置失败：{error}"))?;
-        let stored = serde_json::from_slice::<StoredBaiduConfig>(&raw)
-            .map_err(|error| format!("解析百度网盘应用配置失败：{error}"))?;
-        if stored.version != CONFIG_VERSION {
-            return Err("百度网盘应用配置版本不受支持".to_string());
-        }
-        let protected = hex::decode(stored.protected)
-            .map_err(|error| format!("读取百度网盘应用配置密文失败：{error}"))?;
-        let plain = unprotect(&protected)?;
-        let config = serde_json::from_slice::<BaiduConfig>(&plain)
-            .map_err(|error| format!("解析百度网盘应用凭证失败：{error}"))?;
-        validate(&config)?;
-        Ok(Some(config))
+        };
+        decode(&raw).map(Some)
     }
 
     pub fn view(app_data_dir: &Path) -> Result<BaiduConfigView, String> {
@@ -104,50 +92,33 @@ impl BaiduConfigRepository {
 
     pub fn save(app_data_dir: &Path, config: BaiduConfig) -> Result<(), String> {
         validate(&config)?;
-        fs::create_dir_all(app_data_dir)
-            .map_err(|error| format!("创建百度网盘配置目录失败：{error}"))?;
         let plain = serde_json::to_vec(&config)
-            .map_err(|error| format!("序列化百度网盘应用凭证失败：{error}"))?;
+            .map_err(|error| format!("序列化{CONFIG_LABEL}凭证失败：{error}"))?;
         let stored = StoredBaiduConfig {
             version: CONFIG_VERSION,
             protected: hex::encode(protect(&plain)?),
         };
         let path = Self::path(app_data_dir);
         let bytes = serde_json::to_vec_pretty(&stored)
-            .map_err(|error| format!("序列化百度网盘配置失败：{error}"))?;
-        atomic_replace(&path, &bytes)
+            .map_err(|error| format!("序列化{CONFIG_LABEL}失败：{error}"))?;
+        atomic_replace(&path, &bytes, CONFIG_LABEL)
     }
 }
 
-fn atomic_replace(target: &Path, bytes: &[u8]) -> Result<(), String> {
-    let name = target.file_name().unwrap_or_default().to_string_lossy();
-    let temporary = target.with_file_name(format!(".{name}.tmp-{}", Uuid::new_v4().simple()));
-    let backup = target.with_file_name(format!(".{name}.bak-{}", Uuid::new_v4().simple()));
-    let result = (|| -> Result<(), String> {
-        let mut file = fs::File::create(&temporary)
-            .map_err(|error| format!("创建百度网盘配置临时文件失败：{error}"))?;
-        file.write_all(bytes)
-            .map_err(|error| format!("写入百度网盘配置临时文件失败：{error}"))?;
-        file.sync_all()
-            .map_err(|error| format!("刷新百度网盘配置临时文件失败：{error}"))?;
-        let had_target = target.exists();
-        if had_target {
-            fs::rename(target, &backup)
-                .map_err(|error| format!("暂存百度网盘配置失败：{error}"))?;
-        }
-        if let Err(error) = fs::rename(&temporary, target) {
-            if had_target {
-                let _ = fs::rename(&backup, target);
-            }
-            return Err(format!("提交百度网盘配置失败：{error}"));
-        }
-        if had_target {
-            let _ = fs::remove_file(&backup);
-        }
-        Ok(())
-    })();
-    let _ = fs::remove_file(&temporary);
-    result
+/// 把落盘密文还原成可用配置，同时作为崩溃恢复候选的准入条件。
+fn decode(raw: &[u8]) -> Result<BaiduConfig, String> {
+    let stored = serde_json::from_slice::<StoredBaiduConfig>(raw)
+        .map_err(|error| format!("解析{CONFIG_LABEL}失败：{error}"))?;
+    if stored.version != CONFIG_VERSION {
+        return Err(format!("{CONFIG_LABEL}版本不受支持：{}", stored.version));
+    }
+    let protected = hex::decode(stored.protected)
+        .map_err(|error| format!("读取{CONFIG_LABEL}密文失败：{error}"))?;
+    let plain = unprotect(&protected)?;
+    let config = serde_json::from_slice::<BaiduConfig>(&plain)
+        .map_err(|error| format!("解析{CONFIG_LABEL}凭证失败：{error}"))?;
+    validate(&config)?;
+    Ok(config)
 }
 
 fn validate(config: &BaiduConfig) -> Result<(), String> {

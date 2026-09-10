@@ -1,5 +1,6 @@
 pub mod add_game_commands;
 pub mod admin_commands;
+pub mod app_commands;
 pub mod baidu_commands;
 pub mod baidu_config_commands;
 pub mod cloud_account_commands;

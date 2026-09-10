@@ -474,8 +474,8 @@ pub(crate) fn collect_related_files_by_trace(
                 path: path.clone(),
                 operation,
                 timestamp_ms: clock_time_idx
-                .and_then(|idx| event_field_value(&row, idx))
-                .and_then(|value| parse_trace_timestamp_ms(value)),
+                    .and_then(|idx| event_field_value(&row, idx))
+                    .and_then(|value| parse_trace_timestamp_ms(value)),
                 pid,
                 file_object_id: file_object_id.clone(),
             });

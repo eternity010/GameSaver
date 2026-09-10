@@ -1,6 +1,8 @@
 use crate::{
     app_state::AppState,
-    domain::{ActiveLearningSession, GameLifecycle, SaveProfile, SaveScope, TaskStatus},
+    domain::{
+        ActiveLearningSession, GameLifecycle, SaveProfile, SaveScope, TaskCategory, TaskStatus,
+    },
     repositories::{GameRepository, SaveRepository},
     services::{learning::stop_etw_capture, GameLibraryService, SaveLearningService, TaskService},
 };
@@ -41,7 +43,13 @@ pub fn start_save_learning_task(
             return Err("游戏当前正在运行中，请先关闭游戏后再进行存档识别".to_string());
         }
     }
-    let task_id = TaskService::create(&state, "learn_saves", Some(game_uid), "准备识别存档范围")?;
+    let task_id = TaskService::create(
+        &state,
+        "learn_saves",
+        TaskCategory::Maintenance,
+        Some(game_uid),
+        "准备识别存档范围",
+    )?;
     let app_handle = app.clone();
     let task_id_for_thread = task_id.clone();
     std::thread::spawn(move || {
@@ -80,18 +88,13 @@ pub fn start_save_learning_task(
                 if let Ok(mut sessions) = state.learning_sessions.lock() {
                     sessions.insert(view.session_id.clone(), active);
                 }
-                if let Ok(mut running) = state.running_games.lock() {
-                    running.insert(
-                        view.game_uid.clone(),
-                        crate::domain::GameRuntime {
-                            game_uid: view.game_uid.clone(),
-                            pid: Some(view.root_pid),
-                            status: crate::domain::GameRuntimeStatus::Running,
-                            started_at: Some(view.started_at.clone()),
-                            task_id: None,
-                        },
-                    );
-                }
+                state.set_runtime(crate::domain::GameRuntime {
+                    game_uid: view.game_uid.clone(),
+                    pid: Some(view.root_pid),
+                    status: crate::domain::GameRuntimeStatus::Running,
+                    started_at: Some(view.started_at.clone()),
+                    task_id: None,
+                });
                 TaskService::finish(
                     &state,
                     &task_id_for_thread,
@@ -164,6 +167,7 @@ pub fn start_save_candidate_verification_task(
     let task_id = TaskService::create(
         &state,
         "verify_save_candidates",
+        TaskCategory::Maintenance,
         Some(game_uid),
         "准备再次验证存档候选",
     )?;
@@ -206,18 +210,13 @@ pub fn start_save_candidate_verification_task(
                 if let Ok(mut sessions) = state.learning_sessions.lock() {
                     sessions.insert(view.session_id.clone(), active);
                 }
-                if let Ok(mut running) = state.running_games.lock() {
-                    running.insert(
-                        view.game_uid.clone(),
-                        crate::domain::GameRuntime {
-                            game_uid: view.game_uid.clone(),
-                            pid: Some(view.root_pid),
-                            status: crate::domain::GameRuntimeStatus::Running,
-                            started_at: Some(view.started_at.clone()),
-                            task_id: None,
-                        },
-                    );
-                }
+                state.set_runtime(crate::domain::GameRuntime {
+                    game_uid: view.game_uid.clone(),
+                    pid: Some(view.root_pid),
+                    status: crate::domain::GameRuntimeStatus::Running,
+                    started_at: Some(view.started_at.clone()),
+                    task_id: None,
+                });
                 TaskService::finish(
                     &state,
                     &task_id_for_thread,
@@ -268,6 +267,7 @@ pub fn start_finish_save_learning_task(
     let task_id = TaskService::create(
         &state,
         "analyze_saves",
+        TaskCategory::Maintenance,
         Some(active.view.game_uid.clone()),
         "准备分析存档变化",
     )?;
@@ -294,9 +294,7 @@ pub fn start_finish_save_learning_task(
                 if let Ok(mut sessions) = state.learning_sessions.lock() {
                     sessions.remove(&session_id);
                 }
-                if let Ok(mut running) = state.running_games.lock() {
-                    running.remove(&active.view.game_uid);
-                }
+                state.remove_runtime(&active.view.game_uid);
                 cleanup_active_learning(&active);
                 TaskService::finish(
                     &state,
@@ -313,9 +311,7 @@ pub fn start_finish_save_learning_task(
                 if let Ok(mut sessions) = state.learning_sessions.lock() {
                     sessions.remove(&session_id);
                 }
-                if let Ok(mut running) = state.running_games.lock() {
-                    running.remove(&active.view.game_uid);
-                }
+                state.remove_runtime(&active.view.game_uid);
                 cleanup_active_learning(&active);
                 TaskService::finish(
                     &app_handle.state(),
@@ -332,9 +328,7 @@ pub fn start_finish_save_learning_task(
                 if let Ok(mut sessions) = state.learning_sessions.lock() {
                     sessions.remove(&session_id);
                 }
-                if let Ok(mut running) = state.running_games.lock() {
-                    running.remove(&active.view.game_uid);
-                }
+                state.remove_runtime(&active.view.game_uid);
                 cleanup_active_learning(&active);
                 TaskService::finish(
                     &app_handle.state(),
@@ -360,9 +354,7 @@ pub fn cancel_save_learning(state: State<AppState>, session_id: String) -> Resul
         .map_err(|_| "lock learning session state failed".to_string())?
         .remove(session_id);
     if let Some(active) = active {
-        if let Ok(mut running) = state.running_games.lock() {
-            running.remove(&active.view.game_uid);
-        }
+        state.remove_runtime(&active.view.game_uid);
         cleanup_active_learning(&active);
         crate::logging::info(format!("已取消存档识别会话：session_id={session_id}"));
     } else {
@@ -699,51 +691,40 @@ pub fn update_save_profile_keep_versions(
 ) -> Result<SaveProfile, String> {
     let game_uid = game_uid.trim();
     let keep_versions = keep_versions.clamp(1, 100);
-    let mut store = state
-        .store
-        .lock()
-        .map_err(|_| "lock GameSaver store failed".to_string())?;
-    let game =
-        GameLibraryService::find(&store, game_uid).ok_or_else(|| "游戏不存在".to_string())?;
-    let mut candidate = store.clone();
-    let profile = candidate
-        .save_profiles
-        .iter_mut()
-        .find(|p| {
-            p.game_uid == game_uid
-                && game.save_profile_id.as_deref() == Some(p.profile_id.as_str())
-                && p.enabled
-        })
-        .ok_or_else(|| "未找到存档保护配置".to_string())?;
-    profile.keep_versions = keep_versions;
-    profile.updated_at = now_iso();
-    let updated_profile = profile.clone();
+    let (updated_profile, pruned_versions) = {
+        let mut store = state
+            .store
+            .lock()
+            .map_err(|_| "lock GameSaver store failed".to_string())?;
+        let game =
+            GameLibraryService::find(&store, game_uid).ok_or_else(|| "游戏不存在".to_string())?;
+        let mut candidate = store.clone();
+        let profile = candidate
+            .save_profiles
+            .iter_mut()
+            .find(|p| {
+                p.game_uid == game_uid
+                    && game.save_profile_id.as_deref() == Some(p.profile_id.as_str())
+                    && p.enabled
+            })
+            .ok_or_else(|| "未找到存档保护配置".to_string())?;
+        profile.keep_versions = keep_versions;
+        profile.updated_at = now_iso();
+        let updated_profile = profile.clone();
 
-    let mut game_versions: Vec<_> = candidate
-        .save_versions
-        .iter()
-        .filter(|v| v.game_uid == game_uid)
-        .cloned()
-        .collect();
-    game_versions.sort_by(|a, b| {
-        b.created_at
-            .cmp(&a.created_at)
-            .then(b.version_id.cmp(&a.version_id))
-    });
-    if game_versions.len() > keep_versions {
-        let to_remove: std::collections::HashSet<String> = game_versions
-            .into_iter()
-            .skip(keep_versions)
-            .map(|v| v.version_id)
-            .collect();
-        candidate
-            .save_versions
-            .retain(|v| !(v.game_uid == game_uid && to_remove.contains(&v.version_id)));
-        let _ = SaveRepository::collect_garbage(&app, &candidate.save_versions);
+        let pruned =
+            SaveRepository::prune_game_save_versions(&mut candidate, game_uid, keep_versions);
+
+        GameRepository::persist(&app, &candidate)?;
+        *store = candidate;
+        (updated_profile, pruned)
+    };
+    // 版本清单已落盘，此时回收旧对象才安全（顺序不可颠倒，见
+    // SaveRepository::prune_game_save_versions）；放在守卫块之外，顺带让 store 锁早于
+    // GC 的全盘扫描释放。
+    if let Some(versions) = pruned_versions.as_ref() {
+        let _ = SaveRepository::collect_garbage(&app, versions);
     }
-
-    GameRepository::persist(&app, &candidate)?;
-    *store = candidate;
     Ok(updated_profile)
 }
 
@@ -889,29 +870,30 @@ mod tests {
 
     #[test]
     fn save_profile_prune_logic_selects_oldest_to_remove() {
-        use crate::domain::SaveVersion;
-        let mut versions = (1..=6)
-            .map(|i| SaveVersion {
-                version_id: format!("v{i}"),
-                game_uid: "game1".to_string(),
-                created_at: format!("170000000{i}"),
-                files: Vec::new(),
-                total_bytes: 100,
-            })
-            .collect::<Vec<_>>();
-        versions.sort_by(|a, b| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then(b.version_id.cmp(&a.version_id))
-        });
-        let keep_versions = 5;
-        let to_remove: std::collections::HashSet<String> = versions
-            .into_iter()
-            .skip(keep_versions)
-            .map(|v| v.version_id)
-            .collect();
-        assert_eq!(to_remove.len(), 1);
-        assert!(to_remove.contains("v1"));
+        use crate::domain::{AppStore, SaveVersion};
+        use crate::repositories::SaveRepository;
+        let mut store = AppStore {
+            save_versions: (1..=6)
+                .map(|i| SaveVersion {
+                    version_id: format!("v{i}"),
+                    game_uid: "game1".to_string(),
+                    created_at: format!("170000000{i}"),
+                    files: Vec::new(),
+                    total_bytes: 100,
+                })
+                .collect(),
+            ..AppStore::default()
+        };
+
+        // 走真实剪枝逻辑，而不是在测试里重写一遍排序：返回的存活集就是交给 GC 的依据。
+        let alive = SaveRepository::prune_game_save_versions(&mut store, "game1", 5)
+            .expect("超出保留数应发生剪枝");
+        assert_eq!(alive.len(), 5);
+        assert!(
+            alive.iter().all(|version| version.version_id != "v1"),
+            "最旧的 v1 应当被剪掉"
+        );
+        assert_eq!(store.save_versions.len(), 5);
     }
 
     #[test]

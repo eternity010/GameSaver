@@ -35,9 +35,26 @@ function invokeCommand<T>(command: string, args?: Record<string, unknown>): Prom
   });
 }
 
+/**
+ * 任务分类，由后端给出。
+ *
+ * 前端所有「这个任务要不要显示、能不能取消、算不算进角标」的判断都从这里派生。
+ * 此前这些判断是两份逐字重复的硬编码白名单（`App.vue` 一份、`TransferCenter.vue`
+ * 一份），只覆盖 6/20 个任务类型，`restore_save_version`、`launch_game` 这类任务
+ * 因此离开详情页就既看不到也取消不了。
+ */
+export type TaskCategory =
+  | "body_transfer"
+  | "cloud_save_sync"
+  | "save_restore"
+  | "session"
+  | "maintenance";
+
 export interface AppTask {
   taskId: string;
   taskType: string;
+  /** 旧数据可能缺这个字段，`taskCategoryOf()` 会兜底。 */
+  category?: TaskCategory;
   status: "pending" | "running" | "success" | "failed" | "cancelled" | "interrupted";
   progress: number;
   message: string;
@@ -329,6 +346,16 @@ export function launchGame(gameUid: string): Promise<string> {
   return invokeCommand<string>("launch_game", { gameUid });
 }
 
+/**
+ * 用户确认「知悉存档风险、仍要退出」后调用，结束 GameSaver 进程。
+ *
+ * 后端在检测到有游戏运行却收到关闭请求时会拦截关闭，并推送
+ * `app-exit-blocked`；只有经过本命令才会真正退出。
+ */
+export function confirmAppExit(): Promise<void> {
+  return invokeCommand<void>("confirm_app_exit");
+}
+
 export function getGameRuntime(gameUid: string): Promise<GameRuntime | null> {
   return invokeCommand<GameRuntime | null>("get_game_runtime", { gameUid });
 }
@@ -419,11 +446,17 @@ export interface CloudGamePage {
   games: CloudGameSummary[];
   page: number;
   pageSize: number;
+  totalCount: number;
+  totalPages: number;
   hasMore: boolean;
 }
 
-export function listCloudGames(page = 1, pageSize = 9): Promise<CloudGamePage> {
-  return invokeCommand<CloudGamePage>("list_cloud_games", { page, pageSize });
+export function listCloudGames(page = 1, pageSize = 9, search?: string): Promise<CloudGamePage> {
+  return invokeCommand<CloudGamePage>("list_cloud_games", {
+    page,
+    pageSize,
+    search: search?.trim() || undefined,
+  });
 }
 
 export function getCloudGameCover(gameKey: string): Promise<number[] | null> {
