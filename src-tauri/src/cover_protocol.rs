@@ -1,9 +1,13 @@
 use crate::{
     app_state::AppState,
-    commands::baidu_commands::remote_body_dir,
+    commands::{baidu_commands::remote_body_dir, game_commands::safe_cover_path},
+    domain::is_safe_path_segment,
     services::{CloudManifestService, CoverCaptureService, GameLibraryService},
 };
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use tauri::{
     http::{header, Response, StatusCode},
     Manager, UriSchemeContext,
@@ -24,33 +28,33 @@ pub fn handle_cover_request<R: tauri::Runtime>(
             .unwrap_or_default()
     };
 
-    let Some((kind, raw_identifier)) = path.split_once('/') else {
+    let Some((kind, raw_identifier)) = parse_cover_request_path(path) else {
         return not_found();
     };
-    let decoded_identifier = percent_decode(raw_identifier);
-    let identifier = decoded_identifier.trim();
-    if identifier.is_empty() {
-        return not_found();
-    }
+    let identifier = raw_identifier.as_str();
 
     let file_path = match kind {
         "game" => {
             let state = app.state::<AppState>();
-            let Ok(store) = state.store.lock() else {
-                return not_found();
-            };
-            let cover = GameLibraryService::find(&store, identifier).and_then(|g| g.cover);
-            let Some(cover) = cover else {
-                return not_found();
+            // 只在取封面字段时持锁，后面的路径解析不必占着 store。
+            let display_path = {
+                let Ok(store) = state.store.lock() else {
+                    return not_found();
+                };
+                let Some(cover) =
+                    GameLibraryService::find(&store, identifier).and_then(|g| g.cover)
+                else {
+                    return not_found();
+                };
+                cover.display_path
             };
             let Ok(root) = state.library_root_path() else {
                 return not_found();
             };
-            let rel = Path::new(&cover.display_path);
-            if rel.is_absolute() {
+            let Some(path) = resolve_game_cover_path(&root, identifier, &display_path) else {
                 return not_found();
-            }
-            root.join(rel)
+            };
+            path
         }
         "cloud" => {
             let Ok(base_data_dir) = app.path().app_data_dir() else {
@@ -155,6 +159,31 @@ pub fn handle_cover_request<R: tauri::Runtime>(
         .unwrap_or_else(|_| not_found())
 }
 
+/// 从请求路径解析出 `(kind, identifier)`；路径形状或标识符不合法时返回 `None`。
+///
+/// 三个分支都会把 `identifier` 拼进路径（库根、缓存目录名），所以段里的目录分隔符
+/// 与 `..` 必须在这里一次拦掉 —— 百分号编码的 `%2F` 解出来同样是分隔符，一并按此
+/// 处理。校验收在这一处，免得每个分支各写一份、强度还不一致。
+fn parse_cover_request_path(path: &str) -> Option<(&str, String)> {
+    let (kind, raw_identifier) = path.split_once('/')?;
+    let decoded = percent_decode(raw_identifier);
+    let identifier = decoded.trim();
+    if !is_safe_path_segment(identifier) {
+        return None;
+    }
+    Some((kind, identifier.to_string()))
+}
+
+/// 解析 `game` 分支要读的封面文件路径。
+///
+/// 单独抽出来是为了能被单测覆盖：`handle_cover_request` 依赖 `UriSchemeContext`，
+/// 单测里构造不出来，而「`..` 必须被拒」恰恰是这里最不该只靠人眼看的一条。
+///
+/// 守卫走命令层同一份 `safe_cover_path`，避免同一个不变量出现两种强度。
+fn resolve_game_cover_path(root: &Path, game_uid: &str, display_path: &str) -> Option<PathBuf> {
+    safe_cover_path(root, game_uid, display_path).ok()
+}
+
 pub(crate) fn percent_decode(input: &str) -> String {
     let mut bytes = Vec::with_capacity(input.len());
     let mut chars = input.bytes();
@@ -215,6 +244,67 @@ mod tests {
 
         let unknown = b"unknown_bytes";
         assert_eq!(super::detect_mime(unknown), "image/jpeg");
+    }
+
+    #[test]
+    fn request_path_rejects_identifiers_that_could_walk_out_of_a_root() {
+        // 正常形态照旧通过，中文与空格是合法的 gameKey。
+        assert_eq!(
+            super::parse_cover_request_path("game/409fedc3-aee4-4e6d-a584-f9ef01fa9b5b"),
+            Some(("game", "409fedc3-aee4-4e6d-a584-f9ef01fa9b5b".to_string()))
+        );
+        assert_eq!(
+            super::parse_cover_request_path("cloud/%E8%82%89%E9%81%8A%E3%81%B3%20ver1.0.7"),
+            Some(("cloud", "肉遊び ver1.0.7".to_string()))
+        );
+
+        // 百分号编码的分隔符解出来就是分隔符，必须与裸分隔符同样拒掉。
+        for evil in [
+            "game/..",
+            "game/../other",
+            "game/%2E%2E%2Fother",
+            "cloud/a%2Fb",
+            "game/a%5Cb",
+            "game/",
+            "game",
+            "game/%20",
+        ] {
+            assert!(
+                super::parse_cover_request_path(evil).is_none(),
+                "accepted unsafe request path: {evil:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_cover_paths_that_escape_the_library_root() {
+        use std::path::Path;
+
+        let root = Path::new("C:/GameSaverLibrary");
+        let uid = "409fedc3-aee4-4e6d-a584-f9ef01fa9b5b";
+        let valid = "covers/409fedc3-aee4-4e6d-a584-f9ef01fa9b5b/86ccfbac/display.jpg";
+
+        let resolved =
+            super::resolve_game_cover_path(root, uid, valid).expect("valid cover path rejected");
+        assert!(
+            resolved.starts_with(root),
+            "resolved path left the library root: {resolved:?}"
+        );
+
+        for evil in [
+            "../../../Windows/win.ini",
+            "..\\..\\Windows\\win.ini",
+            "covers/../other-game/display.jpg",
+            "covers/409fedc3-aee4-4e6d-a584-f9ef01fa9b5b/../../outside.jpg",
+            "/absolute/display.jpg",
+            "C:/absolute/display.jpg",
+            "other-game/86ccfbac/display.jpg",
+        ] {
+            assert!(
+                super::resolve_game_cover_path(root, uid, evil).is_none(),
+                "accepted escaping cover path: {evil:?}"
+            );
+        }
     }
 
     #[test]

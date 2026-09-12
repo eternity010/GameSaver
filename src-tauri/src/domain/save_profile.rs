@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum SaveRootType {
     ManagedGame,
@@ -12,6 +12,12 @@ pub enum SaveRootType {
     SavedGames,
     UserProfile,
     Custom,
+    /// `%PROGRAMDATA%`：全用户安装 / 老游戏 / 部分日系游戏的存档落点。
+    ///
+    /// 单独成一个变体而不是复用 `Custom`：它是环境变量可重定位的标准根，云端回传时
+    /// 靠 `root_type + sub_path` 就能在另一台机器上重建路径，而 `Custom` 只能携带源
+    /// 机器的绝对路径。
+    ProgramData,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,8 +108,18 @@ impl SaveScope {
     }
 }
 
+/// 单个存档文件的管理上限，单位字节。
+///
+/// 这是「我们愿意管理多大的文件」这条线的唯一定义：超过它的文件既不进版本库
+/// （收集侧 `collect` 直接跳过），恢复时也不受保护（`is_protected_file` 判否）。
+///
+/// 存档识别产出的 scope 曾经用远高于此的候选判定上限来填 `max_file_bytes`，
+/// 于是出现「列进了 confirmed_files，实际既不备份也不保护」的静默缺口。
+/// 现在两侧共用本常量，超限候选会被明确剔除并告知用户。
+pub const DEFAULT_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
 fn default_max_file_bytes() -> Option<u64> {
-    Some(10 * 1024 * 1024)
+    Some(DEFAULT_MAX_FILE_BYTES)
 }
 
 fn default_keep_versions() -> usize {
@@ -139,7 +155,9 @@ impl SaveProfile {
             game_uid,
             executable_hash,
             scopes,
-            detection_evidence: vec!["snapshot_diff".to_string(), "folder_grouping".to_string()],
+            // 溯源信息由调用方按实际采集方式补上（`with_detection_evidence`）。
+            // 手动创建的 profile 没有识别过程，留空才是真话。
+            detection_evidence: Vec::new(),
             confidence,
             enabled: true,
             keep_versions: 5,
@@ -147,6 +165,29 @@ impl SaveProfile {
             updated_at: now,
         }
     }
+
+    /// 记录这份 profile 的范围是**怎么得出来的**。
+    ///
+    /// 这里原本硬编码 `["snapshot_diff", "folder_grouping"]`，走 ETW 时也原样不动 ——
+    /// 等于把一份会随云端档案一起带出去的溯源信息写成了假话。
+    pub fn with_detection_evidence(mut self, detection_evidence: Vec<String>) -> Self {
+        self.detection_evidence = detection_evidence;
+        self
+    }
+}
+
+/// 识别证据的词汇表。
+///
+/// 刻意收敛在 Rust 单点：前端只负责说清「这次是 ETW 还是快照差异」，具体措辞由这里
+/// 决定，免得同一份溯源信息在前后端各写一套字面量、日后各改各的。
+pub fn detection_evidence_for(capture_mode: Option<&str>) -> Vec<String> {
+    let mut evidence = vec![match capture_mode {
+        Some("etw") => "etw_write",
+        _ => "snapshot_diff",
+    }
+    .to_string()];
+    evidence.push("folder_grouping".to_string());
+    evidence
 }
 
 #[cfg(test)]
@@ -204,5 +245,33 @@ mod tests {
             custom_scope.exclude_directories,
             vec!["custom_dir".to_string()]
         );
+    }
+
+    #[test]
+    fn detection_evidence_reflects_the_actual_capture_mode() {
+        assert_eq!(
+            detection_evidence_for(Some("etw")),
+            vec!["etw_write".to_string(), "folder_grouping".to_string()]
+        );
+        assert_eq!(
+            detection_evidence_for(Some("snapshot")),
+            vec!["snapshot_diff".to_string(), "folder_grouping".to_string()]
+        );
+        // 采集方式缺失或无法识别时按快照差异处理，绝不谎报 ETW。
+        assert_eq!(
+            detection_evidence_for(None),
+            vec!["snapshot_diff".to_string(), "folder_grouping".to_string()]
+        );
+    }
+
+    /// 新建的 profile 不自带溯源信息：手动创建的根本没有识别过程，
+    /// 旧实现无条件写死 `snapshot_diff` 是在说假话。
+    #[test]
+    fn new_profile_has_no_detection_evidence_until_it_is_set() {
+        let profile =
+            SaveProfile::new("g".to_string(), "h".to_string(), vec![], 0, "0".to_string());
+        assert!(profile.detection_evidence.is_empty());
+        let profile = profile.with_detection_evidence(vec!["etw_write".to_string()]);
+        assert_eq!(profile.detection_evidence, vec!["etw_write".to_string()]);
     }
 }

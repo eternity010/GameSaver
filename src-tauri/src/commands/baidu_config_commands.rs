@@ -1,6 +1,6 @@
 use crate::{
     repositories::{BaiduConfig, BaiduConfigRepository, BaiduConfigView},
-    services::{BaiduNetdiskClient, BaiduToken},
+    services::{safe_network_error, BaiduNetdiskClient, BaiduToken},
 };
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -123,11 +123,11 @@ pub fn exchange_baidu_code(app: AppHandle, code: String) -> Result<(), String> {
             ("redirect_uri", REDIRECT_URI),
         ])
         .send()
-        .map_err(|error| format!("请求百度授权 Token 失败：{error}"))?;
+        .map_err(|error| format!("请求百度授权 Token 失败：{}", safe_network_error(error)))?;
     let status = response.status();
     let body = response
         .text()
-        .map_err(|error| format!("读取百度授权响应失败：{error}"))?;
+        .map_err(|error| format!("读取百度授权响应失败：{}", safe_network_error(error)))?;
     let value = serde_json::from_str::<serde_json::Value>(&body)
         .map_err(|error| format!("百度授权返回非 JSON：HTTP {status}，{error}"))?;
     if let Some(error_code) = value.get("error").and_then(serde_json::Value::as_str) {

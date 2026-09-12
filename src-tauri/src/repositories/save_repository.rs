@@ -2,7 +2,7 @@ use crate::{
     app_state::AppState,
     domain::{
         compare_created_at, AppStore, Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope,
-        SaveVersion,
+        SaveVersion, UnknownFilePolicy,
     },
 };
 use sha2::{Digest, Sha256};
@@ -44,15 +44,36 @@ impl SaveRepository {
         let _guard = lock.lock().map_err(|_| "存档仓库锁定失败".to_string())?;
         let files = collect_profile_files(profile)?;
 
+        // 上一版条目按 (root_type, 相对路径) 建一次索引。下面三处「这个文件在上一版里是
+        // 什么样」的查询原本都是「每个文件扫全部条目」：2000 个文件的存档目录就是约
+        // 2000×2000 次比较，其中一次还带 `fs::metadata`。索引只把候选缩到同名的那几条，
+        // 判定本身仍交给 `collected_is_unmodified` / `collected_matches_entry`，语义不变。
+        let old_entries_by_location: HashMap<(SaveRootType, String), Vec<&SaveFileEntry>> = latest
+            .map(|version| {
+                let mut index: HashMap<(SaveRootType, String), Vec<&SaveFileEntry>> =
+                    HashMap::new();
+                for entry in version.files.iter() {
+                    index
+                        .entry((entry.root_type, normalize_relative(&entry.relative_path)))
+                        .or_default()
+                        .push(entry);
+                }
+                index
+            })
+            .unwrap_or_default();
+
         // 1. Fast path: check if absolutely nothing changed compared to latest
         if let Some(latest) = latest {
-            let old_active_files: Vec<&SaveFileEntry> =
-                latest.files.iter().filter(|file| !file.deleted).collect();
-            if old_active_files.len() == files.len() {
+            let old_active_count = latest.files.iter().filter(|file| !file.deleted).count();
+            if old_active_count == files.len() {
                 let all_unmodified = files.iter().all(|file| {
-                    old_active_files
-                        .iter()
-                        .any(|old_entry| collected_is_unmodified(file, old_entry, app))
+                    entries_at_location(
+                        &old_entries_by_location,
+                        file.root_type,
+                        &file.relative_path,
+                    )
+                    .iter()
+                    .any(|old_entry| collected_is_unmodified(file, old_entry, app))
                 });
                 if all_unmodified {
                     return Ok(None);
@@ -62,13 +83,14 @@ impl SaveRepository {
 
         let mut entries = Vec::with_capacity(files.len());
         for (index, file) in files.iter().enumerate() {
-            let cached_hash = latest.and_then(|latest_ver| {
-                latest_ver
-                    .files
-                    .iter()
-                    .find(|entry| collected_is_unmodified(file, entry, app))
-                    .and_then(|entry| entry.object_hash.clone())
-            });
+            let cached_hash = entries_at_location(
+                &old_entries_by_location,
+                file.root_type,
+                &file.relative_path,
+            )
+            .iter()
+            .find(|entry| collected_is_unmodified(file, entry, app))
+            .and_then(|entry| entry.object_hash.clone());
 
             let (hash, size) = if let Some(hash) = cached_hash {
                 (hash, file.size)
@@ -94,12 +116,28 @@ impl SaveRepository {
             );
         }
         if let Some(latest) = latest {
+            // 反向查询（「这一版里的文件现在还在不在」）同样按位置索引，避免又一遍
+            // O(n·m)；被删掉的条目这一次遍历就能认出来。
+            let mut collected_by_location: HashMap<(SaveRootType, String), Vec<&CollectedFile>> =
+                HashMap::new();
+            for file in &files {
+                collected_by_location
+                    .entry((file.root_type, normalize_relative(&file.relative_path)))
+                    .or_default()
+                    .push(file);
+            }
             for old_file in latest.files.iter().filter(|file| !file.deleted) {
-                if !files
-                    .iter()
-                    .any(|file| collected_matches_entry(file, old_file))
-                    && entry_belongs_to_profile(old_file, profile)
-                {
+                let still_present = collected_by_location
+                    .get(&(
+                        old_file.root_type,
+                        normalize_relative(&old_file.relative_path),
+                    ))
+                    .is_some_and(|bucket| {
+                        bucket
+                            .iter()
+                            .any(|file| collected_matches_entry(file, old_file))
+                    });
+                if !still_present && entry_belongs_to_profile(old_file, profile) {
                     entries.push(SaveFileEntry {
                         root_type: old_file.root_type,
                         root_path: old_file.root_path.clone(),
@@ -986,6 +1024,11 @@ fn collect_protected_paths(root: &Path, scope: &SaveScope) -> Result<HashSet<Str
                     .to_string_lossy()
                     .as_ref(),
             );
+            // 与收集侧共用同一道门：一侧收进来、另一侧不认，恢复时就会把从没备份过的文件
+            // 当成「多出来的受保护文件」删掉。
+            if !scope_admits_directory_file(scope, &relative) {
+                continue;
+            }
             if is_protected_file(entry.path(), &relative, scope) {
                 paths.insert(relative);
             }
@@ -1276,7 +1319,13 @@ fn collect_profile_files(profile: &SaveProfile) -> Result<Vec<CollectedFile>, St
         for relative in &scope.confirmed_files {
             let candidate = root.join(relative);
             if candidate.exists() {
-                add_candidate(&mut files, &candidate, &root, scope)?;
+                add_candidate(
+                    &mut files,
+                    &candidate,
+                    &root,
+                    scope,
+                    CandidateSource::Confirmed,
+                )?;
             }
         }
         for relative in &scope.include_directories {
@@ -1287,7 +1336,13 @@ fn collect_profile_files(profile: &SaveProfile) -> Result<Vec<CollectedFile>, St
             for entry in WalkDir::new(&directory).follow_links(false) {
                 let entry = entry.map_err(|err| format!("扫描存档目录失败：{err}"))?;
                 if entry.file_type().is_file() {
-                    add_candidate(&mut files, entry.path(), &root, scope)?;
+                    add_candidate(
+                        &mut files,
+                        entry.path(),
+                        &root,
+                        scope,
+                        CandidateSource::Directory,
+                    )?;
                 }
             }
         }
@@ -1295,11 +1350,38 @@ fn collect_profile_files(profile: &SaveProfile) -> Result<Vec<CollectedFile>, St
     Ok(files.into_values().collect())
 }
 
+/// 某个文件是怎么进入收集视野的 —— 决定它要不要过 `unknown_file_policy` 那道门。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CandidateSource {
+    /// `confirmed_files` 里被显式确认过：无论如何都算这个范围的一员。
+    Confirmed,
+    /// `include_directories` 目录级遍历出来的：可能是「未知文件」。
+    Directory,
+}
+
+/// `include_directories` 目录级收集时，目录里那些**没有**显式列进 `confirmed_files` 的文件
+/// （未知文件）是否算作这个范围的一员。
+///
+/// 这是 `unknown_file_policy` 唯一的语义落点。此前它根本不是个开关：保护范围完全由
+/// `include_directories` 决定，改这个字段不改变任何行为，而前端徽章却写着「自动保护新
+/// 存档 / 仅保护已确认文件」—— 一块假仪表（存档识别审视 R4）。
+///
+/// 收集侧与恢复侧共用本函数：只在一侧生效就会出现「恢复时把一个从没备份过的文件当受保护
+/// 删掉」，或者反过来「备份了却在恢复时当作不存在」。入参 `normalized_relative` 需已归一化。
+fn scope_admits_directory_file(scope: &SaveScope, normalized_relative: &str) -> bool {
+    scope.unknown_file_policy == UnknownFilePolicy::Protect
+        || scope
+            .confirmed_files
+            .iter()
+            .any(|value| normalize_relative(value) == normalized_relative)
+}
+
 fn add_candidate(
     files: &mut BTreeMap<String, CollectedFile>,
     path: &Path,
     root: &Path,
     scope: &SaveScope,
+    source: CandidateSource,
 ) -> Result<(), String> {
     if !path.is_file() {
         return Ok(());
@@ -1314,6 +1396,11 @@ fn add_candidate(
         .map_err(|_| format!("存档文件超出保护范围：{}", path.display()))?;
     let relative_path = normalize_relative(relative.to_string_lossy().as_ref());
     if is_excluded(&relative_path, scope) {
+        return Ok(());
+    }
+    // 目录级收集出来的文件可能是「这个范围从没确认过的未知文件」，是否纳入由
+    // `unknown_file_policy` 决定；`confirmed_files` 那条路进来的不走这道门。
+    if source == CandidateSource::Directory && !scope_admits_directory_file(scope, &relative_path) {
         return Ok(());
     }
     // 恢复产物绝不进版本。它是 `restore_group` 的工作目录，正常情况下早已被清掉；能走到
@@ -1484,9 +1571,15 @@ fn normalize_relative(path: &str) -> String {
 /// 的方向是「多备份」而非「少备份」，不会报错也不会丢数据，所以一直没暴露（存档管理审查 V9）。
 ///
 /// 双指针 + 单个 `*` 回退点：不递归、不产生指数级回溯，多个 `*` 也只需记住最近一个。
+///
+/// 逐字节比较而不是逐 `char`：两者等价（UTF-8 是单射，且大小写折叠只作用于 ASCII，
+/// 非 ASCII 字节原样保留，所以「折叠后逐字节相等」⇔「折叠后逐字符相等」），但省掉了
+/// 每次调用把两侧都 `to_ascii_lowercase()` 再 `collect::<Vec<char>>()` 的四次堆分配 ——
+/// 而它跑在每个文件 × 每条模式上。`?` 与 `*` 的「一个字符」按 UTF-8 首字节推进，多字节
+/// 字符只前进一次，不会被从中间劈开。
 fn wildcard_matches(value: &str, pattern: &str) -> bool {
-    let value = value.to_ascii_lowercase().chars().collect::<Vec<_>>();
-    let pattern = pattern.to_ascii_lowercase().chars().collect::<Vec<_>>();
+    let value = value.as_bytes();
+    let pattern = pattern.as_bytes();
 
     let (mut v, mut p) = (0usize, 0usize);
     // 最近一个 `*` 在模式里的位置，以及它当时把值匹配到了哪 —— 失配时回到这里让它多吞一个字符。
@@ -1494,15 +1587,19 @@ fn wildcard_matches(value: &str, pattern: &str) -> bool {
     let mut star_value = 0usize;
 
     while v < value.len() {
-        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == value[v]) {
-            v += 1;
-            p += 1;
-        } else if p < pattern.len() && pattern[p] == '*' {
+        if p < pattern.len() && pattern[p] == b'*' {
             star = Some(p);
             star_value = v;
             p += 1;
+        } else if p < pattern.len() && wildcard_unit_matches(pattern[p], value[v]) {
+            v = if pattern[p] == b'?' {
+                skip_utf8_char(value, v)
+            } else {
+                v + 1
+            };
+            p += 1;
         } else if let Some(star_position) = star {
-            star_value += 1;
+            star_value = skip_utf8_char(value, star_value);
             v = star_value;
             p = star_position + 1;
         } else {
@@ -1510,10 +1607,26 @@ fn wildcard_matches(value: &str, pattern: &str) -> bool {
         }
     }
     // 值已耗尽：模式尾部剩余的 `*` 可以匹配空串，其余字符则说明没匹配上。
-    while p < pattern.len() && pattern[p] == '*' {
+    while p < pattern.len() && pattern[p] == b'*' {
         p += 1;
     }
     p == pattern.len()
+}
+
+/// 模式下标与值下标的单个「单元」是否相等。`?` 匹配任意一个字符。
+fn wildcard_unit_matches(pattern: u8, value: u8) -> bool {
+    pattern == b'?' || pattern.eq_ignore_ascii_case(&value)
+}
+
+/// 从 `index`（必须是字符边界）跳到下一个字符边界。
+///
+/// ASCII 前进一字节；多字节字符越过它的续字节（`0b10xxxxxx`）。
+fn skip_utf8_char(bytes: &[u8], index: usize) -> usize {
+    let mut next = index + 1;
+    while next < bytes.len() && (bytes[next] & 0xC0) == 0x80 {
+        next += 1;
+    }
+    next
 }
 
 fn read_stable_file(path: &Path) -> Result<(Vec<u8>, u64), String> {
@@ -1568,6 +1681,21 @@ fn collected_matches_entry(file: &CollectedFile, entry: &SaveFileEntry) -> bool 
                     .as_deref()
                     .is_some_and(|other| normalize_path(path) == normalize_path(other))
             }))
+}
+
+/// 在「上一版按位置建好的索引」里取出与某个采集文件同位置的条目。
+///
+/// 索引键是 `(root_type, 归一化相对路径)`；同一位置仍可能有多条（不同 `root_path` 的
+/// 两个范围可以各有一个同名文件），所以返回的是切片，由调用方再跑完整判定。
+fn entries_at_location<'a>(
+    index: &'a HashMap<(SaveRootType, String), Vec<&'a SaveFileEntry>>,
+    root_type: SaveRootType,
+    relative_path: &str,
+) -> &'a [&'a SaveFileEntry] {
+    index
+        .get(&(root_type, normalize_relative(relative_path)))
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
 }
 
 fn collected_is_unmodified(
@@ -1788,6 +1916,76 @@ mod tests {
         assert!(wildcard_matches("anything", "*"));
         assert!(wildcard_matches("save.dat", "save.dat"));
         assert!(!wildcard_matches("save.dat", "save.dats"));
+    }
+
+    /// `?` 与 `*` 以「字符」为单位推进，绝不把一个多字节字符劈成两半。
+    ///
+    /// 把 `?` 的推进改回按字节 `+1`，第一条就会失败 —— `?` 只吃掉「档」的首字节，
+    /// 后面的 `.sav` 再也对不上（改成逐字节比较时最容易踩的坑）。
+    #[test]
+    fn wildcard_patterns_step_over_multibyte_characters() {
+        assert!(wildcard_matches("档.sav", "?.sav"));
+        assert!(wildcard_matches("存档1.sav", "存档?.sav"));
+        assert!(!wildcard_matches("存档12.sav", "存档?.sav"));
+        assert!(wildcard_matches("存档.sav", "*档.sav"));
+        assert!(
+            !wildcard_matches("存档.sav", "*存.sav"),
+            "`*` 之后必须逐字符对齐"
+        );
+    }
+
+    /// 位置索引只按 `(root_type, 归一化相对路径)` 分桶，语义与
+    /// `collected_matches_entry` 的前两个条件一致；同名的不同 `root_path` 必须都留着，
+    /// 由调用方再跑完整判定（否则会把两个范围里的同名文件认成同一个）。
+    #[test]
+    fn location_index_groups_entries_and_keeps_same_name_siblings() {
+        let entry = |root_type: SaveRootType, root_path: &str, relative: &str| SaveFileEntry {
+            root_type,
+            root_path: Some(root_path.to_string()),
+            relative_path: relative.to_string(),
+            object_hash: Some("hash".to_string()),
+            size: 4,
+            deleted: false,
+            mtime_ms: Some(1),
+        };
+        let first = entry(
+            SaveRootType::AppData,
+            r"C:\Users\A\AppData\Roaming\GameA",
+            "Saves/slot1.sav",
+        );
+        let sibling = entry(
+            SaveRootType::AppData,
+            r"C:\Users\A\AppData\Roaming\GameB",
+            r"saves\SLOT1.sav",
+        );
+        let other = entry(
+            SaveRootType::Documents,
+            r"C:\Users\A\Documents\GameA",
+            "Saves/slot1.sav",
+        );
+
+        let mut index: std::collections::HashMap<(SaveRootType, String), Vec<&SaveFileEntry>> =
+            std::collections::HashMap::new();
+        for item in [&first, &sibling, &other] {
+            index
+                .entry((
+                    item.root_type,
+                    super::normalize_relative(&item.relative_path),
+                ))
+                .or_default()
+                .push(item);
+        }
+
+        let bucket = super::entries_at_location(&index, SaveRootType::AppData, "saves/SLOT1.SAV");
+        assert_eq!(bucket.len(), 2, "大小写与分隔符归一化后应落进同一个桶");
+        assert_eq!(
+            super::entries_at_location(&index, SaveRootType::Documents, "saves/slot1.sav").len(),
+            1
+        );
+        assert!(
+            super::entries_at_location(&index, SaveRootType::Custom, "saves/slot1.sav").is_empty(),
+            "root_type 不同不得串桶"
+        );
     }
 
     #[test]
@@ -2478,6 +2676,77 @@ mod tests {
         assert!(!is_restore_artifact_name(".gamesaver-restore-"));
         assert!(!is_restore_artifact_name("gamesaver-restore-0f8b"));
         assert!(!path_is_restore_artifact("saves/slot1.sav"));
+    }
+
+    /// R4 回归：`unknown_file_policy` 必须真的管事 —— 目录级收集时，没在 `confirmed_files`
+    /// 里确认过的未知文件按它决定收不收。
+    ///
+    /// 此前这个字段只写不读：保护范围完全由 `include_directories` 决定，改它不改变任何
+    /// 行为，而前端徽章却写着「自动保护新存档 / 仅保护已确认文件」—— 一块假仪表。
+    #[test]
+    fn unknown_file_policy_decides_whether_directory_files_are_collected() {
+        let root = temp_root("r4-collect");
+        std::fs::write(root.join("slot1.sav"), b"confirmed").expect("write confirmed save");
+        std::fs::write(root.join("slot2.sav"), b"unknown save").expect("write unknown save");
+
+        let collected_for = |policy: UnknownFilePolicy| {
+            let mut scope = SaveScope::new_manual(root.to_string_lossy().to_string());
+            scope.root_type = SaveRootType::Custom;
+            scope.confirmed_files = vec!["slot1.sav".to_string()];
+            scope.unknown_file_policy = policy;
+            let profile = SaveProfile::new(
+                "g".to_string(),
+                "hash".to_string(),
+                vec![scope],
+                100,
+                "0".to_string(),
+            );
+            let mut relatives: Vec<String> = super::collect_profile_files(&profile)
+                .expect("collect")
+                .iter()
+                .map(|file| file.relative_path.clone())
+                .collect();
+            relatives.sort();
+            relatives
+        };
+
+        // Protect：目录里的未知文件一起收 —— 这就是徽章上「自动保护新存档」的实义。
+        assert_eq!(
+            collected_for(UnknownFilePolicy::Protect),
+            vec!["slot1.sav".to_string(), "slot2.sav".to_string()]
+        );
+        // Ignore：只认显式确认过的那批。
+        assert_eq!(
+            collected_for(UnknownFilePolicy::Ignore),
+            vec!["slot1.sav".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 恢复侧必须与收集侧共用同一道门：一侧收、一侧不认，恢复时就会把**从没被备份过**的
+    /// 文件当成「多出来的受保护文件」删掉（恢复是精确回到该版本）。
+    #[test]
+    fn protected_paths_share_the_unknown_file_policy_with_collection() {
+        let root = temp_root("r4-protect");
+        std::fs::write(root.join("slot1.sav"), b"confirmed").expect("write confirmed save");
+        std::fs::write(root.join("slot2.sav"), b"unknown save").expect("write unknown save");
+
+        let mut scope = SaveScope::new_manual(root.to_string_lossy().to_string());
+        scope.root_type = SaveRootType::Custom;
+        scope.confirmed_files = vec!["slot1.sav".to_string()];
+
+        scope.unknown_file_policy = UnknownFilePolicy::Protect;
+        let protected = super::collect_protected_paths(&root, &scope).expect("collect protected");
+        assert_eq!(protected.len(), 2, "Protect 时目录里的未知文件也算受保护");
+
+        scope.unknown_file_policy = UnknownFilePolicy::Ignore;
+        let protected = super::collect_protected_paths(&root, &scope).expect("collect protected");
+        let mut relatives: Vec<String> = protected.into_iter().collect();
+        relatives.sort();
+        assert_eq!(relatives, vec!["slot1.sav".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// V7 回归（防线 1）：恢复产物绝不进版本。

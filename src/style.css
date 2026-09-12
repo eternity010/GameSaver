@@ -465,6 +465,9 @@ h1 { margin-bottom: 0; font-size: 30px; letter-spacing: 0; }
 .directory-chip { color: #c5d6f5; border-color: #3f5578; background: #253149; }
 .exclude-chip { color: #f0c6c6; border-color: #68444b; background: #322329; }
 .exclude-dir-chip { color: #f0d79d; border-color: #69552f; background: #3a3021; }
+/* 疑似存档：只是启发式判断，还没被纳入保护范围，用虚线跟已确认的文件区分开。 */
+.proposed-block { padding: 10px; border: 1px dashed #3f5578; border-radius: 6px; }
+.proposed-chip { color: #c5d6f5; border-style: dashed; border-color: #3f5578; background: #1e2733; }
 .muted-text, .scope-note { color: #7f8897; font-size: 12px; }
 .scope-note { margin: -5px 0 0; }
 .inline-editor { display: flex; gap: 8px; }

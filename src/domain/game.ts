@@ -97,6 +97,14 @@ export interface SaveVersion {
   totalBytes: number;
 }
 
+/** 详情页版本列表的传输摘要：只带计数，不带文件清单。 */
+export interface SaveVersionSummary {
+  versionId: string;
+  createdAt: string;
+  totalBytes: number;
+  fileCount: number;
+}
+
 export interface SaveProfile {
   profileId: string;
   gameUid: string;
@@ -110,7 +118,7 @@ export interface SaveProfile {
   updatedAt: string;
 }
 
-export type SaveRootType = "managed_game" | "app_data" | "local_app_data" | "local_low" | "documents" | "saved_games" | "user_profile" | "custom";
+export type SaveRootType = "managed_game" | "app_data" | "local_app_data" | "local_low" | "documents" | "saved_games" | "user_profile" | "custom" | "program_data";
 export type UnknownFilePolicy = "protect" | "ignore";
 
 export const DEFAULT_EXCLUDE_PATTERNS: string[] = [
@@ -165,6 +173,8 @@ export interface SaveScope {
 export interface SaveScopeDraft {
   scope: SaveScope;
   changedFiles: string[];
+  /** 目录里看起来也是存档、但本次学习没有变化的文件，需要用户确认后才纳入保护。 */
+  proposedFiles: string[];
   confidence: number;
   evidenceLevel: SaveCandidateEvidenceLevel;
   evidenceReason: string;
@@ -232,7 +242,7 @@ export interface CloudSaveOverview {
 
 export interface GameDetailView {
   precheck: LaunchPrecheck;
-  versions: SaveVersion[];
+  versions: SaveVersionSummary[];
   runtime: GameRuntime | null;
   bodyVersions: GameBodyVersion[];
   saveProfile: SaveProfile | null;

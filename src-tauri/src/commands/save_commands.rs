@@ -405,11 +405,13 @@ pub fn confirm_save_profile(
     game_uid: String,
     mut scopes: Vec<SaveScope>,
     confidence: u8,
+    capture_mode: Option<String>,
 ) -> Result<SaveProfile, String> {
     let game_uid = game_uid.trim().to_string();
     crate::logging::info(format!(
-        "开始确认存档保护：game_uid={game_uid} scopes={}",
-        scopes.len()
+        "开始确认存档保护：game_uid={game_uid} scopes={} capture_mode={:?}",
+        scopes.len(),
+        capture_mode
     ));
     if scopes.is_empty() {
         return Err("至少需要一个存档保护范围".to_string());
@@ -429,95 +431,92 @@ pub fn confirm_save_profile(
         key: format!("confirm:{game_uid}"),
         active: operation_reserved,
     };
-    let game = {
-        let store = state
-            .store
-            .lock()
-            .map_err(|_| "lock GameSaver store failed".to_string())?;
+    // 读 → 改 → 持久化 → 提交必须在**一次**加锁里完成。
+    //
+    // 旧写法先在一把锁里取 `game` 并检查 `PendingSetup`，释放锁后再在另一把锁里写入：
+    // 两次加锁之间任何一次并发改动都能让生命周期判定失效，而且持久化还握着第二把锁。
+    // 现在复核与提交同处一个闭包，判定和落盘之间不再留窗口。
+    //
+    // 代价是启动程序哈希与持久化发生在锁内（本机文件 IO，毫秒到几百毫秒量级），
+    // 这正是项目里 `with_store_mut` 的既定形态。
+    let profile = state.with_store_mut(|store| {
         let game =
-            GameLibraryService::find(&store, &game_uid).ok_or_else(|| "游戏不存在".to_string())?;
+            GameLibraryService::find(store, &game_uid).ok_or_else(|| "游戏不存在".to_string())?;
         if !matches!(game.lifecycle, GameLifecycle::PendingSetup) {
             return Err("该游戏已经完成设置".to_string());
         }
-        game
-    };
-    for scope in &mut scopes {
-        scope.ensure_default_exclusions_if_empty();
-        validate_scope(scope)?;
-    }
-    crate::logging::info(format!(
-        "存档保护范围校验完成：game_uid={game_uid} scopes={}",
-        scopes.len()
-    ));
-    let executable_path = managed_executable_path(&game).map_err(|error| {
-        crate::logging::error(format!(
-            "确认存档保护失败：启动程序路径无效：game_uid={game_uid} error={error}"
+        for scope in &mut scopes {
+            scope.ensure_default_exclusions_if_empty();
+            validate_scope(scope)?;
+        }
+        crate::logging::info(format!(
+            "存档保护范围校验完成：game_uid={game_uid} scopes={}",
+            scopes.len()
         ));
-        error
+        let executable_path = managed_executable_path(&game).map_err(|error| {
+            crate::logging::error(format!(
+                "确认存档保护失败：启动程序路径无效：game_uid={game_uid} error={error}"
+            ));
+            error
+        })?;
+        let executable_metadata = fs::metadata(&executable_path).map_err(|error| {
+            let message = format!(
+                "读取启动程序信息失败：{}：{error}",
+                executable_path.display()
+            );
+            crate::logging::error(format!(
+                "确认存档保护失败：game_uid={game_uid} error={message}"
+            ));
+            message
+        })?;
+        if !executable_metadata.is_file() {
+            return Err(format!(
+                "启动程序不是有效文件：{}",
+                executable_path.display()
+            ));
+        }
+        crate::logging::info(format!(
+            "启动程序路径已确认：game_uid={game_uid} path={} size={}",
+            executable_path.display(),
+            executable_metadata.len()
+        ));
+        let executable_hash = sha256_file(&executable_path).map_err(|error| {
+            crate::logging::error(format!(
+                "确认存档保护失败：启动程序哈希失败：game_uid={game_uid} error={error}"
+            ));
+            error
+        })?;
+        crate::logging::info(format!("启动程序哈希完成：game_uid={game_uid}"));
+        let profile = SaveProfile::new(
+            game_uid.clone(),
+            executable_hash,
+            scopes,
+            confidence.min(100),
+            now_iso(),
+        )
+        .with_detection_evidence(crate::domain::detection_evidence_for(
+            capture_mode.as_deref(),
+        ));
+        crate::logging::info(format!(
+            "存档保护配置已创建：game_uid={game_uid} profile_id={}",
+            profile.profile_id
+        ));
+        store.save_profiles.retain(|item| item.game_uid != game_uid);
+        store.save_profiles.push(profile.clone());
+        let target = store
+            .games
+            .iter_mut()
+            .find(|item| item.game_uid == game_uid)
+            .ok_or_else(|| "游戏登记已不存在".to_string())?;
+        target.activate(profile.profile_id.clone());
+        GameRepository::persist(&app, store).map_err(|error| {
+            crate::logging::error(format!(
+                "确认存档保护失败：持久化失败：game_uid={game_uid} error={error}"
+            ));
+            error
+        })?;
+        Ok(profile)
     })?;
-    let executable_metadata = fs::metadata(&executable_path).map_err(|error| {
-        let message = format!(
-            "读取启动程序信息失败：{}：{error}",
-            executable_path.display()
-        );
-        crate::logging::error(format!(
-            "确认存档保护失败：game_uid={game_uid} error={message}"
-        ));
-        message
-    })?;
-    if !executable_metadata.is_file() {
-        return Err(format!(
-            "启动程序不是有效文件：{}",
-            executable_path.display()
-        ));
-    }
-    crate::logging::info(format!(
-        "启动程序路径已确认：game_uid={game_uid} path={} size={}",
-        executable_path.display(),
-        executable_metadata.len()
-    ));
-    let executable_hash = sha256_file(&executable_path).map_err(|error| {
-        crate::logging::error(format!(
-            "确认存档保护失败：启动程序哈希失败：game_uid={game_uid} error={error}"
-        ));
-        error
-    })?;
-    crate::logging::info(format!("启动程序哈希完成：game_uid={game_uid}"));
-    let profile = SaveProfile::new(
-        game_uid.clone(),
-        executable_hash,
-        scopes,
-        confidence.min(100),
-        now_iso(),
-    );
-    crate::logging::info(format!(
-        "存档保护配置已创建：game_uid={game_uid} profile_id={}",
-        profile.profile_id
-    ));
-    let mut store = state
-        .store
-        .lock()
-        .map_err(|_| "lock GameSaver store failed".to_string())?;
-    crate::logging::info(format!("开始准备存档保护持久化：game_uid={game_uid}"));
-    let mut candidate = store.clone();
-    candidate
-        .save_profiles
-        .retain(|item| item.game_uid != game_uid);
-    candidate.save_profiles.push(profile.clone());
-    let target = candidate
-        .games
-        .iter_mut()
-        .find(|item| item.game_uid == game_uid)
-        .ok_or_else(|| "游戏登记已不存在".to_string())?;
-    target.activate(profile.profile_id.clone());
-    GameRepository::persist(&app, &candidate).map_err(|error| {
-        crate::logging::error(format!(
-            "确认存档保护失败：持久化失败：game_uid={game_uid} error={error}"
-        ));
-        error
-    })?;
-    crate::logging::info(format!("存档保护持久化完成：game_uid={game_uid}"));
-    *store = candidate;
     crate::logging::info(format!(
         "存档保护确认完成：game_uid={game_uid} profile_id={}",
         profile.profile_id

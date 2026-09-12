@@ -338,6 +338,7 @@ pub fn extract_sub_path(scope: &SaveScope, game: Option<&Game>) -> Option<String
             std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join("Saved Games"))
         }
         SaveRootType::UserProfile => std::env::var_os("USERPROFILE").map(PathBuf::from),
+        SaveRootType::ProgramData => std::env::var_os("PROGRAMDATA").map(PathBuf::from),
         SaveRootType::ManagedGame | SaveRootType::Custom => None,
     };
 
@@ -364,6 +365,7 @@ pub fn extract_sub_path(scope: &SaveScope, game: Option<&Game>) -> Option<String
         SaveRootType::AppData => Some(r"\appdata\roaming\"),
         SaveRootType::Documents => Some(r"\documents\"),
         SaveRootType::SavedGames => Some(r"\saved games\"),
+        SaveRootType::ProgramData => Some(r"\programdata\"),
         _ => None,
     };
 

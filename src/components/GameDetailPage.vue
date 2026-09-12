@@ -4,10 +4,10 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { AlertTriangle, Archive, ArrowLeft, Camera, Check, CheckCircle2, Clock3, Cloud, CloudDownload, CloudUpload, Folder, FolderOpen, Gamepad2, HardDrive, ImagePlus, LoaderCircle, Pencil, Play, RefreshCw, RotateCcw, ShieldCheck, Trash2, Upload, X } from "@lucide/vue";
-import { armGameCoverCapture, deleteCloudSaveVersion, deleteGameBodyPackage, deleteSaveVersion, discardGameCoverCapture, getBaiduConfig, getBaiduStatus, getCloudSaveOverview, getGameCover, getGameCoverCaptureUrl, getGameCoverUrl, getGameDetailView, getGameRuntime, getSaveProfile, getTask, launchGame, listGameBodyVersions, listSaveVersions, openPathInExplorer, packageGameBody, precheckGameLaunch, pruneSaveVersions, removeGameFromLibrary, renameGame, restoreSaveVersion, saveGameCover, startRestoreCloudSaveTask, startUploadSaveVersionTask, uninstallGameBody, updateGameBody, uploadGameBodyPackage, updateSaveProfileKeepVersions, updateSaveProfileScopes } from "../api";
+import { armGameCoverCapture, deleteCloudSaveVersion, deleteGameBodyPackage, deleteSaveVersion, discardGameCoverCapture, getBaiduConfig, getBaiduStatus, getCloudSaveOverview, getGameCover, getGameCoverCaptureUrl, getGameCoverUrl, getGameDetailView, getGameRuntime, getSaveProfile, getTask, launchGame, listGameBodyVersions, openPathInExplorer, packageGameBody, precheckGameLaunch, pruneSaveVersions, removeGameFromLibrary, renameGame, restoreSaveVersion, saveGameCover, startRestoreCloudSaveTask, startUploadSaveVersionTask, uninstallGameBody, updateGameBody, uploadGameBodyPackage, updateSaveProfileKeepVersions, updateSaveProfileScopes } from "../api";
 import type { BaiduConfigView, BaiduStatus } from "../api";
 import { createDefaultSaveScope, gameStatusLabel } from "../domain/game";
-import type { CloudSaveManifestVersion, CloudSaveSyncStatusView, CoverCrop, CoverPosition, Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveProfile, SaveRootType, SaveScope, SaveVersion } from "../domain/game";
+import type { CloudSaveManifestVersion, CloudSaveSyncStatusView, CoverCrop, CoverPosition, Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveProfile, SaveRootType, SaveScope, SaveVersionSummary } from "../domain/game";
 
 const props = defineProps<{
   game: Game;
@@ -24,7 +24,7 @@ const emit = defineEmits<{
 
 const precheck = ref<LaunchPrecheck | null>(null);
 const runtime = ref<GameRuntime | null>(null);
-const versions = ref<SaveVersion[]>([]);
+const versions = ref<SaveVersionSummary[]>([]);
 const bodyVersions = ref<GameBodyVersion[]>([]);
 const cloudSaveStatus = ref<CloudSaveSyncStatusView | null>(null);
 const cloudSaveVersions = ref<CloudSaveManifestVersion[]>([]);
@@ -53,6 +53,7 @@ const rootTypeLabel: Record<SaveRootType, string> = {
   saved_games: "Saved Games",
   user_profile: "用户目录",
   custom: "自定义目录",
+  program_data: "ProgramData",
 };
 
 function cleanDisplayPath(rawPath: string): string {
@@ -310,7 +311,7 @@ function loadCloudSaveOverview(force = false): Promise<void> {
   return request;
 }
 
-async function uploadSave(version: SaveVersion) {
+async function uploadSave(version: SaveVersionSummary) {
   if (busy.value || runtime.value || !baiduReady()) return;
   busy.value = true;
   error.value = "";
@@ -575,7 +576,7 @@ function handleTaskChanged(payload: { taskId?: string; gameUid?: string } | unde
   }, TASK_EVENT_DEBOUNCE_MS);
 }
 
-async function restoreVersion(version: SaveVersion) {
+async function restoreVersion(version: SaveVersionSummary) {
   if (busy.value || runtime.value) return;
   if (
     !window.confirm(
@@ -594,7 +595,7 @@ async function restoreVersion(version: SaveVersion) {
   }
 }
 
-async function deleteVersion(version: SaveVersion) {
+async function deleteVersion(version: SaveVersionSummary) {
   if (busy.value || runtime.value) return;
   if (!window.confirm("删除后将无法从这个版本恢复，确定继续吗？")) return;
   busy.value = true;
@@ -1302,7 +1303,7 @@ onUnmounted(() => {
           <article v-for="(version, index) in versions" :key="version.versionId" class="version-row">
             <div class="version-icon"><Clock3 :size="17" /></div>
             <div class="version-copy"><strong>{{ index === 0 ? "最近一次保存" : "保存版本" }}</strong><span>{{ formatDate(version.createdAt) }}</span></div>
-            <div class="version-meta"><strong>{{ version.files.length }} 个文件</strong><span>{{ formatBytes(version.totalBytes) }}</span></div>
+            <div class="version-meta"><strong>{{ version.fileCount }} 个文件</strong><span>{{ formatBytes(version.totalBytes) }}</span></div>
             <div class="version-actions">
               <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime || !baiduReady()" title="上传这个保存版本到百度网盘" @click="uploadSave(version)"><CloudUpload :size="15" />上传云端</button>
               <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" title="恢复这个保存版本" @click="restoreVersion(version)"><RotateCcw :size="15" />恢复</button>

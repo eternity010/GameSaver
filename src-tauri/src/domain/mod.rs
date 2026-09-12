@@ -1,5 +1,6 @@
 pub mod game;
 pub mod learning;
+pub mod path_safety;
 pub mod save_profile;
 pub mod save_version;
 pub mod store;
@@ -15,9 +16,10 @@ pub use learning::{
     SaveCandidateEvidenceLevel, SaveLearningResult, SaveScopeDraft, SaveTransactionSummary,
     ScanRoot,
 };
+pub use path_safety::is_safe_path_segment;
 pub use save_profile::{
-    SaveProfile, SaveRootType, SaveScope, UnknownFilePolicy, DEFAULT_EXCLUDE_DIRECTORIES,
-    DEFAULT_EXCLUDE_PATTERNS,
+    detection_evidence_for, SaveProfile, SaveRootType, SaveScope, UnknownFilePolicy,
+    DEFAULT_EXCLUDE_DIRECTORIES, DEFAULT_EXCLUDE_PATTERNS, DEFAULT_MAX_FILE_BYTES,
 };
 pub use save_version::{SaveFileEntry, SaveVersion};
 pub use store::AppStore;

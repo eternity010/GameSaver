@@ -28,6 +28,13 @@ struct TransactionGroup {
     operations: Vec<FileOperation>,
 }
 
+/// 把一次采集到的文件操作按「2 秒静默窗口 + 同进程 + 同目录」聚成事务并打分。
+///
+/// **前置条件**：`operations` 必须已经是候选口径（见
+/// `save_learning_service::transaction_evidence`）。本函数不认识「什么算存档」，
+/// 喂多宽的口径就按多宽打分——噪音目录里的写入进来就会凭空多出几个「已完成」事务，
+/// 并顺着 `calculate_learning_confidence` 抬高识别置信度。口径刻意留在学习服务里：
+/// 候选判定是上层启发式（`is_etw_candidate`），不该为唯一一个调用点下沉到采集层。
 pub(crate) fn analyze_save_transactions(
     mut operations: Vec<FileOperation>,
 ) -> SaveTransactionSummary {

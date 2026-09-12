@@ -316,6 +316,9 @@ pub(crate) fn resolve_scope(
         crate::domain::SaveRootType::UserProfile => {
             std::env::var_os("USERPROFILE").map(PathBuf::from)
         }
+        crate::domain::SaveRootType::ProgramData => {
+            std::env::var_os("PROGRAMDATA").map(PathBuf::from)
+        }
         crate::domain::SaveRootType::Custom => scope.custom_root_path.as_ref().map(PathBuf::from),
     };
 

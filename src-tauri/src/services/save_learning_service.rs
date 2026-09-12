@@ -2,10 +2,12 @@ use crate::domain::{
     ActiveLearningSession, FileFingerprint, Game, LearningSessionView, LearningStatus,
     SaveCandidateEvidenceLevel, SaveLearningResult, SaveRootType, SaveScope, SaveScopeDraft,
     UnknownFilePolicy, DEFAULT_EXCLUDE_DIRECTORIES, DEFAULT_EXCLUDE_PATTERNS,
+    DEFAULT_MAX_FILE_BYTES,
 };
 use crate::services::learning::{
-    collect_related_files_by_trace, extend_tracked_process_tree, should_ignore_snapshot_path,
-    stop_etw_capture, try_start_etw_capture, FileOperation, FileOperationKind,
+    collect_related_files_by_trace, extend_tracked_process_tree, should_ignore_event_path,
+    should_ignore_snapshot_path, stop_etw_capture, try_start_etw_capture, FileOperation,
+    FileOperationKind,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -23,7 +25,15 @@ use tauri::AppHandle;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+/// 「这个文件像不像存档」的**判定**上限，只用来放宽候选识别的视野，
+/// 不等于我们愿意管理的体积 —— 真正入 scope 的上限是 `DEFAULT_MAX_FILE_BYTES`。
+/// 两者刻意分开：判定宽松才不会漏掉大存档，管理上限才是实际承诺。
 const MAX_CANDIDATE_FILE_BYTES: u64 = 100 * 1024 * 1024;
+/// 单个范围最多列出多少个「疑似存档但本次未变化」的文件。
+///
+/// 这是给用户看的清单，不是收集清单；`%APPDATA%\<游戏名>` 这类目录通常只有几十个文件，
+/// 上限定这么低是为了挡住病态目录（比如误把整个安装目录当成范围根）拖慢分析。
+const MAX_PROPOSED_FILES: usize = 200;
 const SAVE_EXTENSIONS: [&str; 10] = [
     "sav", "save", "db", "sqlite", "es3", "sl2", "ess", "savegame", "state", "vdf",
 ];
@@ -477,16 +487,19 @@ impl SaveLearningService {
         on_progress(92, "正在按文件夹整理存档候选");
         let mut active_effective = active.clone();
         active_effective.roots = effective_roots;
+        // 事务摘要与范围证据都只看候选口径的操作；原始 `etw_operations` 只保留给
+        // 「本次是否跑过采集」这个判断，不参与评分。
+        let transaction_operations = transaction_evidence(&etw_operations);
         let (changed_files, scope_drafts, mut inference_notes) = infer_scope_drafts(
             &active_effective,
             &final_snapshot,
             baseline,
             &etw_files,
-            &etw_operations,
+            &transaction_operations,
         );
         notes.append(&mut inference_notes);
         let transaction_summary = (!etw_operations.is_empty() || active.etw_capture.is_some())
-            .then(|| crate::services::learning::analyze_save_transactions(etw_operations));
+            .then(|| crate::services::learning::analyze_save_transactions(transaction_operations));
         let confidence = calculate_learning_confidence(
             &scope_drafts,
             &event_capture_mode,
@@ -647,18 +660,7 @@ fn discover_scan_roots(game: &Game) -> Result<Vec<crate::domain::ScanRoot>, Stri
         physical_path: managed_path,
     }];
     let hints = game_name_hints(game);
-    let known_roots = [
-        ("APPDATA", SaveRootType::AppData),
-        ("LOCALAPPDATA", SaveRootType::LocalAppData),
-    ];
-    for (variable, root_type) in known_roots {
-        let Some(raw_root) = env::var_os(variable) else {
-            continue;
-        };
-        let root = PathBuf::from(raw_root);
-        if !root.is_dir() {
-            continue;
-        }
+    for (root, root_type) in environment_scan_roots() {
         for path in find_candidate_directories(&root, &hints) {
             roots.push(crate::domain::ScanRoot {
                 root_type,
@@ -730,6 +732,33 @@ fn discover_scan_roots(game: &Game) -> Result<Vec<crate::domain::ScanRoot>, Stri
     let mut seen = HashSet::new();
     roots.retain(|root| seen.insert(normalize_path(&root.physical_path)));
     Ok(roots)
+}
+
+/// 学习会话要扫的「环境变量根」：变量名 + 根类型。
+///
+/// 单独列出来是为了让「扫哪些标准位置」可被断言 —— 漏掉一项就意味着那一类位置的存档
+/// 无论走快照还是 ETW 都识别不出来，而症状只是「没有发现变化」，不会有任何报错。
+/// `%PROGRAMDATA%` 就这么漏过一整个版本：全用户安装、老游戏、部分日系游戏把存档写在
+/// `%PROGRAMDATA%\<厂商>\<游戏>`，它不受 UAC 文件虚拟化影响，是这几类游戏唯一稳定的
+/// 落点。
+///
+/// 文档 / Saved Games / LocalLow / Public Documents / Steam `userdata` 不在这里 ——
+/// 它们不是「一个环境变量直接指过去」的形态，在 `discover_scan_roots` 里单独处理。
+const ENVIRONMENT_SCAN_ROOTS: [(&str, SaveRootType); 3] = [
+    ("APPDATA", SaveRootType::AppData),
+    ("LOCALAPPDATA", SaveRootType::LocalAppData),
+    ("PROGRAMDATA", SaveRootType::ProgramData),
+];
+
+/// 把 `ENVIRONMENT_SCAN_ROOTS` 里当前机器确实存在的项解析成物理根。
+fn environment_scan_roots() -> Vec<(PathBuf, SaveRootType)> {
+    ENVIRONMENT_SCAN_ROOTS
+        .iter()
+        .filter_map(|(variable, root_type)| {
+            let path = PathBuf::from(env::var_os(variable)?);
+            path.is_dir().then_some((path, *root_type))
+        })
+        .collect()
 }
 
 fn find_steam_userdata_dirs() -> Vec<PathBuf> {
@@ -871,6 +900,10 @@ fn infer_scan_root_for_etw_file(
     let profile_root = env::var_os("USERPROFILE").map(PathBuf::from)?;
     let app_data = env::var_os("APPDATA").map(PathBuf::from);
     let local_app_data = env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let program_data = env::var_os("PROGRAMDATA").map(PathBuf::from).or_else(|| {
+        env::var_os("SystemDrive")
+            .map(|d| PathBuf::from(format!(r"{}\ProgramData", d.to_string_lossy())))
+    });
     let local_low = profile_root.join("AppData").join("LocalLow");
     let saved_games = profile_root.join("Saved Games");
     let documents = profile_root.join("Documents");
@@ -881,11 +914,12 @@ fn infer_scan_root_for_etw_file(
         })
         .map(|p| PathBuf::from(p).join("Documents"));
 
-    let bases: [(Option<PathBuf>, SaveRootType); 7] = [
+    let bases: [(Option<PathBuf>, SaveRootType); 8] = [
         (Some(local_low), SaveRootType::LocalLow),
         (Some(saved_games), SaveRootType::SavedGames),
         (app_data, SaveRootType::AppData),
         (local_app_data, SaveRootType::LocalAppData),
+        (program_data, SaveRootType::ProgramData),
         (Some(documents), SaveRootType::Documents),
         (public_documents, SaveRootType::Documents),
         (Some(profile_root.clone()), SaveRootType::UserProfile),
@@ -902,6 +936,10 @@ fn infer_scan_root_for_etw_file(
                     .join(components[1])
                     .join(components[2])
             } else if components.len() >= 2 && components[0] == "my games" {
+                base.join(components[0]).join(components[1])
+            } else if root_type == SaveRootType::ProgramData && components.len() >= 3 {
+                // `%PROGRAMDATA%\<厂商>\<游戏>\<文件>`：取厂商 + 游戏两级。要求至少三段，
+                // 否则第二段就是文件名本身，取两级会把文件当成范围根。
                 base.join(components[0]).join(components[1])
             } else if components.len() >= 2
                 && (root_type == SaveRootType::LocalLow
@@ -1253,6 +1291,61 @@ fn resolve_scope_root_and_relative(
     Some((root, relative))
 }
 
+/// 列出一个范围目录里「看起来是存档、但本次学习没有发生变化」的文件。
+///
+/// 只在范围根目录**不是**命名存档容器时使用：那种范围当前等于「学习那一刻的文件清单」，
+/// 之后用户新建的档位、游戏写出的带时间戳自动存档都不会再进来，也没有任何提示。这里把
+/// 目录里现存的疑似存档列出来交给用户在草稿页确认（`SaveScopeDraft::proposed_files`），
+/// **由用户决定纳不纳入，而不是直接写进规则**。
+///
+/// 之所以不直接自动纳入：`is_save_candidate` 是启发式，误收别的存档（模拟器共享的
+/// `SAVEDATA` 目录最典型）比漏收更难收拾 —— 用户会拿到一堆不属于这个游戏的版本。
+fn propose_directory_saves(scope_root: &Path, confirmed: &[String]) -> Vec<String> {
+    if !scope_root.is_dir() {
+        return Vec::new();
+    }
+    let mut proposals = Vec::new();
+    for entry in WalkDir::new(scope_root)
+        .follow_links(false)
+        .max_depth(3)
+        .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || !is_noise_path(entry.path()))
+    {
+        if proposals.len() >= MAX_PROPOSED_FILES {
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        // 提议是「确认后要不要一起管」，所以按管理上限而不是候选上限来筛：
+        // 超过 `DEFAULT_MAX_FILE_BYTES` 的文件即便列出来也无从纳入。
+        if metadata.len() > DEFAULT_MAX_FILE_BYTES {
+            continue;
+        }
+        if !is_save_candidate(&normalize_path(entry.path())) {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(scope_root) else {
+            continue;
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if confirmed
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(&relative))
+        {
+            continue;
+        }
+        proposals.push(relative);
+    }
+    proposals.sort();
+    proposals.dedup();
+    proposals
+}
+
 fn infer_scope_drafts(
     active: &ActiveLearningSession,
     final_snapshot: &HashMap<String, FileFingerprint>,
@@ -1300,6 +1393,7 @@ fn infer_scope_drafts(
 
     let mut groups: BTreeMap<String, ScopeGroup> = BTreeMap::new();
     let mut unhandled_noise: Vec<(String, &FileFingerprint)> = Vec::new();
+    let mut oversize_skipped = 0usize;
     let ignored_system_noise = etw_files
         .iter()
         .filter(|path| is_noise_path(Path::new(path)))
@@ -1367,7 +1461,13 @@ fn infer_scope_drafts(
             });
             entry.count += 1;
             if final_snapshot.contains_key(path) {
-                entry.files.push(relative);
+                // 超过管理上限的文件不能留在 confirmed_files 里：留下就是「看着受保护，
+                // 实际既不进版本库也不受保护」的静默缺口。这里剔除并计数，稍后统一告知。
+                if fingerprint.size > DEFAULT_MAX_FILE_BYTES {
+                    oversize_skipped += 1;
+                } else {
+                    entry.files.push(relative);
+                }
             }
         } else {
             unhandled_noise.push((path.clone(), fingerprint));
@@ -1402,7 +1502,7 @@ fn infer_scope_drafts(
             continue;
         }
 
-        let mut exclude_patterns: Vec<String> = DEFAULT_EXCLUDE_PATTERNS
+        let exclude_patterns: Vec<String> = DEFAULT_EXCLUDE_PATTERNS
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -1418,19 +1518,26 @@ fn infer_scope_drafts(
             }
             if let Some((dir, _)) = noise.split_once('/') {
                 let dir_norm = dir.to_ascii_lowercase();
-                if !exclude_directories
+                // 同理：若已确认是存档的文件就住在这个子目录里，说明该目录不是纯噪音目录，
+                // 排除整目录会连真存档一起挡掉。
+                let dir_prefix = format!("{dir_norm}/");
+                let holds_confirmed_file = group
+                    .files
                     .iter()
-                    .any(|d| d.to_ascii_lowercase() == dir_norm)
+                    .any(|file| file.to_ascii_lowercase().starts_with(&dir_prefix));
+                if !holds_confirmed_file
+                    && !exclude_directories
+                        .iter()
+                        .any(|d| d.to_ascii_lowercase() == dir_norm)
                 {
                     exclude_directories.push(dir.to_string());
                 }
             }
-            if let Some(ext) = Path::new(&noise).extension().and_then(|e| e.to_str()) {
-                let ext_pattern = format!("*.{}", ext.to_ascii_lowercase());
-                if !exclude_patterns.contains(&ext_pattern) {
-                    exclude_patterns.push(ext_pattern);
-                }
-            }
+            // 刻意**不**按噪音文件的扩展名注入 `*.ext`：
+            // `is_excluded` 同时喂收集侧和 `scope_matches_entry_*`（恢复归组），一旦出现
+            // 一个 `settings.json` 就把 `*.json` 整族排除，同组里真存档若也是 `.json`
+            // 会既不被备份、又让恢复找不到范围。宁可多留几个噪音文件（由精确路径与
+            // 目录排除兜住），也不冒丢存档的风险。
             if !exclude_exact.contains(&noise) {
                 exclude_exact.push(noise);
             }
@@ -1453,6 +1560,13 @@ fn infer_scope_drafts(
             etw_files.is_empty(),
             etw_operations,
         );
+        // 非容器命名的范围等价于「只认这一刻看到的文件清单」：目录里已经存在、但本次学习
+        // 没有变化的疑似存档必须摆出来给用户确认，否则用户新建的档位永远进不来。
+        let proposed_files = if protects_container {
+            Vec::new()
+        } else {
+            propose_directory_saves(&group.physical_path, &group.files)
+        };
         drafts.push(SaveScopeDraft {
             scope: SaveScope {
                 root_type: group.root_type,
@@ -1466,15 +1580,17 @@ fn infer_scope_drafts(
                 exclude_patterns,
                 exclude_directories,
                 unknown_file_policy,
-                max_file_bytes: Some(MAX_CANDIDATE_FILE_BYTES),
+                max_file_bytes: Some(DEFAULT_MAX_FILE_BYTES),
             },
             changed_files: group.files,
+            proposed_files,
             confidence,
             evidence_level,
             evidence_reason,
         });
     }
 
+    let limit_mb = DEFAULT_MAX_FILE_BYTES / (1024 * 1024);
     let mut notes = vec![(if etw_files.is_empty() {
         "当前使用快照差异按文件夹归类，已自动注入标准排除规则与伴生噪音过滤。"
     } else {
@@ -1487,13 +1603,24 @@ fn infer_scope_drafts(
                 .to_string(),
         );
     } else {
-        notes.push(
-            "默认只保护 100 MB 以内的存档候选，大文件、日志与噪音缓存已自动排除。".to_string(),
-        );
+        notes.push(format!(
+            "默认只保护 {limit_mb} MB 以内的存档文件，大文件、日志与噪音缓存已自动排除。"
+        ));
+    }
+    if oversize_skipped > 0 {
+        notes.push(format!(
+            "已跳过 {oversize_skipped} 个超过 {limit_mb} MB 的文件：它们不会进入版本库，恢复时也不受保护。"
+        ));
     }
     if ignored_system_noise > 0 {
         notes.push(format!(
             "已忽略 {ignored_system_noise} 项系统噪声文件，不会纳入存档候选。"
+        ));
+    }
+    let proposed_total: usize = drafts.iter().map(|draft| draft.proposed_files.len()).sum();
+    if proposed_total > 0 {
+        notes.push(format!(
+            "目录里还有 {proposed_total} 个疑似存档、本次没有变化：它们不会被自动纳入，确认后可在对应范围里勾选。"
         ));
     }
     (changed, drafts, notes)
@@ -1735,6 +1862,44 @@ fn is_etw_candidate(path: &str) -> bool {
     SAVE_EXTENSIONS.contains(&extension.as_str())
 }
 
+/// 事务评分与范围证据只应看见「候选口径」的文件操作。
+///
+/// 两条采集路径的过滤强度本来就不一样：原生 ETL 在「是否为变更操作」判定**之前**就把
+/// 操作推进列表（`:152-160` vs `:161-168`），因此多含 `Delete` 与非 write-like 的
+/// `Close`；CSV 回退更松，连 `should_ignore_event_path` 都没过。于是 `\logs\`、
+/// `\cache\` 里的一次「写入 + 关闭」就能自成一组拿到 80 分 → `status = completed`
+/// → `calculate_learning_confidence` 白送 +10~15。用户看到的「事务 3 个」里有两个
+/// 是日志和截图。
+///
+/// 这里统一收口一次，口径与 `infer_scope_drafts` 判定候选时用的 `is_etw_candidate`
+/// 对齐。唯一例外是原子保存的中间产物：`.tmp`/`.temp`/`.bak` 本身不是存档文件
+/// （它们在草稿里落到 `noise_exact` → `exclude_exact`），但「写临时文件再重命名」
+/// 正是最常见的保存动作；连同它们一起丢掉，会让真实的原子保存在事务摘要里退化成
+/// 「证据不足」，反而丢掉它应得的置信度。噪音目录优先于这条例外——`\logs\x.tmp`
+/// 仍然被 `should_ignore_event_path` 挡在前面。
+fn transaction_evidence(operations: &[FileOperation]) -> Vec<FileOperation> {
+    operations
+        .iter()
+        .filter(|operation| is_transaction_evidence_path(&operation.path))
+        .cloned()
+        .collect()
+}
+
+fn is_transaction_evidence_path(path: &str) -> bool {
+    if path.is_empty() || should_ignore_event_path(Path::new(path)) {
+        return false;
+    }
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(extension.as_str(), "tmp" | "temp" | "bak") {
+        return true;
+    }
+    is_etw_candidate(path)
+}
+
 fn is_generic_config_file(
     path: &Path,
     normalized_path: &str,
@@ -1820,18 +1985,29 @@ mod tests {
     use super::{
         calculate_learning_confidence, classify_scope_evidence, directory_matches_hint,
         discover_save_container_files, infer_scope_drafts, is_etw_candidate, is_save_candidate,
-        is_save_container_directory, normalize_path, path_is_within_root,
-        snapshot_analysis_progress, MAX_CANDIDATE_FILE_BYTES,
+        is_save_container_directory, is_transaction_evidence_path, normalize_path,
+        path_is_within_root, propose_directory_saves, snapshot_analysis_progress,
+        transaction_evidence, MAX_CANDIDATE_FILE_BYTES,
     };
     use crate::domain::{
         ActiveLearningSession, FileFingerprint, LearningSessionView, LearningStatus,
         SaveCandidateEvidenceLevel, SaveRootType, SaveScope, SaveScopeDraft,
-        SaveTransactionSummary, ScanRoot, UnknownFilePolicy,
+        SaveTransactionSummary, ScanRoot, UnknownFilePolicy, DEFAULT_MAX_FILE_BYTES,
     };
-    use crate::services::learning::{FileOperation, FileOperationKind};
+    use crate::services::learning::{analyze_save_transactions, FileOperation, FileOperationKind};
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use std::sync::{atomic::AtomicBool, Arc, Mutex};
+
+    fn operation(path: &str, operation: FileOperationKind) -> FileOperation {
+        FileOperation {
+            path: path.to_string(),
+            operation,
+            timestamp_ms: Some(1_000),
+            pid: 42,
+            file_object_id: None,
+        }
+    }
 
     #[test]
     fn snapshot_progress_does_not_overflow_at_completion() {
@@ -1857,6 +2033,80 @@ mod tests {
         assert!(!is_etw_candidate(r"C:\GameSaver\GPUCache\data_0"));
         assert!(!is_etw_candidate(r"C:\GameSaver\D3DSCache\cache.bin"));
         assert!(!is_etw_candidate(r"C:\GameSaver\blob_storage\entry"));
+    }
+
+    #[test]
+    fn transaction_evidence_keeps_only_candidate_paths() {
+        let operations = vec![
+            operation(r"C:\GameSaver\Saves\slot.sav", FileOperationKind::Write),
+            operation(r"C:\GameSaver\logs\session.log", FileOperationKind::Write),
+            operation(r"C:\GameSaver\cache\blob.bin", FileOperationKind::Write),
+            operation(r"C:\GameSaver\screenshot.png", FileOperationKind::Write),
+            operation(r"C:\GameSaver\Game.exe", FileOperationKind::Write),
+            operation(
+                r"C:\Users\Player\AppData\Local\Temp\scratch.dat",
+                FileOperationKind::Write,
+            ),
+        ];
+        let kept = transaction_evidence(&operations);
+        assert_eq!(
+            kept.iter()
+                .map(|item| item.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![r"C:\GameSaver\Saves\slot.sav"]
+        );
+    }
+
+    #[test]
+    fn transaction_evidence_keeps_atomic_save_intermediates() {
+        // `.tmp`/`.temp`/`.bak` 不是候选存档文件，但「写临时文件再重命名」是最常见的
+        // 保存动作，丢掉它们会让真实的原子保存退化成「证据不足」。
+        let operations = vec![
+            operation(r"C:\GameSaver\Saves\slot.tmp", FileOperationKind::Write),
+            operation(r"C:\GameSaver\Saves\slot.temp", FileOperationKind::Write),
+            operation(r"C:\GameSaver\Saves\slot.bak", FileOperationKind::Delete),
+            // 噪音目录优先于这条例外。
+            operation(r"C:\GameSaver\logs\scratch.tmp", FileOperationKind::Write),
+        ];
+        let kept = transaction_evidence(&operations);
+        assert_eq!(
+            kept.iter()
+                .map(|item| item.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                r"C:\GameSaver\Saves\slot.tmp",
+                r"C:\GameSaver\Saves\slot.temp",
+                r"C:\GameSaver\Saves\slot.bak",
+            ]
+        );
+    }
+
+    #[test]
+    fn noise_writes_no_longer_reach_the_transaction_scorer() {
+        let operations = vec![
+            operation(r"C:\GameSaver\logs\session.log", FileOperationKind::Write),
+            operation(r"C:\GameSaver\logs\session.log", FileOperationKind::Close),
+        ];
+        // 收口之前，同一目录下的一次「写入 + 关闭」自成一组拿满 80 分 → completed，
+        // 于是 calculate_learning_confidence 白送 +10~15。这条断言记录的正是那个缺口。
+        assert_eq!(
+            analyze_save_transactions(operations.clone()).status,
+            "completed"
+        );
+        let filtered = analyze_save_transactions(transaction_evidence(&operations));
+        assert_eq!(filtered.status, "insufficient_evidence");
+        assert_eq!(filtered.transaction_count, 0);
+        assert!(filtered.affected_files.is_empty());
+    }
+
+    #[test]
+    fn transaction_evidence_path_matches_candidate_or_temp() {
+        assert!(is_transaction_evidence_path(r"C:\GameSaver\Saves\slot.sav"));
+        assert!(is_transaction_evidence_path(r"C:\GameSaver\Saves\slot.TMP"));
+        assert!(is_transaction_evidence_path(r"C:\GameSaver\Saves\slot.bak"));
+        assert!(!is_transaction_evidence_path(r"C:\GameSaver\Game.exe"));
+        assert!(!is_transaction_evidence_path(r"C:\GameSaver\logs\slot.sav"));
+        assert!(!is_transaction_evidence_path(""));
     }
 
     #[test]
@@ -2010,6 +2260,113 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// R2：只认「学习那一刻的文件清单」的范围，必须把目录里**已经存在**的疑似存档列成
+    /// 提议交给用户确认 —— 否则用户新建的档位、游戏写出的带时间戳自动存档永远不会被
+    /// 发现，而且没有任何提示。
+    ///
+    /// 提议只收「像存档」的文件：`settings.ini` 与 `screenshot.png` 不在默认排除模式里
+    /// （默认只挡 `*.log`/`*.tmp` 一类），但它们不是存档，不该被摆到用户面前。
+    #[test]
+    fn proposal_lists_only_unconfirmed_save_like_files() {
+        let root = std::env::current_dir()
+            .expect("resolve test working directory")
+            .join(format!("gamesaver-proposal-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("slot1.sav"), b"confirmed").expect("write confirmed save");
+        fs::write(root.join("autosave_2026.sav"), b"new slot").expect("write new slot");
+        fs::write(root.join("settings.ini"), b"[cfg]").expect("write config");
+        fs::write(root.join("screenshot.png"), b"png").expect("write screenshot");
+
+        let proposals = propose_directory_saves(&root, &["slot1.sav".to_string()]);
+
+        assert_eq!(proposals, vec!["autosave_2026.sav".to_string()]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 提议只该出现在「只认历史清单」的范围上：容器命名的范围本来就整目录收集
+    /// （`include_directories = ["."]`），再列一遍提议是噪音。
+    #[test]
+    fn only_non_container_drafts_carry_proposals() {
+        let root = std::env::current_dir()
+            .expect("resolve test working directory")
+            .join(format!("gamesaver-proposal-scope-{}", uuid::Uuid::new_v4()));
+        let plain_dir = root.join("Game");
+        let container_dir = root.join("SaveData");
+        fs::create_dir_all(&plain_dir).expect("create plain directory");
+        fs::create_dir_all(&container_dir).expect("create container directory");
+        let changed_plain = plain_dir.join("slot1.sav");
+        let changed_container = container_dir.join("slot1.sav");
+        fs::write(&changed_plain, b"changed").expect("write changed save");
+        fs::write(plain_dir.join("slot2.sav"), b"existing").expect("write existing save");
+        fs::write(&changed_container, b"changed").expect("write changed container save");
+        fs::write(container_dir.join("slot2.sav"), b"existing").expect("write existing");
+
+        let active = ActiveLearningSession {
+            view: LearningSessionView {
+                session_id: "test-sess".to_string(),
+                game_uid: "game-1".to_string(),
+                root_pid: 100,
+                started_at: "0".to_string(),
+                status: LearningStatus::Capturing,
+            },
+            roots: vec![ScanRoot {
+                root_type: SaveRootType::AppData,
+                physical_path: root.clone(),
+            }],
+            baseline: None,
+            tracked_pids: Arc::new(Mutex::new(vec![100])),
+            process_tracker_stop: Arc::new(AtomicBool::new(false)),
+            process_tracker_done: Arc::new(AtomicBool::new(false)),
+            etw_capture: None,
+            etw_start_error: None,
+            validation_only: false,
+        };
+
+        // 只有 slot1 在本次变化里，slot2 是目录里早已存在、没被这次学习看到的文件。
+        let mut final_snapshot = HashMap::new();
+        final_snapshot.insert(
+            normalize_path(&changed_plain),
+            FileFingerprint {
+                size: 16,
+                modified_unix: 1,
+            },
+        );
+        final_snapshot.insert(
+            normalize_path(&changed_container),
+            FileFingerprint {
+                size: 16,
+                modified_unix: 1,
+            },
+        );
+
+        let etw_empty = HashSet::new();
+        let (_, drafts, _) = infer_scope_drafts(
+            &active,
+            &final_snapshot,
+            Some(&HashMap::new()),
+            &etw_empty,
+            &[],
+        );
+
+        let find_draft = |leaf: &str| {
+            drafts
+                .iter()
+                .find(|draft| draft.scope.root_path.to_ascii_lowercase().ends_with(leaf))
+                .unwrap_or_else(|| panic!("找不到以 {leaf} 结尾的范围草稿"))
+        };
+        assert_eq!(
+            find_draft("\\game").proposed_files,
+            vec!["slot2.sav".to_string()],
+            "只认历史清单的范围必须把目录里现存的疑似存档列出来"
+        );
+        assert!(
+            find_draft("\\savedata").proposed_files.is_empty(),
+            "容器范围本来就是整目录收集，不该再列提议"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn path_matching_is_case_insensitive_for_windows_roots() {
         assert!(path_is_within_root(
@@ -2064,6 +2421,7 @@ mod tests {
         let single_file_draft = SaveScopeDraft {
             scope: dummy_scope.clone(),
             changed_files: vec!["profile.sav".to_string()],
+            proposed_files: vec![],
             confidence: 65,
             evidence_level: SaveCandidateEvidenceLevel::Review,
             evidence_reason: "test".to_string(),
@@ -2088,6 +2446,7 @@ mod tests {
         let container_draft = SaveScopeDraft {
             scope: container_scope,
             changed_files: vec!["slot1.sav".to_string(), "slot2.sav".to_string()],
+            proposed_files: vec![],
             confidence: 80,
             evidence_level: SaveCandidateEvidenceLevel::Strong,
             evidence_reason: "test".to_string(),
@@ -2188,6 +2547,164 @@ mod tests {
             .scope
             .exclude_directories
             .contains(&"logs".to_string()));
+    }
+
+    /// 学习产出的 scope 必须用「管理上限」而不是「候选判定上限」。
+    ///
+    /// 超过管理上限的文件留在 confirmed_files 里就是「看着受保护、实际既不进版本库
+    /// 也不受保护」的静默缺口，所以必须被剔除，并且要有一条明确的告知。
+    #[test]
+    fn learning_draft_drops_oversize_files_and_reports_them() {
+        let active = ActiveLearningSession {
+            view: LearningSessionView {
+                session_id: "test-sess-oversize".to_string(),
+                game_uid: "game-oversize".to_string(),
+                root_pid: 100,
+                started_at: "0".to_string(),
+                status: LearningStatus::Capturing,
+            },
+            roots: vec![ScanRoot {
+                root_type: SaveRootType::SavedGames,
+                physical_path: PathBuf::from(r"c:\users\player\saved games\mygame"),
+            }],
+            baseline: None,
+            tracked_pids: Arc::new(Mutex::new(vec![100])),
+            process_tracker_stop: Arc::new(AtomicBool::new(false)),
+            process_tracker_done: Arc::new(AtomicBool::new(false)),
+            etw_capture: None,
+            etw_start_error: None,
+            validation_only: false,
+        };
+
+        let normal = r"c:\users\player\saved games\mygame\slot1.sav".to_string();
+        let oversize = r"c:\users\player\saved games\mygame\slot2.sav".to_string();
+
+        let mut final_snapshot = HashMap::new();
+        final_snapshot.insert(
+            normal,
+            FileFingerprint {
+                size: 4096,
+                modified_unix: 200,
+            },
+        );
+        final_snapshot.insert(
+            oversize,
+            FileFingerprint {
+                size: DEFAULT_MAX_FILE_BYTES + 1,
+                modified_unix: 200,
+            },
+        );
+
+        let etw_empty = HashSet::new();
+        let (_, drafts, notes) = infer_scope_drafts(
+            &active,
+            &final_snapshot,
+            Some(&HashMap::new()),
+            &etw_empty,
+            &[],
+        );
+
+        assert_eq!(drafts.len(), 1, "同目录的两个候选应聚成一个范围");
+        assert_eq!(
+            drafts[0].scope.max_file_bytes,
+            Some(DEFAULT_MAX_FILE_BYTES),
+            "学习产出的管理上限必须与领域默认一致，不能再用候选判定上限"
+        );
+        assert_eq!(
+            drafts[0].scope.confirmed_files,
+            vec!["slot1.sav".to_string()],
+            "超限文件不得留在 confirmed_files 里"
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("已跳过 1 个超过")),
+            "超限文件必须明确告知，不能静默消失：{notes:?}"
+        );
+    }
+
+    /// 噪音文件的排除规则不得扩到真存档头上。
+    ///
+    /// 旧实现会按噪音的扩展名注入 `*.png` 这类整族排除，并把噪音所在的整个子目录
+    /// 加进 `exclude_directories`。`is_excluded` 同时喂收集侧与恢复归组，一旦误伤，
+    /// 真存档既不被备份、恢复时还可能找不到范围。现在两个方向都要被挡住。
+    #[test]
+    fn noise_files_never_widen_exclusions_onto_confirmed_saves() {
+        let active = ActiveLearningSession {
+            view: LearningSessionView {
+                session_id: "test-sess-noise".to_string(),
+                game_uid: "game-noise".to_string(),
+                root_pid: 100,
+                started_at: "0".to_string(),
+                status: LearningStatus::Capturing,
+            },
+            roots: vec![ScanRoot {
+                root_type: SaveRootType::SavedGames,
+                physical_path: PathBuf::from(r"c:\users\player\saved games\mygame"),
+            }],
+            baseline: None,
+            tracked_pids: Arc::new(Mutex::new(vec![100])),
+            process_tracker_stop: Arc::new(AtomicBool::new(false)),
+            process_tracker_done: Arc::new(AtomicBool::new(false)),
+            etw_capture: None,
+            etw_start_error: None,
+            validation_only: false,
+        };
+
+        let real_save = r"c:\users\player\saved games\mygame\savedata\slot1\save.dat".to_string();
+        let noisy_image =
+            r"c:\users\player\saved games\mygame\savedata\slot1\avatar.png".to_string();
+
+        let mut final_snapshot = HashMap::new();
+        final_snapshot.insert(
+            real_save,
+            FileFingerprint {
+                size: 2048,
+                modified_unix: 200,
+            },
+        );
+        final_snapshot.insert(
+            noisy_image,
+            FileFingerprint {
+                size: 512,
+                modified_unix: 200,
+            },
+        );
+
+        let etw_empty = HashSet::new();
+        let (_, drafts, _) = infer_scope_drafts(
+            &active,
+            &final_snapshot,
+            Some(&HashMap::new()),
+            &etw_empty,
+            &[],
+        );
+
+        assert_eq!(drafts.len(), 1);
+        let scope = &drafts[0].scope;
+        assert_eq!(
+            scope.confirmed_files,
+            vec!["slot1/save.dat".to_string()],
+            "真存档必须留在 confirmed_files 里"
+        );
+        assert!(
+            !scope.exclude_patterns.contains(&"*.png".to_string()),
+            "噪音的扩展名不得被放大成整族排除：{:?}",
+            scope.exclude_patterns
+        );
+        assert!(
+            !scope
+                .exclude_directories
+                .iter()
+                .any(|dir| dir.eq_ignore_ascii_case("slot1")),
+            "住着真存档的子目录不得被排除：{:?}",
+            scope.exclude_directories
+        );
+        assert!(
+            scope
+                .exclude_exact
+                .contains(&"slot1/avatar.png".to_string()),
+            "噪音自身仍要被精确排除：{:?}",
+            scope.exclude_exact
+        );
     }
 
     #[test]
@@ -2364,6 +2881,63 @@ mod tests {
         assert_eq!(
             normalize_path(&root.physical_path),
             normalize_path(&public_doc.join("Steam").join("RUNE").join("2456740"))
+        );
+    }
+
+    /// R1：`%PROGRAMDATA%\<厂商>\<游戏>\<文件>` 必须回推出「厂商\游戏」两级范围根。
+    ///
+    /// 旧实现的 `bases` 没有 ProgramData 这一项，函数会一路走到末尾 `None` —— 也就是
+    /// 说即使 ETW 已经证明游戏写了这个文件，`infer_scope_drafts` 也会因为找不到范围而
+    /// 丢掉这份证据，用户只看到「没有发现变化」。
+    #[test]
+    fn infer_scan_root_for_etw_file_resolves_program_data() {
+        let program_data = std::env::var_os("PROGRAMDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+
+        let nested = program_data
+            .join("Vendor")
+            .join("ClassicGame")
+            .join("save")
+            .join("slot0.dat");
+        let root = super::infer_scan_root_for_etw_file(&nested, None).expect("应回推出范围");
+        assert_eq!(root.root_type, SaveRootType::ProgramData);
+        assert_eq!(
+            normalize_path(&root.physical_path),
+            normalize_path(&program_data.join("Vendor").join("ClassicGame")),
+            "应取厂商 + 游戏两级，而不是文件所在的 save 子目录"
+        );
+
+        // 少一段时只能取一级：把第二段（其实是文件名）也拼进去，范围根就成了文件路径。
+        let shallow = program_data.join("ClassicGame").join("save.dat");
+        let root = super::infer_scan_root_for_etw_file(&shallow, None).expect("应回推出范围");
+        assert_eq!(root.root_type, SaveRootType::ProgramData);
+        assert_eq!(
+            normalize_path(&root.physical_path),
+            normalize_path(&program_data.join("ClassicGame"))
+        );
+    }
+
+    /// R1 的覆盖守卫：三个环境变量根都必须被解析出来。
+    ///
+    /// 这不是逻辑测试而是覆盖断言 —— 少一项就意味着那一类位置的存档永久漏识别。把
+    /// `ENVIRONMENT_SCAN_ROOTS` 里的 `PROGRAMDATA` 那一行删掉，这条会立刻失败。
+    #[test]
+    #[cfg(windows)]
+    fn environment_scan_roots_include_program_data() {
+        let roots = super::environment_scan_roots();
+        assert!(roots.iter().any(|(_, kind)| *kind == SaveRootType::AppData));
+        assert!(roots
+            .iter()
+            .any(|(_, kind)| *kind == SaveRootType::LocalAppData));
+        let program_data = roots
+            .iter()
+            .find(|(_, kind)| *kind == SaveRootType::ProgramData)
+            .map(|(path, _)| path.clone())
+            .expect("PROGRAMDATA 必须被解析为扫描根；缺失会让 ProgramData 下的存档永久漏识别");
+        assert_eq!(
+            program_data,
+            PathBuf::from(std::env::var_os("PROGRAMDATA").expect("Windows 上 PROGRAMDATA 必有值"))
         );
     }
 

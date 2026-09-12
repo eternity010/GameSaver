@@ -376,11 +376,11 @@ impl BaiduNetdiskClient {
                 ("client_secret", context.secret_key.as_str()),
             ])
             .send()
-            .map_err(|error| format!("请求百度 Token 刷新失败：{error}"))?;
+            .map_err(|error| format!("请求百度 Token 刷新失败：{}", safe_network_error(error)))?;
         let status = response.status();
-        let body = response
-            .text()
-            .map_err(|error| format!("读取百度 Token 刷新响应失败：{error}"))?;
+        let body = response.text().map_err(|error| {
+            format!("读取百度 Token 刷新响应失败：{}", safe_network_error(error))
+        })?;
         let value = serde_json::from_str::<serde_json::Value>(&body)
             .map_err(|error| format!("百度 Token 刷新返回非 JSON：HTTP {status}，{error}"))?;
         let parsed = serde_json::from_value::<OAuthTokenResponse>(value.clone())
@@ -872,10 +872,11 @@ impl BaiduNetdiskClient {
                     last_error = Some(format!("HTTP {}", response.status()));
                 }
                 Err(error) => {
+                    let message = safe_network_error(error);
                     if attempt + 1 == MAX_REQUEST_ATTEMPTS {
-                        return Err(format!("{operation}失败：{error}"));
+                        return Err(format!("{operation}失败：{message}"));
                     }
-                    last_error = Some(error.to_string());
+                    last_error = Some(message);
                 }
             }
             std::thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
@@ -903,9 +904,9 @@ impl BaiduNetdiskClient {
             let token = self.access_token()?;
             let response = self.send_with_retry(&mut build, &token, operation)?;
             let status = response.status();
-            let body = response
-                .text()
-                .map_err(|error| format!("{operation}读取响应失败：{error}"))?;
+            let body = response.text().map_err(|error| {
+                format!("{operation}读取响应失败：{}", safe_network_error(error))
+            })?;
             let value = serde_json::from_str::<serde_json::Value>(&body)
                 .map_err(|_| format!("{operation}返回非 JSON：HTTP {status}"))?;
             if !refreshed && is_auth_failure(status, &value) {
@@ -945,6 +946,19 @@ impl BaiduNetdiskClient {
             return Ok(response);
         }
     }
+}
+
+/// 把 reqwest 的网络错误转成可以写进日志、回显给前端的文本。
+///
+/// 百度 OpenAPI 强制把 access/refresh token、client_secret 放在查询串里，
+/// 而 `reqwest::Error` 的 `Display`（以及 `Debug`）会原样带上请求 URL：直接
+/// 格式化的话，凭据就顺着「命令返回值 → 前端 → 日志」这条链路落到磁盘上。
+/// 这里统一先 `without_url()` 去掉 URL，只留下错误类型与原因。
+///
+/// 所有把 `reqwest::Error` 变成字符串的地方都必须经过它 —— 单独一处的
+/// `.send()` 忘掉处理，就是一次完整的凭据泄露。
+pub fn safe_network_error(error: reqwest::Error) -> String {
+    error.without_url().to_string()
 }
 
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
@@ -1321,5 +1335,37 @@ mod tests {
         assert_eq!(token.access_token, "access");
         assert_eq!(token.expires_at, Some(123));
         assert_eq!(token.refresh_token.as_deref(), Some("refresh"));
+    }
+
+    /// 百度把 token 放在查询串里，`reqwest::Error` 默认会带上完整 URL，
+    /// 于是「命令返回值 → 前端 → 日志」这条路会把凭据写进磁盘。
+    /// 这里用一个必然失败的本机地址证明错误文本里已经没有 URL。
+    #[test]
+    fn network_errors_never_carry_the_url_that_holds_the_token() {
+        let client = BaiduNetdiskClient::new(token("secret-access-token", None)).expect("client");
+        let error = match client.send_with_retry(
+            |client, _token| {
+                client
+                    .get("http://127.0.0.1:1/rest/2.0/xpan/file?method=list&access_token=LEAKED-TOKEN")
+                    .send()
+            },
+            "unused-token",
+            "测试请求",
+        ) {
+            Ok(_) => panic!("连接 127.0.0.1:1 不应成功"),
+            Err(error) => error,
+        };
+        assert!(
+            error.starts_with("测试请求失败："),
+            "错误文本应保留操作名：{error}"
+        );
+        assert!(
+            !error.contains("LEAKED-TOKEN"),
+            "错误文本不应带出查询串中的凭据：{error}"
+        );
+        assert!(
+            !error.contains("127.0.0.1"),
+            "错误文本不应带出请求 URL：{error}"
+        );
     }
 }

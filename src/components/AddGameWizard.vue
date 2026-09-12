@@ -34,6 +34,10 @@ const reviewScopes = ref<SaveScope[]>([]);
 const scopeEvidence = ref<Record<string, { level: SaveCandidateEvidenceLevel; reason: string }>>({});
 const validatingCandidates = ref(false);
 const confidence = ref(0);
+// `confidence` 是 30–95 之间的**评分**，不是概率（后端 calculate_learning_confidence
+// 末尾 clamp(30, 95)，只要有候选就至少 30）。以前直接渲染成 `xx%` 会被当成准确率读，
+// 所以只对外暴露档位，原始分数降为副文本。
+const confidenceBand = computed(() => (confidence.value >= 85 ? "高" : confidence.value >= 65 ? "中" : "低"));
 const progress = ref(0);
 const message = ref("");
 const error = ref("");
@@ -44,6 +48,9 @@ const showLargeConfirmModal = ref(false);
 const largeConfirmMessage = ref("");
 const newFileByScope = ref<Record<number, string>>({});
 const newPatternByScope = ref<Record<number, string>>({});
+// 「目录里看起来也是存档、但本次学习没有变化」的文件，按范围根路径索引。
+// 它们不会被自动纳入保护范围——毕竟只是启发式判断，误收别人的存档比漏收更难收拾。
+const proposedByScope = ref<Record<string, string[]>>({});
 let pollTimer: ReturnType<typeof setTimeout> | undefined;
 
 const isBusy = computed(() => phase.value === "copying" || phase.value === "analyzing");
@@ -62,6 +69,7 @@ const rootTypeLabel: Record<SaveRootType, string> = {
   saved_games: "Saved Games",
   user_profile: "用户目录",
   custom: "自定义目录",
+  program_data: "ProgramData",
 };
 
 function cleanDisplayPath(rawPath: string): string {
@@ -103,6 +111,7 @@ function applyInitialLearningResult(result: SaveLearningResult) {
   learningResult.value = result;
   reviewScopes.value = result.scopeDrafts.map((draft) => ({ ...draft.scope, confirmedFiles: [...draft.scope.confirmedFiles], includeDirectories: [...draft.scope.includeDirectories], excludeExact: [...draft.scope.excludeExact], excludePatterns: [...draft.scope.excludePatterns], excludeDirectories: [...draft.scope.excludeDirectories] }));
   scopeEvidence.value = Object.fromEntries(result.scopeDrafts.map((draft) => [scopeEvidenceKey(draft.scope), { level: draft.evidenceLevel, reason: draft.evidenceReason }]));
+  proposedByScope.value = Object.fromEntries(result.scopeDrafts.map((draft) => [scopeEvidenceKey(draft.scope), [...(draft.proposedFiles ?? [])]]));
   confidence.value = result.confidence;
 }
 
@@ -116,6 +125,10 @@ function mergeCandidateVerification(result: SaveLearningResult) {
     if (!matched) continue;
     for (const file of matched.scope.confirmedFiles) {
       if (!scope.confirmedFiles.includes(file)) scope.confirmedFiles.push(file);
+    }
+    const extraProposals = matched.proposedFiles ?? [];
+    if (extraProposals.length) {
+      proposedByScope.value[key] = [...new Set([...(proposedByScope.value[key] ?? []), ...extraProposals])];
     }
     if (prior?.level === "review") {
       scopeEvidence.value[key] = { level: "strong", reason: "两次独立保存均命中此范围，已提升为高可信。" };
@@ -334,6 +347,16 @@ function addPattern(scopeIndex: number) {
   newPatternByScope.value[scopeIndex] = "";
 }
 
+function adoptProposedFiles(scopeIndex: number) {
+  const scope = reviewScopes.value[scopeIndex];
+  if (!scope) return;
+  const key = scopeEvidenceKey(scope);
+  for (const file of proposedByScope.value[key] ?? []) {
+    if (!scope.confirmedFiles.includes(file)) scope.confirmedFiles.push(file);
+  }
+  proposedByScope.value[key] = [];
+}
+
 function removeFile(scopeIndex: number, fileIndex: number) {
   reviewScopes.value[scopeIndex]?.confirmedFiles.splice(fileIndex, 1);
 }
@@ -352,7 +375,11 @@ function removeExcludeDirectory(scopeIndex: number, dirIndex: number) {
 
 function removeScope(scopeIndex: number) {
   const [removed] = reviewScopes.value.splice(scopeIndex, 1);
-  if (removed) delete scopeEvidence.value[scopeEvidenceKey(removed)];
+  if (removed) {
+    const key = scopeEvidenceKey(removed);
+    delete scopeEvidence.value[key];
+    delete proposedByScope.value[key];
+  }
 }
 
 async function openFolder(path: string) {
@@ -376,7 +403,7 @@ async function confirm() {
   error.value = "";
   confirming.value = true;
   try {
-    await confirmSaveProfile(completedGame.value.gameUid, reviewScopes.value, confidence.value);
+    await confirmSaveProfile(completedGame.value.gameUid, reviewScopes.value, confidence.value, learningResult.value?.eventCaptureMode ?? null);
     completedGame.value = await getGame(completedGame.value.gameUid);
     if (!completedGame.value) throw new Error("存档保护已保存，但游戏记录读取失败");
     phase.value = "done";
@@ -480,7 +507,7 @@ onUnmounted(stopPolling);
     </section>
 
     <section v-else-if="phase === 'review'" class="wizard-form">
-      <section class="wizard-section result-summary"><div><p class="eyebrow">识别结果</p><h2>确认存档保护范围</h2><p>{{ learningResult?.changedFiles.length || 0 }} 个文件发生变化，已按目录整理为 {{ reviewScopes.length }} 个候选范围。</p><div class="evidence-summary"><span>{{ learningResult?.eventCaptureMode === "etw" ? "ETW + 快照证据" : "快照差异证据" }}</span><span v-if="learningResult?.transactionSummary">事务 {{ learningResult.transactionSummary.transactionCount }} 个 · {{ learningResult.transactionSummary.operationCount }} 条操作 · {{ learningResult.transactionSummary.status === "completed" ? "已确认" : learningResult.transactionSummary.status === "candidate" ? "候选" : "证据不足" }}</span></div></div><div class="confidence-score"><strong>{{ confidence }}%</strong><span>识别置信度</span></div></section>
+      <section class="wizard-section result-summary"><div><p class="eyebrow">识别结果</p><h2>确认存档保护范围</h2><p>{{ learningResult?.changedFiles.length || 0 }} 个文件发生变化，已按目录整理为 {{ reviewScopes.length }} 个候选范围。</p><div class="evidence-summary"><span>{{ learningResult?.eventCaptureMode === "etw" ? "ETW + 快照证据" : "快照差异证据" }}</span><span v-if="learningResult?.transactionSummary">事务 {{ learningResult.transactionSummary.transactionCount }} 个 · {{ learningResult.transactionSummary.operationCount }} 条操作 · {{ learningResult.transactionSummary.status === "completed" ? "已确认" : learningResult.transactionSummary.status === "candidate" ? "候选" : "证据不足" }}</span></div></div><div class="confidence-score"><strong>{{ confidenceBand }}</strong><span>识别置信度 · 评分 {{ confidence }}/100</span></div></section>
       <section v-for="(scope, scopeIndex) in reviewScopes" :key="`${scope.rootPath}-${scopeIndex}`" class="wizard-section scope-editor">
         <header class="scope-heading">
           <div>
@@ -500,6 +527,7 @@ onUnmounted(stopPolling);
           </div>
         </header>
         <div class="editor-block"><div class="editor-label"><strong>保护文件</strong><span>{{ scope.confirmedFiles.length }} 项</span></div><div class="chip-list"><span v-for="(file, fileIndex) in scope.confirmedFiles" :key="file" class="file-chip">{{ file }}<button type="button" :aria-label="`删除 ${file}`" title="删除文件" @click="removeFile(scopeIndex, fileIndex)"><X :size="13" /></button></span><span v-if="!scope.confirmedFiles.length && !scope.includeDirectories.length" class="muted-text">暂无确认文件</span></div><div class="inline-editor"><input v-model="newFileByScope[scopeIndex]" type="text" placeholder="输入相对文件名，例如 save.dat" @keyup.enter="addFile(scopeIndex)" /><button class="secondary-button" type="button" @click="addFile(scopeIndex)"><Plus :size="15" />添加文件</button></div></div>
+        <div v-if="proposedByScope[scopeEvidenceKey(scope)]?.length" class="editor-block proposed-block"><div class="editor-label"><strong>疑似存档（本次未变化）</strong><span>{{ proposedByScope[scopeEvidenceKey(scope)].length }} 项</span></div><div class="chip-list"><span v-for="file in proposedByScope[scopeEvidenceKey(scope)].slice(0, 12)" :key="file" class="file-chip proposed-chip">{{ file }}</span><span v-if="proposedByScope[scopeEvidenceKey(scope)].length > 12" class="muted-text">另有 {{ proposedByScope[scopeEvidenceKey(scope)].length - 12 }} 项</span></div><p class="scope-note">这些文件看起来也是存档，但本次学习没有发生变化。纳入后会一起备份并受保护；如果不属于这个游戏，忽略即可。</p><div class="inline-editor"><button class="secondary-button" type="button" @click="adoptProposedFiles(scopeIndex)"><Plus :size="15" />全部纳入保护</button></div></div>
         <div v-if="scope.includeDirectories.length" class="editor-block"><div class="editor-label"><strong>保护目录</strong><span>{{ scope.includeDirectories.length }} 项</span></div><div class="chip-list"><span v-for="directory in scope.includeDirectories" :key="directory" class="file-chip directory-chip">{{ directory }}</span></div></div>
         <div v-if="scope.excludeDirectories.length" class="editor-block"><div class="editor-label"><strong>排除目录</strong><span>{{ scope.excludeDirectories.length }} 项</span></div><div class="chip-list"><span v-for="(dir, dirIndex) in scope.excludeDirectories" :key="dir" class="file-chip exclude-dir-chip">{{ dir }}<button type="button" :aria-label="`删除排除目录 ${dir}`" title="删除排除目录" @click="removeExcludeDirectory(scopeIndex, dirIndex)"><X :size="13" /></button></span></div></div>
         <div v-if="scope.excludeExact.length" class="editor-block"><div class="editor-label"><strong>排除特定文件</strong><span>{{ scope.excludeExact.length }} 项</span></div><div class="chip-list"><span v-for="(exact, exactIndex) in scope.excludeExact" :key="exact" class="file-chip exclude-chip">{{ exact }}<button type="button" :aria-label="`删除排除文件 ${exact}`" title="删除排除文件" @click="removeExcludeExact(scopeIndex, exactIndex)"><X :size="13" /></button></span></div></div>

@@ -297,16 +297,16 @@ Rust 标准库在 Windows 上的 `FileType::is_symlink()` **已经覆盖 `IO_REP
 
 ### P2 — 中等影响
 
-> 共 15 条，截至 2026-09-10：**P2-14 已随 S5 顺带解决**（两处轮询合并为唯一任务流）、**P2-2 已随存档管理审查 V6 解决**（解压改为先校验后读取）、**P2-1 已解决**（打包前磁盘预检，并收口三份磁盘探测拷贝），其余 12 条未处理。
+> 共 15 条，截至 2026-09-11：**P2-14 已随 S5 顺带解决**（两处轮询合并为唯一任务流）、**P2-2 已随存档管理审查 V6 解决**（解压改为先校验后读取）、**P2-1 已解决**（打包前磁盘预检，并收口三份磁盘探测拷贝）、**P2-4 已解决**（封面路径收口到 `safe_cover_path`，并补上请求段校验）、**P2-6 已结案**（日志泄露半边已修；「明文落盘」半边经评估不修，见该条备注），**其余 10 条未处理**。
 
 | 编号 | 位置 | 问题 |
 | --- | --- | --- |
 | P2-1 | ~~`services/game_body_package_service.rs`（打包入口 `:114`）~~ | ✅ **已解决（2026-09-10）**：抽出 `services/disk_space.rs` 统一探测与判定，打包前先算「包最多多大」（源文件总量 + 每条目 ZIP 固定开销 + 已存在的同版本包），再要求同样的可用空间加 128 MiB 余量；预检放在创建缓存目录与临时文件**之前**，磁盘不足时直接拒绝，不再让 7z 把 `.tmp` 写坏。顺带把 `add_game_service` / `game_body_update_service` / `library_commands` 三份 `GetDiskFreeSpaceExW` 拷贝收口到同一模块（原先三份探测、两种失败语义） |
 | P2-2 | ~~`services/cloud_save_service.rs:317-323`~~ | ✅ **已解决（2026-09-10，随存档管理审查 V6）**：抽出 `read_zip_entry_bounded`，**校验全部前移到读取之前** —— zip 头部声明值先与版本清单比对（不一致直接拒绝、一个字节都不读），再叠加一道与清单无关的硬上限（数据条目 1 GiB / `meta.json` 32 MiB，后者原先也是裸 `read_to_end`），最后用 `Read::take(declared + 1)` 钉死读取量。本体包（`game_body_package_service.rs`）那条解压路径不属本条：它是**流式写盘 + 1 MiB 缓冲 + 清单长度上限**，不在内存里展开 |
 | P2-3 | `commands/baidu_commands.rs:1165-1171`、`services/cloud_save_service.rs:507` | 远端删除**非原子**：先 `delete_file` 再重建清单。若清单重写失败，文件已删而清单仍引用它。`cloud_save_service.rs:507` 更是 `let _ = client.delete_file(...)` 直接吞掉失败，导致清单剔除版本但远端残留孤立 ZIP |
-| P2-4 | `cover_protocol.rs:49-53` | 封面路径只拒绝绝对路径，**不拒绝 `..`**。`display_path` 若被污染（store 被改 / 数据异常），可读出库目录之外的文件。项目其他地方（`safe_join`、`scope_is_accessible`）都做了 `..` 检查，此处漏了 |
+| P2-4 | ~~`cover_protocol.rs:49-53`~~ | ✅ **已解决（2026-09-11）**：协议层改为调用命令层既有的 `safe_cover_path`（拒绝绝对路径 + 拒绝 `..`/根/前缀分量 + 强制 `covers/<game_uid>` 前缀），不再自写弱化版，同一个不变量从「两种强度」收回到一处。顺带揪出同形状的两处：`sync_cloud_catalog` 上传封面时同样裸 `join`（库外文件会被推到云端）；请求路径里的 `identifier` 从未校验，`%2F` 解出来就是分隔符，会在一层更早处产生同样效果。单段校验收口到 `domain::path_safety::is_safe_path_segment`，`remote_body_dir` 改用它。新增 3 条测试，变异 ×3 各自精确命中 |
 | P2-5 | `cover_protocol.rs:182-183` | `percent_decode` 把 `+` 解码成空格（表单语义），但这是**路径**上下文，`+` 应是字面量。当前前端用 `encodeURIComponent` 会编码成 `%2B` 所以不触发，属潜在隐患 |
-| P2-6 | `services/baidu_netdisk_service.rs:885` | token **明文落盘**（`baidu-netdisk-token.json`），而 AppKey/SecretKey 在 `repositories/baidu_config_repository.rs:163-196` 是 DPAPI 加密的。同一份配置里两种存储策略不一致。另外 `logging.rs` 没有敏感信息脱敏层 |
+| P2-6 | `services/baidu_netdisk_service.rs:885`、`logging.rs` | ✅ **已结案（2026-09-11）**。日志泄露半边已修；明文落盘半边**经评估不修**（非「待办」，见条末理由）。**已解决半边**：日志泄露。百度 OpenAPI 强制把 token 放进查询串，而 `reqwest::Error` 的 `Display`/`Debug` 都会带上 URL，失败链「命令返回值 → 前端 rejection → `report_frontend_error` → `gamesaver.log`」因此把完整凭据写进磁盘（现网日志已实际命中 3 行）。修法分两层：`safe_network_error` 在「reqwest 错误首次变成文本」处 `without_url()`（含 `refresh_access_token` / `exchange_baidu_code` 两处绕过 `send_with_retry` 的直连 `.send()` —— 恰恰是唯一会带出 `refresh_token` / `client_secret` 的两个请求）；`logging::write_line` 增加按键名脱敏，作为落盘唯一出口兜住所有路径（含将来忘记 `without_url` 的新代码）。脱敏按标识符边界匹配，`error_code=110`、`code_verifier=...` 不受影响，且逐字节扫描保证 UTF-8 安全。**明文落盘半边不修的理由**：DPAPI 是**同机同用户**的用户态保护，同账户下的任何进程都能解密，它真正挡的只是「文件被拷走 / 同步 / 备份出去」这一种场景；而 `baidu-netdisk-token.json` 与 DPAPI 保护的 AppKey/SecretKey 躺在同一个目录，拿到文件的人多半也拿到了配置目录本身。代价却是**行为变更**（盘上已有明文文件按新格式读不出 → 用户需重新授权一次），收益与代价不匹配。真正实在的那半边（凭据被明文写进用户会主动外发的日志）已修 |
 | P2-7 | `services/task_service.rs:56-72` | `TaskService::update`（进度更新）**只改内存不落盘**，只有 `create`/`finish`/`cancel`/`set_retry` 才持久化。崩溃时任务进度丢失（状态本身能被 `Interrupted` 兜住，可接受，但要知道这个设计） |
 | P2-8 | `save_repository.rs:18-20` | `REPOSITORY_LOCK` 是全局 `Mutex<()>`，**所有 commit/restore/GC 串行**；而 `PENDING_OBJECTS` 引用计数的增减时机与 GC 读取不在同一个锁边界内，理论上存在「回收正在提交的对象」的窗口 |
 | P2-9 | `game_body_update_service.rs:291/297`、`:316` | 目录 `rename` 在 Windows 上遇到**目标非空或文件被占用**即失败，无等待/重试；`rollback` 也依赖 `rename`，文件被锁时可能回滚失败，留下半更新状态 |
@@ -427,8 +427,10 @@ grep -rn "GameLifecycle::Removing" src-tauri/src
 | P1-4 | 独立探针 crate 实测 `FileType::is_symlink()` 对 junction 的返回值 | junction 返回 `true` → **本条撤回，未改任何代码** |
 | P2-2 / V6 | `cargo test` / `cargo clippy` / 变异 ×3 | 218 passed（+5）；撤清单比对、撤硬上限、撤 `take` 各自只打掉自己那条测试 |
 | P2-1 | `cargo test` / `cargo clippy` / 变异 ×4 | **223 passed**（+5）；撤预检、改判定边界、去余量、漏算源文件体积各自精确命中；clippy 由 30/34 **降到 28/32**（打包侧重复的参数列随重构消失） |
+| P2-4 | `cargo test` / `cargo clippy` / 变异 ×3 | **232 passed**（+3）；还原为裸 `root.join`、删掉 `..` 判定、撤掉请求段校验各自精确命中；clippy 34 行与基线持平 |
+| P2-6（日志泄露半边） | `cargo test` / `cargo clippy` / `cargo fmt --check` / 变异 ×3 | **238 passed**（+6：脱敏 5 条 + 网络错误 1 条）；从键名表里删掉 `access_token` → 两条脱敏测试失败；删掉标识符边界判断 → `error_code=110` 被误脱敏；把 `without_url()` 换回裸 `to_string()` → 错误文本里重新出现 `access_token=LEAKED-TOKEN`；clippy 34 行与基线持平（`logging.rs` 仅剩原有那条 `str::replace`）。**明文落盘半边未实施**，经评估不修（理由见图前 P2-6 条） |
 
-当前全量 `cargo test`：**223 passed / 0 failed**。
+当前全量 `cargo test`：**238 passed / 0 failed**。
 
 > 关于 P1-4 的方法论提示：涉及平台特定 API 语义的安全结论，应当先用最小可运行程序实测再采纳。本次若照原始结论直改，会引入一次无意义的改动并污染 `safe_join` 的语义。
 

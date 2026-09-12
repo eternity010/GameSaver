@@ -451,7 +451,12 @@ fn relative_cover_path(game_uid: &str, cover_id: &str, file_name: &str) -> Strin
     format!("covers/{game_uid}/{cover_id}/{file_name}")
 }
 
-fn safe_cover_path(root: &Path, game_uid: &str, value: &str) -> Result<PathBuf, String> {
+/// 把 `covers/<game_uid>/...` 形式的相对路径解析到库根之下。
+///
+/// 三重约束缺一不可：拒绝绝对路径、拒绝任何上级/根/前缀分量（`..` 会让
+/// `root.join` 直接跨出库目录），并要求结果确实位于**该游戏自己的**封面目录下。
+/// 协议层读取封面时同样要走这里，否则同一个不变量会出现两种强度。
+pub(crate) fn safe_cover_path(root: &Path, game_uid: &str, value: &str) -> Result<PathBuf, String> {
     let relative = Path::new(value);
     if relative.is_absolute()
         || relative.components().any(|component| {
@@ -635,11 +640,38 @@ pub fn remove_game_from_library(
     Ok(())
 }
 
+/// 详情页版本列表的传输摘要。
+///
+/// 详情页只展示「几个文件 / 多大 / 什么时候」，从不读取单条文件记录；而
+/// [`crate::domain::SaveVersion`] 的 `files` 承载的是每个版本的全部文件清单
+/// （相对路径 + 对象哈希 + 大小），体积随「版本数 × 文件数」线性膨胀。把这些
+/// 清单原样序列化给前端，会让 WebView 主线程付出与页面展示无关的 JSON 解析成本，
+/// 因此这里只传计数。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveVersionSummary {
+    pub version_id: String,
+    pub created_at: String,
+    pub total_bytes: u64,
+    pub file_count: usize,
+}
+
+impl From<&crate::domain::SaveVersion> for SaveVersionSummary {
+    fn from(version: &crate::domain::SaveVersion) -> Self {
+        Self {
+            version_id: version.version_id.clone(),
+            created_at: version.created_at.clone(),
+            total_bytes: version.total_bytes,
+            file_count: version.files.len(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GameDetailView {
     pub precheck: crate::services::LaunchPrecheck,
-    pub versions: Vec<crate::domain::SaveVersion>,
+    pub versions: Vec<SaveVersionSummary>,
     pub runtime: Option<crate::domain::GameRuntime>,
     pub body_versions: Vec<crate::commands::game_body_commands::GameBodyVersionView>,
     pub save_profile: Option<crate::domain::SaveProfile>,
@@ -657,7 +689,7 @@ pub fn query_game_detail_view(
         .save_versions
         .iter()
         .filter(|version| version.game_uid == game_uid)
-        .cloned()
+        .map(SaveVersionSummary::from)
         .collect::<Vec<_>>();
     versions.sort_by(|left, right| compare_created_at(&right.created_at, &left.created_at));
 
@@ -745,11 +777,8 @@ mod tests {
         assert_eq!(result.unwrap_err(), "游戏不存在");
     }
 
-    #[test]
-    fn query_game_detail_view_returns_aggregated_details() {
-        let mut store = AppStore::default();
-        let running = HashMap::new();
-        let game = Game {
+    fn detail_view_game() -> Game {
+        Game {
             game_uid: "test-uid-1".to_string(),
             game_key: "test-key".to_string(),
             display_name: "Test Game".to_string(),
@@ -767,8 +796,14 @@ mod tests {
             last_played_at: None,
             latest_save_version_id: None,
             added_at: None,
-        };
-        store.games.push(game);
+        }
+    }
+
+    #[test]
+    fn query_game_detail_view_returns_aggregated_details() {
+        let mut store = AppStore::default();
+        let running = HashMap::new();
+        store.games.push(detail_view_game());
 
         let detail = query_game_detail_view(&store, &running, "test-uid-1").unwrap();
         assert_eq!(detail.precheck.game_uid, "test-uid-1");
@@ -776,6 +811,45 @@ mod tests {
         assert_eq!(detail.body_versions.len(), 0);
         assert!(detail.runtime.is_none());
         assert!(detail.save_profile.is_none());
+    }
+
+    #[test]
+    fn detail_view_versions_carry_counts_but_not_file_lists() {
+        use crate::domain::{SaveFileEntry, SaveRootType, SaveVersion};
+
+        let entry = |name: &str| SaveFileEntry {
+            root_type: SaveRootType::SavedGames,
+            root_path: None,
+            relative_path: name.to_string(),
+            object_hash: Some("a".repeat(64)),
+            size: 2048,
+            deleted: false,
+            mtime_ms: None,
+        };
+
+        let mut store = AppStore::default();
+        let running = HashMap::new();
+        store.games.push(detail_view_game());
+        store.save_versions.push(SaveVersion {
+            version_id: "v1".to_string(),
+            game_uid: "test-uid-1".to_string(),
+            created_at: "1700000000".to_string(),
+            total_bytes: 4096,
+            files: vec![entry("slot1.sav"), entry("slot2.sav")],
+        });
+
+        let detail = query_game_detail_view(&store, &running, "test-uid-1").unwrap();
+        assert_eq!(detail.versions.len(), 1);
+        assert_eq!(detail.versions[0].file_count, 2);
+        assert_eq!(detail.versions[0].total_bytes, 4096);
+
+        // 详情页只消费计数，文件清单不得进入传输载荷。
+        let version = serde_json::to_value(&detail).unwrap();
+        assert!(
+            version["versions"][0].get("files").is_none(),
+            "详情页不应再序列化文件清单"
+        );
+        assert_eq!(version["versions"][0]["fileCount"], 2);
     }
 
     #[test]

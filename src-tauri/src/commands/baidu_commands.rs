@@ -1,9 +1,11 @@
 use crate::{
     app_state::AppState,
+    commands::game_commands::safe_cover_path,
     domain::{
         compare_optional_created_at,
         game::{CloudStatus, LaunchConfig},
-        Game, GameBodyVersion, GameHealth, GameLifecycle, TaskCategory, TaskRetry, TaskStatus,
+        is_safe_path_segment, Game, GameBodyVersion, GameHealth, GameLifecycle, TaskCategory,
+        TaskRetry, TaskStatus,
     },
     repositories::{BaiduConfigRepository, GameRepository},
     services::{
@@ -1390,9 +1392,10 @@ fn sync_cloud_catalog(
         &CloudManifestService::catalog_from_game(&game),
         &temporary_root,
     )?;
-    if let Some(cover) = &game.cover {
-        if let Ok(root) = state.library_root_path() {
-            let display_path = root.join(&cover.display_path);
+    if let (Some(cover), Ok(root)) = (&game.cover, state.library_root_path()) {
+        // 与封面读取共用同一份守卫：`..` 或越出 `covers/<uid>` 一律当作没有封面。
+        // 这里若照旧裸 `join`，库目录之外的文件会被当成封面传到云端。
+        if let Ok(display_path) = safe_cover_path(&root, game_uid, &cover.display_path) {
             if display_path.is_file() {
                 if let Ok(bytes) = std::fs::read(&display_path) {
                     let _ = CloudManifestService::write_cover(
@@ -1837,13 +1840,7 @@ fn body_package_cache_root(app: &AppHandle) -> Result<PathBuf, String> {
 
 pub(crate) fn remote_body_dir(game_key: &str) -> Result<String, String> {
     let game_key = game_key.trim();
-    if game_key.is_empty()
-        || game_key == "."
-        || game_key == ".."
-        || game_key.contains('/')
-        || game_key.contains('\\')
-        || game_key.chars().any(char::is_control)
-    {
+    if !is_safe_path_segment(game_key) {
         return Err("gameKey 包含不支持的远程路径字符".to_string());
     }
     Ok(format!("{REMOTE_ROOT}/{game_key}/body"))
