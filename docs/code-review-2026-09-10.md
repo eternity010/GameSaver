@@ -360,7 +360,7 @@ let sleep_duration = if all_exited {
 - **死枚举**：`GameLifecycle::Removing` 全项目零赋值（`GameLifecycle::Removing` grep 无结果），`list()` 还会把它过滤掉；`GameHealth::NeedsSetup` 只在 `new_pending` 构造时赋过值
 - **`health` 字段名不副实**：`GameLibraryService::list` 每次都用 `derive_health` 重新推导并写进返回的克隆（`game_library_service.rs:41`），落盘的 `health` 值实际是陈旧的死数据。同时 `derive_health` 只看 `is_installed` + 存档范围有效性，**不参考 `lifecycle`**，所以 `NeedsRepair` 的游戏可能显示成 `Ready`
 - **重复实现**：`now_iso()` 有 4 份拷贝（`save_learning_service.rs:1758`、`save_repository.rs:1142`、`save_commands.rs:866`、`launch_service.rs:521`）；`normalize_path` 有 3 份**行为不一致**的实现（`save_repository.rs:1109`、`save_learning_service.rs:1749`、`process_service.rs:127`）；`managed_executable_path`/`safe_join` 有 3 份；「按 game_uid 过滤版本 → 排序 → skip(keep) → 删除 → GC」的保留策略逻辑逐字重复了 3 遍（`launch_service.rs:331-354`、`save_version_commands.rs:242-265`、`save_commands.rs:722-743`）
-- **`unknownFilePolicy` 实际未生效**：`SaveScope.unknown_file_policy` 在 `save_repository.rs:651-662` 的保护判断里**没有被读取**，`Ignore` 与 `Protect` 在提交路径上行为一致，与设计意图不符
+- ~~**`unknownFilePolicy` 实际未生效**~~ **→ ✅ 已解决（2026-09-12，随存档识别审查 R4）**：原先 `SaveScope.unknown_file_policy` 在保护判断里没被读取，`Ignore` 与 `Protect` 行为一致。现在语义收口在 `scope_admits_directory_file` 一处 —— 「目录级收集时，没有显式列进 `confirmed_files` 的文件算不算该范围的成员」——**收集侧与恢复侧共用**（只在一侧生效会让恢复删掉从没备份过的文件）。详见 `docs/save-recognition-improvement-review-2026-09-11.md` 的 R4 条。
 - **`percent_decode` / `instance_service.rs:194-203`**：`WideAsciiCaseEq` 把 `u16` 强转 `u8` 比较，非 ASCII 文件名会被截断（exe 名实际是 ASCII，暂不触发）
 - **前端**：15+ 处阻塞式 `window.confirm`（`App.vue:422` 甚至连着弹两次），无键盘/无障碍处理，在 `Teleport` 弹窗里调用还会丢失焦点；`GameDetailPage.vue:179` 直接改 `props.game.displayName`（违反单向数据流，下次 `loadGames` 被覆盖）；`GameDetailPage.vue:1032` 用 `message.includes('更新')` 这类**中文字符串匹配**来决定是否显示 spinner，极脆弱
 - **性能**：`library_service.rs:120-138` 的 `collect_usage` 每次 `get_library_settings` 都全库递归遍历、无缓存；`App.vue:70-133` 每次输入全量 filter+sort+`new Map`（无防抖）；`cover_protocol.rs:83-116` 的云端封面兜底路径会**遍历整个缓存目录并逐个解析 JSON**
@@ -373,7 +373,7 @@ let sleep_duration = if all_exited {
 | 文档承诺 | 实际实现 |
 | --- | --- |
 | 「token 过期不会触发远程请求」（`docs/gamesaver-new-architecture.md` 阶段 6） | ✅ 已对齐：`request_json` 系列入口遇鉴权失败会刷新并重放（P1-3，2026-09-10） |
-| `unknownFilePolicy` 区分 protect / ignore | 提交路径未读取该字段，两者行为相同 |
+| `unknownFilePolicy` 区分 protect / ignore | ✅ 已对齐（2026-09-12，随存档识别审查 R4）：`scope_admits_directory_file` 单点读取该字段，收集侧与恢复侧共用同一判定 |
 | `GameLifecycle::Removing` 用于表达「正在移除」 | 从未被赋值 |
 | 阶段 6 待办「补齐 token 自动刷新、断点续传」 | token 自动刷新 ✅ 已实现（P1-3，2026-09-10）；**断点续传仍未开始**（代码中无续传逻辑） |
 

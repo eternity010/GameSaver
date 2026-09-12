@@ -13,9 +13,10 @@
 > **容器目录被判定时，规则是「整目录收集」；没被判定时，规则是「只认当时看到的文件」。**
 > 于是同一套模型下，一边可能把**别人的存档**收进版本库，一边又**收不到自己新增的存档**。
 
-按收益排序，建议先做 4 项：**R1（ProgramData 缺失）→ R2（新文件不纳入）→ R3（事务口径）→ P1/P2（两处性能）**。R1、R3、P1、P2 都是小改；R2 是结构性改动，收益最大但需要设计守卫。
+按收益排序，建议先做 4 项：**R1（ProgramData 缺失）→ R2（新文件不纳入）→ R3（事务口径）→ P1/P2（两处性能）**。R1、R3、P1、P2 都是小改；R2 是结构性改动，收益最大但需要设计守卫。**这 4 项已全部落地**（分三批，见第 5 节）。
 
-> **第 1 批（R1 + P1/P2）与第 2 批（R3）已于 2026-09-11 实施**，落地记录与变异结果见第 5 节。下面各条保留审视当时的原文，并在末尾补上「已解决」说明。
+> **第 1 批（R1 + P1/P2）与第 2 批（R3）已于 2026-09-11 实施，第 3 批（R2 + R4）已于 2026-09-12 实施**，落地记录与变异结果见第 5 节。下面各条保留审视当时的原文，并在末尾补上「已解决」说明。
+> 仍未动的部分：**R2b**（收集侧行为变更）、A1/A2/A3、R5、R6 —— 见第 5 节的批次表。
 
 ---
 
@@ -162,7 +163,7 @@
 | 第 5 批 | **A1** profile 形状复用、目录推断前置、保存后自动分析 | 自动化，涉及前端 | 大 | 待办 |
 | 备选 | **A3 / R5 / R6** 边缘缺口 | — | 小 | 待办 |
 
-第 1 批全部是「不加行为、只补覆盖与省开销」，可以一次做完；第 2 批要动评分，建议单独一笔并逐条变异验证；第 3 批是本轮真正的核心，但也是唯一可能**把范围收错**的改动，建议先只做「新文件自动纳入」的**提议**（在草稿里列出，由用户确认），而不是直接写进规则。
+第 1 批全部是「不加行为、只补覆盖与省开销」，可以一次做完；第 2 批要动评分，建议单独一笔并逐条变异验证；第 3 批是本轮真正的核心，但也是唯一可能**把范围收错**的改动，所以按这里写的做法执行了 —— **只做「疑似存档」的提议**（在草稿里列出、由用户确认），没有直接写进规则。真正会改变容器范围收集结果的 R2b 因此单列成第 3.5 批，与「提议」分开做。
 
 **第 1 批落地记录（2026-09-11）**：`cargo test --lib` **242 passed**（238 → 242，+4）；`npm run build` 通过；`cargo fmt --check` 干净；clippy **31 条**（基线 32，少掉的那条是 `infer_scan_root_for_etw_file` 里一处既有的 `if_same_then_else`，未新增任何告警）。变异 ×5，各自精确命中：
 
@@ -182,3 +183,15 @@
 | 候选门换成无条件 `true` | `screenshot.png` / `Game.exe` 被当成事务证据 | ✅ 命中（2 条断言）|
 | 去掉 `.tmp`/`.temp`/`.bak` 例外 | 原子保存的中间产物被丢弃，保留集变空 | ✅ 命中（保留集 `[]`）|
 | `transaction_evidence` 改成直通 | 组合测试从 `insufficient_evidence` 变回 `completed` | ✅ 命中 |
+
+**第 3 批落地记录（2026-09-12）**：`cargo test --lib` **250 passed**（246 → 250，+4）；`npm run build`（含 `vue-tsc`）通过；`cargo fmt --check` 初检 4 处不规范，`cargo fmt` 后干净；clippy **31 条**（`--lib --all-targets`，与第 1/2 批基线持平）—— 落在本次触及文件上的告警逐条核对过，全是本次之前就存在的（`save_learning_service.rs` 的 5 条 + `save_repository.rs` / `domain/save_profile.rs` 各 1 条），只有行号因新增代码整体位移，**没有新增任何告警**。变异 ×5，各自精确命中：
+
+| 变异 | 预期失败点 | 结果 |
+| --- | --- | --- |
+| 去掉 `propose_directory_saves` 里的 `is_save_candidate` 过滤 | 配置 / 截图等非存档混进提议 | ✅ 命中（`proposal_lists_only_unconfirmed_save_like_files`）|
+| 去掉「剔除本次已确认文件」的去重 | 已确认的 `slot1.sav` 重复出现在提议里 | ✅ 命中（`proposal_lists_only_unconfirmed_save_like_files`、`only_non_container_drafts_carry_proposals`）|
+| `scope_admits_directory_file` 恒放行 | `Ignore` 形同虚设，收集与恢复两侧同时失败 | ✅ 命中（`unknown_file_policy_decides_whether_directory_files_are_collected`、`protected_paths_share_the_unknown_file_policy_with_collection`）|
+| `scope_admits_directory_file` 恒拦截 | `Protect` 反向失效：已收集的文件在恢复侧不再被认作受保护 | ✅ 命中（上述 2 条 + `collect_profile_files_skips_restore_artifacts`）|
+| 容器命中的范围也列提议 | 与「容器整目录收、无需提议」的设计冲突 | ✅ 命中（`only_non_container_drafts_carry_proposals`）|
+
+新增 4 条测试：`proposal_lists_only_unconfirmed_save_like_files`、`only_non_container_drafts_carry_proposals`（`services::save_learning_service::tests`）、`unknown_file_policy_decides_whether_directory_files_are_collected`、`protected_paths_share_the_unknown_file_policy_with_collection`（`repositories::save_repository::tests`）。

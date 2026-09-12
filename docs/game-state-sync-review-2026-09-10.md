@@ -18,8 +18,8 @@
 | S6 | 中 | ✅ **已修** 后台复查云端总览时不再把整个区块打成加载态（`force` 经核对必须保留，理由见正文） | `refresh()` `:205`、`cloudSaveStatusText()` `:378`、按钮 `:1277` |
 | S7 | 中 | ✅ **已修** 详情页改为 `:key="gameUid"` 逐游戏重建，`loadCover` 补显式清空；失效的 uid watcher 已删 | `App.vue:618`、`loadCover()` `:1001` |
 | S8 | 中 | ✅ **已修** 分类下沉到后端 `AppTask.category`，前端两份重复白名单已删除；`restore_save_version`、`launch_game` 现在可见，取消确认文案按分类分流 | `domain/task.rs`、`taskFeed.ts`、`App.vue`、`TransferCenter.vue` |
-| S9 | 低 | 5 个前端 API 导入后从未调用，其中 `precheck_game_launch` 是后端整条死命令 | `GameDetailPage.vue:7`、`api.ts:324` |
-| S10 | 低 | `cloudStatus` / `latestSaveVersionId` / `GameRuntime.taskId` 三个字段前端零引用 | `domain/game.ts:39/44/53` |
+| S9 | 低 | 5 个前端 API 导入后从未调用，其中 `precheck_game_launch` 是后端整条死命令。**2026-09-12 复核**：`listSaveVersions` 已从导入删掉、`getGameCover` 已转为实际调用；余下 `precheckGameLaunch` / `listGameBodyVersions` / `getSaveProfile` 仍是纯导入，死命令仍在 | `GameDetailPage.vue:7`、`api.ts:341` |
+| S10 | 低 | `cloudStatus` / `latestSaveVersionId` 仍前端零引用；~~`GameRuntime.taskId`~~ ✅ **已随 S3 启用**（`GameDetailPage.vue` 读 `runtime.value?.taskId` 接回会话轮询） | `domain/game.ts:39/44/53` |
 | S11 | 低 | 库分页越界摘要：clamp 用未过滤总数，显示用过滤后的列表 | `App.vue:220` |
 | S12 | 低 | `search` 在游戏库与商店之间共用一个 ref，切页会带着关键词触发一次云端搜索 | `App.vue:28/191-199` |
 
@@ -376,15 +376,17 @@ S4 已完成，放开 `launch_game` 可见性的硬前置已解除。
 
 其中 `precheck_game_launch`（`launch_commands.rs:8-18`）是**后端注册了整条命令但前端零调用**——详情页的 precheck 实际来自 `get_game_detail_view`（`game_commands.rs:645`）。两条路径算同一件事，建议保留 `GameDetailView.precheck`、删掉独立命令与其 API 包装，减少"同一状态两个来源"的隐患。
 
+**2026-09-12 复核**：这条仍半开。5 个里的 `listSaveVersions` 已从导入里删除、`getGameCover` 已转为实际调用（封面相关改动顺带消化），剩下 `precheckGameLaunch` / `listGameBodyVersions` / `getSaveProfile` 依然只在 `GameDetailPage.vue:7` 的 import 行出现，`precheck_game_launch` 仍是后端死命令。清理动作未做。
+
 ### S10 前端零引用的字段
 
 | 字段 | 声明 | 后端写入 | 前端读取 |
 |---|---|---|---|
 | `Game.cloudStatus` | `domain/game.ts:39` | 3 处（`baidu_commands.rs:1586`、`cloud_account_commands.rs:193/212`） | **0** |
 | `Game.latestSaveVersionId` | `domain/game.ts:44` | `launch_service.rs:360` | **0** |
-| `GameRuntime.taskId` | `domain/game.ts:53` | `launch_service.rs:164` | **0** |
+| `GameRuntime.taskId` | `domain/game.ts:53` | `launch_service.rs:164` | ✅ **已启用（2026-09-10，随 S3）**：`GameDetailPage.vue` 的 `reattachRuntimeTask` 读 `runtime.value?.taskId` 接回会话轮询 |
 
-前两个目前是纯存储字段（无害但会误导读者以为前端在用）。第三个则是**本可用于修复 S3 的现成钥匙**，建议在修 S3 时启用而不是删除。
+前两个目前仍是纯存储字段（无害但会误导读者以为前端在用）。第三个则是**本可用于修复 S3 的现成钥匙**，已在修 S3 时按建议启用而不是删除（见上表）。
 
 `cloudStatus` 更值得留意：它语义上是「用户可见的云端状态」，而前端实际展示云端状态用的是 `getBaiduStatus` + `getCloudSaveOverview` 两套独立数据。按"用户可见状态必须少"的原则，这个字段要么真正驱动 UI（例如 S2 的失败提示），要么明确标注为内部字段。
 
@@ -425,7 +427,7 @@ S4 已完成，放开 `launch_game` 可见性的硬前置已解除。
 | 5 | ~~**S4** 取消启动任务需清理整棵进程树~~ ✅ 已完成 2026-09-10 | 放开可见性的硬前置：不修它，S8 一放开就会在真机上对着仍在写盘的存档做快照 |
 | 6 | ~~**S8** 任务分类下沉后端（`AppTask.category`）~~ ✅ 已完成 2026-09-10 | 消除前后端两份白名单；`launch_game` 与 `restore_save_version` 已可见，取消确认文案按分类分流 |
 | 7 | ~~**S1（完整版）** 启动时会话重建~~ ✅ **已完成（2026-09-10）** | 启动时扫描游戏目录、接回仍在运行的会话，兑现「退出即提交」；剩下的「退出前等待在途任务」另计 |
-| 8 | S9-S12（S6 / S7 已于 2026-09-10 完成） | 独立小修，可随时插入 |
+| 8 | S9-S12（S6 / S7 已于 2026-09-10 完成；**S10 已随 S3 结案 2026-09-10**，S9 半开：`listSaveVersions` / `getGameCover` 已消化，剩 3 个死导入 + 1 条死命令） | 独立小修，可随时插入 |
 
 ---
 
