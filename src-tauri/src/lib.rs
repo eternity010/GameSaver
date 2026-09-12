@@ -234,6 +234,7 @@ pub fn run() {
             commands::save_commands::cancel_save_learning,
             commands::save_commands::confirm_save_profile,
             commands::save_commands::get_save_profile,
+            commands::save_commands::preview_save_scopes,
             commands::save_commands::update_save_profile_keep_versions,
             commands::save_commands::update_save_profile_scopes,
             commands::save_commands::discard_pending_game,

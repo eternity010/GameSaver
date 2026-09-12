@@ -1,6 +1,8 @@
 pub mod game;
 pub mod learning;
 pub mod path_safety;
+pub mod path_utils;
+pub mod save_candidate;
 pub mod save_profile;
 pub mod save_version;
 pub mod store;

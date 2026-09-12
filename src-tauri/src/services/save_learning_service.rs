@@ -1,13 +1,18 @@
+use crate::domain::path_utils::{normalize_path, strip_verbatim_prefix};
+use crate::domain::save_candidate::{
+    is_generic_config_file, is_noise_path, is_save_candidate, is_save_container_directory,
+    path_has_save_container_ancestor, path_has_segment, should_ignore_event_path, NAME_HINTS,
+    RESOURCE_EXTENSIONS, SAVE_EXTENSIONS,
+};
 use crate::domain::{
-    ActiveLearningSession, FileFingerprint, Game, LearningSessionView, LearningStatus,
-    SaveCandidateEvidenceLevel, SaveLearningResult, SaveRootType, SaveScope, SaveScopeDraft,
-    UnknownFilePolicy, DEFAULT_EXCLUDE_DIRECTORIES, DEFAULT_EXCLUDE_PATTERNS,
+    ActiveLearningSession, EtwCaptureHandle, FileFingerprint, Game, LearningSessionView,
+    LearningStatus, SaveCandidateEvidenceLevel, SaveLearningResult, SaveRootType, SaveScope,
+    SaveScopeDraft, UnknownFilePolicy, DEFAULT_EXCLUDE_DIRECTORIES, DEFAULT_EXCLUDE_PATTERNS,
     DEFAULT_MAX_FILE_BYTES,
 };
 use crate::services::learning::{
-    collect_related_files_by_trace, extend_tracked_process_tree, should_ignore_event_path,
-    should_ignore_snapshot_path, stop_etw_capture, try_start_etw_capture, FileOperation,
-    FileOperationKind,
+    collect_related_files_by_trace, extend_tracked_process_tree, stop_etw_capture,
+    try_start_etw_capture, FileOperation, FileOperationKind,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -34,26 +39,20 @@ const MAX_CANDIDATE_FILE_BYTES: u64 = 100 * 1024 * 1024;
 /// 这是给用户看的清单，不是收集清单；`%APPDATA%\<游戏名>` 这类目录通常只有几十个文件，
 /// 上限定这么低是为了挡住病态目录（比如误把整个安装目录当成范围根）拖慢分析。
 const MAX_PROPOSED_FILES: usize = 200;
-const SAVE_EXTENSIONS: [&str; 10] = [
-    "sav", "save", "db", "sqlite", "es3", "sl2", "ess", "savegame", "state", "vdf",
-];
-const RESOURCE_EXTENSIONS: [&str; 12] = [
-    "dll", "exe", "pak", "pdb", "png", "jpg", "jpeg", "webp", "ogg", "wav", "mp3", "ttf",
-];
-const NAME_HINTS: [&str; 8] = [
-    "save", "slot", "profile", "userdata", "autosave", "progress", "system", "remote",
-];
-const SAVE_DIRECTORY_HINTS: [&str; 9] = [
-    "save",
-    "savedata",
-    "saves",
-    "savegame",
-    "savegames",
-    "profile",
-    "profiles",
-    "userdata",
-    "remote",
-];
+/// 只读初稿的采集模式标记。它不是一次真正的采集 —— 单独取值是为了让前端能区分文案，
+/// 也让 `calculate_learning_confidence` 不给它任何 ETW 加分（`_ => 0`）。
+const PREVIEW_CAPTURE_MODE: &str = "preview";
+/// ETW 会话的兜底时长上限。
+///
+/// `logman` 原生的 `-rf`（运行指定时长）与 `-ets` 互斥 —— 本机实测报「参数"rf"不允许具有
+/// 其他指定的参数」—— 所以时长上限只能在 Rust 侧兜。它是采集资源上界里**由我们掌握的那
+/// 一半**：`logman -max` 也给了磁盘上界，但那条没法在本机验证（创建 ETW 会话需要管理员），
+/// 而这条完全可控，且到点后 `.etl` 就不再增长。
+///
+/// 取 30 分钟：正常会话是「启动游戏 → 手动存一次档 → 点分析」，量级是分钟；30 分钟只会在
+/// 用户忘了结束会话时触发。触发后**已采到的证据全部保留**，用户仍可正常点分析，此后的写入
+/// 由快照差异兜底。
+const MAX_CAPTURE_DURATION: Duration = Duration::from_secs(30 * 60);
 const GENERIC_NAME_BLACKLIST: [&str; 38] = [
     "game",
     "games",
@@ -131,6 +130,14 @@ fn is_managed_game_asset_dir(entry_path: &Path) -> bool {
 pub struct SaveLearningService;
 
 impl SaveLearningService {
+    /// 只读推断一份存档范围初稿：不启动游戏、不采集 ETW、没有任何写入证据。
+    ///
+    /// 给「跳过学习」用 —— 用户可以先拿到一份待确认的草稿直接进审阅界面，不必先跑完
+    /// 「启动游戏 → 手动存一次档 → 点分析」。草稿的证据等级一律是 `Review`。
+    pub fn preview(game: &Game) -> Result<SaveLearningResult, String> {
+        preview_scope_drafts(game)
+    }
+
     pub fn start(
         app: &AppHandle,
         game: &Game,
@@ -259,6 +266,8 @@ impl SaveLearningService {
                 },
             );
         }
+        // 采集期原本没有任何时长上界，`logman` 的 `-rf` 又与 `-ets` 互斥，只能在这里兜。
+        arm_capture_watchdog(etw_capture.as_ref(), spawn_capture_watchdog);
         if is_cancelled() {
             if let Some(handle) = etw_capture.as_ref() {
                 let _ = stop_etw_capture(&handle.trace_name);
@@ -491,7 +500,7 @@ impl SaveLearningService {
         // 「本次是否跑过采集」这个判断，不参与评分。
         let transaction_operations = transaction_evidence(&etw_operations);
         let (changed_files, scope_drafts, mut inference_notes) = infer_scope_drafts(
-            &active_effective,
+            &active_effective.roots,
             &final_snapshot,
             baseline,
             &etw_files,
@@ -556,6 +565,47 @@ fn any_process_alive(pids: &[u32]) -> bool {
 #[cfg(not(target_os = "windows"))]
 fn any_process_alive(_pids: &[u32]) -> bool {
     true
+}
+
+/// 到点后停止 ETW 会话，给 `.etl` 一个上界。
+///
+/// `sleep` / `stop` 做成注入点，是为了让「到点真的会去停会话」可被测试钉住 —— 否则这条
+/// 防护只能靠读代码确认。`stop` 返回错误不算异常：会话已被正常结束或被取消时，看门狗到点
+/// 再停一次必然拿到错误，此时只记日志。
+fn run_capture_watchdog(
+    trace_name: &str,
+    duration: Duration,
+    sleep: impl FnOnce(Duration),
+    stop: impl FnOnce(&str) -> Result<(), String>,
+) {
+    sleep(duration);
+    match stop(trace_name) {
+        Ok(()) => crate::logging::info(format!(
+            "ETW 会话已达时长上限（{} 分钟），已停止采集：{trace_name}",
+            duration.as_secs() / 60
+        )),
+        Err(error) => crate::logging::info(format!(
+            "ETW 会话已达时长上限，停止时返回（会话可能已结束）：{trace_name} {error}"
+        )),
+    }
+}
+
+/// 在后台线程里按 [`MAX_CAPTURE_DURATION`] 兜住一次采集的时长。
+fn spawn_capture_watchdog(trace_name: String, duration: Duration) {
+    thread::spawn(move || {
+        run_capture_watchdog(&trace_name, duration, thread::sleep, stop_etw_capture);
+    });
+}
+
+/// 装配采集看门狗：有句柄就按上限挂表，没有（ETW 不可用）就什么都不做。
+///
+/// 单独成函数是为了让「到底有没有把看门狗挂上去」可被断言。挂表动作本身只是
+/// `thread::spawn`，删掉它不会有任何测试变红 —— 那样这条防护就会悄无声息地消失，
+/// 而它正是 `.etl` 唯一由我们掌控的时长上界。
+fn arm_capture_watchdog(capture: Option<&EtwCaptureHandle>, arm: impl FnOnce(String, Duration)) {
+    if let Some(handle) = capture {
+        arm(handle.trace_name.clone(), MAX_CAPTURE_DURATION);
+    }
 }
 
 fn spawn_process_tracker(
@@ -636,17 +686,6 @@ fn managed_executable_path(game: &Game) -> Result<PathBuf, String> {
         return Err("启动程序相对路径无效".to_string());
     }
     Ok(root.join(relative))
-}
-
-pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{}", rest))
-    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-        PathBuf::from(rest)
-    } else {
-        path.to_path_buf()
-    }
 }
 
 fn discover_scan_roots(game: &Game) -> Result<Vec<crate::domain::ScanRoot>, String> {
@@ -1162,35 +1201,6 @@ fn discover_save_container_files(
     Ok(files)
 }
 
-fn is_save_container_directory(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .collect::<String>()
-        .to_ascii_lowercase();
-    if SAVE_DIRECTORY_HINTS.contains(&name.as_str()) {
-        if name == "userdata" {
-            let norm = normalize_path(path);
-            return norm.contains(r"\steam\");
-        }
-        return true;
-    }
-    let norm = normalize_path(path);
-    if norm.contains(r"\steam\")
-        || norm.contains(r"\rune\")
-        || norm.contains(r"\codex\")
-        || norm.contains(r"\onlinefix\")
-    {
-        if name.chars().all(|c| c.is_ascii_digit()) && name.len() >= 2 {
-            return true;
-        }
-    }
-    false
-}
-
 fn collect_snapshot(
     roots: &[crate::domain::ScanRoot],
     on_progress: impl Fn(u8, &str),
@@ -1346,8 +1356,14 @@ fn propose_directory_saves(scope_root: &Path, confirmed: &[String]) -> Vec<Strin
     proposals
 }
 
+/// 把「一次采集里变化的文件」归组成候选存档范围草稿。
+///
+/// 参数刻意收成 `roots` 而不是 `&ActiveLearningSession`：这个函数**从来只用得到
+/// `active.roots`**，而只读初稿（`preview_scope_drafts`，没有会话）需要复用同一份归组与
+/// 排除规则。如果为了初稿另写一份，两边的启发式必然随时间漂移 —— 正是评审 R2 教训里
+/// 「同一个判定有两份实现」那类坑。
 fn infer_scope_drafts(
-    active: &ActiveLearningSession,
+    roots: &[crate::domain::ScanRoot],
     final_snapshot: &HashMap<String, FileFingerprint>,
     baseline: Option<&HashMap<String, FileFingerprint>>,
     etw_files: &HashSet<String>,
@@ -1404,8 +1420,7 @@ fn infer_scope_drafts(
         norm_path: String,
         components_count: usize,
     }
-    let cached_roots: Vec<CachedScanRoot> = active
-        .roots
+    let cached_roots: Vec<CachedScanRoot> = roots
         .iter()
         .map(|root| CachedScanRoot {
             root,
@@ -1543,12 +1558,13 @@ fn infer_scope_drafts(
             }
         }
 
-        let unknown_file_policy =
-            if protects_container || group.root_type == SaveRootType::SavedGames {
-                UnknownFilePolicy::Protect
-            } else {
-                UnknownFilePolicy::Ignore
-            };
+        // 策略不再按「是不是容器」分化：容器与否改由收集侧那道门从 `root_path` 现推
+        // （见 `save_repository::scope_admits_directory_file`），这个字段从此只当**用户开关**用。
+        //
+        // 默认 Protect = 前端徽章上的「自动保护新存档」，也正是 R2b 补上的那一半：学习**之后**
+        // 才出现的档位、游戏写出的带时间戳自动存档，会按候选启发式自动纳入版本库。用户想收窄成
+        // 「仅保护已确认文件」，在向导里把这个范围切到 Ignore 即可。
+        let unknown_file_policy = UnknownFilePolicy::Protect;
 
         let physical_root_str = strip_verbatim_prefix(&group.physical_path)
             .to_string_lossy()
@@ -1560,8 +1576,8 @@ fn infer_scope_drafts(
             etw_files.is_empty(),
             etw_operations,
         );
-        // 非容器命名的范围等价于「只认这一刻看到的文件清单」：目录里已经存在、但本次学习
-        // 没有变化的疑似存档必须摆出来给用户确认，否则用户新建的档位永远进不来。
+        // 提议是 **Ignore 档的兜底**：Protect 档下这些文件已经由收集侧自动纳入了，前端不再展示
+        // 这份清单；但数据照常算出来 —— 用户在向导里把范围切回 Ignore 时立刻可用，不必重跑学习。
         let proposed_files = if protects_container {
             Vec::new()
         } else {
@@ -1572,10 +1588,10 @@ fn infer_scope_drafts(
                 root_type: group.root_type,
                 root_path: physical_root_str,
                 confirmed_files: group.files.clone(),
-                include_directories: protects_container
-                    .then(|| ".".to_string())
-                    .into_iter()
-                    .collect(),
+                // 所有范围都开目录级收集。容器范围整目录收（行为不变）；普通目录（典型是
+                // `%APPDATA%\<游戏名>`）只收「像存档的」—— 由 `scope_admits_directory_file`
+                // 那道门把关，收集侧与恢复侧共用同一份判定。
+                include_directories: vec![".".to_string()],
                 exclude_exact,
                 exclude_patterns,
                 exclude_directories,
@@ -1624,6 +1640,66 @@ fn infer_scope_drafts(
         ));
     }
     (changed, drafts, notes)
+}
+
+/// 从「目录现状」推断候选范围初稿 —— 不启动游戏、不采集 ETW、没有任何写入证据。
+///
+/// 这是评审 A1 第 4 项「允许跳过学习」的落地：容器名启发式 + 扩展名白名单已经能给出可用的
+/// 初稿，用户不该被强制走完「启动游戏 → 手动存一次档 → 点分析」才能进到确认界面。
+///
+/// **证据口径必须诚实**：这条路完全没有写入证据，所以草稿一律降为 `Review`，并且不谎称
+/// 「本次学习有文件变化」。宁可让用户觉得「这只是一份草稿」，也不能让一份猜出来的范围看起来
+/// 像被证据确认过。
+fn preview_drafts_from_roots(
+    roots: &[crate::domain::ScanRoot],
+    snapshot: &HashMap<String, FileFingerprint>,
+) -> (Vec<SaveScopeDraft>, Vec<String>) {
+    // 空 baseline + 空 etw_files ⇒ `infer_scope_drafts` 把快照里的每个文件都当「待判定」，
+    // 逐文件过 `is_save_candidate`（**快照口径**，不是 ETW 口径）。这正是只读初稿的语义：
+    // 「这些目录里哪些文件看起来像存档」。若走 ETW 口径，反而会把没有写入证据的文件判成候选。
+    let empty_baseline = HashMap::new();
+    let etw_files = HashSet::new();
+    let (_, mut drafts, notes) =
+        infer_scope_drafts(roots, snapshot, Some(&empty_baseline), &etw_files, &[]);
+
+    for draft in &mut drafts {
+        draft.evidence_level = SaveCandidateEvidenceLevel::Review;
+        draft.evidence_reason =
+            "只读初稿：没有启动游戏、没有任何写入证据，仅按目录名与文件特征推断。请确认内容，或改回完整识别。"
+                .to_string();
+    }
+    (drafts, notes)
+}
+
+/// 只读推断一份存档范围初稿（不启动游戏、不采集 ETW）。
+fn preview_scope_drafts(game: &Game) -> Result<SaveLearningResult, String> {
+    let roots = discover_scan_roots(game)?;
+    if roots.is_empty() {
+        return Err("没有推断出可扫描的存档目录，请改用完整识别。".to_string());
+    }
+    let snapshot = collect_snapshot(&roots, |_, _| {}, &|| false)?;
+    let (drafts, mut notes) = preview_drafts_from_roots(&roots, &snapshot);
+    notes.insert(
+        0,
+        format!(
+            "只读初稿：没有启动游戏，也没有记录任何写入证据，仅按 {} 个候选目录的目录名与文件特征推断。",
+            roots.len()
+        ),
+    );
+    if drafts.is_empty() {
+        notes.push("初稿没有推断出候选范围，建议改用完整识别，或手动添加存档目录。".to_string());
+    }
+    let confidence = calculate_learning_confidence(&drafts, PREVIEW_CAPTURE_MODE, None);
+    Ok(SaveLearningResult {
+        session_id: String::new(),
+        // 没有观察任何变化，就不能报「N 个文件发生变化」。
+        changed_files: Vec::new(),
+        scope_drafts: drafts,
+        confidence,
+        notes,
+        event_capture_mode: PREVIEW_CAPTURE_MODE.to_string(),
+        transaction_summary: None,
+    })
 }
 
 fn classify_scope_evidence(
@@ -1753,60 +1829,6 @@ fn collect_targeted_snapshot(
     Ok(files)
 }
 
-fn is_save_candidate(path: &str) -> bool {
-    let path_obj = Path::new(path);
-    if is_noise_path(path_obj) {
-        return false;
-    }
-    let path_lower = path.to_ascii_lowercase();
-    if path_lower.contains("\\analytics\\") || path_lower.contains("/analytics/") {
-        return false;
-    }
-    let extension = path_obj
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default();
-    let ext_lower = extension.to_ascii_lowercase();
-    if ext_lower == "log"
-        || ext_lower == "tmp"
-        || ext_lower == "dmp"
-        || RESOURCE_EXTENSIONS.contains(&ext_lower.as_str())
-    {
-        return false;
-    }
-    let file_stem = path_obj
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let has_file_hint = NAME_HINTS.iter().any(|hint| file_stem.contains(hint));
-    let has_save_container = path_obj
-        .parent()
-        .is_some_and(path_has_save_container_ancestor);
-    let has_save_path_hint = [
-        "savedata",
-        "savegame",
-        "savegames",
-        "userdata",
-        "profiles",
-        "remote",
-    ]
-    .iter()
-    .any(|hint| path_has_segment(&path_lower, hint));
-    if is_generic_config_file(
-        path_obj,
-        &path_lower,
-        has_save_container,
-        has_save_path_hint,
-    ) {
-        return false;
-    }
-    has_save_container
-        || has_save_path_hint
-        || has_file_hint
-        || SAVE_EXTENSIONS.contains(&ext_lower.as_str())
-}
-
 fn is_etw_candidate(path: &str) -> bool {
     let path_obj = Path::new(path);
     if is_noise_path(path_obj) {
@@ -1900,57 +1922,12 @@ fn is_transaction_evidence_path(path: &str) -> bool {
     is_etw_candidate(path)
 }
 
-fn is_generic_config_file(
-    path: &Path,
-    normalized_path: &str,
-    has_save_container: bool,
-    has_save_path_hint: bool,
-) -> bool {
-    let is_ini = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|value| value.eq_ignore_ascii_case("ini"));
-    let file_stem = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let has_explicit_save_name = ["save", "slot", "userdata", "autosave", "progress"]
-        .iter()
-        .any(|hint| file_stem.contains(hint));
-    is_ini
-        && path_has_segment(normalized_path, "config")
-        && !has_save_container
-        && !has_save_path_hint
-        && !has_explicit_save_name
-}
-
 fn path_is_within_root(path: &str, root: &Path) -> bool {
     let normalized_path = normalize_path(Path::new(path));
     let normalized_root = normalize_path(root);
     normalized_path == normalized_root
         || (normalized_path.starts_with(&normalized_root)
             && normalized_path.as_bytes().get(normalized_root.len()) == Some(&b'\\'))
-}
-
-fn is_noise_path(path: &Path) -> bool {
-    should_ignore_snapshot_path(path)
-}
-
-fn path_has_segment(path: &str, segment: &str) -> bool {
-    path.split(['\\', '/'])
-        .any(|item| item.eq_ignore_ascii_case(segment))
-}
-
-fn path_has_save_container_ancestor(path: &Path) -> bool {
-    let mut current = Some(path);
-    while let Some(candidate) = current {
-        if is_save_container_directory(candidate) {
-            return true;
-        }
-        current = candidate.parent();
-    }
-    false
 }
 
 fn modified_unix(metadata: &fs::Metadata) -> u64 {
@@ -1960,15 +1937,6 @@ fn modified_unix(metadata: &fs::Metadata) -> u64 {
         .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
         .map(|value| value.as_secs())
         .unwrap_or_default()
-}
-
-fn normalize_path(path: &Path) -> String {
-    let clean = strip_verbatim_prefix(path);
-    clean
-        .to_string_lossy()
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_ascii_lowercase()
 }
 
 fn now_iso() -> String {
@@ -1983,21 +1951,27 @@ mod tests {
     use std::{fs, path::Path};
 
     use super::{
-        calculate_learning_confidence, classify_scope_evidence, directory_matches_hint,
-        discover_save_container_files, infer_scope_drafts, is_etw_candidate, is_save_candidate,
-        is_save_container_directory, is_transaction_evidence_path, normalize_path,
-        path_is_within_root, propose_directory_saves, snapshot_analysis_progress,
-        transaction_evidence, MAX_CANDIDATE_FILE_BYTES,
+        arm_capture_watchdog, calculate_learning_confidence, classify_scope_evidence,
+        directory_matches_hint, discover_save_container_files, infer_scope_drafts,
+        is_etw_candidate, is_transaction_evidence_path, path_is_within_root,
+        preview_drafts_from_roots, propose_directory_saves, run_capture_watchdog,
+        snapshot_analysis_progress, transaction_evidence, MAX_CANDIDATE_FILE_BYTES,
+        MAX_CAPTURE_DURATION,
+    };
+    use crate::domain::path_utils::normalize_path;
+    use crate::domain::save_candidate::{
+        is_noise_path, is_save_candidate, is_save_container_directory,
     };
     use crate::domain::{
-        ActiveLearningSession, FileFingerprint, LearningSessionView, LearningStatus,
-        SaveCandidateEvidenceLevel, SaveRootType, SaveScope, SaveScopeDraft,
+        ActiveLearningSession, EtwCaptureHandle, FileFingerprint, LearningSessionView,
+        LearningStatus, SaveCandidateEvidenceLevel, SaveRootType, SaveScope, SaveScopeDraft,
         SaveTransactionSummary, ScanRoot, UnknownFilePolicy, DEFAULT_MAX_FILE_BYTES,
     };
     use crate::services::learning::{analyze_save_transactions, FileOperation, FileOperationKind};
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use std::sync::{atomic::AtomicBool, Arc, Mutex};
+    use std::time::Duration;
 
     fn operation(path: &str, operation: FileOperationKind) -> FileOperation {
         FileOperation {
@@ -2014,6 +1988,71 @@ mod tests {
         assert_eq!(snapshot_analysis_progress(0), 10);
         assert_eq!(snapshot_analysis_progress(64), 61);
         assert_eq!(snapshot_analysis_progress(100), 90);
+    }
+
+    /// 采集看门狗是 `.etl` 唯一的**可控**时长上界（`logman -rf` 与 `-ets` 互斥），
+    /// 所以「到点真的会去停那个会话」这件事必须有断言钉住，不能只靠读代码。
+    #[test]
+    fn capture_watchdog_stops_the_session_when_the_deadline_passes() {
+        let mut slept = None;
+        let mut stopped = None;
+        run_capture_watchdog(
+            "GameSaverTrace_deadline",
+            Duration::from_secs(60),
+            |duration| slept = Some(duration),
+            |name| {
+                stopped = Some(name.to_string());
+                Ok(())
+            },
+        );
+        assert_eq!(slept, Some(Duration::from_secs(60)), "必须先等满上限");
+        assert_eq!(
+            stopped.as_deref(),
+            Some("GameSaverTrace_deadline"),
+            "必须停的是这次采集的会话名"
+        );
+    }
+
+    /// 会话已被正常结束或被取消时，看门狗到点再停一次必然报错 —— 只记日志，不得 panic。
+    #[test]
+    fn capture_watchdog_tolerates_a_session_that_is_already_gone() {
+        let mut attempts = 0;
+        run_capture_watchdog(
+            "GameSaverTrace_gone",
+            Duration::from_secs(1),
+            |_| {},
+            |_| {
+                attempts += 1;
+                Err("找不到数据收集器集".to_string())
+            },
+        );
+        assert_eq!(attempts, 1, "即便会报错也要尝试停一次");
+    }
+
+    /// 挂表动作本身只是 `thread::spawn`，删掉它不会有别的测试变红 —— 所以必须单独钉住
+    /// 「会话启动时确实按上限挂了看门狗」，否则这条防护会悄无声息地消失。
+    #[test]
+    fn capture_watchdog_is_armed_for_an_active_session() {
+        let handle = EtwCaptureHandle {
+            trace_name: "GameSaverTrace_armed".to_string(),
+            etl_path: PathBuf::from(r"C:\logs\armed.etl"),
+        };
+        let mut armed = None;
+        arm_capture_watchdog(Some(&handle), |name, duration| {
+            armed = Some((name, duration))
+        });
+        assert_eq!(
+            armed,
+            Some(("GameSaverTrace_armed".to_string(), MAX_CAPTURE_DURATION)),
+            "必须用这次采集的会话名和统一上限挂表"
+        );
+    }
+
+    #[test]
+    fn capture_watchdog_is_not_armed_without_a_session() {
+        let mut armed = false;
+        arm_capture_watchdog(None, |_, _| armed = true);
+        assert!(!armed, "ETW 不可用时没有会话可停，不该挂表");
     }
 
     #[test]
@@ -2283,6 +2322,93 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    fn preview_fixture(
+        label: &str,
+        files: &[(&str, &[u8])],
+    ) -> (
+        std::path::PathBuf,
+        Vec<ScanRoot>,
+        HashMap<String, FileFingerprint>,
+    ) {
+        let root = std::env::current_dir()
+            .expect("resolve test working directory")
+            .join(format!("gamesaver-{label}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create root");
+        let mut snapshot = HashMap::new();
+        for (relative, bytes) in files {
+            let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("create parent");
+            }
+            fs::write(&path, bytes).expect("write fixture file");
+            snapshot.insert(
+                normalize_path(&path),
+                FileFingerprint {
+                    size: bytes.len() as u64,
+                    modified_unix: 0,
+                },
+            );
+        }
+        let roots = vec![ScanRoot {
+            root_type: SaveRootType::AppData,
+            physical_path: root.clone(),
+        }];
+        (root, roots, snapshot)
+    }
+
+    /// A1「跳过学习」的只读初稿：不启动游戏、不采集 ETW，只按目录名与文件特征推断。
+    ///
+    /// 两条断言分别钉住「能推出范围」和「证据口径诚实」—— 后者更重要：一份没有任何写入证据
+    /// 的草稿，绝不能看起来像被证据确认过，否则用户会把猜出来的范围当成已确认的。
+    #[test]
+    fn preview_drafts_are_review_only_and_skip_non_save_files() {
+        let (root, roots, snapshot) = preview_fixture(
+            "preview",
+            &[
+                ("SAVEDATA/slot1.sav", b"save"),
+                ("settings.ini", b"[cfg]"),
+                ("screenshot.png", b"png"),
+            ],
+        );
+
+        let (drafts, _notes) = preview_drafts_from_roots(&roots, &snapshot);
+
+        assert_eq!(drafts.len(), 1, "只该推出 SAVEDATA 这一个候选范围");
+        let draft = &drafts[0];
+        assert!(
+            normalize_path(Path::new(&draft.scope.root_path)).ends_with(r"\savedata"),
+            "范围根应落在命名存档容器上，实际 {}",
+            draft.scope.root_path
+        );
+        assert_eq!(draft.scope.confirmed_files, vec!["slot1.sav".to_string()]);
+        // 没有任何写入证据 ⇒ 证据等级必须是「待确认」，且说明里要写清这是只读推断。
+        assert_eq!(draft.evidence_level, SaveCandidateEvidenceLevel::Review);
+        assert!(
+            draft.evidence_reason.contains("只读初稿"),
+            "说明必须写清这是只读推断，实际：{}",
+            draft.evidence_reason
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 目录里没有像存档的文件时初稿必须是空的 —— 不能凭目录名硬凑一个范围出来。
+    #[test]
+    fn preview_drafts_stay_empty_without_save_like_files() {
+        let (root, roots, snapshot) = preview_fixture(
+            "preview-empty",
+            &[("settings.ini", b"[cfg]"), ("readme.txt", b"hi")],
+        );
+
+        let (drafts, _notes) = preview_drafts_from_roots(&roots, &snapshot);
+
+        assert!(
+            drafts.is_empty(),
+            "没有候选文件就不该有范围，实际推出 {} 个",
+            drafts.len()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// 提议只该出现在「只认历史清单」的范围上：容器命名的范围本来就整目录收集
     /// （`include_directories = ["."]`），再列一遍提议是噪音。
     #[test]
@@ -2341,7 +2467,7 @@ mod tests {
 
         let etw_empty = HashSet::new();
         let (_, drafts, _) = infer_scope_drafts(
-            &active,
+            &active.roots,
             &final_snapshot,
             Some(&HashMap::new()),
             &etw_empty,
@@ -2362,6 +2488,20 @@ mod tests {
         assert!(
             find_draft("\\savedata").proposed_files.is_empty(),
             "容器范围本来就是整目录收集，不该再列提议"
+        );
+
+        // R2b：非容器范围也必须开目录级收集，并把策略默认成「自动保护新存档」。
+        // 两件事缺一不可 —— 只加 `include_directories` 而策略仍是 Ignore，收集侧那道门
+        // 第二层就把候选文件全拒了，R2b 会静默失效。
+        let plain = find_draft("\\game");
+        assert_eq!(plain.scope.include_directories, vec![".".to_string()]);
+        assert_eq!(plain.scope.unknown_file_policy, UnknownFilePolicy::Protect);
+        // 容器范围的行为保持不变：整目录收。
+        let container = find_draft("\\savedata");
+        assert_eq!(container.scope.include_directories, vec![".".to_string()]);
+        assert_eq!(
+            container.scope.unknown_file_policy,
+            UnknownFilePolicy::Protect
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -2520,8 +2660,13 @@ mod tests {
         );
 
         let etw_empty = HashSet::new();
-        let (changed, drafts, _) =
-            infer_scope_drafts(&active, &final_snapshot, Some(&baseline), &etw_empty, &[]);
+        let (changed, drafts, _) = infer_scope_drafts(
+            &active.roots,
+            &final_snapshot,
+            Some(&baseline),
+            &etw_empty,
+            &[],
+        );
 
         // 双向 diff 必须同时捕获被删除的 old_save 和新建的 new_save
         assert_eq!(changed.len(), 2);
@@ -2597,7 +2742,7 @@ mod tests {
 
         let etw_empty = HashSet::new();
         let (_, drafts, notes) = infer_scope_drafts(
-            &active,
+            &active.roots,
             &final_snapshot,
             Some(&HashMap::new()),
             &etw_empty,
@@ -2671,7 +2816,7 @@ mod tests {
 
         let etw_empty = HashSet::new();
         let (_, drafts, _) = infer_scope_drafts(
-            &active,
+            &active.roots,
             &final_snapshot,
             Some(&HashMap::new()),
             &etw_empty,
@@ -2762,7 +2907,7 @@ mod tests {
 
         let etw_empty = HashSet::new();
         let (_, drafts, _) = infer_scope_drafts(
-            &active,
+            &active.roots,
             &final_snapshot,
             Some(&HashMap::new()),
             &etw_empty,
@@ -2877,7 +3022,7 @@ mod tests {
         assert!(root.is_some());
         let root = root.unwrap();
         assert_eq!(root.root_type, SaveRootType::Documents);
-        assert!(super::is_save_container_directory(&root.physical_path));
+        assert!(is_save_container_directory(&root.physical_path));
         assert_eq!(
             normalize_path(&root.physical_path),
             normalize_path(&public_doc.join("Steam").join("RUNE").join("2456740"))
@@ -2943,35 +3088,35 @@ mod tests {
 
     #[test]
     fn noise_filtering_rejects_unity_and_engine_logs() {
-        assert!(super::is_noise_path(Path::new(
+        assert!(is_noise_path(Path::new(
             r"C:\Users\User\AppData\LocalLow\Game\Player.log"
         )));
-        assert!(super::is_noise_path(Path::new(
+        assert!(is_noise_path(Path::new(
             r"C:\Users\User\AppData\LocalLow\Game\Player-prev.log"
         )));
-        assert!(super::is_noise_path(Path::new(
+        assert!(is_noise_path(Path::new(
             r"C:\Users\User\AppData\LocalLow\Game\test.tmp"
         )));
-        assert!(super::is_noise_path(Path::new(
+        assert!(is_noise_path(Path::new(
             r"C:\Users\User\AppData\LocalLow\Game\crash.dmp"
         )));
-        assert!(!super::is_noise_path(Path::new(
+        assert!(!is_noise_path(Path::new(
             r"C:\Users\User\AppData\LocalLow\Game\save01.dat"
         )));
-        assert!(!super::is_noise_path(Path::new(
+        assert!(!is_noise_path(Path::new(
             r"C:\Users\Public\Documents\Steam\RUNE\2456740\remote\slot0.json"
         )));
     }
 
     #[test]
     fn noise_filtering_rejects_system_generated_paths() {
-        assert!(super::is_noise_path(Path::new(
+        assert!(is_noise_path(Path::new(
             r"C:\Users\User\AppData\Local\NVIDIA\dxcache\cache.nvph"
         )));
-        assert!(super::is_noise_path(Path::new(
+        assert!(is_noise_path(Path::new(
             r"C:\Users\User\AppData\Local\Game\crashreportclient\settings.ini"
         )));
-        assert!(super::is_noise_path(Path::new(
+        assert!(is_noise_path(Path::new(
             r"C:\Users\User\AppData\LocalLow\Tencent\WetType\mm_tip.xlog"
         )));
     }
@@ -3021,26 +3166,26 @@ mod tests {
 
     #[test]
     fn is_save_container_directory_rejects_appdata_user_data() {
-        assert!(!super::is_save_container_directory(Path::new(
+        assert!(!is_save_container_directory(Path::new(
             r"C:\Users\Player\AppData\Local\rmmz-game\User Data"
         )));
-        assert!(super::is_save_container_directory(Path::new(
+        assert!(is_save_container_directory(Path::new(
             r"C:\Program Files (x86)\Steam\userdata"
         )));
-        assert!(super::is_save_container_directory(Path::new(
+        assert!(is_save_container_directory(Path::new(
             r"C:\Program Files (x86)\Steam\userdata\123456\2456740"
         )));
     }
 
     #[test]
     fn noise_filtering_rejects_chromium_user_data_cache() {
-        assert!(super::is_noise_path(Path::new(
+        assert!(is_noise_path(Path::new(
             r"C:\Users\Player\AppData\Local\rmmz-game\User Data\Default\Cookies"
         )));
-        assert!(super::is_noise_path(Path::new(
+        assert!(is_noise_path(Path::new(
             r"C:\Users\Player\AppData\Local\rmmz-game\User Data\Default\Code Cache\js\123_0"
         )));
-        assert!(super::is_noise_path(Path::new(
+        assert!(is_noise_path(Path::new(
             r"C:\Users\Player\AppData\Local\rmmz-game\User Data\crashpadmetrics-active.pma"
         )));
     }

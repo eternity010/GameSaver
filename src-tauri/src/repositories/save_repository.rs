@@ -1,8 +1,11 @@
 use crate::{
     app_state::AppState,
     domain::{
-        compare_created_at, AppStore, Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope,
-        SaveVersion, UnknownFilePolicy,
+        compare_created_at,
+        path_utils::strip_verbatim_prefix,
+        save_candidate::{is_save_candidate, is_save_container_directory},
+        AppStore, Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope, SaveVersion,
+        UnknownFilePolicy,
     },
 };
 use sha2::{Digest, Sha256};
@@ -1026,7 +1029,7 @@ fn collect_protected_paths(root: &Path, scope: &SaveScope) -> Result<HashSet<Str
             );
             // 与收集侧共用同一道门：一侧收进来、另一侧不认，恢复时就会把从没备份过的文件
             // 当成「多出来的受保护文件」删掉。
-            if !scope_admits_directory_file(scope, &relative) {
+            if !scope_admits_directory_file(scope, &relative, entry.path()) {
                 continue;
             }
             if is_protected_file(entry.path(), &relative, scope) {
@@ -1070,24 +1073,41 @@ fn scope_matches_entry_loose(scope: &SaveScope, entry: &SaveFileEntry, relative:
         && !is_excluded(relative, scope)
 }
 
-fn trailing_path_components_match(a: &str, b: &str) -> bool {
+/// 从末尾往前数，两个路径一共有多少段完全相同。
+///
+/// 名字就是它做的事。这里原本叫 `trailing_path_components_match`，却只比**最后一段**文件名
+/// —— 名不符实，且会漏掉「末段同名、但其中一个明显更近」的情形（评审 R6）。
+///
+/// 只比**尾段**而不是整条路径，是因为这个判定的存在意义就是跨设备恢复：换台机器用户名必然
+/// 不同（`C:\Users\Alice\...` vs `C:\Users\Bob\...`），而 `normalize_path` 并不剥用户目录
+/// 前缀。从末尾往回数，用户名那一层的差异落在计数之外，正好被忽略。这也正是评审文档建议的
+/// 「比较完整尾段序列」**不能照做**的原因 —— 那样会把跨设备恢复直接打断。
+fn trailing_path_component_match_len(a: &str, b: &str) -> usize {
     let norm_a = normalize_path(a);
     let norm_b = normalize_path(b);
     let parts_a: Vec<&str> = norm_a.split('\\').filter(|p| !p.is_empty()).collect();
     let parts_b: Vec<&str> = norm_b.split('\\').filter(|p| !p.is_empty()).collect();
-    if let (Some(last_a), Some(last_b)) = (parts_a.last(), parts_b.last()) {
-        if last_a == last_b {
-            return true;
-        }
-    }
-    false
+    parts_a
+        .iter()
+        .rev()
+        .zip(parts_b.iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count()
 }
 
 /// 在一组同类型候选范围中，按条目记录的 `root_path` 选出唯一匹配者。
 ///
-/// 先按物理路径精确匹配（同机、路径未改动），再按路径尾段匹配（跨设备或存档目录被改动
-/// 过）。候选只有一个时直接返回；无法唯一确定时返回 `None` —— 调用方据此报错，绝不
+/// 先按物理路径精确匹配（同机、路径未改动），再按**共同尾段最长**匹配（跨设备或存档目录被
+/// 改动过）。候选只有一个时直接返回；无法唯一确定时返回 `None` —— 调用方据此报错，绝不
 /// 「随便挑一个」。
+///
+/// 为什么是「共同尾段最长」而不是「末段是否同名」：后者只能给出一个是/否，遇到两个候选末段
+/// 同名就只好放弃。改成比长度之后，其中路径更接近的那个能被唯一选出来。这个改动是**严格
+/// 超集**，不会把原来选对的变成选错：
+///   - 旧实现能选出结果，等价于「恰好一个候选末段同名」，也就是「恰好一个候选共同尾段 ≥ 1」，
+///     而它必然同时是最长者 —— 新实现选中的仍是同一个；
+///   - 旧实现放弃（返回 `None`）的场景里，新实现只在**最长者唯一**时才给出结果，仍然同分就
+///     照旧放弃。
 fn pick_scope_by_root_path<'a>(
     candidates: &[&'a SaveScope],
     entry: &SaveFileEntry,
@@ -1109,15 +1129,26 @@ fn pick_scope_by_root_path<'a>(
         return Some(exact[0]);
     }
 
-    let trailing: Vec<&'a SaveScope> = candidates
-        .iter()
-        .copied()
-        .filter(|scope| trailing_path_components_match(entry_root, &scope.root_path))
-        .collect();
-    if trailing.len() == 1 {
-        return Some(trailing[0]);
+    let mut best: Option<(usize, &'a SaveScope)> = None;
+    let mut tied = false;
+    for scope in candidates.iter().copied() {
+        let score = trailing_path_component_match_len(entry_root, &scope.root_path);
+        if score == 0 {
+            continue;
+        }
+        match best {
+            Some((best_score, _)) if score < best_score => {}
+            Some((best_score, _)) if score == best_score => tied = true,
+            _ => {
+                best = Some((score, scope));
+                tied = false;
+            }
+        }
     }
-    None
+    match best {
+        Some((_, scope)) if !tied => Some(scope),
+        _ => None,
+    }
 }
 
 fn find_scope_for_entry<'a>(
@@ -1182,17 +1213,6 @@ pub(crate) fn find_scope_for_read<'a>(
             entry.relative_path
         )
     })
-}
-
-pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{}", rest))
-    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-        PathBuf::from(rest)
-    } else {
-        path.to_path_buf()
-    }
 }
 
 pub(crate) fn scope_root(game: &Game, scope: &SaveScope) -> PathBuf {
@@ -1362,18 +1382,44 @@ enum CandidateSource {
 /// `include_directories` 目录级收集时，目录里那些**没有**显式列进 `confirmed_files` 的文件
 /// （未知文件）是否算作这个范围的一员。
 ///
-/// 这是 `unknown_file_policy` 唯一的语义落点。此前它根本不是个开关：保护范围完全由
-/// `include_directories` 决定，改这个字段不改变任何行为，而前端徽章却写着「自动保护新
-/// 存档 / 仅保护已确认文件」—— 一块假仪表（存档识别审视 R4）。
+/// 判定分三层，顺序有意为之：
 ///
-/// 收集侧与恢复侧共用本函数：只在一侧生效就会出现「恢复时把一个从没备份过的文件当受保护
-/// 删掉」，或者反过来「备份了却在恢复时当作不存在」。入参 `normalized_relative` 需已归一化。
-fn scope_admits_directory_file(scope: &SaveScope, normalized_relative: &str) -> bool {
-    scope.unknown_file_policy == UnknownFilePolicy::Protect
-        || scope
-            .confirmed_files
-            .iter()
-            .any(|value| normalize_relative(value) == normalized_relative)
+/// 1. 显式确认过的文件永远算数 —— 不受策略与启发式影响。
+/// 2. `unknown_file_policy != Protect` 直接拒绝 —— 这是用户开关「仅保护已确认文件」。
+/// 3. 再看目录本身的性质：范围根是**命名存档容器**（`SAVEDATA` / `SaveGames` / Steam `userdata`
+///    等）时，目录名已经证明「这里住的是存档」，整目录收；否则是普通目录（典型
+///    `%APPDATA%\<游戏名>`），里面混着配置、日志、截图，只认 `is_save_candidate` 判为
+///    「像存档的」。
+///
+/// 第 3 层的容器分支是**行为保持**（此前所有带 `include_directories` 的范围都是容器，
+/// 且策略恒为 Protect，结论一致）；非容器分支是 R2b 补上的那一半 —— 学习**之后**才出现的
+/// 档位、游戏写出的带时间戳自动存档从此能自动纳入，而不是永远停在「只认学习那一刻看到的文件」。
+///
+/// 收集侧（`collect_profile_files`）与恢复侧（`collect_protected_paths`）共用本函数：
+/// 只在一侧生效就会出现「恢复时把一个从没备份过的文件当受保护删掉」，或者反过来
+/// 「备份了却在恢复时当作不存在」。
+///
+/// 入参 `normalized_relative` 需已归一化；`absolute` 需是该文件的实际路径（候选启发式要看
+/// 扩展名、文件名与祖先目录名）。
+fn scope_admits_directory_file(
+    scope: &SaveScope,
+    normalized_relative: &str,
+    absolute: &Path,
+) -> bool {
+    if scope
+        .confirmed_files
+        .iter()
+        .any(|value| normalize_relative(value) == normalized_relative)
+    {
+        return true;
+    }
+    if scope.unknown_file_policy != UnknownFilePolicy::Protect {
+        return false;
+    }
+    if is_save_container_directory(Path::new(&scope.root_path)) {
+        return true;
+    }
+    is_save_candidate(&absolute.to_string_lossy())
 }
 
 fn add_candidate(
@@ -1400,7 +1446,9 @@ fn add_candidate(
     }
     // 目录级收集出来的文件可能是「这个范围从没确认过的未知文件」，是否纳入由
     // `unknown_file_policy` 决定；`confirmed_files` 那条路进来的不走这道门。
-    if source == CandidateSource::Directory && !scope_admits_directory_file(scope, &relative_path) {
+    if source == CandidateSource::Directory
+        && !scope_admits_directory_file(scope, &relative_path, &path)
+    {
         return Ok(());
     }
     // 恢复产物绝不进版本。它是 `restore_group` 的工作目录，正常情况下早已被清掉；能走到
@@ -2551,6 +2599,106 @@ mod tests {
     }
 
     #[test]
+    fn trailing_path_component_match_len_counts_only_the_shared_suffix() {
+        // 用户名不同（跨设备）不参与计数 —— 差异在末尾往回数的那几段之外。
+        assert_eq!(
+            super::trailing_path_component_match_len(
+                r"C:\Users\Alice\AppData\Roaming\GameA\remote",
+                r"C:\Users\Bob\AppData\Roaming\GameA\remote"
+            ),
+            4
+        );
+        // 只有末段同名时是 1。
+        assert_eq!(
+            super::trailing_path_component_match_len(
+                r"C:\Users\Alice\AppData\Roaming\GameA\remote",
+                r"C:\Users\Bob\AppData\Roaming\GameB\remote"
+            ),
+            1
+        );
+        // 末段都不同就是 0。
+        assert_eq!(
+            super::trailing_path_component_match_len(r"C:\A\saves", r"C:\B\remote"),
+            0
+        );
+    }
+
+    /// 两个候选范围**末段同名**（典型是都用 `remote`），但其中一个与条目路径明显更近。
+    ///
+    /// 旧实现只问「末段是否同名」，两个都命中就只好放弃 → 报错拒绝恢复。新实现按共同尾段
+    /// 长度取唯一最长者，能把更近的那个选出来 —— 这是 R6 真正新增的能力。
+    #[test]
+    fn find_scope_for_entry_picks_the_closest_root_when_leaf_names_collide() {
+        let mut scope_a =
+            SaveScope::new_manual(r"C:\Users\Bob\AppData\Roaming\GameA\remote".to_string());
+        scope_a.root_type = SaveRootType::AppData;
+        let mut scope_b =
+            SaveScope::new_manual(r"C:\Users\Bob\AppData\Roaming\GameB\remote".to_string());
+        scope_b.root_type = SaveRootType::AppData;
+
+        let profile = SaveProfile::new(
+            "g1".to_string(),
+            "hash".to_string(),
+            vec![scope_a, scope_b],
+            100,
+            "2026-01-01".to_string(),
+        );
+
+        let entry = SaveFileEntry {
+            root_type: SaveRootType::AppData,
+            root_path: Some(r"C:\Users\Alice\AppData\Roaming\GameA\remote".to_string()),
+            relative_path: "save.dat".to_string(),
+            object_hash: Some("mock_hash".to_string()),
+            size: 100,
+            deleted: false,
+            mtime_ms: None,
+        };
+
+        let resolved =
+            super::find_scope_for_entry(&profile, &entry, "save.dat").expect("应能按共同尾段消歧");
+        assert_eq!(
+            resolved.root_path,
+            r"C:\Users\Bob\AppData\Roaming\GameA\remote"
+        );
+    }
+
+    /// 末段同名 + 共同尾段**等长** = 真的分不清。此时必须继续拒绝，绝不「随便挑一个」——
+    /// 挑错的方向是把 A 的版本恢复到 B 的范围，比报错严重得多（评审 R6 点名的场景）。
+    #[test]
+    fn find_scope_for_entry_still_refuses_when_shared_suffixes_tie() {
+        let mut scope_a =
+            SaveScope::new_manual(r"C:\Users\Bob\AppData\Roaming\GameA\remote".to_string());
+        scope_a.root_type = SaveRootType::AppData;
+        let mut scope_b =
+            SaveScope::new_manual(r"C:\Users\Bob\AppData\Roaming\GameB\remote".to_string());
+        scope_b.root_type = SaveRootType::AppData;
+
+        let profile = SaveProfile::new(
+            "g1".to_string(),
+            "hash".to_string(),
+            vec![scope_a, scope_b],
+            100,
+            "2026-01-01".to_string(),
+        );
+
+        // 与两个候选都只共有 `remote` 一段 —— 两边一样近，没有胜者。
+        let entry = SaveFileEntry {
+            root_type: SaveRootType::AppData,
+            root_path: Some(r"C:\Users\Alice\AppData\Roaming\GameC\remote".to_string()),
+            relative_path: "save.dat".to_string(),
+            object_hash: Some("mock_hash".to_string()),
+            size: 100,
+            deleted: false,
+            mtime_ms: None,
+        };
+
+        assert!(
+            super::find_scope_for_entry(&profile, &entry, "save.dat").is_err(),
+            "同分时必须拒绝，不得随便挑一个"
+        );
+    }
+
+    #[test]
     fn find_scope_for_read_picks_the_scope_matching_the_entry_root_path() {
         let mut scope_a =
             SaveScope::new_manual(r"C:\Users\Bob\Documents\StudioA\GameX".to_string());
@@ -2649,7 +2797,13 @@ mod tests {
     }
 
     fn temp_root(label: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("gamesaver-{label}-{}", uuid::Uuid::new_v4()));
+        // 刻意**不用** `std::env::temp_dir()`：它在 Windows 上位于 `\AppData\Local\Temp\`，
+        // 而那正是 `is_noise_path` 明确挡掉的噪音目录（`should_ignore_event_path` 的片段表里有
+        // `\appdata\local\temp\`）。拿它当范围根，非容器范围的候选过滤会把测试文件全判成噪音，
+        // 测的就不是策略而是噪音规则了。改用 crate 工作目录下的临时目录 —— 服务层测试同样如此。
+        let root = std::env::current_dir()
+            .expect("resolve test working directory")
+            .join(format!("gamesaver-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create temp root");
         root
     }
@@ -2745,6 +2899,139 @@ mod tests {
         let mut relatives: Vec<String> = protected.into_iter().collect();
         relatives.sort();
         assert_eq!(relatives, vec!["slot1.sav".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R2b 回归：非容器范围（典型 `%APPDATA%\<游戏名>`）里，**学习之后**才出现的候选存档
+    /// 必须能自动进收集 —— 这正是 R2b 补上的那一半。
+    ///
+    /// 修之前，这类范围的 `include_directories` 是空的，规则只认「学习那一刻看到的文件」，
+    /// 于是用户新建的档位、游戏写出的带时间戳自动存档永远进不了版本库，也不会有任何提示。
+    #[test]
+    fn non_container_scope_collects_new_save_like_files() {
+        let root = temp_root("r2b-new");
+        std::fs::write(root.join("slot1.sav"), b"confirmed").expect("write confirmed save");
+        // 学习之后才出现的：新档位 + 带时间戳的自动存档
+        std::fs::write(root.join("slot2.sav"), b"new slot").expect("write new slot");
+        std::fs::write(root.join("autosave_20260912.sav"), b"autosave").expect("write autosave");
+        // 目录里混着的非存档：不该被收
+        std::fs::write(root.join("settings.ini"), b"[cfg]").expect("write config");
+        std::fs::write(root.join("screenshot.png"), b"png").expect("write screenshot");
+        std::fs::write(root.join("player.log"), b"log").expect("write log");
+
+        let mut scope = SaveScope::new_manual(root.to_string_lossy().to_string());
+        scope.root_type = SaveRootType::Custom;
+        scope.confirmed_files = vec!["slot1.sav".to_string()];
+        let profile = SaveProfile::new(
+            "g".to_string(),
+            "hash".to_string(),
+            vec![scope],
+            100,
+            "0".to_string(),
+        );
+
+        let mut relatives: Vec<String> = super::collect_profile_files(&profile)
+            .expect("collect")
+            .iter()
+            .map(|file| file.relative_path.clone())
+            .collect();
+        relatives.sort();
+
+        assert_eq!(
+            relatives,
+            vec![
+                "autosave_20260912.sav".to_string(),
+                "slot1.sav".to_string(),
+                "slot2.sav".to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R2b 的行为保持：命名容器范围仍然**整目录收**，包括不像存档的文件。
+    ///
+    /// 这道锚用来证明「非容器开目录收集」没有顺手改掉容器范围的语义 —— 收紧容器范围是
+    /// 单独的第 3 步，本轮刻意不做。
+    #[test]
+    fn container_scope_still_collects_every_directory_file() {
+        let parent = temp_root("r2b-container");
+        let root = parent.join("SaveData");
+        std::fs::create_dir_all(&root).expect("create container");
+        std::fs::write(root.join("slot1.sav"), b"confirmed").expect("write confirmed save");
+        std::fs::write(root.join("settings.ini"), b"[cfg]").expect("write config");
+        std::fs::write(root.join("screenshot.png"), b"png").expect("write screenshot");
+
+        let mut scope = SaveScope::new_manual(root.to_string_lossy().to_string());
+        scope.root_type = SaveRootType::Custom;
+        scope.confirmed_files = vec!["slot1.sav".to_string()];
+        let profile = SaveProfile::new(
+            "g".to_string(),
+            "hash".to_string(),
+            vec![scope],
+            100,
+            "0".to_string(),
+        );
+
+        let mut relatives: Vec<String> = super::collect_profile_files(&profile)
+            .expect("collect")
+            .iter()
+            .map(|file| file.relative_path.clone())
+            .collect();
+        relatives.sort();
+
+        assert_eq!(
+            relatives,
+            vec![
+                "screenshot.png".to_string(),
+                "settings.ini".to_string(),
+                "slot1.sav".to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// R2b 两侧同门：非容器范围下，收集侧收哪些文件，恢复侧就得认哪些 —— 一个不差。
+    ///
+    /// 两侧判定一旦分叉，恢复（精确回到该版本）就会把「收集侧没收、恢复侧却当成受保护」的
+    /// 文件当作多出来的东西删掉。这里直接断言两个集合相等，比逐条断言更难被绕过。
+    #[test]
+    fn non_container_scope_keeps_collection_and_restore_in_step() {
+        let root = temp_root("r2b-pair");
+        std::fs::write(root.join("slot1.sav"), b"confirmed").expect("write confirmed save");
+        std::fs::write(root.join("slot2.sav"), b"new slot").expect("write new slot");
+        std::fs::write(root.join("settings.ini"), b"[cfg]").expect("write config");
+        std::fs::write(root.join("screenshot.png"), b"png").expect("write screenshot");
+
+        let mut scope = SaveScope::new_manual(root.to_string_lossy().to_string());
+        scope.root_type = SaveRootType::Custom;
+        scope.confirmed_files = vec!["slot1.sav".to_string()];
+        let profile = SaveProfile::new(
+            "g".to_string(),
+            "hash".to_string(),
+            vec![scope.clone()],
+            100,
+            "0".to_string(),
+        );
+
+        let mut collected: Vec<String> = super::collect_profile_files(&profile)
+            .expect("collect")
+            .iter()
+            .map(|file| file.relative_path.clone())
+            .collect();
+        collected.sort();
+
+        let mut protected: Vec<String> = super::collect_protected_paths(&root, &scope)
+            .expect("collect protected")
+            .into_iter()
+            .collect();
+        protected.sort();
+
+        assert_eq!(collected, protected, "收集侧与恢复侧必须得出同一批文件");
+        assert!(!collected.contains(&"settings.ini".to_string()));
+        assert!(!collected.contains(&"screenshot.png".to_string()));
 
         let _ = std::fs::remove_dir_all(&root);
     }

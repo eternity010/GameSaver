@@ -1,3 +1,4 @@
+use crate::domain::save_candidate::should_ignore_event_path;
 use crate::domain::EtwCaptureHandle;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -10,6 +11,52 @@ use tauri::{AppHandle, Manager};
 use super::transactions::{FileOperation, FileOperationKind};
 
 const KERNEL_FILE_CAPTURE_KEYWORDS: u64 = 0x1EB0;
+
+/// ETW 会话缓冲区大小（KB）。`logman` 官方示例用的就是 64。
+const ETW_TRACE_BUFFER_SIZE_KB: u32 = 64;
+/// ETW 会话缓冲区数量的下界 / 上界 —— 内存侧的上界（256 × 64KB ≈ 16MB）。
+const ETW_TRACE_MIN_BUFFERS: u32 = 16;
+const ETW_TRACE_MAX_BUFFERS: u32 = 256;
+/// 单个 `.etl` 的磁盘上界（MB）。采集期原本没有任何上界，本机实测单个文件到过 422MB。
+const ETW_TRACE_MAX_LOG_MB: u32 = 256;
+
+/// 组装 `logman create trace` 的参数。
+///
+/// 补上三层资源上界：`-nb`/`-bs` 限住内存里的缓冲池，`-max` 限住磁盘上的日志文件。
+///
+/// ⚠️ **不要再加 `-b` 或 `-rf`**。评审文档曾建议用 `-b` 当缓冲参数、用 `-rf` 当会话时长
+/// 上限，但在这台机器的 `logman`（10.0.26100.1150）上实测**两者都与 `-ets` 互斥**，报
+/// 「参数"b"/"rf"不允许具有其他指定的参数」—— 加进去会让**整个会话创建失败**并静默回退到
+/// 快照模式（存档识别质量随之下降，且不会有明显报错）：
+///   - `-b` 是「在指定时间开始收集」的起始时刻，不是缓冲大小（缓冲大小是 `-bs`）；
+///   - `-rf` 是「运行指定时长」，与 `-ets` 互斥 —— 所以时长上限只能放在 Rust 侧，
+///     见 `save_learning_service` 里的采集看门狗。
+///
+/// 同理**不加 `-ct`**：它只影响时间戳时钟（省一点 CPU），却会改变 CSV 里 ClockTime 的
+/// 量纲，而 `parse_trace_timestamp_ms` 是靠数值大小猜格式的（>1e14 当 FILETIME、
+/// <1e10 当秒）。换了时钟类型有可能把时间戳静默解析错，进而打散 2 秒窗口的事务聚合，
+/// 而它对「资源上界」这个目标毫无贡献。
+fn etw_trace_args(trace_name: &str, etl_path: &str) -> Vec<String> {
+    vec![
+        "create".to_string(),
+        "trace".to_string(),
+        trace_name.to_string(),
+        "-o".to_string(),
+        etl_path.to_string(),
+        "-p".to_string(),
+        "Microsoft-Windows-Kernel-File".to_string(),
+        format!("0x{KERNEL_FILE_CAPTURE_KEYWORDS:X}"),
+        "4".to_string(),
+        "-bs".to_string(),
+        ETW_TRACE_BUFFER_SIZE_KB.to_string(),
+        "-nb".to_string(),
+        ETW_TRACE_MIN_BUFFERS.to_string(),
+        ETW_TRACE_MAX_BUFFERS.to_string(),
+        "-max".to_string(),
+        ETW_TRACE_MAX_LOG_MB.to_string(),
+        "-ets".to_string(),
+    ]
+}
 
 pub(crate) struct TraceCollectionResult {
     pub(crate) files: HashSet<String>,
@@ -90,20 +137,8 @@ pub(crate) fn try_start_etw_capture(
     };
 
     let created = {
-        let keyword_mask = format!("0x{KERNEL_FILE_CAPTURE_KEYWORDS:X}");
         let mut command = Command::new("logman");
-        command.args([
-            "create",
-            "trace",
-            &trace_name,
-            "-o",
-            &etl_path_str,
-            "-p",
-            "Microsoft-Windows-Kernel-File",
-            &keyword_mask,
-            "4",
-            "-ets",
-        ]);
+        command.args(etw_trace_args(&trace_name, &etl_path_str));
         apply_background_process_flags(&mut command)
             .output()
             .map_err(|err| format!("ETW 启动失败：无法执行 logman（{err}）"))?
@@ -873,94 +908,6 @@ pub(crate) fn normalize_windows_path(path: &str) -> String {
         .to_ascii_lowercase()
 }
 
-pub(crate) fn should_ignore_event_path(path: &Path) -> bool {
-    let text = path.to_string_lossy().to_ascii_lowercase();
-    if text.ends_with(".log")
-        || text.ends_with(".dmp")
-        || text.ends_with(".etl")
-        || text.ends_with(".pma")
-        || text.ends_with(".ico.md5")
-        || text.ends_with("chrome_shutdown_ms.txt")
-    {
-        return true;
-    }
-    if (text.contains(r"\appdata\local\") || text.contains(r"\appdata\roaming\"))
-        && (text.contains(r"\user data\") || text.contains("/user data/"))
-    {
-        return true;
-    }
-    [
-        "com.gamesaver.desktop",
-        "com.gamesaver.next",
-        "\\appdata\\local\\temp\\",
-        "\\appdata\\local\\microsoft\\windows\\powershell\\",
-        "\\shadervariantanalytics\\",
-        "\\shadercache\\",
-        "\\gpucache\\",
-        "\\d3dscache\\",
-        "\\blob_storage\\",
-        "\\session storage\\",
-        "\\local storage\\",
-        "\\indexeddb\\",
-        "\\code cache\\",
-        "\\dawngraphitecache\\",
-        "\\dawnwebgpucache\\",
-        "\\grshadercache\\",
-        "\\graphitedawncache\\",
-        "\\autofillstrikedatabase\\",
-        "\\clientcertificates\\",
-        "\\data_reduction_proxy_leveldb\\",
-        "\\shared_proto_db\\",
-        "\\optimization_guide_hint_cache_store\\",
-        "\\segmentation platform\\",
-        "\\sync data\\",
-        "\\safe browsing network\\",
-        "\\platform notifications\\",
-        "\\extension rules\\",
-        "\\extension scripts\\",
-        "\\extension state\\",
-        "\\feature engagement tracker\\",
-        "\\gcm store\\",
-        "\\shared dictionary\\",
-        "\\site characteristics database\\",
-        "\\videodecodestats\\",
-        "\\cache\\",
-        "\\logs\\",
-        "\\temp\\",
-        "\\crashdumps\\",
-        "\\crashreportclient\\",
-        "\\crashpad\\",
-        "\\nvidia\\dxcache\\",
-        "\\nvidia\\glcache\\",
-        "\\nvidia\\compute_cache\\",
-        "\\wettype\\",
-        "\\inputmethod\\",
-        "\\microsoft\\inputmethod\\",
-        "\\wer\\",
-        "\\webcache\\",
-        "\\player.log",
-        "\\player-prev.log",
-        "/cache/",
-        "/logs/",
-        "/gpucache/",
-        "/shadercache/",
-        "/webcache/",
-        "/code cache/",
-        "/player.log",
-        "/player-prev.log",
-    ]
-    .iter()
-    .any(|fragment| text.contains(fragment))
-}
-
-pub(crate) fn should_ignore_snapshot_path(path: &Path) -> bool {
-    let text = path.to_string_lossy().to_ascii_lowercase();
-    if text.ends_with(".tmp") || text.ends_with(".temp") || text.ends_with(".bak") {
-        return true;
-    }
-    should_ignore_event_path(path)
-}
-
 fn event_logs_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     let directory = app
         .path()
@@ -994,9 +941,10 @@ fn command_failure_detail(output: &std::process::Output, message: &str) -> Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_file_operation, event_field_value, event_file_object_id, event_pid_value,
-        fast_csv_field, is_trace_artifact, parse_csv_line, parse_trace_timestamp_ms, parse_u32,
-        resolve_device_path, should_skip_kernel_task, KERNEL_FILE_CAPTURE_KEYWORDS,
+        classify_file_operation, etw_trace_args, event_field_value, event_file_object_id,
+        event_pid_value, fast_csv_field, is_trace_artifact, parse_csv_line,
+        parse_trace_timestamp_ms, parse_u32, resolve_device_path, should_skip_kernel_task,
+        KERNEL_FILE_CAPTURE_KEYWORDS,
     };
     use crate::services::learning::transactions::FileOperationKind;
     use std::path::Path;
@@ -1075,6 +1023,45 @@ mod tests {
         assert_ne!(KERNEL_FILE_CAPTURE_KEYWORDS & 0x400, 0);
         assert_ne!(KERNEL_FILE_CAPTURE_KEYWORDS & 0x800, 0);
         assert_ne!(KERNEL_FILE_CAPTURE_KEYWORDS & 0x1000, 0);
+    }
+
+    /// 取 `flag` 紧跟其后的那个值。
+    fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        let index = args.iter().position(|arg| arg == flag)?;
+        args.get(index + 1).map(String::as_str)
+    }
+
+    #[test]
+    fn etw_trace_args_bound_the_capture_resources() {
+        let args = etw_trace_args("GameSaverTrace_abc", r"C:\logs\abc.etl");
+        assert_eq!(flag_value(&args, "-bs"), Some("64"), "缓冲区大小");
+        assert_eq!(flag_value(&args, "-nb"), Some("16"), "缓冲区数量下界");
+        // `-nb` 吃「最小值 最大值」两个值，上界是紧跟其后的第二个。
+        let nb_index = args
+            .iter()
+            .position(|arg| arg == "-nb")
+            .expect("-nb 必须存在");
+        assert_eq!(args.get(nb_index + 2).map(String::as_str), Some("256"));
+        assert_eq!(flag_value(&args, "-max"), Some("256"), "日志文件大小上界");
+        // 会话形态不能变：`-ets` 表示立即开始且不落成数据收集器集，停止路径依赖它。
+        assert_eq!(args.first().map(String::as_str), Some("create"));
+        assert_eq!(args.get(1).map(String::as_str), Some("trace"));
+        assert_eq!(args.last().map(String::as_str), Some("-ets"));
+    }
+
+    #[test]
+    fn etw_trace_args_avoid_flags_that_conflict_with_ets() {
+        let args = etw_trace_args("GameSaverTrace_abc", r"C:\logs\abc.etl");
+        // 本机 logman（10.0.26100.1150）实测：`-b`（起始时刻）与 `-rf`（运行时长）都与
+        // `-ets` 互斥，报「参数不允许具有其他指定的参数」。一旦出现，整个会话创建会失败，
+        // 且只会静默回退到快照模式 —— 用户看不到明显报错，识别质量却掉了。`-ct` 虽能用，
+        // 但会改变 ClockTime 的量纲，而时间戳是按数值大小猜格式解析的，故一并禁止。
+        for forbidden in ["-b", "-rf", "-ct"] {
+            assert!(
+                !args.iter().any(|arg| arg == forbidden),
+                "{forbidden} 与 -ets 冲突或会改变时间戳量纲，不得出现在采集参数里"
+            );
+        }
     }
 
     #[test]

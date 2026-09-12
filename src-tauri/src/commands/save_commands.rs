@@ -1,7 +1,8 @@
 use crate::{
     app_state::AppState,
     domain::{
-        ActiveLearningSession, GameLifecycle, SaveProfile, SaveScope, TaskCategory, TaskStatus,
+        ActiveLearningSession, GameLifecycle, SaveLearningResult, SaveProfile, SaveScope,
+        TaskCategory, TaskStatus,
     },
     repositories::{GameRepository, SaveRepository},
     services::{learning::stop_etw_capture, GameLibraryService, SaveLearningService, TaskService},
@@ -655,6 +656,34 @@ fn sha256_file(path: &Path) -> Result<String, String> {
         digest.update(&buffer[..read]);
     }
     Ok(hex::encode(digest.finalize()))
+}
+
+/// 只读推断一份存档范围初稿：不启动游戏、不采集 ETW。
+///
+/// 对应评审 A1 的「允许跳过学习」—— 给用户一条不必先跑完整识别就能进到确认界面的入口。
+/// 返回结构与 `finish_save_learning` 一致（`eventCaptureMode = "preview"`），前端复用同一套
+/// 审阅界面；证据等级一律是「待确认」，不会有任何范围被当成已确认。
+#[tauri::command]
+pub fn preview_save_scopes(
+    state: State<AppState>,
+    game_uid: String,
+) -> Result<SaveLearningResult, String> {
+    let game_uid = game_uid.trim();
+    let game = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "lock GameSaver store failed".to_string())?;
+        GameLibraryService::find(&store, game_uid).ok_or_else(|| "游戏不存在".to_string())?
+    };
+    crate::logging::info(format!("开始只读推断存档初稿：game_uid={game_uid}"));
+    let result = SaveLearningService::preview(&game)?;
+    crate::logging::info(format!(
+        "只读推断完成：game_uid={game_uid} 候选范围={} 置信度={}",
+        result.scope_drafts.len(),
+        result.confidence
+    ));
+    Ok(result)
 }
 
 #[tauri::command]

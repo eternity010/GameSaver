@@ -15,8 +15,9 @@
 
 按收益排序，建议先做 4 项：**R1（ProgramData 缺失）→ R2（新文件不纳入）→ R3（事务口径）→ P1/P2（两处性能）**。R1、R3、P1、P2 都是小改；R2 是结构性改动，收益最大但需要设计守卫。**这 4 项已全部落地**（分三批，见第 5 节）。
 
-> **第 1 批（R1 + P1/P2）与第 2 批（R3）已于 2026-09-11 实施，第 3 批（R2 + R4）已于 2026-09-12 实施**，落地记录与变异结果见第 5 节。下面各条保留审视当时的原文，并在末尾补上「已解决」说明。
-> 仍未动的部分：**R2b**（收集侧行为变更）、A1/A2/A3、R5、R6 —— 见第 5 节的批次表。
+> **第 1 批（R1 + P1/P2）与第 2 批（R3）已于 2026-09-11 实施，第 3 批（R2 + R4）与第 3.5 批（R2b）已于 2026-09-12 实施**，落地记录与变异结果见第 5 节。下面各条保留审视当时的原文，并在末尾补上「已解决」说明。
+> **A2、R6 已于 2026-09-12 实施**（第 4 批与备选批的一部分）。
+> 仍未动的部分：**A1**、**A3**、**R5**、**P3/P4**（P3/P4 建议等实测再做）—— 见第 5 节的批次表。
 
 ---
 
@@ -78,6 +79,11 @@
 - 证据：`save_repository.rs:1030-1041`，函数名说「尾段匹配」，实现只比**最后一段文件名**（`parts_a.last() == parts_b.last()`）。
 - 后果：跨设备恢复时，`pick_scope_by_root_path`（`:1069-1076`）用它给 `loose_matches` 消歧。同 `root_type` 下两个 scope 末段同名（例如两个游戏都用 `remote`）时会误判为同一范围，可能挑错 scope → **把 A 的版本恢复到 B 的范围**。需要「多 scope + 末段同名 + 精确路径失配」三重条件同时成立，触发概率低，但方向是错误恢复而非拒绝。
 - 修法：改成比较**完整尾段序列**（从末段往回逐段相等，长度取短者），与函数名一致；或明确改名为 `same_leaf_name` 并保留现有行为 —— 但要先确认调用方真想要哪种语义。
+- **已解决（2026-09-12）**：先确认了调用方要的语义，结论是**这条的「修法」不能照做**。`normalize_path` 不剥用户目录前缀，所以「比较完整尾段序列」会让 `C:\Users\Alice\...\Game\saves` 与 `C:\Users\Bob\...\Game\saves` 失配 —— 而 `loose_matches` 存在的意义恰恰是跨设备（用户名必然不同），照做会**直接打断跨设备恢复**。
+  改法：把布尔判定换成**共同尾段长度** `trailing_path_component_match_len`（从末尾往回数完全相同的段数），`pick_scope_by_root_path` 取**唯一最长者**，同分仍然返回 `None`。
+  这个改动是**严格超集**，不会把原来选对的变成选错：旧实现能给出结果 ⟺ 恰好一个候选末段同名 ⟺ 恰好一个候选共同尾段 ≥ 1，而它必然同时是最长者 → 新实现选中的仍是同一个；旧实现放弃的场景里，新实现只在最长者唯一时才给结果。
+  真正新增的能力是「多个候选末段同名、但其中一个明显更近」—— 旧实现只能放弃并报错，新实现能唯一选出正确的那一个（测试 `find_scope_for_entry_picks_the_closest_root_when_leaf_names_collide`）。「末段同名且同样近」依旧拒绝（`find_scope_for_entry_still_refuses_when_shared_suffixes_tie`），保住「绝不随便挑一个」。
+  顺带一提，既有的 `find_scope_for_entry_disambiguates_multiple_scopes_by_subpath` 之前是靠「末段不同」通过的，现在才真的是按子路径消歧。
 
 ---
 
@@ -97,6 +103,13 @@
 - 证据：`logman` 参数只有 `-o/-p/level 4/-ets`（`etw_capture.rs:95-106`），未设 `-b/-bs/-ct`（无缓冲/丢弃策略）；PID 过滤在**解析期**（`:421`），采集期是全系统；去重结构 `file_object_paths` / `written_file_objects` / `operations` / `files` 整场只增不减（`:379-381`、`:497-503`）。
 - 实物：本机 `%APPDATA%\com.gamesaver.desktop\events\` 下存在单个 **422 MB** 的 `.etl` 与 **450 MB** 的 `.etl.csv`。会话期间没有任何峰值保护。
 - 修法：会话加时长上限（超时自动进入分析，而不是无限等）、给 `logman` 加缓冲与丢弃参数、对 `operations` 设条目上限（超出按「已见文件」收敛）。
+- **已实施（2026-09-12）**：落地时先用本机 `logman`（10.0.26100.1150）实测了参数，发现**本文档给的 `-b` 是错的**：
+  - `-b` 不是缓冲大小，而是「在指定时间开始收集」的起始时刻，且与 `-ets` 互斥 —— 加进去会让**整个会话创建失败**。缓冲大小是 `-bs`。
+  - `-rf`（运行指定时长）同样与 `-ets` 互斥，报「参数"rf"不允许具有其他指定的参数」。所以**时长上限没法用 `logman` 原生做**。
+  - 实测可用的组合：`-bs 64 -nb 16 256 -max 256`（`-nb` 限住内存缓冲池，`-max` 限住磁盘上的 `.etl`）。`-ct` 虽然也能用，但会改变 CSV 里 ClockTime 的量纲，而 `parse_trace_timestamp_ms` 是按数值大小猜格式的 —— 有静默解析错时间戳、进而打散 2 秒窗口事务聚合的风险，故**不采用**。
+  实际改了三处：①`etw_trace_args`（参数抽成纯函数并加 `-bs/-nb/-max`，两条测试钉住「上界必须在」与「`-b`/`-rf`/`-ct` 必须不在」）；②时长上限改在 Rust 侧做 —— `MAX_CAPTURE_DURATION`（30 分钟）+ 采集看门狗，到点停止会话，已采到的证据全部保留、用户仍可正常点分析；③`-max` 那条**无法在本机验证**（创建 ETW 会话需要管理员），所以看门狗才是「由我们掌控的那一半」。
+  **未做**：`operations` 的条目上限。它改变的是事务打分口径（`analyze_save_transactions` 按 `operations` 聚合），而磁盘/内存的真正上界已由 `-max` + `-nb` 给出，此时再加一个「超出就丢」的截断只会引入静默少算 —— 与 R2b 要修的是同一类 bug，故留作待办。
+  ⚠️ **已知缺口**：装配看门狗的那一行落在 `start_learning_session` 里（需要 `AppHandle` + 真实游戏进程），单元测试够不到；helper 自身的契约有两组测试守着，但「这一行有没有被删掉」没有断言。变异测试里标为 GAP 而非 HIT。
 
 ### A3. 目录发现强依赖「游戏名出现在目录名里」（中）
 
@@ -158,10 +171,10 @@
 | 第 1 批 | **P2 + P1** 通配预小写、`commit` 建索引 | 纯性能，无行为变更 | 小 | **已实施 2026-09-11** |
 | 第 2 批 | **R3** 事务输入口径收口（含 `score_group` 只对候选路径计分） | 会改分数，需同步 7 条既有测试 | 中 | **已实施 2026-09-11**（未动 `score_group`，改在入口收口，见 R3 条） |
 | 第 3 批 | **R2 + R4**：草稿列出「疑似存档」提议交用户确认；`unknown_file_policy` 接上语义 | 结构性，收益最大 | 大 | **已实施 2026-09-12**（R2 只做「提议」一半，见 R2 条） |
-| 第 3.5 批 | **R2b** 收集侧「目录 + 候选过滤」，让学习**之后**新出现的存档自动纳入 | 行为变更：会改容器范围现有的收集结果，且需先把 `is_save_candidate` 下沉到 domain | 大 | 待办 |
-| 第 4 批 | **A2** ETW 会话上限 / 缓冲参数 | 防护性 | 小-中 | 待办 |
+| 第 3.5 批 | **R2b** 收集侧「目录 + 候选过滤」，让学习**之后**新出现的存档自动纳入 | 行为变更：会改容器范围现有的收集结果，且需先把 `is_save_candidate` 下沉到 domain | 大 | **已实施 2026-09-12**（分两步：①候选判定簇下沉 domain；②非容器范围开目录级收集。容器范围收紧**未做**，见 R2b 条） |
+| 第 4 批 | **A2** ETW 会话上限 / 缓冲参数 | 防护性 | 小-中 | **已实施 2026-09-12**（参数经本机实测修正，见 A2 条） |
 | 第 5 批 | **A1** profile 形状复用、目录推断前置、保存后自动分析 | 自动化，涉及前端 | 大 | 待办 |
-| 备选 | **A3 / R5 / R6** 边缘缺口 | — | 小 | 待办 |
+| 备选 | **A3 / R5 / R6** 边缘缺口 | — | 小 | **R6 已实施 2026-09-12**；A3 / R5 待办 |
 
 第 1 批全部是「不加行为、只补覆盖与省开销」，可以一次做完；第 2 批要动评分，建议单独一笔并逐条变异验证；第 3 批是本轮真正的核心，但也是唯一可能**把范围收错**的改动，所以按这里写的做法执行了 —— **只做「疑似存档」的提议**（在草稿里列出、由用户确认），没有直接写进规则。真正会改变容器范围收集结果的 R2b 因此单列成第 3.5 批，与「提议」分开做。
 
@@ -195,3 +208,29 @@
 | 容器命中的范围也列提议 | 与「容器整目录收、无需提议」的设计冲突 | ✅ 命中（`only_non_container_drafts_carry_proposals`）|
 
 新增 4 条测试：`proposal_lists_only_unconfirmed_save_like_files`、`only_non_container_drafts_carry_proposals`（`services::save_learning_service::tests`）、`unknown_file_policy_decides_whether_directory_files_are_collected`、`protected_paths_share_the_unknown_file_policy_with_collection`（`repositories::save_repository::tests`）。
+
+**第 3.5 批（R2b）落地记录（2026-09-12）**：分两步，各自独立验证。
+
+- **第 1 步（纯重构，零行为变更）**：候选判定簇下沉到 `domain/save_candidate.rs`；`strip_verbatim_prefix` / `normalize_path` 收进 `domain/path_utils.rs`（顺手合并了服务层与仓储层两份逐字节相同的 `strip_verbatim_prefix`）。用 `.workbuddy/verify_pure_move.py` 逐项比对 **15/15 逐字节一致**，唯一差异是可见性由 private 提升为 `pub(crate)`。
+- **第 2 步（功能主体）**：共用门 `scope_admits_directory_file` 改成三层 —— ①`confirmed_files` 里的永远算数；②`policy != Protect` 直接拒；③范围根是**命名容器** → 整目录收（行为保持），否则 → `is_save_candidate(绝对路径)`。收集侧（`add_candidate`）与恢复侧（`collect_protected_paths`）**共用同一道门** —— 只改一侧会出现「恢复时把从没备份过的文件当多出来的受保护文件删掉」。
+- **一处自我修正（重要）**：只给非容器范围加 `include_directories: ["."]` **会静默失效** —— 非容器范围的 `unknown_file_policy` 默认是 `Ignore`，而门的第 2 层就是 `policy == Protect`。所以草稿构造改成对所有范围都给 `["."]` + `Protect`，容器与否改由门从 `root_path` 现推，policy 从此只当用户开关（前端徽章也从 `<span>` 变成真开关，提议区块只在 Ignore 档显示）。
+- `cargo test --lib` **253 passed**（250 → 253，+3）；`npm run build`（含 `vue-tsc`）通过；`cargo fmt --check` 干净；clippy **31 条**与基线持平（告警位置只有行号位移）。变异 ×6 全部精确命中（`.workbuddy/mutate_r2b2.py`）。
+- **刻意未做**：容器范围收紧（第 3 步）；目录遍历的深度/条数上界 —— 容器范围本来就无上界，加了不一致，且上界会造成**静默少收**（正是 R2b 要修的那类 bug），性能角度由 P3 覆盖。
+- ⚠️ **踩坑**：仓储测试的 `temp_root` 原本用 `std::env::temp_dir()`，而它在 Windows 上位于 `\AppData\Local\Temp\` —— 正是 `is_noise_path` 明确挡掉的噪音目录。候选过滤把测试文件全判成噪音，3 个既有测试假失败。改用 `current_dir()`（与服务层测试一致），**测试期望值一个没改**。
+- 补充：测试残留目录 `src-tauri/gamesaver-*` 的来源已查清 —— 每个测试的 `remove_dir_all` 都在最后一行，**断言失败就永远走不到清理**，所以「有残留」本身就是「这轮跑挂过测试」的信号；全绿的一轮为零。
+
+**第 4 批（A2）+ R6 落地记录（2026-09-12）**：`cargo test --lib` **262 passed**（253 → 262，+9：A2 六条 + R6 三条）；`npm run build`（含 `vue-tsc`）通过；`cargo fmt --check` 干净；clippy **31 条**与基线持平。变异 ×9（`.workbuddy/mutate_a2_r6.py`）：
+
+| 变异 | 预期失败点 | 结果 |
+| --- | --- | --- |
+| `etw_trace_args` 去掉 `-max`（磁盘上界） | `etw_trace_args_bound_the_capture_resources` | ✅ 命中 |
+| `etw_trace_args` 去掉 `-nb`（内存上界） | 同上 | ✅ 命中 |
+| 把文档建议的 `-rf` 加回来（与 `-ets` 互斥） | `etw_trace_args_avoid_flags_that_conflict_with_ets` | ✅ 命中 |
+| 看门狗不等待就停会话 | `capture_watchdog_stops_the_session_when_the_deadline_passes` | ✅ 命中 |
+| 会话启动时不挂看门狗 | `capture_watchdog_is_armed_for_an_active_session` | ⚠️ **GAP**（装配只有一行，落在需要 `AppHandle` + 真实游戏进程的 `start_learning_session` 里，单元测试够不到；helper 自身契约另有两条测试守着）|
+| 没有采集句柄也照样挂表 | `capture_watchdog_is_not_armed_without_a_session` | ✅ 命中 |
+| 尾段匹配退回「只比末段文件名」 | `find_scope_for_entry_picks_the_closest_root_when_leaf_names_collide` | ✅ 命中 |
+| 去掉同分保护（同分也挑一个） | `find_scope_for_entry_still_refuses_when_shared_suffixes_tie` | ✅ 命中 |
+| 共同尾段从前往后数（方向反了） | `find_scope_for_entry_picks_the_closest_root_when_leaf_names_collide` | ✅ 命中 |
+
+R6 的结论见「1. 精准度」R6 条：**文档给的修法是错的**（比较完整尾段序列会打断跨设备恢复），实际改成共同尾段长度取唯一最长者，且证明为严格超集。
