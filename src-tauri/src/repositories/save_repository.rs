@@ -1432,22 +1432,37 @@ fn add_candidate(
     if !path.is_file() {
         return Ok(());
     }
-    let path = strip_verbatim_prefix(
-        &path
-            .canonicalize()
-            .map_err(|err| format!("解析存档文件失败：{err}"))?,
-    );
-    let relative = path
-        .strip_prefix(root)
-        .map_err(|_| format!("存档文件超出保护范围：{}", path.display()))?;
-    let relative_path = normalize_relative(relative.to_string_lossy().as_ref());
+
+    // 先算相对路径、再跑便宜的门、**最后**才 canonicalize —— 顺序是性能的关键。
+    //
+    // 目录级来源可能一次送来上万个文件（范围根就是游戏安装目录时），而其中绝大多数会在
+    // 下面几道门被挡掉。若照旧先 canonicalize，被挡掉的那些也各付一次开句柄的代价
+    // （Windows 上是 `GetFinalPathNameByHandle`，实测约 258µs/次，见评审文档 P5）。
+    // 所以目录级来源先用**词法**相对路径过门，只有幸存者才 canonicalize。
+    //
+    // 等价性：`root` 在 `collect_profile_files` 开头已 canonical，遍历用 `follow_links(false)`，
+    // 所以 `root.join(..)` 出来的路径没有符号链接或 8.3 短名需要解析，词法相对路径与
+    // canonical 相对路径经 `normalize_relative` 后是同一个字符串 —— 门看到的东西不变。
+    // 幸存者照旧 canonicalize，因此**存储路径与改动前逐字节相同**。
+    //
+    // 显式确认的来源（数量少）保持原样先 canonicalize：`confirmed_files` 可能指向符号链接，
+    // 那种情况下词法路径与解析后路径真的不同，语义必须原样保留。
+    let resolved = match source {
+        CandidateSource::Confirmed => Some(strip_verbatim_prefix(
+            &path
+                .canonicalize()
+                .map_err(|err| format!("解析存档文件失败：{err}"))?,
+        )),
+        CandidateSource::Directory => None,
+    };
+    let relative_path = relative_path_of(resolved.as_deref().unwrap_or(path), root)?;
     if is_excluded(&relative_path, scope) {
         return Ok(());
     }
     // 目录级收集出来的文件可能是「这个范围从没确认过的未知文件」，是否纳入由
     // `unknown_file_policy` 决定；`confirmed_files` 那条路进来的不走这道门。
     if source == CandidateSource::Directory
-        && !scope_admits_directory_file(scope, &relative_path, &path)
+        && !scope_admits_directory_file(scope, &relative_path, path)
     {
         return Ok(());
     }
@@ -1462,6 +1477,17 @@ fn add_candidate(
     if path_is_restore_artifact(&relative_path) {
         return Ok(());
     }
+
+    // 幸存者才 canonicalize：存储路径保持 canonical 形态，与改动前逐字节相同。
+    let path = match resolved {
+        Some(resolved) => resolved,
+        None => strip_verbatim_prefix(
+            &path
+                .canonicalize()
+                .map_err(|err| format!("解析存档文件失败：{err}"))?,
+        ),
+    };
+    let relative_path = relative_path_of(&path, root)?;
     let metadata = fs::metadata(&path).map_err(|err| format!("读取存档文件信息失败：{err}"))?;
     if scope
         .max_file_bytes
@@ -1483,6 +1509,17 @@ fn add_candidate(
         },
     );
     Ok(())
+}
+
+/// 把 `path` 相对 `root` 归一化成存档相对路径（`normalize_relative` 负责大小写与分隔符）。
+///
+/// 只做词法运算、不碰文件系统 —— 调用方据此可以在付 `canonicalize` 的代价之前先跑便宜的门
+/// （见 `add_candidate` 与评审文档 P5）。
+fn relative_path_of(path: &Path, root: &Path) -> Result<String, String> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| format!("存档文件超出保护范围：{}", path.display()))?;
+    Ok(normalize_relative(relative.to_string_lossy().as_ref()))
 }
 
 fn mtime_millis(metadata: &fs::Metadata) -> Option<u64> {
