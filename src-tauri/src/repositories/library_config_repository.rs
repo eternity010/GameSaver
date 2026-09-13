@@ -65,8 +65,7 @@ mod tests {
 
     #[test]
     fn configured_root_is_loaded_from_config() {
-        let root =
-            std::env::temp_dir().join(format!("gamesaver-library-config-{}", uuid::Uuid::new_v4()));
+        let root = crate::test_support::TempWorkspace::new("library-config");
         LibraryConfigRepository::save(
             &root,
             &LibraryConfig {
@@ -78,6 +77,5 @@ mod tests {
             LibraryConfigRepository::resolve_root(&root).unwrap(),
             Path::new(r"E:\GameSaverLibrary")
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 }

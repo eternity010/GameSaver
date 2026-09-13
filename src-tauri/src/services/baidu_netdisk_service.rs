@@ -1185,13 +1185,32 @@ mod tests {
     use super::{is_auth_failure, md5_hex, token_needs_refresh, BaiduNetdiskClient, BaiduToken};
     use std::fs;
 
-    /// 建一个独立的双层临时目录，避免命中 legacy 路径下真实存在的 token。
-    fn test_token_dir() -> (std::path::PathBuf, std::path::PathBuf) {
-        let base =
-            std::env::temp_dir().join(format!("gamesaver-token-test-{}", uuid::Uuid::new_v4()));
-        let app_data = base.join("app-data");
-        fs::create_dir_all(&app_data).expect("create temp token dir");
-        (base, app_data)
+    /// token 夹具：一个临时「AppData」目录，随作用域自动清理。
+    ///
+    /// 为什么要建**双层**：`token_paths` 会看 `app_data.parent()`（legacy 路径回退），
+    /// 单层目录会把父目录当成 legacy 位置，可能读到真实存在的 token。
+    ///
+    /// 清理挂在 `Drop` 上（同 `crate::test_support::TempWorkspace`）：此前靠测试末尾
+    /// `remove_dir_all`，`assert!` 一失败就执行不到，`%TEMP%` 下会攒下 `gamesaver-token-test-*`。
+    struct TokenWorkspace {
+        workspace: crate::test_support::TempWorkspace,
+    }
+
+    impl TokenWorkspace {
+        fn new() -> Self {
+            let workspace = crate::test_support::TempWorkspace::new("token-test");
+            fs::create_dir_all(workspace.join("app-data")).expect("create temp token dir");
+            Self { workspace }
+        }
+
+        /// 交给 `BaiduNetdiskClient::from_parts` 的 AppData 目录（它收 `PathBuf`）。
+        fn app_data(&self) -> std::path::PathBuf {
+            self.workspace.join("app-data")
+        }
+
+        fn join(&self, relative: &str) -> std::path::PathBuf {
+            self.app_data().join(relative)
+        }
     }
 
     fn token(access: &str, expires_at: Option<u64>) -> BaiduToken {
@@ -1229,10 +1248,10 @@ mod tests {
 
     #[test]
     fn refresh_without_credentials_reports_unavailable() {
-        let (base, app_data) = test_token_dir();
+        let workspace = TokenWorkspace::new();
         let client = BaiduNetdiskClient::from_parts(
             token("stale", Some(super::now_millis().saturating_sub(1))),
-            app_data,
+            workspace.app_data(),
             None,
         )
         .expect("client");
@@ -1240,19 +1259,19 @@ mod tests {
             !client.refresh_token(true).expect("refresh call"),
             "没有凭据且磁盘无更新时应报告无法刷新"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn refresh_picks_up_token_written_by_another_process() {
-        let (base, app_data) = test_token_dir();
-        let path = app_data.join(super::TOKEN_FILE_NAME);
+        let workspace = TokenWorkspace::new();
+        let path = workspace.join(super::TOKEN_FILE_NAME);
         let stale = token(
             "stale-token",
             Some(super::now_millis().saturating_sub(1000)),
         );
         super::save_token_at(&path, stale.clone()).expect("seed token");
-        let client = BaiduNetdiskClient::from_parts(stale, app_data, None).expect("client");
+        let client =
+            BaiduNetdiskClient::from_parts(stale, workspace.app_data(), None).expect("client");
 
         // 模拟另一个进程刷新后落盘。
         super::save_token_at(
@@ -1266,7 +1285,6 @@ mod tests {
 
         assert!(client.refresh_token(true).expect("refresh call"));
         assert_eq!(client.access_token().expect("access token"), "fresh-token");
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -150,12 +150,20 @@ impl AddGameService {
 #[cfg(test)]
 mod tests {
     use super::{needs_large_source_confirmation, AddGameService};
+    use crate::test_support::TempWorkspace;
     use std::fs;
-    use uuid::Uuid;
+
+    /// 建一棵带 `Drop` 清理的测试目录树，理由见 `crate::test_support::TempWorkspace`。
+    ///
+    /// 这里三个用例都必须有真实目录（复制/清理都要落盘）。此前清理靠末尾
+    /// `remove_dir_all(...).expect(...)`，`assert!` 一失败就执行不到。
+    fn temp_root() -> TempWorkspace {
+        TempWorkspace::new("next-test")
+    }
 
     #[test]
     fn copies_game_and_preserves_executable_relative_path() {
-        let root = std::env::temp_dir().join(format!("gamesaver-next-test-{}", Uuid::new_v4()));
+        let root = temp_root();
         let source = root.join("source");
         let games_root = root.join("games");
         fs::create_dir_all(source.join("bin")).expect("create source");
@@ -184,7 +192,7 @@ mod tests {
 
     #[test]
     fn cancellation_removes_staging_directory() {
-        let root = std::env::temp_dir().join(format!("gamesaver-next-cancel-{}", Uuid::new_v4()));
+        let root = temp_root();
         let source = root.join("source");
         let games_root = root.join("games");
         fs::create_dir_all(&source).expect("create source");
@@ -206,7 +214,7 @@ mod tests {
 
     #[test]
     fn cleanup_removes_managed_and_staging_directories() {
-        let root = std::env::temp_dir().join(format!("gamesaver-next-cleanup-{}", Uuid::new_v4()));
+        let root = temp_root();
         let games_root = root.join("games");
         fs::create_dir_all(games_root.join("game-3/bin")).expect("create managed directory");
         fs::create_dir_all(games_root.join(".game-3.copying/bin"))

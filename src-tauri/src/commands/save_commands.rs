@@ -883,17 +883,19 @@ fn now_iso() -> String {
 mod tests {
     use super::sha256_file;
     use std::fs;
-    use uuid::Uuid;
 
     #[test]
     fn hashes_executable_without_using_large_stack_buffer() {
-        let path = std::env::temp_dir().join(format!("gamesaver-hash-{}.bin", Uuid::new_v4()));
+        // 一个只放这个测试文件的目录，随作用域自动清理（理由见 `crate::test_support::TempWorkspace`）。
+        // 此前是 `remove_file(path).expect(...)` 收尾：`assert!` 一失败就执行不到，
+        // 而且 `.expect()` 让「删不掉」也能把一次通过的测试判失败。
+        let workspace = crate::test_support::TempWorkspace::new("hash");
+        let path = workspace.join("sample.bin");
         fs::write(&path, b"abc").expect("write test file");
         assert_eq!(
             sha256_file(&path).expect("hash test file"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        fs::remove_file(path).expect("remove test file");
     }
 
     #[test]

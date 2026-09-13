@@ -499,22 +499,32 @@ fn normalize_path(path: &Path) -> String {
 mod tests {
     use super::GameBodyUpdateService;
     use crate::domain::{Game, GameBodyVersion};
+    use crate::test_support::TempWorkspace;
     use std::fs;
-    use uuid::Uuid;
+
+    /// 建一棵带 `Drop` 清理的测试目录树，理由见 `crate::test_support::TempWorkspace`。
+    ///
+    /// 这些用例都要真实目录（原子交换、日志、回滚都要落盘）。此前清理靠各测试末尾
+    /// `remove_dir_all(root).expect("cleanup")`，`assert!` 一失败就执行不到；
+    /// 而且 `.expect()` 让「清理失败」也能把一次通过的测试判失败，两头都不对。
+    ///
+    /// `label` 保留各用例原本的语义（`swap` / `recovery` / …），失败现场据此找回是哪个用例。
+    fn temp_workspace(label: &str) -> TempWorkspace {
+        TempWorkspace::new(label)
+    }
 
     #[test]
     fn update_source_must_contain_existing_executable() {
-        let root = std::env::temp_dir().join(format!("gamesaver-update-{}", Uuid::new_v4()));
+        let root = temp_workspace("gamesaver-update");
         let source = root.join("source");
         fs::create_dir_all(&source).expect("create source");
         let game = Game::new_pending("Game", root.join("managed").to_string_lossy(), "game.exe");
         assert!(GameBodyUpdateService::validate_source(&source, &game).is_err());
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn swap_and_rollback_restore_the_original_directory() {
-        let root = std::env::temp_dir().join(format!("gamesaver-swap-{}", Uuid::new_v4()));
+        let root = temp_workspace("gamesaver-swap");
         let managed = root.join("managed");
         let staging = root.join("staging");
         let archive = root.join("versions").join("old");
@@ -532,12 +542,11 @@ mod tests {
             fs::read(managed.join("state.txt")).expect("read old"),
             b"old"
         );
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn recovery_restores_original_directory_after_interrupted_swap() {
-        let root = std::env::temp_dir().join(format!("gamesaver-recovery-{}", Uuid::new_v4()));
+        let root = temp_workspace("gamesaver-recovery");
         let games_root = root.join("games");
         let managed = games_root.join("game-1");
         let staging = games_root.join(".game-1.updating");
@@ -571,13 +580,11 @@ mod tests {
         assert!(!staging.exists());
         assert!(!archive.exists());
         assert!(!journal.exists());
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn recovery_keeps_new_directory_after_committed_swap() {
-        let root =
-            std::env::temp_dir().join(format!("gamesaver-committed-recovery-{}", Uuid::new_v4()));
+        let root = temp_workspace("gamesaver-committed-recovery");
         let games_root = root.join("games");
         let managed = games_root.join("game-1");
         let staging = games_root.join(".game-1.updating");
@@ -610,12 +617,11 @@ mod tests {
             b"new"
         );
         assert!(!journal.exists());
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn cleanup_archived_body_versions_removes_full_old_copy() {
-        let root = std::env::temp_dir().join(format!("gamesaver-cleanup-{}", Uuid::new_v4()));
+        let root = temp_workspace("gamesaver-cleanup");
         let games_root = root.join("games");
         let archive = games_root
             .join(".versions")
@@ -646,12 +652,11 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(!archive.exists());
         assert!(versions.is_empty());
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn recovery_removes_orphan_update_staging_directory() {
-        let root = std::env::temp_dir().join(format!("gamesaver-orphan-update-{}", Uuid::new_v4()));
+        let root = temp_workspace("gamesaver-orphan-update");
         let games_root = root.join("games");
         let staging = games_root.join(".game-1.updating");
         fs::create_dir_all(&staging).expect("create staging");
@@ -664,13 +669,11 @@ mod tests {
         .expect("recover update");
 
         assert!(!staging.exists());
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn swap_succeeds_when_managed_path_does_not_exist() {
-        let root =
-            std::env::temp_dir().join(format!("gamesaver-missing-body-swap-{}", Uuid::new_v4()));
+        let root = temp_workspace("gamesaver-missing-body-swap");
         let managed = root.join("games").join("game-1");
         let staging = root.join("games").join(".game-1.updating");
         let archive = root

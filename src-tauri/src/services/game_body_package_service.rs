@@ -1149,11 +1149,20 @@ mod tests {
         BodyPackageFile, BodyPackageService, ZIP_ENTRY_OVERHEAD_BYTES,
     };
     use std::{collections::HashSet, fs, path::PathBuf};
-    use uuid::Uuid;
+
+    /// 建一棵带 `Drop` 清理的测试目录树，理由见 `crate::test_support::TempWorkspace`。
+    ///
+    /// 这些用例都要真实目录（打包、解压、清理都要落盘）。此前清理靠各测试末尾
+    /// `remove_dir_all(root).expect("cleanup")`，`assert!` 一失败就执行不到。
+    ///
+    /// `label` 保留各用例原本的语义（`body-package` / `body-space` / …）。
+    fn temp_workspace(label: &str) -> crate::test_support::TempWorkspace {
+        crate::test_support::TempWorkspace::new(label)
+    }
 
     #[test]
     fn package_keeps_game_files_without_name_or_suffix_filters() {
-        let root = std::env::temp_dir().join(format!("gamesaver-body-package-{}", Uuid::new_v4()));
+        let root = temp_workspace("gamesaver-body-package");
         let source = root.join("source");
         let cache = root.join("cache");
         fs::create_dir_all(source.join("localization_work")).expect("create excluded directory");
@@ -1190,7 +1199,6 @@ mod tests {
         assert!(staging.join("readme.txt").is_file());
         assert!(staging.join("debug.log").is_file());
         assert!(staging.join("localization_work/draft.txt").is_file());
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -1205,8 +1213,7 @@ mod tests {
 
     #[test]
     fn orphan_packages_are_removed_but_referenced_packages_are_kept() {
-        let root =
-            std::env::temp_dir().join(format!("gamesaver-body-package-orphans-{}", Uuid::new_v4()));
+        let root = temp_workspace("gamesaver-body-package-orphans");
         let cache = root.join("cache");
         fs::create_dir_all(cache.join("game-1")).expect("create cache");
         let kept = cache.join("game-1/kept.zip");
@@ -1221,13 +1228,11 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(kept.is_file());
         assert!(!orphan.exists());
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn corrupted_package_is_rejected_before_extraction() {
-        let root =
-            std::env::temp_dir().join(format!("gamesaver-body-package-corrupt-{}", Uuid::new_v4()));
+        let root = temp_workspace("gamesaver-body-package-corrupt");
         let source = root.join("source");
         let cache = root.join("cache");
         fs::create_dir_all(&source).expect("create source");
@@ -1257,13 +1262,11 @@ mod tests {
         .expect_err("corruption should fail");
         assert!(error.contains("哈希校验失败"));
         assert!(!staging.exists());
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn cancelled_extraction_removes_staging_directory() {
-        let root =
-            std::env::temp_dir().join(format!("gamesaver-body-package-cancel-{}", Uuid::new_v4()));
+        let root = temp_workspace("gamesaver-body-package-cancel");
         let source = root.join("source");
         let cache = root.join("cache");
         fs::create_dir_all(&source).expect("create source");
@@ -1292,7 +1295,6 @@ mod tests {
         .expect_err("cancellation should fail");
         assert_eq!(error, "任务已取消");
         assert!(!staging.exists());
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -1309,8 +1311,7 @@ mod tests {
 
     #[test]
     fn temporary_package_cleanup_removes_manifest_directories() {
-        let root =
-            std::env::temp_dir().join(format!("gamesaver-body-package-temp-{}", Uuid::new_v4()));
+        let root = temp_workspace("gamesaver-body-package-temp");
         let cache = root.join("cache");
         let manifest_root = cache.join("game-1/.version.manifest-test/.gamesaver");
         fs::create_dir_all(&manifest_root).expect("create manifest temp directory");
@@ -1326,7 +1327,6 @@ mod tests {
         assert!(!cache.join("game-1/.version.manifest-test").exists());
         assert!(!cache.join("game-1/.version.zip.tmp-test").exists());
         assert!(cache.join("game-1/real.zip").is_file());
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -1356,7 +1356,7 @@ mod tests {
     /// 错误；若预检被删掉（或挪到建目录之后），错误就会变成"创建本体包缓存目录失败"。
     #[test]
     fn packaging_checks_free_space_before_writing_anything() {
-        let root = std::env::temp_dir().join(format!("gamesaver-body-space-{}", Uuid::new_v4()));
+        let root = temp_workspace("gamesaver-body-space");
         let source = root.join("source");
         fs::create_dir_all(&source).expect("create source");
         fs::write(source.join("game.exe"), b"exe").expect("write executable");
@@ -1380,7 +1380,6 @@ mod tests {
             !error.contains("创建本体包缓存目录失败"),
             "预检必须发生在创建缓存目录之前，实际错误：{error}"
         );
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     /// 当前没有映射的盘符下的一个路径 —— 用来稳定复现「探不到磁盘」，不必注入探测。

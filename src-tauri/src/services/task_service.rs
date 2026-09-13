@@ -264,14 +264,23 @@ fn now_millis() -> String {
 mod tests {
     use super::*;
     use crate::domain::AppStore;
+    use crate::test_support::TempWorkspace;
 
-    fn test_state(dir: &std::path::Path) -> AppState {
+    fn test_state(dir: &TempWorkspace) -> AppState {
         AppState::new(
             AppStore::default(),
             dir.to_path_buf(),
             std::collections::HashMap::new(),
             dir.join("tasks.json"),
         )
+    }
+
+    /// 建一棵带 `Drop` 清理的测试目录树，理由见 `crate::test_support::TempWorkspace`。
+    ///
+    /// 目录必须真的存在：`TaskService` 的终态会写 `tasks.json`。此前清理靠各测试末尾
+    /// `remove_dir_all`，`assert!` 一失败就执行不到。
+    fn temp_root() -> TempWorkspace {
+        TempWorkspace::new("task-service")
     }
 
     /// 云存档同步的"失败要响"就建立在这条契约上：终态、错误原因、重试参数都必须落盘。
@@ -281,9 +290,7 @@ mod tests {
     /// 一次真实的失败则连原因都丢了。
     #[test]
     fn failed_sync_task_keeps_status_error_and_retry_on_disk() {
-        let dir =
-            std::env::temp_dir().join(format!("gamesaver-task-service-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = temp_root();
         let state = test_state(&dir);
 
         let task_id = TaskService::create(
@@ -341,9 +348,7 @@ mod tests {
     /// 进度条会丢掉中间态，重启后读到的也是错的。
     #[test]
     fn progress_below_the_notify_threshold_still_updates_the_task() {
-        let dir =
-            std::env::temp_dir().join(format!("gamesaver-task-throttle-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = temp_root();
         let state = test_state(&dir);
 
         let task_id = TaskService::create(
@@ -370,9 +375,7 @@ mod tests {
     /// 任务会静默落到「不展示」分支。
     #[test]
     fn created_tasks_carry_their_category_on_disk() {
-        let dir =
-            std::env::temp_dir().join(format!("gamesaver-task-category-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = temp_root();
         let state = test_state(&dir);
 
         let task_id = TaskService::create(

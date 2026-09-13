@@ -820,7 +820,6 @@ mod tests {
     };
     use crate::{domain::GameBodyVersion, services::RemoteFile};
     use std::fs;
-    use uuid::Uuid;
 
     fn version() -> GameBodyVersion {
         GameBodyVersion {
@@ -968,8 +967,7 @@ mod tests {
 
     #[test]
     fn cache_roundtrip_loads_matching_catalog_and_manifest() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("cloud-manifest-cache-test-{}", Uuid::new_v4()));
+        let temp_dir = crate::test_support::TempWorkspace::new("cache-test");
         let remote_dir = "/apps/GameSaver/games/game-test/body";
         let remote_file = RemoteFile {
             path: format!("{remote_dir}/game.json"),

@@ -111,30 +111,35 @@ impl GameLibraryService {
 mod tests {
     use super::GameLibraryService;
     use crate::domain::{game::GameLifecycle, AppStore, Game};
-    use std::{fs, path::PathBuf};
-    use uuid::Uuid;
+    use crate::test_support::TempWorkspace;
+    use std::fs;
 
-    fn test_game(root: PathBuf) -> Game {
-        let mut game = Game::new_pending("Test Game", root.to_string_lossy(), "game.exe");
+    fn test_game(managed_path: String) -> Game {
+        let mut game = Game::new_pending("Test Game", managed_path, "game.exe");
         game.activate("profile-1");
         game
     }
 
-    fn test_root() -> PathBuf {
-        std::env::temp_dir().join(format!("gamesaver-library-test-{}", Uuid::new_v4()))
+    /// 建一棵带 `Drop` 清理的测试目录树，理由见 `crate::test_support::TempWorkspace`。
+    ///
+    /// 这些测试都不往里面建目录（`is_installed` 只看路径存不存在），所以 dir 本身不是必须的；
+    /// 但**清理**是必须的 —— 此前靠测试末尾 `remove_dir_all`，`assert!` 一失败就执行不到。
+    fn test_root() -> TempWorkspace {
+        TempWorkspace::new("library-test")
     }
 
     #[test]
     fn library_keeps_broken_game_when_managed_body_is_missing() {
         let root = test_root();
         let mut store = AppStore::default();
-        store.games.push(test_game(root.clone()));
+        store
+            .games
+            .push(test_game(root.to_string_lossy().to_string()));
 
         assert!(!GameLibraryService::is_installed(&store.games[0]));
         let listed = GameLibraryService::list(&store);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].health, crate::domain::GameHealth::Broken);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -142,13 +147,14 @@ mod tests {
         let root = test_root();
         fs::create_dir_all(&root).expect("create managed body");
         let mut store = AppStore::default();
-        store.games.push(test_game(root.clone()));
+        store
+            .games
+            .push(test_game(root.to_string_lossy().to_string()));
 
         assert!(!GameLibraryService::is_installed(&store.games[0]));
         let listed = GameLibraryService::list(&store);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].health, crate::domain::GameHealth::Broken);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -157,11 +163,12 @@ mod tests {
         fs::create_dir_all(&root).expect("create managed body");
         fs::write(root.join("game.exe"), b"test executable").expect("create executable");
         let mut store = AppStore::default();
-        store.games.push(test_game(root.clone()));
+        store
+            .games
+            .push(test_game(root.to_string_lossy().to_string()));
 
         assert!(GameLibraryService::is_installed(&store.games[0]));
         assert_eq!(GameLibraryService::list(&store).len(), 1);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -177,7 +184,6 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].lifecycle, GameLifecycle::PendingSetup);
         assert_eq!(listed[0].health, crate::domain::GameHealth::NeedsAttention);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -185,7 +191,7 @@ mod tests {
         let root = test_root();
         fs::create_dir_all(&root).expect("create save scope");
         let mut store = AppStore::default();
-        let mut game = test_game(root.clone());
+        let mut game = test_game(root.to_string_lossy().to_string());
         game.save_profile_id = Some("profile-1".to_string());
         store.games.push(game);
         store.save_profiles.push(crate::domain::SaveProfile {
@@ -215,7 +221,6 @@ mod tests {
             GameLibraryService::valid_scope_count(&store.save_profiles[0]),
             1
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -243,20 +248,18 @@ mod tests {
         assert_eq!(GameLibraryService::valid_scope_count(&profile), 0);
         profile.scopes[0].include_directories = vec![".".to_string()];
         assert_eq!(GameLibraryService::valid_scope_count(&profile), 1);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn library_populates_added_at_when_missing() {
         let root = test_root();
         let mut store = AppStore::default();
-        let mut g = test_game(root.clone());
+        let mut g = test_game(root.to_string_lossy().to_string());
         g.added_at = None;
         store.games.push(g);
 
         let listed = GameLibraryService::list(&store);
         assert_eq!(listed.len(), 1);
         assert!(listed[0].added_at.is_some());
-        let _ = fs::remove_dir_all(root);
     }
 }

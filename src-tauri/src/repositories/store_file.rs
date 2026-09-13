@@ -226,11 +226,11 @@ fn prune_residue(residues: &[Residue], threshold: SystemTime) {
 mod tests {
     use super::*;
 
-    fn sandbox() -> PathBuf {
-        let directory =
-            std::env::temp_dir().join(format!("gamesaver-store-file-{}", Uuid::new_v4().simple()));
-        fs::create_dir_all(&directory).expect("create sandbox");
-        directory
+    /// 每个测试一个独立沙箱，随作用域自动清理（理由见 `crate::test_support::TempWorkspace`）。
+    ///
+    /// 此前靠各测试末尾自己的 `remove_dir_all`，`assert!` 一失败就执行不到。
+    fn sandbox() -> crate::test_support::TempWorkspace {
+        crate::test_support::TempWorkspace::new("store-file")
     }
 
     fn accepts(bytes: &[u8]) -> bool {

@@ -119,12 +119,18 @@ mod tests {
         }
     }
 
+    /// 建一棵带 `Drop` 清理的测试目录树，理由见 `crate::test_support::TempWorkspace`。
+    ///
+    /// 此前四处测试各自 `create_dir_all` + 末尾 `remove_dir_all`：前者是必要的（`persist`
+    /// 不建父目录），后者在 `assert!` 失败时执行不到，于是 `%TEMP%` 下攒下残留。
+    fn temp_root() -> crate::test_support::TempWorkspace {
+        crate::test_support::TempWorkspace::new("task-repository")
+    }
+
     #[test]
     fn interrupted_tasks_are_recovered_with_retry_data() {
-        let root =
-            std::env::temp_dir().join(format!("gamesaver-task-repository-{}", Uuid::new_v4()));
+        let root = temp_root();
         let path = root.join("tasks.json");
-        fs::create_dir_all(&root).expect("create task repository directory");
         let pending = task(TaskStatus::Running);
         let task_id = pending.task_id.clone();
         let tasks = HashMap::from([(task_id.clone(), pending)]);
@@ -150,10 +156,8 @@ mod tests {
 
     #[test]
     fn completed_task_history_is_trimmed() {
-        let root =
-            std::env::temp_dir().join(format!("gamesaver-task-repository-{}", Uuid::new_v4()));
+        let root = temp_root();
         let path = root.join("tasks.json");
-        fs::create_dir_all(&root).expect("create task repository directory");
         let mut tasks = HashMap::new();
         for index in 0..105 {
             let mut current = task(TaskStatus::Success);
@@ -168,10 +172,8 @@ mod tests {
 
     #[test]
     fn tasks_are_recovered_when_last_write_crashed_mid_replace() {
-        let root =
-            std::env::temp_dir().join(format!("gamesaver-task-repository-{}", Uuid::new_v4()));
+        let root = temp_root();
         let path = root.join("tasks.json");
-        fs::create_dir_all(&root).expect("create task repository directory");
         let saved = task(TaskStatus::Success);
         let task_id = saved.task_id.clone();
         TaskRepository::persist(&path, &HashMap::from([(task_id.clone(), saved)]))
@@ -192,10 +194,8 @@ mod tests {
     /// 分类，历史同步任务的「存档未同步」红标会在重启后消失。
     #[test]
     fn legacy_tasks_without_category_get_one_inferred() {
-        let root =
-            std::env::temp_dir().join(format!("gamesaver-task-repository-{}", Uuid::new_v4()));
+        let root = temp_root();
         let path = root.join("tasks.json");
-        fs::create_dir_all(&root).expect("create task repository directory");
         let legacy = r#"{"schemaVersion":1,"tasks":[
             {"taskId":"legacy-sync","taskType":"sync_cloud_save","status":"failed","progress":100,"message":"同步失败","createdAt":"1"},
             {"taskId":"legacy-launch","taskType":"launch_game","status":"success","progress":100,"message":"已结束","createdAt":"2"},
