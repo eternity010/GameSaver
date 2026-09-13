@@ -2529,6 +2529,98 @@ mod tests {
         assert_eq!(result.unwrap().len(), 0);
     }
 
+    /// P3/P4 的测量夹具（默认 `#[ignore]`，不进常规门禁）。
+    ///
+    /// 手动跑：`cargo test --lib measure_p3_p4 -- --ignored --nocapture`
+    ///
+    /// 为什么把它固化成测试而不是一次性脚本：P3/P4 的结论就是「值不值得优化」，而这个判断
+    /// 完全依赖本机实测数字。夹具留下来，换机器或换目录结构时可以原地复测，不必重新推导。
+    #[test]
+    #[ignore = "测量用，需手动触发"]
+    fn measure_p3_p4_traversal_and_hashing() {
+        use std::time::Instant;
+
+        let root = std::env::current_dir()
+            .expect("resolve test working directory")
+            .join(format!("gamesaver-measure-{}", uuid::Uuid::new_v4()));
+
+        // 造一棵「像游戏安装目录」的树：4 个桶 × 40 组 × 60 个文件 = 9600 个，
+        // 外加一条 depth > 4 的深链 —— 用来暴露 `collect_profile_files` **无深度上限**，
+        // 而学习侧 `collect_snapshot` 对 ManagedGame 有 `max_depth(4)` + 资产目录剪枝。
+        let mut paths = Vec::new();
+        for bucket in ["bin", "data", "assets", "save"] {
+            for group in 0..40 {
+                let dir = root.join(bucket).join(format!("g{group:02}"));
+                std::fs::create_dir_all(&dir).expect("create dir");
+                for file in 0..60 {
+                    let path = dir.join(format!("f{file:03}.dat"));
+                    std::fs::write(&path, b"x").expect("write file");
+                    paths.push(path);
+                }
+            }
+        }
+        let deep = root
+            .join("data")
+            .join("g00")
+            .join("a")
+            .join("b")
+            .join("c")
+            .join("d");
+        std::fs::create_dir_all(&deep).expect("create deep dir");
+        for file in 0..60 {
+            let path = deep.join(format!("deep{file:03}.dat"));
+            std::fs::write(&path, b"x").expect("write file");
+            paths.push(path);
+        }
+        println!("\n[P3/P4] 夹具：{} 个文件", paths.len());
+
+        // ① 仓储侧：`collect_profile_files`（ManagedGame 范围 + `include_directories=["."]`）
+        let mut scope = SaveScope::new_manual(root.to_string_lossy().to_string());
+        scope.root_type = SaveRootType::ManagedGame;
+        let profile = SaveProfile::new(
+            "g1".to_string(),
+            "h".to_string(),
+            vec![scope],
+            100,
+            "2026-01-01".to_string(),
+        );
+        let started = Instant::now();
+        let collected = super::collect_profile_files(&profile).expect("collect_profile_files");
+        let collect_elapsed = started.elapsed();
+        println!(
+            "[P3] collect_profile_files：收 {} 个 / {collect_elapsed:?}（{:.0} 文件/秒）",
+            collected.len(),
+            collected.len() as f64 / collect_elapsed.as_secs_f64()
+        );
+
+        // ② 裸遍历（≈ 恢复侧 `collect_protected_paths` 的形态：无深度上限、无剪枝）
+        let started = Instant::now();
+        let walked = walkdir::WalkDir::new(&root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .count();
+        let walk_elapsed = started.elapsed();
+        println!("[P3] 裸 WalkDir（无上限）：{walked} 个文件 / {walk_elapsed:?}");
+
+        // ③ P4：读 + 哈希（`commit` 里那条串行长尾）
+        let started = Instant::now();
+        let mut hashed = 0usize;
+        for path in &paths {
+            let (bytes, _) = super::read_stable_file(path).expect("read_stable_file");
+            let _ = super::sha256_bytes(&bytes);
+            hashed += 1;
+        }
+        let hash_elapsed = started.elapsed();
+        println!(
+            "[P4] read + sha256：{hashed} 个 / {hash_elapsed:?}（{:.0} 文件/秒）",
+            hashed as f64 / hash_elapsed.as_secs_f64()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn find_scope_for_entry_resolves_cross_user_path() {
         let mut scope =

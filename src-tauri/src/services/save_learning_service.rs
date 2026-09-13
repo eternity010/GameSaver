@@ -2690,6 +2690,57 @@ mod tests {
         }
     }
 
+    /// P3 的对照测量（默认 `#[ignore]`）：学习侧 `collect_snapshot` 对 ManagedGame 有
+    /// `max_depth(4)` + 资产目录剪枝，应当明显便宜于仓储侧那条**无深度上限**的遍历。
+    /// 两个数字放在一起，才能判断「学习一次要扫 3 遍」到底值不值得优化。
+    ///
+    /// 手动跑：`cargo test --lib measure_learning_snapshot -- --ignored --nocapture`
+    #[test]
+    #[ignore = "测量用，需手动触发"]
+    fn measure_learning_snapshot_cost() {
+        use std::time::Instant;
+
+        let root = std::env::current_dir()
+            .expect("resolve test working directory")
+            .join(format!("gamesaver-measure-snap-{}", uuid::Uuid::new_v4()));
+        let mut created = 0usize;
+        for bucket in ["bin", "data", "assets", "save"] {
+            for group in 0..40 {
+                let dir = root.join(bucket).join(format!("g{group:02}"));
+                fs::create_dir_all(&dir).expect("create dir");
+                for file in 0..60 {
+                    fs::write(dir.join(format!("f{file:03}.dat")), b"x").expect("write file");
+                    created += 1;
+                }
+            }
+        }
+        let deep = root
+            .join("data")
+            .join("g00")
+            .join("a")
+            .join("b")
+            .join("c")
+            .join("d");
+        fs::create_dir_all(&deep).expect("create deep dir");
+        for file in 0..60 {
+            fs::write(deep.join(format!("deep{file:03}.dat")), b"x").expect("write file");
+            created += 1;
+        }
+
+        let roots = vec![ScanRoot {
+            root_type: SaveRootType::ManagedGame,
+            physical_path: root.clone(),
+        }];
+        let started = Instant::now();
+        let snapshot = collect_snapshot(&roots, |_, _| {}, &|| false).expect("collect_snapshot");
+        let elapsed = started.elapsed();
+        println!(
+            "\n[P3] collect_snapshot（ManagedGame，max_depth 4 + 剪枝）：夹具 {created} 个 → 收 {} 个 / {elapsed:?}",
+            snapshot.len()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// 提议只该出现在「只认历史清单」的范围上：容器命名的范围本来就整目录收集
     /// （`include_directories = ["."]`），再列一遍提议是噪音。
     #[test]
