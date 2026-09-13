@@ -19,7 +19,8 @@
 > **A2、R6 已于 2026-09-12 实施**（第 4 批与备选批的一部分）。
 > **A1 已于 2026-09-13 部分实施**：只做了第 4 项「允许跳过学习」（只读初稿 + 前端旁路），profile 形状复用与保存后自动分析**未做**，目录推断前置只算部分落地 —— 取舍理由见 A1 条。
 > **A3 已于 2026-09-13 实施**：只做「说清病因 + 指明明路」，**不做自动猜测**（理由见 A3 条）。
-> 仍未动的部分：**A1 的三项**、**R5**、**P3/P4**（P3/P4 建议等实测再做）—— 见第 5 节的批次表。
+> **R5 已于 2026-09-13 结案（不做）**：按「暂不考虑非管理员情况」的前提，它的两个半边分别是「不成立」与「刻意取舍」；核对时发现本文档这条的因果只对了一半 —— 见 R5 条。
+> 仍未动的部分：**A1 的三项**、**P3/P4**（P3/P4 建议等实测再做）—— 见第 5 节的批次表。
 
 ---
 
@@ -75,6 +76,11 @@
 - 证据：`collect_snapshot` 的 `filter_entry`（`:1178-1186`）对 `is_managed_game_asset_dir` 直接跳过**整个子树**，名单含 `content`/`assets`/`sound`/`movies`/`textures` 等（`:97-123`）。另一处 `is_save_candidate` 把 `png/jpg/jpeg/webp/ogg/wav/mp3/ttf` 一律排除（`:1670`）。
 - 后果：ETW 可用时无碍（走 `is_etw_candidate`），但 ETW 需要管理员权限（`etw_capture.rs:71`）。**非管理员用户是纯快照**，此时「存档住在 `content/` 下」或「存档是图片形式」就永久看不见。
 - 说明：我在现有真实数据里**没有观察到**这种布局，属理论缺口，所以排低。改法也很便宜：把资产目录剪枝从「整棵剪掉」改成「剪枝但仍接受 `.sav` 等强扩展名」，代价是 ManagedGame 快照会慢一点。
+- **结案（2026-09-13）：按「暂不考虑非管理员情况」的前提，不做。** 核对代码时发现本文档这条的因果**只对了一半**，两个半边要分开说：
+  - **前半（资产目录剪枝）——文档说对了**：ETW 路径根本不走 `collect_snapshot`。`:473-492` 在 `etw_files` 非空时改走 `collect_targeted_snapshot`，那个函数只做「根内 + 非噪音 + 是文件」三件事，**没有** `is_managed_game_asset_dir` 剪枝、也没有 ManagedGame 的 `max_depth(4)`。所以「存档住在 `content/` 下」在 ETW 可用时是**看得见**的。这里有个容易被忽略的机关：`infer_scope_drafts` 里 `changed` 是拿 `etw_files` 去 `final_snapshot.contains_key()` 过滤的 —— 如果 `collect_targeted_snapshot` 也剪枝，ETW 证据会被**静默丢掉**。它没剪，所以没问题。
+  - **后半（资源扩展名）——文档说错了**：`is_etw_candidate`（`:1888`）**同样**拒掉 `RESOURCE_EXTENSIONS`，而且是在看名字线索**之前**就一票否决。所以「存档就是一张 `.png` / 一段 `.wav`」在 ETW 下**照样看不见**，这不是「ETW 能绕过」的限制。但这一半应当**保留**：那 12 个扩展名是 `dll/exe/pak/pdb/png/jpg/jpeg/webp/ogg/wav/mp3/ttf`，没有一个像存档；放开就会把贴图、音频、字体、dll 当成存档收进来 —— 误收比漏收更难收拾。
+  - **为什么「不做」而不是「放宽剪枝」**：文档建议的改法（剪枝仍接受强扩展名）只对非管理员有效，却要让**每次 ManagedGame 完整快照都变慢**；而且在「统一两个快照函数」这类重构里，剪枝极易被顺手搬进 `collect_targeted_snapshot`，那会把 ETW 路径一起拖慢。按当前前提，收益为零、风险为正。
+  - **留下的是守卫而不是代码改动**：新增 3 条测试把结论所依赖的性质钉住 —— `targeted_snapshot_keeps_files_under_asset_directories`（前半的依据）、`full_snapshot_prunes_files_under_asset_directories`（成因的对照，说明「什么条件下会漏」）、`resource_extensions_are_rejected_by_both_candidate_paths`（后半是**刻意**取舍，不是疏漏）。将来若前提变化（开始支持非管理员），这三条会告诉你该从哪里接手。
 
 ### R6. `trailing_path_components_match` 名不符实（低，方向是错误恢复）
 
@@ -189,7 +195,7 @@
 | 第 3.5 批 | **R2b** 收集侧「目录 + 候选过滤」，让学习**之后**新出现的存档自动纳入 | 行为变更：会改容器范围现有的收集结果，且需先把 `is_save_candidate` 下沉到 domain | 大 | **已实施 2026-09-12**（分两步：①候选判定簇下沉 domain；②非容器范围开目录级收集。容器范围收紧**未做**，见 R2b 条） |
 | 第 4 批 | **A2** ETW 会话上限 / 缓冲参数 | 防护性 | 小-中 | **已实施 2026-09-12**（参数经本机实测修正，见 A2 条） |
 | 第 5 批 | **A1** profile 形状复用、目录推断前置、保存后自动分析 | 自动化，涉及前端 | 大 | **部分实施 2026-09-13**（只做「跳过学习」旁路；profile 复用 / 自动分析**未做**，见 A1 条） |
-| 备选 | **A3 / R5 / R6** 边缘缺口 | — | 小 | **R6 已实施 2026-09-12**；**A3 已实施 2026-09-13**（只引导、不猜，见 A3 条）；R5 待办 |
+| 备选 | **A3 / R5 / R6** 边缘缺口 | — | 小 | **R6 已实施 2026-09-12**；**A3 已实施 2026-09-13**（只引导、不猜）；**R5 已结案 2026-09-13**（按「暂不考虑非管理员」不做，理由见 R5 条） |
 
 第 1 批全部是「不加行为、只补覆盖与省开销」，可以一次做完；第 2 批要动评分，建议单独一笔并逐条变异验证；第 3 批是本轮真正的核心，但也是唯一可能**把范围收错**的改动，所以按这里写的做法执行了 —— **只做「疑似存档」的提议**（在草稿里列出、由用户确认），没有直接写进规则。真正会改变容器范围收集结果的 R2b 因此单列成第 3.5 批，与「提议」分开做。
 
@@ -286,3 +292,18 @@ R6 的结论见「1. 精准度」R6 条：**文档给的修法是错的**（比�
 
 - **一处未被测试覆盖的不变量（诚实记录）**：`discover_scan_roots` 「至少返回安装目录这一个根」是删掉死分支的依据，但它需要真实 `Game` + 完整环境扫描才能断言，**单元测试没覆盖**。这条不变量目前靠阅读确认，并写在 `preview_scope_drafts` 的注释里。
 - **一处自证**：删除死分支后，如果将来 `discover_scan_roots` 真的返回了空，行为是「`drafts` 为空 → 走 A3 说明」—— 仍然安全，不会 panic、也不会给出错误建议。
+
+**R5 结案记录（2026-09-13）**：结论是**不做**（理由见 R5 条），所以本轮的产出是「3 条守卫测试 + 一次文档纠错」，没有行为改动。`cargo test --lib` **272 passed**（269 → 272，+3）；`npm run build`（含 `vue-tsc`）通过；`cargo fmt --check` 初检 2 处 → `cargo fmt` 后干净；clippy **27/31 条**与基线持平，新增代码零告警。变异 ×4（`.workbuddy/mutate_r5.py`），**4 命中 0 问题**：
+
+| 变异 | 预期失败点 | 结果 |
+| --- | --- | --- |
+| ETW 目标快照也剪掉资产目录里的文件 | `targeted_snapshot_keeps_files_under_asset_directories` | ✅ 命中 |
+| 完整快照不再剪枝资产目录 | `full_snapshot_prunes_files_under_asset_directories` | ✅ 命中 |
+| ETW 候选放过资源扩展名 | `resource_extensions_are_rejected_by_both_candidate_paths` | ✅ 命中 |
+| 快照候选放过资源扩展名 | 同上 | ✅ 命中 |
+
+新增 3 条测试（均在 `services::save_learning_service::tests`）：`targeted_snapshot_keeps_files_under_asset_directories`、`full_snapshot_prunes_files_under_asset_directories`、`resource_extensions_are_rejected_by_both_candidate_paths`。
+
+- ⚠️ **一次「假 MISSED」——变异本身写错了，不是测试不够**：第 1 个变异最初写成在 `collect_targeted_snapshot` 里加 `is_managed_game_asset_dir(candidate)`，结果测试**照过**（MISSED）。查下来是变异失真：`is_managed_game_asset_dir` 看的是**条目自己的文件名**，对 `content/save.dat` 判的是 `"save.dat"`，永远不命中。`collect_snapshot` 之所以能剪掉整棵子树，是因为它用 `filter_entry` **拒绝下降进** `content` 这个目录 —— 而 `collect_targeted_snapshot` 是遍历显式文件列表、根本没有「下降」这回事。改成 `candidate.parent().is_some_and(is_managed_game_asset_dir)`（等价于「父目录是资产目录就跳过」）后立刻命中。
+  **教训**：变异必须忠实模拟「真实会发生的那种破坏」。一个写歪的变异会伪装成「测试覆盖不足」，而照着它去补测试只会补出一堆没用的断言。判据是问一句：**这个变异真的改变了行为吗？**
+- **一处刻意的测试不对称**：只钉住 `targeted_snapshot` 的「不剪枝」是不够的 —— 单看这一条容易让人以为 R5 压根不存在。所以同时钉住 `full_snapshot` 的「**确实**剪枝」，把「什么条件下会漏」写清楚，将来前提变化时才知道从哪里接手。

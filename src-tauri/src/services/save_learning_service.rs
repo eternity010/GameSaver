@@ -1994,8 +1994,9 @@ mod tests {
 
     use super::{
         arm_capture_watchdog, calculate_learning_confidence, classify_scope_evidence,
-        directory_matches_hint, discover_save_container_files, discovered_only_the_install_dir,
-        infer_scope_drafts, is_etw_candidate, is_transaction_evidence_path, path_is_within_root,
+        collect_snapshot, collect_targeted_snapshot, directory_matches_hint,
+        discover_save_container_files, discovered_only_the_install_dir, infer_scope_drafts,
+        is_etw_candidate, is_transaction_evidence_path, path_is_within_root,
         preview_drafts_from_roots, preview_result, propose_directory_saves, run_capture_watchdog,
         snapshot_analysis_progress, transaction_evidence, MAX_CANDIDATE_FILE_BYTES,
         MAX_CAPTURE_DURATION,
@@ -2617,6 +2618,76 @@ mod tests {
             "应给出普通的「确认是否保存过」说明，实际说明：{joined}"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R5 的闭合依据（前半）：ETW 路径走 `collect_targeted_snapshot`，**不套用** `collect_snapshot`
+    /// 的资产目录剪枝。所以「存档住在 `content/` 下」在 ETW 可用时看得见 —— 一旦有人把两个快照
+    /// 函数「统一」掉、顺手把这个剪枝也搬过去，R5 就会真的成立。钉住它。
+    #[test]
+    fn targeted_snapshot_keeps_files_under_asset_directories() {
+        let (root, _roots, _) = preview_fixture("r5-asset-dir", &[("content/save.dat", b"save")]);
+        let roots = vec![ScanRoot {
+            root_type: SaveRootType::ManagedGame,
+            physical_path: root.clone(),
+        }];
+        let etw_files: HashSet<String> = [normalize_path(&root.join("content").join("save.dat"))]
+            .into_iter()
+            .collect();
+
+        let snapshot =
+            collect_targeted_snapshot(&roots, &etw_files, &|| false).expect("收集 ETW 目标快照");
+
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "ETW 定位到的文件必须原样进快照，不该被资产目录剪枝挡掉"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R5 的成因（对照）：无 ETW 时走 `collect_snapshot`，它**确实**把资产目录整棵剪掉。
+    /// 两条测试一起钉住，「什么条件下会漏」才是明确的 —— 只测一边容易让人误以为 R5 不存在。
+    #[test]
+    fn full_snapshot_prunes_files_under_asset_directories() {
+        let (root, _roots, _) = preview_fixture("r5-asset-full", &[("content/save.dat", b"save")]);
+        let roots = vec![ScanRoot {
+            root_type: SaveRootType::ManagedGame,
+            physical_path: root.clone(),
+        }];
+
+        let snapshot = collect_snapshot(&roots, |_, _| {}, &|| false).expect("收集完整快照");
+
+        assert!(
+            snapshot.is_empty(),
+            "完整快照应剪掉 content/ 整个子树（R5 在无 ETW 时的成因），实际 {} 项",
+            snapshot.len()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R5 的另一半（资源扩展名一刀切）**不是** ETW 能绕过的：`is_etw_candidate` 与
+    /// `is_save_candidate` 都在看名字线索**之前**就把 `RESOURCE_EXTENSIONS` 一票否决。
+    /// 也就是说「存档就是一张 .png / 一段 .wav」这种形态，在两条路径下都看不见。
+    ///
+    /// 这是**刻意保留**的取舍：放开就会把贴图、音频、字体、dll 当成存档（误收比漏收更难收拾）。
+    /// 代价是「以资源扩展名命名的存档」收不到 —— 真实数据里没观察到这种布局，故接受。
+    #[test]
+    fn resource_extensions_are_rejected_by_both_candidate_paths() {
+        // 路径里带 `slot1`（命中名字线索）也照样被拒 —— 证明这是一票否决，不是「优先级低」。
+        for path in [
+            r"C:\Games\Demo\content\slot1.png",
+            r"C:\Games\Demo\content\slot1.wav",
+            r"C:\Games\Demo\content\slot1.ttf",
+        ] {
+            assert!(
+                !is_etw_candidate(path),
+                "资源扩展名必须被 ETW 候选拒掉：{path}"
+            );
+            assert!(
+                !is_save_candidate(path),
+                "资源扩展名必须被快照候选拒掉：{path}"
+            );
+        }
     }
 
     /// 提议只该出现在「只认历史清单」的范围上：容器命名的范围本来就整目录收集
