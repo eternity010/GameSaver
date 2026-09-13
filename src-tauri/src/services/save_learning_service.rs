@@ -832,7 +832,92 @@ fn find_steam_userdata_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// 目录发现时的提示词匹配器：把「与具体提示词无关」的检查与规范化**每个目录只做一次**。
+///
+/// 起因（2026-09-13 实测）：`discover_scan_roots` 在一次添加游戏里要 116ms–1.9s，其中
+/// `%APPDATA%` / `%LOCALAPPDATA%` / `%PROGRAMDATA%` 三处目录探测占绝大部分。原来的写法把
+/// 「噪声目录 / 存档容器目录 / 目录名规范化 / `is_generic_hint` 黑名单查询」全放在
+/// `hints.iter().any(..)` 的**逐 hint 调用里**，而这几件事与 hint 毫无关系 —— 于是同一份
+/// 工作被重复了「提示词个数」遍。
+struct DirectoryHintMatcher {
+    /// 目录名的紧凑形式：去掉非字母数字并小写。
+    compact_name: String,
+    /// 目录名小写形式。
+    name: String,
+}
+
+impl DirectoryHintMatcher {
+    /// 返回 `None` 表示这个目录**在当前提示词集合下不可能命中任何一项**。
+    ///
+    /// **注意 `hints` 必须是调用方预先剔除通用词的切片**（见 `find_candidate_directories`）
+    /// —— 这里**不**自己过滤、更不 `cloned()` 收集。第一版就是在这里收了一份
+    /// `Vec<String>`，于是**每个被检视的目录都克隆一遍全部提示词**（真实机器上约 1 万多个
+    /// 目录），整函数实测反而从 185.7ms 涨到 213.0ms。教训：这条热路径上**一次多余分配 ×
+    /// 一万次 = 明显回退**，与「提出重复工作」的初衷正好相反。
+    fn new(path: &Path, hints: &[String]) -> Option<Self> {
+        let raw_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        // `is_generic_hint` 自带 `trim`，所以对原始名判一次即可（涵盖空名的情况）。
+        if is_generic_hint(raw_name) {
+            return None;
+        }
+        let name = raw_name.to_lowercase();
+        let compact_name = name
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .collect::<String>();
+        // 空提示词集合 ⇒ 任何目录都不可能命中，直接省掉后续全部比较。
+        if hints.is_empty() {
+            return None;
+        }
+        Some(Self { compact_name, name })
+    }
+
+    /// `hints` 由调用方传入**已剔除通用词**的切片（不在这里过滤，避免每目录一次分配）。
+    fn matches_any(&self, hints: &[String]) -> bool {
+        hints.iter().any(|hint| self.matches(hint))
+    }
+
+    fn matches(&self, hint: &str) -> bool {
+        let compact_hint = hint
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .collect::<String>();
+        if compact_hint.is_empty() {
+            return false;
+        }
+        if self.name == hint || self.compact_name == compact_hint {
+            return true;
+        }
+        if compact_hint.chars().count() >= 4 {
+            if self.compact_name.starts_with(&compact_hint) {
+                return true;
+            }
+            if self
+                .name
+                .split(['_', '-', '.', ' '])
+                .any(|token| token == hint || token == compact_hint)
+            {
+                return true;
+            }
+            if compact_hint.chars().count() >= 5 && self.compact_name.contains(&compact_hint) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 fn find_candidate_directories(root: &Path, hints: &[String]) -> Vec<PathBuf> {
+    // 通用词提示词对**任何**目录都不匹配（原逻辑在逐 hint 调用里判），所以在这里、
+    // 每个根只剔除一次。这个切片随后被所有目录共享，不产生逐目录分配。
+    let usable_hints: Vec<String> = hints
+        .iter()
+        .filter(|hint| !is_generic_hint(hint))
+        .cloned()
+        .collect();
     let mut candidates = Vec::new();
     let mut frontier = vec![root.to_path_buf()];
     for depth in 0..3 {
@@ -846,10 +931,22 @@ fn find_candidate_directories(root: &Path, hints: &[String]) -> Vec<PathBuf> {
                 let Ok(file_type) = entry.file_type() else {
                     continue;
                 };
-                if !file_type.is_dir() || is_scan_noise_directory(&path) {
+                if !file_type.is_dir() {
                     continue;
                 }
-                if hints.iter().any(|hint| directory_matches_hint(&path, hint)) {
+                // 这两项与提示词无关，判一次就够（原先在逐 hint 调用里被重复判断）。
+                if is_scan_noise_directory(&path) || is_save_container_directory(&path) {
+                    continue;
+                }
+                let Some(matcher) = DirectoryHintMatcher::new(&path, hints) else {
+                    // 命中不可达：不可能是候选，但**仍然要继续下探** —— 判定与「是否下探」
+                    // 是两件事，跳过下探会漏掉更深的候选目录。
+                    if depth < 2 {
+                        next.push(path);
+                    }
+                    continue;
+                };
+                if matcher.matches_any(&usable_hints) {
                     candidates.push(path);
                 } else if depth < 2 {
                     next.push(path);
@@ -1111,49 +1208,6 @@ fn game_name_hints(game: &Game) -> Vec<String> {
         }
     }
     hints
-}
-
-fn directory_matches_hint(path: &Path, hint: &str) -> bool {
-    if is_save_container_directory(path) || is_scan_noise_directory(path) {
-        return false;
-    }
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_lowercase();
-    if is_generic_hint(&name) || is_generic_hint(hint) {
-        return false;
-    }
-    let compact_name = name
-        .chars()
-        .filter(|character| character.is_alphanumeric())
-        .collect::<String>();
-    let compact_hint = hint
-        .chars()
-        .filter(|character| character.is_alphanumeric())
-        .collect::<String>();
-    if compact_hint.is_empty() {
-        return false;
-    }
-    if name == hint || compact_name == compact_hint {
-        return true;
-    }
-    if compact_hint.chars().count() >= 4 {
-        if compact_name.starts_with(&compact_hint) {
-            return true;
-        }
-        if name
-            .split(['_', '-', '.', ' '])
-            .any(|token| token == hint || token == compact_hint)
-        {
-            return true;
-        }
-        if compact_hint.chars().count() >= 5 && compact_name.contains(&compact_hint) {
-            return true;
-        }
-    }
-    false
 }
 
 fn discover_save_container_files(
@@ -1994,8 +2048,8 @@ mod tests {
 
     use super::{
         arm_capture_watchdog, calculate_learning_confidence, classify_scope_evidence,
-        collect_snapshot, collect_targeted_snapshot, directory_matches_hint,
-        discover_save_container_files, discovered_only_the_install_dir, infer_scope_drafts,
+        collect_snapshot, collect_targeted_snapshot, discover_save_container_files,
+        discovered_only_the_install_dir, find_candidate_directories, infer_scope_drafts,
         is_etw_candidate, is_transaction_evidence_path, path_is_within_root,
         preview_drafts_from_roots, preview_result, propose_directory_saves, run_capture_watchdog,
         snapshot_analysis_progress, transaction_evidence, MAX_CANDIDATE_FILE_BYTES,
@@ -2309,16 +2363,29 @@ mod tests {
         )));
     }
 
+    /// 匹配只认**目录名自身**，不认父路径文本 —— 否则 `BlackMarket\UnrelatedPublisher`
+    /// 会因为父目录叫 BlackMarket 而把子目录也当成候选。
     #[test]
     fn scan_root_matching_does_not_match_arbitrary_parent_path_text() {
-        assert!(directory_matches_hint(
-            Path::new(r"C:\\Users\\Player\\AppData\\LocalLow\\ApplePie\\MonsterBlackMarket"),
-            "blackmarket"
-        ));
-        assert!(!directory_matches_hint(
-            Path::new(r"C:\\Users\\Player\\AppData\\LocalLow\\BlackMarket\\UnrelatedPublisher"),
-            "blackmarket"
-        ));
+        let root = temp_root("scan-parent-text");
+        let hit = root.join("ApplePie").join("MonsterBlackMarket");
+        let miss = root.join("BlackMarket").join("UnrelatedPublisher");
+        fs::create_dir_all(&hit).expect("create hit dir");
+        fs::create_dir_all(&miss).expect("create miss dir");
+
+        let hints = vec!["blackmarket".to_string()];
+        let found = find_candidate_directories(&root, &hints);
+        let paths: Vec<String> = found.iter().map(|p| p.display().to_string()).collect();
+
+        // 注意：命中是在第二层找到的（父目录 ApplePie 不含提示词，所以先下探）。
+        assert!(
+            found.iter().any(|p| p.ends_with("MonsterBlackMarket")),
+            "目录名含提示词时应当命中：{paths:?}"
+        );
+        assert!(
+            !found.iter().any(|p| p.ends_with("UnrelatedPublisher")),
+            "父目录名含提示词不该让子目录命中：{paths:?}"
+        );
     }
 
     #[test]
@@ -2686,6 +2753,10 @@ mod tests {
             );
         }
     }
+
+    /// 临时基准：把候选优化各做成一份独立副本，同一进程交替测量（消除缓存漂移）。
+
+    /// 临时基准：新实现 vs 旧算法，在**同一进程内交替测量**（消除缓存漂移），
 
     /// P3 的对照测量（默认 `#[ignore]`）：学习侧 `collect_snapshot` 对 ManagedGame 有
     /// `max_depth(4)` + 资产目录剪枝，应当明显便宜于仓储侧那条**无深度上限**的遍历。
@@ -3470,20 +3541,69 @@ mod tests {
         assert!(hints.contains(&"rpg".to_string()));
     }
 
+    /// 目录发现的排除规则（存档容器 / 噪声目录 / 通用词）必须仍然生效。
+    ///
+    /// 2026-09-13 把这三条从「逐 hint 重复判断」提到 `DirectoryHintMatcher::new` 之后重写：
+    /// 原来这条测试直接调 `directory_matches_hint`，而那个函数已被删除（它的职责拆成了
+    /// 「与 hint 无关的前置检查」+ 匹配器）。改成**走真实入口** `find_candidate_directories`
+    /// 来钉住同样的行为 —— 钉在真实入口上比钉在内部函数上更难被重构绕过。
     #[test]
-    fn directory_matches_hint_rejects_save_containers_and_noise() {
-        assert!(!super::directory_matches_hint(
-            Path::new(r"C:\Users\Player\AppData\Local\BrightMemoryInfinite\Saved\SaveGames"),
-            "game"
-        ));
-        assert!(!super::directory_matches_hint(
-            Path::new(r"C:\Users\Player\AppData\Local\EpicGamesLauncher"),
-            "game"
-        ));
-        assert!(!super::directory_matches_hint(
-            Path::new(r"C:\Users\Player\AppData\Local\SaveData"),
-            "save"
-        ));
+    fn find_candidate_directories_rejects_save_containers_noise_and_generic_names() {
+        let root = temp_root("scan-exclude");
+        for name in ["Saved Games", "temp", "SaveData", "Game", "DemonicMahjong"] {
+            fs::create_dir_all(root.join(name)).expect("create dir");
+        }
+        // 提示词刻意选两个**非通用**词，且都不与 Game / temp / Saved Games / SaveData 沾边：
+        // 这样「没被选中」只可能是排除规则生效，而不是碰巧没匹配上。
+        // （不能用 "game"：它本身就在 GENERIC_NAME_BLACKLIST 里，会被当作通用词剔除。）
+        let hints = vec!["demonic".to_string(), "mahjong".to_string()];
+        let found = super::find_candidate_directories(&root, &hints);
+        let names: Vec<String> = found
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        // 存档容器目录不是「某个游戏」的候选；噪声目录、通用词目录名同理。
+        assert!(
+            !names.iter().any(|n| n == "Saved Games"),
+            "存档容器目录应被排除：{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "temp"),
+            "噪声目录应被排除：{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "SaveData"),
+            "存档容器目录应被排除：{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "Game"),
+            "通用词目录名应被排除：{names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "DemonicMahjong"),
+            "命中提示词的真实游戏目录必须留下：{names:?}"
+        );
+    }
+
+    /// 提前返回不能顺手跳过下探：被排除的目录**自身**不是候选，但它下面仍可能有候选。
+    ///
+    /// 这是本次重构最容易被写错的一处（把「不是候选」和「不下探」混为一谈），所以单独钉住。
+    #[test]
+    fn rejection_does_not_stop_descending_into_deeper_candidates() {
+        let root = temp_root("scan-descend");
+        // 中间层是通用词（因此不可能是候选），深层才是命中提示词的目录。
+        fs::create_dir_all(root.join("Game").join("DemonicMahjong")).expect("create dirs");
+
+        let hints = vec!["game".to_string(), "demonic".to_string()];
+        let found = super::find_candidate_directories(&root, &hints);
+        let paths: Vec<String> = found.iter().map(|p| p.display().to_string()).collect();
+
+        assert_eq!(found.len(), 1, "应当只在深层命中一个：{paths:?}");
+        assert!(
+            found[0].ends_with(std::path::Path::new("Game").join("DemonicMahjong")),
+            "命中的应当是深层目录本身：{paths:?}"
+        );
     }
 
     #[test]
