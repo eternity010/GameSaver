@@ -14,6 +14,7 @@ import {
   startFinishSaveLearningTask,
   startSaveLearningTask,
   openPathInExplorer,
+  previewSaveScopes,
   type AppTask,
 } from "../api";
 import { createDefaultSaveScope, type Game, type SaveCandidateEvidenceLevel, type SaveLearningResult, type SaveLearningSession, type SaveRootType, type SaveScope } from "../domain/game";
@@ -43,6 +44,7 @@ const message = ref("");
 const error = ref("");
 const completedGame = ref<Game | null>(null);
 const confirming = ref(false);
+const previewing = ref(false);
 const cancelling = ref(false);
 const showLargeConfirmModal = ref(false);
 const largeConfirmMessage = ref("");
@@ -59,6 +61,9 @@ const stepNumber = computed(() => phase.value === "form" || phase.value === "cop
 const stepTitle = computed(() => phase.value === "form" || phase.value === "copying" ? "选择并复制游戏本体" : phase.value === "ready" || phase.value === "capturing" ? "完成一次游戏内保存" : phase.value === "analyzing" ? "分析存档变化" : phase.value === "review" ? "确认存档保护范围" : "添加完成");
 const canConfirm = computed(() => reviewScopes.value.length > 0 && reviewScopes.value.every((scope) => scope.confirmedFiles.length > 0 || scope.includeDirectories.length > 0));
 const hasReviewCandidates = computed(() => reviewScopes.value.some((scope) => scopeEvidence.value[scopeEvidenceKey(scope)]?.level === "review"));
+// 只读初稿（评审 A1）：没有启动游戏、没有任何写入证据。文案必须与「真的跑过一次识别」
+// 明确区分 —— 否则用户会把一份猜出来的范围当成已经被证据确认过的。
+const isPreviewDraft = computed(() => learningResult.value?.eventCaptureMode === "preview");
 
 const rootTypeLabel: Record<SaveRootType, string> = {
   managed_game: "游戏目录",
@@ -306,6 +311,46 @@ async function analyze() {
   }
 }
 
+/**
+ * 只读推断一份初稿，直接进审阅界面 —— 不必先跑「启动游戏 → 手动存一次档 → 点分析」。
+ *
+ * 后端返回的结构与「完成学习」一致，所以直接复用 `applyInitialLearningResult`；区别在于
+ * 证据等级一律是「待确认」，界面上也会换成只读初稿的文案。
+ */
+async function previewDraft() {
+  if (!completedGame.value || phase.value !== "ready" || previewing.value) return;
+  error.value = "";
+  previewing.value = true;
+  message.value = "正在按目录推断候选范围";
+  try {
+    applyInitialLearningResult(await previewSaveScopes(completedGame.value.gameUid));
+    phase.value = "review";
+  } catch (reason) {
+    error.value = String(reason);
+  } finally {
+    previewing.value = false;
+  }
+}
+
+/**
+ * 从只读初稿退回完整识别。
+ *
+ * 没有这个出口的话，用户一旦选了「跳过识别」就只能「放弃添加」重来一遍 —— 想反悔的代价
+ * 比不跳过大得多。清掉初稿状态再回 `ready`，重新点「启动并开始识别」即可。
+ */
+function backToFullLearning() {
+  if (phase.value !== "review" || confirming.value) return;
+  error.value = "";
+  learningResult.value = null;
+  reviewScopes.value = [];
+  scopeEvidence.value = {};
+  proposedByScope.value = {};
+  confidence.value = 0;
+  session.value = null;
+  message.value = "";
+  phase.value = "ready";
+}
+
 async function beginCandidateVerification() {
   if (!completedGame.value || phase.value !== "review" || !hasReviewCandidates.value) return;
   const candidates = reviewScopes.value.filter((scope) => evidenceForScope(scope).level === "review");
@@ -504,7 +549,7 @@ onUnmounted(stopPolling);
       <section class="wizard-section learning-intro"><div class="section-icon"><Gamepad2 :size="22" /></div><div><h2>{{ completedGame?.displayName }} 的存档保护</h2><p>{{ validatingCandidates ? "只验证待确认的候选目录。请在游戏内再次完成一次保存。" : "启动受管游戏，在游戏内完成一次保存。建议保存后退出游戏再点击分析，确保数据完整落盘。" }}</p></div></section>
       <section class="wizard-section"><div class="task-progress-heading"><span>{{ validatingCandidates ? "再次验证会话" : "学习会话" }}</span><strong v-if="session">PID {{ session.rootPid }}</strong><strong v-else>尚未启动</strong></div><p v-if="phase === 'ready'" class="field-note">只会记录本次学习期间的文件变化，不会立即创建正式存档版本。</p><p v-else class="field-note">在游戏内完成一次保存后，建议先退出游戏，再点击分析；也可以直接点击分析。</p><div v-if="phase === 'capturing'" class="capture-state"><span class="loader"></span><strong>{{ validatingCandidates ? "正在验证候选范围" : "正在记录文件变化" }}</strong><span>{{ message }}</span></div></section>
       <p v-if="error" class="error-message" role="alert">{{ error }}</p>
-      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="cancelling" @click="abandonPendingGame">放弃添加</button><button v-if="phase === 'capturing'" class="secondary-button" type="button" :disabled="cancelling" @click="cancelTaskOrLearning"><LoaderCircle v-if="cancelling" :size="16" class="spin" /><X v-else :size="16" />{{ cancelling ? "正在停止" : `停止${validatingCandidates ? "验证" : "识别"}` }}</button><button v-if="phase === 'ready'" class="primary-button" type="button" @click="beginLearning"><Gamepad2 :size="17" />启动并开始识别</button><button v-else class="primary-button" type="button" @click="analyze"><Check :size="17" />完成保存，开始{{ validatingCandidates ? "验证" : "分析" }}</button></footer>
+      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="cancelling" @click="abandonPendingGame">放弃添加</button><button v-if="phase === 'capturing'" class="secondary-button" type="button" :disabled="cancelling" @click="cancelTaskOrLearning"><LoaderCircle v-if="cancelling" :size="16" class="spin" /><X v-else :size="16" />{{ cancelling ? "正在停止" : `停止${validatingCandidates ? "验证" : "识别"}` }}</button><button v-if="phase === 'ready'" class="secondary-button" type="button" :disabled="previewing" title="不启动游戏，直接按存档目录名与文件特征推断一份待确认的初稿" @click="previewDraft"><LoaderCircle v-if="previewing" :size="16" class="spin" /><FolderOpen v-else :size="16" />{{ previewing ? "正在推断" : "跳过识别，先看初稿" }}</button><button v-if="phase === 'ready'" class="primary-button" type="button" :disabled="previewing" @click="beginLearning"><Gamepad2 :size="17" />启动并开始识别</button><button v-else class="primary-button" type="button" @click="analyze"><Check :size="17" />完成保存，开始{{ validatingCandidates ? "验证" : "分析" }}</button></footer>
     </section>
 
     <section v-else-if="phase === 'analyzing'" class="wizard-form">
@@ -513,7 +558,7 @@ onUnmounted(stopPolling);
     </section>
 
     <section v-else-if="phase === 'review'" class="wizard-form">
-      <section class="wizard-section result-summary"><div><p class="eyebrow">识别结果</p><h2>确认存档保护范围</h2><p>{{ learningResult?.changedFiles.length || 0 }} 个文件发生变化，已按目录整理为 {{ reviewScopes.length }} 个候选范围。</p><div class="evidence-summary"><span>{{ learningResult?.eventCaptureMode === "etw" ? "ETW + 快照证据" : "快照差异证据" }}</span><span v-if="learningResult?.transactionSummary">事务 {{ learningResult.transactionSummary.transactionCount }} 个 · {{ learningResult.transactionSummary.operationCount }} 条操作 · {{ learningResult.transactionSummary.status === "completed" ? "已确认" : learningResult.transactionSummary.status === "candidate" ? "候选" : "证据不足" }}</span></div></div><div class="confidence-score"><strong>{{ confidenceBand }}</strong><span>识别置信度 · 评分 {{ confidence }}/100</span></div></section>
+      <section class="wizard-section result-summary"><div><p class="eyebrow">{{ isPreviewDraft ? "只读初稿" : "识别结果" }}</p><h2>确认存档保护范围</h2><p v-if="isPreviewDraft">没有启动游戏，也没有记录任何写入证据；以下 {{ reviewScopes.length }} 个候选范围只按目录名与文件特征推断，请逐项确认，或改回完整识别。</p><p v-else>{{ learningResult?.changedFiles.length || 0 }} 个文件发生变化，已按目录整理为 {{ reviewScopes.length }} 个候选范围。</p><div class="evidence-summary"><span>{{ isPreviewDraft ? "只读推断 · 无写入证据" : learningResult?.eventCaptureMode === "etw" ? "ETW + 快照证据" : "快照差异证据" }}</span><span v-if="learningResult?.transactionSummary">事务 {{ learningResult.transactionSummary.transactionCount }} 个 · {{ learningResult.transactionSummary.operationCount }} 条操作 · {{ learningResult.transactionSummary.status === "completed" ? "已确认" : learningResult.transactionSummary.status === "candidate" ? "候选" : "证据不足" }}</span></div></div><div v-if="isPreviewDraft" class="confidence-score"><strong>初稿</strong><span>只读推断 · 未经写入证据校验</span></div><div v-else class="confidence-score"><strong>{{ confidenceBand }}</strong><span>识别置信度 · 评分 {{ confidence }}/100</span></div></section>
       <section v-for="(scope, scopeIndex) in reviewScopes" :key="`${scope.rootPath}-${scopeIndex}`" class="wizard-section scope-editor">
         <header class="scope-heading">
           <div>
@@ -544,7 +589,7 @@ onUnmounted(stopPolling);
       <button class="secondary-button add-scope-button" type="button" @click="addDirectoryScope"><Plus :size="16" />手动添加存档目录</button>
       <div v-if="learningResult?.notes.length" class="notes-panel"><strong>识别说明</strong><p v-for="note in learningResult.notes" :key="note">{{ note }}</p></div>
       <p v-if="error" class="error-message" role="alert">{{ error }}</p>
-      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="confirming" @click="abandonPendingGame">放弃添加</button><button v-if="hasReviewCandidates" class="secondary-button" type="button" :disabled="confirming" @click="beginCandidateVerification"><Gamepad2 :size="17" />再次保存验证</button><button class="primary-button" type="button" :disabled="!canConfirm || confirming" @click="confirm"><LoaderCircle v-if="confirming" :size="17" class="spin" /><Check v-else :size="17" />{{ confirming ? "正在保存" : "确认并加入游戏库" }}</button></footer>
+      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="confirming" @click="abandonPendingGame">放弃添加</button><button v-if="isPreviewDraft" class="secondary-button" type="button" :disabled="confirming" title="放弃这份只读初稿，回到上一步启动游戏做完整识别" @click="backToFullLearning"><ArrowLeft :size="16" />改回完整识别</button><button v-if="hasReviewCandidates" class="secondary-button" type="button" :disabled="confirming" @click="beginCandidateVerification"><Gamepad2 :size="17" />再次保存验证</button><button class="primary-button" type="button" :disabled="!canConfirm || confirming" @click="confirm"><LoaderCircle v-if="confirming" :size="17" class="spin" /><Check v-else :size="17" />{{ confirming ? "正在保存" : "确认并加入游戏库" }}</button></footer>
     </section>
 
     <div v-else class="wizard-success"><CheckCircle2 :size="34" /><div><h2>{{ completedGame?.displayName }} 已加入游戏库</h2><p>存档保护范围已确认，现在可以从游戏库启动它。</p></div><button class="primary-button" type="button" @click="emit('completed', completedGame!)">返回游戏库</button></div>

@@ -301,6 +301,16 @@ export function confirmSaveProfile(gameUid: string, scopes: SaveScope[], confide
   return invokeCommand<SaveProfile>("confirm_save_profile", { gameUid, scopes, confidence, captureMode });
 }
 
+/**
+ * 只读推断一份存档范围初稿：不启动游戏、不采集 ETW。
+ *
+ * 返回结构与「完成学习」一致（`eventCaptureMode = "preview"`），所以审阅界面可以直接复用；
+ * 证据等级一律是「待确认」—— 这条路没有任何写入证据。
+ */
+export function previewSaveScopes(gameUid: string): Promise<SaveLearningResult> {
+  return invokeCommand<SaveLearningResult>("preview_save_scopes", { gameUid });
+}
+
 export function getSaveProfile(gameUid: string): Promise<SaveProfile | null> {
   return invokeCommand<SaveProfile | null>("get_save_profile", { gameUid });
 }

@@ -1671,26 +1671,27 @@ fn preview_drafts_from_roots(
     (drafts, notes)
 }
 
-/// 只读推断一份存档范围初稿（不启动游戏、不采集 ETW）。
-fn preview_scope_drafts(game: &Game) -> Result<SaveLearningResult, String> {
-    let roots = discover_scan_roots(game)?;
-    if roots.is_empty() {
-        return Err("没有推断出可扫描的存档目录，请改用完整识别。".to_string());
-    }
-    let snapshot = collect_snapshot(&roots, |_, _| {}, &|| false)?;
-    let (drafts, mut notes) = preview_drafts_from_roots(&roots, &snapshot);
+/// 组装只读初稿的返回结构。
+///
+/// 从 `preview_scope_drafts` 里抽出来，是为了让「证据诚实」这条**能被单元测试钉住**：初稿没有
+/// 观察过任何变化，所以 `changed_files` 必须为空、模式必须标成 `preview`、也谈不上事务摘要。
+/// 这三件事只要错一件，界面就会把一份猜出来的范围渲染成「有写入证据」的样子。
+fn preview_result(
+    drafts: Vec<SaveScopeDraft>,
+    mut notes: Vec<String>,
+    root_count: usize,
+) -> SaveLearningResult {
     notes.insert(
         0,
         format!(
-            "只读初稿：没有启动游戏，也没有记录任何写入证据，仅按 {} 个候选目录的目录名与文件特征推断。",
-            roots.len()
+            "只读初稿：没有启动游戏，也没有记录任何写入证据，仅按 {root_count} 个候选目录的目录名与文件特征推断。"
         ),
     );
     if drafts.is_empty() {
         notes.push("初稿没有推断出候选范围，建议改用完整识别，或手动添加存档目录。".to_string());
     }
     let confidence = calculate_learning_confidence(&drafts, PREVIEW_CAPTURE_MODE, None);
-    Ok(SaveLearningResult {
+    SaveLearningResult {
         session_id: String::new(),
         // 没有观察任何变化，就不能报「N 个文件发生变化」。
         changed_files: Vec::new(),
@@ -1699,7 +1700,18 @@ fn preview_scope_drafts(game: &Game) -> Result<SaveLearningResult, String> {
         notes,
         event_capture_mode: PREVIEW_CAPTURE_MODE.to_string(),
         transaction_summary: None,
-    })
+    }
+}
+
+/// 只读推断一份存档范围初稿（不启动游戏、不采集 ETW）。
+fn preview_scope_drafts(game: &Game) -> Result<SaveLearningResult, String> {
+    let roots = discover_scan_roots(game)?;
+    if roots.is_empty() {
+        return Err("没有推断出可扫描的存档目录，请改用完整识别。".to_string());
+    }
+    let snapshot = collect_snapshot(&roots, |_, _| {}, &|| false)?;
+    let (drafts, notes) = preview_drafts_from_roots(&roots, &snapshot);
+    Ok(preview_result(drafts, notes, roots.len()))
 }
 
 fn classify_scope_evidence(
@@ -1954,7 +1966,7 @@ mod tests {
         arm_capture_watchdog, calculate_learning_confidence, classify_scope_evidence,
         directory_matches_hint, discover_save_container_files, infer_scope_drafts,
         is_etw_candidate, is_transaction_evidence_path, path_is_within_root,
-        preview_drafts_from_roots, propose_directory_saves, run_capture_watchdog,
+        preview_drafts_from_roots, preview_result, propose_directory_saves, run_capture_watchdog,
         snapshot_analysis_progress, transaction_evidence, MAX_CANDIDATE_FILE_BYTES,
         MAX_CAPTURE_DURATION,
     };
@@ -2407,6 +2419,74 @@ mod tests {
             drafts.len()
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 只读初稿的返回结构必须诚实：没有观察过变化，就不能报「有文件变化」、不能标成有证据的
+    /// 采集模式、也不能凭空造一份事务摘要。界面完全靠这三个字段决定渲染「初稿」还是「识别结果」，
+    /// 错一个用户就会把猜出来的范围当成已确认的。
+    #[test]
+    fn preview_result_never_claims_observed_changes() {
+        let draft = SaveScopeDraft {
+            scope: SaveScope {
+                root_type: SaveRootType::AppData,
+                root_path: r"C:\Users\Player\AppData\Roaming\DemoGame\SaveData".to_string(),
+                confirmed_files: vec!["slot1.sav".to_string()],
+                include_directories: vec![".".to_string()],
+                exclude_exact: vec![],
+                exclude_patterns: vec![],
+                exclude_directories: vec![],
+                unknown_file_policy: UnknownFilePolicy::Protect,
+                max_file_bytes: Some(DEFAULT_MAX_FILE_BYTES),
+            },
+            changed_files: vec!["slot1.sav".to_string()],
+            proposed_files: vec![],
+            confidence: 70,
+            evidence_level: SaveCandidateEvidenceLevel::Review,
+            evidence_reason: "只读初稿（测试夹具）".to_string(),
+        };
+
+        let result = preview_result(vec![draft], vec![], 3);
+
+        assert!(
+            result.changed_files.is_empty(),
+            "初稿没有观察过任何变化，不能报 {} 个文件变化",
+            result.changed_files.len()
+        );
+        assert_eq!(result.event_capture_mode, "preview");
+        assert!(
+            result.transaction_summary.is_none(),
+            "没有采集就谈不上事务摘要"
+        );
+        assert!(result.session_id.is_empty(), "初稿不属于任何学习会话");
+        assert!(
+            result
+                .notes
+                .first()
+                .is_some_and(|note| note.contains("只读初稿")),
+            "首条说明必须写清这是只读初稿，实际：{:?}",
+            result.notes
+        );
+        assert!(
+            result.scope_drafts.len() == 1,
+            "草稿应原样透传，实际 {} 个",
+            result.scope_drafts.len()
+        );
+    }
+
+    /// 初稿推不出任何范围时，说明里要给出下一步 —— 不能静默返回空结果让用户干瞪眼。
+    #[test]
+    fn preview_result_explains_an_empty_draft() {
+        let result = preview_result(vec![], vec!["原有的采集说明".to_string()], 0);
+
+        assert!(
+            result
+                .notes
+                .iter()
+                .any(|note| note.contains("没有推断出候选范围")),
+            "空初稿必须给出下一步提示，实际：{:?}",
+            result.notes
+        );
+        assert_eq!(result.confidence, 0, "没有草稿时置信度必须是 0");
     }
 
     /// 提议只该出现在「只认历史清单」的范围上：容器命名的范围本来就整目录收集
