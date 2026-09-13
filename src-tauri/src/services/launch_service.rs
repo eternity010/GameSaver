@@ -874,9 +874,10 @@ mod tests {
     use super::*;
     use crate::domain::game::{CloudStatus, LaunchConfig};
     use crate::domain::{AppStore, GameHealth};
+    use crate::test_support::TempWorkspace;
     use std::sync::Arc;
 
-    fn test_state(dir: &Path) -> AppState {
+    fn test_state(dir: &TempWorkspace) -> AppState {
         AppState::new(
             AppStore::default(),
             dir.to_path_buf(),
@@ -885,10 +886,12 @@ mod tests {
         )
     }
 
-    fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("gamesaver-launch-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    /// 建一棵带 `Drop` 清理的测试目录树，理由见 `crate::test_support::TempWorkspace`。
+    ///
+    /// 此前这里只 `create_dir_all`、从不清理：`%TEMP%` 下实测积了 **547** 个
+    /// `gamesaver-launch-*`。清理改挂 `Drop` 之后，正常结束与失败路径都能走。
+    fn temp_root() -> TempWorkspace {
+        TempWorkspace::new("launch")
     }
 
     /// 从 `root_pid` 出发展开进程树，返回第一个后代进程的 PID。
@@ -917,7 +920,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn cancelling_a_session_terminates_the_tracked_process_tree() {
-        let dir = temp_dir();
+        let dir = temp_root();
         let state = Arc::new(test_state(&dir));
         let task_id = TaskService::create(
             &state,
@@ -943,7 +946,7 @@ mod tests {
 
         let wait_state = Arc::clone(&state);
         let wait_task_id = task_id.clone();
-        let wait_dir = dir.clone();
+        let wait_dir = dir.to_path_buf();
         let session = thread::spawn(move || {
             let mut root = SessionRoot::Spawned(child);
             wait_for_game_session(&mut root, &wait_dir, &wait_state, &wait_task_id)
@@ -971,7 +974,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn a_session_that_ends_on_its_own_reports_exited() {
-        let dir = temp_dir();
+        let dir = temp_root();
         let state = test_state(&dir);
         let task_id = TaskService::create(
             &state,
@@ -1005,7 +1008,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn restore_finds_a_game_whose_process_outlived_the_app() {
-        let dir = temp_dir();
+        let dir = temp_root();
         let system_ping = Path::new("C:/Windows/System32/ping.exe");
         if !system_ping.is_file() {
             return;
@@ -1064,7 +1067,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn an_adopted_session_reports_exited_without_an_exit_code() {
-        let dir = temp_dir();
+        let dir = temp_root();
         let state = test_state(&dir);
         let task_id = TaskService::create(
             &state,
@@ -1098,7 +1101,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn cancelling_an_adopted_session_terminates_the_process() {
-        let dir = temp_dir();
+        let dir = temp_root();
         let state = Arc::new(test_state(&dir));
         let task_id = TaskService::create(
             &state,
@@ -1121,7 +1124,7 @@ mod tests {
 
         let wait_state = Arc::clone(&state);
         let wait_task_id = task_id.clone();
-        let wait_dir = dir.clone();
+        let wait_dir = dir.to_path_buf();
         let session = thread::spawn(move || {
             wait_for_game_session(&mut root, &wait_dir, &wait_state, &wait_task_id)
         });

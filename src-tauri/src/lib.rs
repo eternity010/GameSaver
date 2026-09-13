@@ -6,6 +6,8 @@ mod events;
 mod logging;
 mod repositories;
 mod services;
+#[cfg(test)]
+mod test_support;
 
 use app_state::AppState;
 use repositories::{GameRepository, LibraryConfigRepository, SaveRepository, TaskRepository};

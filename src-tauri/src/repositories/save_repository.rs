@@ -1851,12 +1851,14 @@ mod tests {
     use super::{
         build_restore_groups, entry_belongs_to_profile, find_scope_for_entry, find_scope_for_read,
         is_excluded, is_restore_artifact_name, path_is_restore_artifact, removed_relative_paths,
-        same_entries, sweep_restore_artifacts, wildcard_matches, RestoreUndo, SaveRepository,
+        same_entries, strip_verbatim_prefix, sweep_restore_artifacts, wildcard_matches,
+        RestoreUndo, SaveRepository,
     };
     use crate::domain::{
         AppStore, Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope, SaveVersion,
         UnknownFilePolicy,
     };
+    use crate::test_support::TempWorkspace;
 
     fn version(game_uid: &str, version_id: &str, created_at: &str) -> SaveVersion {
         SaveVersion {
@@ -2577,9 +2579,7 @@ mod tests {
     fn measure_p3_p4_traversal_and_hashing() {
         use std::time::Instant;
 
-        let root = std::env::current_dir()
-            .expect("resolve test working directory")
-            .join(format!("gamesaver-measure-{}", uuid::Uuid::new_v4()));
+        let root = temp_root("measure");
 
         // 造一棵「像游戏安装目录」的树：4 个桶 × 40 组 × 60 个文件 = 9600 个，
         // 外加一条 depth > 4 的深链 —— 用来暴露 `collect_profile_files` **无深度上限**，
@@ -2654,8 +2654,6 @@ mod tests {
             "[P4] read + sha256：{hashed} 个 / {hash_elapsed:?}（{:.0} 文件/秒）",
             hashed as f64 / hash_elapsed.as_secs_f64()
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2925,16 +2923,18 @@ mod tests {
         assert!(find_scope_for_entry(&profile, &entry, "Config/settings.ini").is_err());
     }
 
-    fn temp_root(label: &str) -> std::path::PathBuf {
-        // 刻意**不用** `std::env::temp_dir()`：它在 Windows 上位于 `\AppData\Local\Temp\`，
-        // 而那正是 `is_noise_path` 明确挡掉的噪音目录（`should_ignore_event_path` 的片段表里有
-        // `\appdata\local\temp\`）。拿它当范围根，非容器范围的候选过滤会把测试文件全判成噪音，
-        // 测的就不是策略而是噪音规则了。改用 crate 工作目录下的临时目录 —— 服务层测试同样如此。
-        let root = std::env::current_dir()
-            .expect("resolve test working directory")
-            .join(format!("gamesaver-{label}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).expect("create temp root");
-        root
+    /// 建一棵带 `Drop` 清理的测试目录树。
+    ///
+    /// 清理**不再**由测试末尾那行 `remove_dir_all` 负责：`assert!` 失败会 panic，那一行根本
+    /// 执行不到，一次失败的测试就在仓库里永久留下一棵目录树（实测攒过 18 个）。清理改挂在
+    /// `TempWorkspace` 的 `Drop` 上，成功与失败路径共用同一条逻辑 —— 见 `test_support`。
+    ///
+    /// 目录刻意**不建在** `std::env::temp_dir()`：它在 Windows 上位于 `\AppData\Local\Temp\`，
+    /// 而那正是 `is_noise_path` 明确挡掉的噪音目录（`should_ignore_event_path` 的片段表里有
+    /// `\appdata\local\temp\`）。拿它当范围根，非容器范围的候选过滤会把测试文件全判成噪音，
+    /// 测的就不是策略而是噪音规则了。所以建在 crate 工作目录下 —— 服务层夹具同样如此。
+    fn temp_root(label: &str) -> TempWorkspace {
+        TempWorkspace::new(label)
     }
 
     /// V7 回归：产物目录名必须带 `restore_group` 拼出来的那个 id（32 位十六进制）。
@@ -3003,8 +3003,145 @@ mod tests {
             collected_for(UnknownFilePolicy::Ignore),
             vec!["slot1.sav".to_string()]
         );
+    }
 
-        let _ = std::fs::remove_dir_all(&root);
+    /// P5 回归：目录级来源改成「先用词法相对路径过门、只有幸存者才 canonicalize」之后，
+    /// **门一道都不能少**，而且幸存者的存储路径必须仍是 canonical 形态（不含 `.` 组件）。
+    ///
+    /// 钉两件事：①被排除的（`logs/` 目录 + `*.tmp`）与被判非候选的（`game.exe` 命中
+    /// `RESOURCE_EXTENSIONS`）照旧被挡在门外；②收集到的 `path` 仍是 canonical 的。
+    #[test]
+    fn directory_collection_keeps_canonical_paths_and_still_filters() {
+        let root = temp_root("p5-filter");
+        let scope_root = root.join("Game");
+        for dir in ["save", "bin", "logs"] {
+            std::fs::create_dir_all(scope_root.join(dir)).expect("create dir");
+        }
+        std::fs::write(scope_root.join("save").join("slot1.sav"), b"a").expect("write");
+        std::fs::write(scope_root.join("save").join("slot2.sav"), b"b").expect("write");
+        // `slot9.sav` 在 `save/` 下、`.sav` 扩展名 —— 按所有启发式它都是**完全合格**的
+        // 存档，唯一能挡住它的是 `is_excluded` 的 `exclude_exact`。这样单独拿掉
+        // `is_excluded` 那道门就一定会被这条测试抓住。
+        // （用 `*.bak` / `*.tmp` 都不行：那些扩展名还被另外的门同时挡着，两道门互相掩护，
+        //  拿掉一道看不出来 —— 这是第一次写这条测试时踩到的坑，换 `exclude_exact` 才成立。）
+        std::fs::write(scope_root.join("save").join("slot9.sav"), b"c").expect("write");
+        std::fs::write(scope_root.join("bin").join("game.exe"), b"d").expect("write");
+        std::fs::write(scope_root.join("logs").join("trace.tmp"), b"e").expect("write");
+
+        let mut scope = SaveScope::new_manual(scope_root.to_string_lossy().to_string());
+        scope.root_type = SaveRootType::Custom;
+        scope.unknown_file_policy = UnknownFilePolicy::Protect;
+        scope.exclude_exact = vec!["save/slot9.sav".to_string()];
+        let profile = SaveProfile::new(
+            "g".to_string(),
+            "hash".to_string(),
+            vec![scope],
+            100,
+            "0".to_string(),
+        );
+
+        let mut files = super::collect_profile_files(&profile).expect("collect");
+        files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        let relatives: Vec<&str> = files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        assert_eq!(
+            relatives,
+            vec!["save/slot1.sav", "save/slot2.sav"],
+            "非候选（game.exe）与被排除的（logs/*.tmp）都不能进来"
+        );
+
+        // 存储路径仍是 canonical 形态：没有 `.`（CurDir）组件，且与 canonical 根拼出来的一致。
+        let canonical_root =
+            strip_verbatim_prefix(&scope_root.canonicalize().expect("canonicalize scope root"));
+        for file in &files {
+            assert!(
+                !file
+                    .path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::CurDir)),
+                "存储路径不该带 `.` 组件：{}",
+                file.path.display()
+            );
+            assert_eq!(
+                file.path,
+                canonical_root.join(file.relative_path.replace('/', "\\")),
+                "存储路径必须是 canonical 形态"
+            );
+        }
+    }
+
+    /// P5 回归：同一个文件从「显式确认」和「目录遍历」两条路进来，必须落到**同一个键**上。
+    ///
+    /// 这是「目录级跳过 canonicalize 不改变存储路径」的直接证据 —— 两条来源若算出的路径
+    /// 不同，`BTreeMap` 里就会多出一条重复条目，长度会变成 3 而不是 2。
+    #[test]
+    fn directory_and_confirmed_sources_agree_on_the_same_file() {
+        let root = temp_root("p5-agree");
+        let scope_root = root.join("Game");
+        std::fs::create_dir_all(scope_root.join("save")).expect("create dir");
+        std::fs::write(scope_root.join("save").join("slot1.sav"), b"a").expect("write");
+        std::fs::write(scope_root.join("save").join("slot2.sav"), b"b").expect("write");
+
+        let mut scope = SaveScope::new_manual(scope_root.to_string_lossy().to_string());
+        scope.root_type = SaveRootType::Custom;
+        // slot1 同时被显式确认、又会被目录遍历扫到；slot2 只来自遍历。
+        scope.confirmed_files = vec!["save/slot1.sav".to_string()];
+        scope.unknown_file_policy = UnknownFilePolicy::Protect;
+        let profile = SaveProfile::new(
+            "g".to_string(),
+            "hash".to_string(),
+            vec![scope],
+            100,
+            "0".to_string(),
+        );
+
+        let files = super::collect_profile_files(&profile).expect("collect");
+        assert_eq!(
+            files.len(),
+            2,
+            "slot1 同时来自确认与遍历，也只能算一条（两条来源必须算出同一个键）"
+        );
+        assert!(files
+            .iter()
+            .any(|file| file.relative_path == "save/slot1.sav"));
+    }
+
+    /// P5 回归：显式确认的来源**仍然** canonicalize —— 那里可能指向符号链接，语义不能动。
+    ///
+    /// 用带 `.` 组件的确认路径就能观察到这一步：canonicalize 会把它清掉，而词法路径会留着。
+    #[test]
+    fn confirmed_source_still_canonicalizes_dot_components() {
+        let root = temp_root("p5-confirmed");
+        let scope_root = root.join("Game");
+        std::fs::create_dir_all(scope_root.join("save")).expect("create dir");
+        std::fs::write(scope_root.join("save").join("slot1.sav"), b"a").expect("write");
+
+        let mut scope = SaveScope::new_manual(scope_root.to_string_lossy().to_string());
+        scope.root_type = SaveRootType::Custom;
+        scope.confirmed_files = vec!["./save/slot1.sav".to_string()];
+        // 只留「确认」这一条来源，避免目录遍历把同一个文件又收一遍掩盖问题。
+        scope.include_directories = Vec::new();
+        let profile = SaveProfile::new(
+            "g".to_string(),
+            "hash".to_string(),
+            vec![scope],
+            100,
+            "0".to_string(),
+        );
+
+        let files = super::collect_profile_files(&profile).expect("collect");
+        assert_eq!(files.len(), 1);
+        assert!(
+            !files[0]
+                .path
+                .components()
+                .any(|component| matches!(component, std::path::Component::CurDir)),
+            "确认来源必须 canonicalize 掉 `.` 组件：{}",
+            files[0].path.display()
+        );
+        assert_eq!(files[0].relative_path, "save/slot1.sav");
     }
 
     /// 恢复侧必须与收集侧共用同一道门：一侧收、一侧不认，恢复时就会把**从没被备份过**的
@@ -3028,8 +3165,6 @@ mod tests {
         let mut relatives: Vec<String> = protected.into_iter().collect();
         relatives.sort();
         assert_eq!(relatives, vec!["slot1.sav".to_string()]);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// R2b 回归：非容器范围（典型 `%APPDATA%\<游戏名>`）里，**学习之后**才出现的候选存档
@@ -3075,8 +3210,6 @@ mod tests {
                 "slot2.sav".to_string(),
             ]
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// R2b 的行为保持：命名容器范围仍然**整目录收**，包括不像存档的文件。
@@ -3118,8 +3251,6 @@ mod tests {
                 "slot1.sav".to_string(),
             ]
         );
-
-        let _ = std::fs::remove_dir_all(&parent);
     }
 
     /// R2b 两侧同门：非容器范围下，收集侧收哪些文件，恢复侧就得认哪些 —— 一个不差。
@@ -3161,8 +3292,6 @@ mod tests {
         assert_eq!(collected, protected, "收集侧与恢复侧必须得出同一批文件");
         assert!(!collected.contains(&"settings.ini".to_string()));
         assert!(!collected.contains(&"screenshot.png".to_string()));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// V7 回归（防线 1）：恢复产物绝不进版本。
@@ -3196,8 +3325,6 @@ mod tests {
             .map(|file| file.relative_path.as_str())
             .collect();
         assert_eq!(relatives, vec!["slot1.sav"], "只应收集真实存档");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// V7 回归（防线 2）：只有 staging 残留，说明崩溃发生在「还没动用户文件」之前 ——
@@ -3219,7 +3346,6 @@ mod tests {
             b"real save",
             "用户存档不得被动过"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// V7 回归（防线 2 的核心不变量）：崩溃落在「把现有存档搬进 rollback」之后时，用户存档
@@ -3250,7 +3376,6 @@ mod tests {
             b"deep",
             "嵌套路径也要按原样建目录并归位"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// V7 回归（防线 2 的反面）：只要有**一个**文件没能归位，回滚副本就必须留着。
@@ -3277,7 +3402,6 @@ mod tests {
             error.contains("slot1.sav"),
             "错误信息应指出是哪个文件：{error}"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// V7 回归：只是「长得像」产物的用户文件与目录不能被误删 —— 严格匹配 id 的意义就在这里。
@@ -3295,7 +3419,6 @@ mod tests {
             "同名用户文件不得被删"
         );
         assert!(fake.is_dir(), "后缀不是十六进制的目录不得被删");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn undo_with(backed_up: &[&str], installed: &[&str]) -> RestoreUndo {
@@ -3404,6 +3527,5 @@ mod tests {
             1,
             "产物条目应被跳过，只恢复真实存档"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -2011,10 +2011,21 @@ mod tests {
         SaveTransactionSummary, ScanRoot, UnknownFilePolicy, DEFAULT_MAX_FILE_BYTES,
     };
     use crate::services::learning::{analyze_save_transactions, FileOperation, FileOperationKind};
+    use crate::test_support::TempWorkspace;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use std::sync::{atomic::AtomicBool, Arc, Mutex};
     use std::time::Duration;
+
+    /// 建一棵带 `Drop` 清理的测试目录树，理由见 `crate::test_support::TempWorkspace`。
+    ///
+    /// 与 `save_repository::tests::temp_root` 同源：两处夹具都要真实目录树、都不能建在
+    /// `%TEMP%` 下（那里被 `is_noise_path` 当噪音挡掉），于是都建在 crate 工作目录里。
+    /// 清理挂在 `Drop` 上，失败路径与成功路径共用同一条逻辑，不再依赖测试末尾那行
+    /// `remove_dir_all`（`assert!` 一失败就执行不到，目录会永久堆积）。
+    fn temp_root(label: &str) -> TempWorkspace {
+        TempWorkspace::new(label)
+    }
 
     fn operation(path: &str, operation: FileOperationKind) -> FileOperation {
         FileOperation {
@@ -2312,9 +2323,7 @@ mod tests {
 
     #[test]
     fn fallback_collects_files_from_a_game_specific_save_container() {
-        let root = std::env::current_dir()
-            .expect("resolve test working directory")
-            .join(format!("gamesaver-save-container-{}", uuid::Uuid::new_v4()));
+        let root = temp_root("save-container");
         let save_data = root.join("SaveData");
         fs::create_dir_all(&save_data).expect("create SaveData directory");
         fs::write(save_data.join("PlayerData0.sav"), b"save").expect("write save file");
@@ -2329,7 +2338,7 @@ mod tests {
         let files = discover_save_container_files(
             &[ScanRoot {
                 root_type: SaveRootType::LocalAppData,
-                physical_path: root.clone(),
+                physical_path: root.to_path_buf(),
             }],
             &|| false,
         )
@@ -2350,10 +2359,7 @@ mod tests {
     /// （默认只挡 `*.log`/`*.tmp` 一类），但它们不是存档，不该被摆到用户面前。
     #[test]
     fn proposal_lists_only_unconfirmed_save_like_files() {
-        let root = std::env::current_dir()
-            .expect("resolve test working directory")
-            .join(format!("gamesaver-proposal-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).expect("create root");
+        let root = temp_root("proposal");
         fs::write(root.join("slot1.sav"), b"confirmed").expect("write confirmed save");
         fs::write(root.join("autosave_2026.sav"), b"new slot").expect("write new slot");
         fs::write(root.join("settings.ini"), b"[cfg]").expect("write config");
@@ -2362,21 +2368,17 @@ mod tests {
         let proposals = propose_directory_saves(&root, &["slot1.sav".to_string()]);
 
         assert_eq!(proposals, vec!["autosave_2026.sav".to_string()]);
-        let _ = fs::remove_dir_all(&root);
     }
 
     fn preview_fixture(
         label: &str,
         files: &[(&str, &[u8])],
     ) -> (
-        std::path::PathBuf,
+        TempWorkspace,
         Vec<ScanRoot>,
         HashMap<String, FileFingerprint>,
     ) {
-        let root = std::env::current_dir()
-            .expect("resolve test working directory")
-            .join(format!("gamesaver-{label}-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).expect("create root");
+        let root = temp_root(label);
         let mut snapshot = HashMap::new();
         for (relative, bytes) in files {
             let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
@@ -2394,7 +2396,7 @@ mod tests {
         }
         let roots = vec![ScanRoot {
             root_type: SaveRootType::AppData,
-            physical_path: root.clone(),
+            physical_path: root.to_path_buf(),
         }];
         (root, roots, snapshot)
     }
@@ -2405,7 +2407,8 @@ mod tests {
     /// 的草稿，绝不能看起来像被证据确认过，否则用户会把猜出来的范围当成已确认的。
     #[test]
     fn preview_drafts_are_review_only_and_skip_non_save_files() {
-        let (root, roots, snapshot) = preview_fixture(
+        // 绑定为 `_root` 而不是丢弃：它是目录的守卫，必须活到测试结束（见 `TempWorkspace`）。
+        let (_root, roots, snapshot) = preview_fixture(
             "preview",
             &[
                 ("SAVEDATA/slot1.sav", b"save"),
@@ -2431,13 +2434,12 @@ mod tests {
             "说明必须写清这是只读推断，实际：{}",
             draft.evidence_reason
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// 目录里没有像存档的文件时初稿必须是空的 —— 不能凭目录名硬凑一个范围出来。
     #[test]
     fn preview_drafts_stay_empty_without_save_like_files() {
-        let (root, roots, snapshot) = preview_fixture(
+        let (_root, roots, snapshot) = preview_fixture(
             "preview-empty",
             &[("settings.ini", b"[cfg]"), ("readme.txt", b"hi")],
         );
@@ -2449,7 +2451,6 @@ mod tests {
             "没有候选文件就不该有范围，实际推出 {} 个",
             drafts.len()
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// 只读初稿的返回结构必须诚实：没有观察过变化，就不能报「有文件变化」、不能标成有证据的
@@ -2560,7 +2561,7 @@ mod tests {
         // 只有安装目录这一个根 —— 正是「提示词一处都没命中」的形态。
         let install_only = vec![ScanRoot {
             root_type: SaveRootType::ManagedGame,
-            physical_path: root.clone(),
+            physical_path: root.to_path_buf(),
         }];
 
         let (_, drafts, notes) = infer_scope_drafts(
@@ -2589,14 +2590,13 @@ mod tests {
             !joined.contains("请确认游戏内完成了一次保存"),
             "这是发现失败的场景，不该把用户引去怀疑自己没保存，实际说明：{joined}"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// 反过来：发现确实找到了安装目录之外的根时，就不能再提「目录名不含游戏名」——
     /// 否则每个「忘了保存」的用户都会被引到错误的方向上去。
     #[test]
     fn empty_drafts_stay_plain_when_discovery_found_more_than_the_install_dir() {
-        let (root, roots, snapshot) =
+        let (_root, roots, snapshot) =
             preview_fixture("a3-found-a-root", &[("settings.ini", b"[cfg]")]);
 
         let (_, drafts, notes) = infer_scope_drafts(
@@ -2617,7 +2617,6 @@ mod tests {
             joined.contains("请确认游戏内完成了一次保存"),
             "应给出普通的「确认是否保存过」说明，实际说明：{joined}"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// R5 的闭合依据（前半）：ETW 路径走 `collect_targeted_snapshot`，**不套用** `collect_snapshot`
@@ -2628,7 +2627,7 @@ mod tests {
         let (root, _roots, _) = preview_fixture("r5-asset-dir", &[("content/save.dat", b"save")]);
         let roots = vec![ScanRoot {
             root_type: SaveRootType::ManagedGame,
-            physical_path: root.clone(),
+            physical_path: root.to_path_buf(),
         }];
         let etw_files: HashSet<String> = [normalize_path(&root.join("content").join("save.dat"))]
             .into_iter()
@@ -2642,7 +2641,6 @@ mod tests {
             1,
             "ETW 定位到的文件必须原样进快照，不该被资产目录剪枝挡掉"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// R5 的成因（对照）：无 ETW 时走 `collect_snapshot`，它**确实**把资产目录整棵剪掉。
@@ -2652,7 +2650,7 @@ mod tests {
         let (root, _roots, _) = preview_fixture("r5-asset-full", &[("content/save.dat", b"save")]);
         let roots = vec![ScanRoot {
             root_type: SaveRootType::ManagedGame,
-            physical_path: root.clone(),
+            physical_path: root.to_path_buf(),
         }];
 
         let snapshot = collect_snapshot(&roots, |_, _| {}, &|| false).expect("收集完整快照");
@@ -2662,7 +2660,6 @@ mod tests {
             "完整快照应剪掉 content/ 整个子树（R5 在无 ETW 时的成因），实际 {} 项",
             snapshot.len()
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// R5 的另一半（资源扩展名一刀切）**不是** ETW 能绕过的：`is_etw_candidate` 与
@@ -2700,9 +2697,7 @@ mod tests {
     fn measure_learning_snapshot_cost() {
         use std::time::Instant;
 
-        let root = std::env::current_dir()
-            .expect("resolve test working directory")
-            .join(format!("gamesaver-measure-snap-{}", uuid::Uuid::new_v4()));
+        let root = temp_root("measure-snap");
         let mut created = 0usize;
         for bucket in ["bin", "data", "assets", "save"] {
             for group in 0..40 {
@@ -2729,7 +2724,7 @@ mod tests {
 
         let roots = vec![ScanRoot {
             root_type: SaveRootType::ManagedGame,
-            physical_path: root.clone(),
+            physical_path: root.to_path_buf(),
         }];
         let started = Instant::now();
         let snapshot = collect_snapshot(&roots, |_, _| {}, &|| false).expect("collect_snapshot");
@@ -2738,16 +2733,13 @@ mod tests {
             "\n[P3] collect_snapshot（ManagedGame，max_depth 4 + 剪枝）：夹具 {created} 个 → 收 {} 个 / {elapsed:?}",
             snapshot.len()
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// 提议只该出现在「只认历史清单」的范围上：容器命名的范围本来就整目录收集
     /// （`include_directories = ["."]`），再列一遍提议是噪音。
     #[test]
     fn only_non_container_drafts_carry_proposals() {
-        let root = std::env::current_dir()
-            .expect("resolve test working directory")
-            .join(format!("gamesaver-proposal-scope-{}", uuid::Uuid::new_v4()));
+        let root = temp_root("proposal-scope");
         let plain_dir = root.join("Game");
         let container_dir = root.join("SaveData");
         fs::create_dir_all(&plain_dir).expect("create plain directory");
@@ -2769,7 +2761,7 @@ mod tests {
             },
             roots: vec![ScanRoot {
                 root_type: SaveRootType::AppData,
-                physical_path: root.clone(),
+                physical_path: root.to_path_buf(),
             }],
             baseline: None,
             tracked_pids: Arc::new(Mutex::new(vec![100])),
@@ -2835,8 +2827,6 @@ mod tests {
             container.scope.unknown_file_policy,
             UnknownFilePolicy::Protect
         );
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
