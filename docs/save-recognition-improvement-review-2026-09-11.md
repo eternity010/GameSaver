@@ -344,3 +344,23 @@ R6 的结论见「1. 精准度」R6 条：**文档给的修法是错的**（比�
 - ⚠️ **一个「按结构推性能」的教训**：P3 当初是**照代码结构**推的（「同一个目录被走了好几遍，所以慢」），而这类结构性推断最容易错 —— 真实耗时往往不在「走了几遍」，而在**每个条目身上干了什么**。测量夹具的价值就在这里：它把「哪一段贵」从推断变成数字，本次直接把 P3 从「低-中收益」翻成「诊断不成立」。
 - 夹具**刻意留在代码里**（`repositories::save_repository::tests::measure_p3_p4_traversal_and_hashing`、`services::save_learning_service::tests::measure_learning_snapshot_cost`，均 `#[ignore = "测量用，需手动触发"]`）：P3/P4/P5 的判断都依赖本机数字，换机器或换目录结构时可原地复测，不必重新推导。
 - **本轮没有变异表**（与其它批次不同）：两条新增测试都是**测量夹具**，只计时、不断言，不含任何守卫判定分支 —— 没有可变的东西。真正的守卫（`canonicalize` 那条）属于 P5，等实施 P5 时再配变异。门禁：`cargo fmt --check` 干净、`npm run build` 通过、`cargo test --lib` **272 passed**（0 failed，2 ignored）、clippy **27/31** 与基线持平且落在新增代码上的告警**零条**。
+
+**第 6 批（P5）落地记录（2026-09-13）**：提交 `5e4ea1d`。改动见 P5 条（`add_candidate` 改成「先算词法相对路径 → 过便宜的门 → 最后才 canonicalize」，`Confirmed` 来源保持原样）。实测 **2497ms → 1598ms（1.56×）**，明显低于当初按结构估的 4× —— 估错经过记在 P5 条里；按差额推算剩余耗时已转移到 `is_save_candidate`（约 90µs/文件）。守卫测试 3 条（`repositories::save_repository::tests`）：
+
+| 测试 | 钉住的性质 |
+| --- | --- |
+| `directory_collection_keeps_canonical_paths_and_still_filters` | 目录级收集仍过滤，且存储用 canonical 路径 |
+| `directory_and_confirmed_sources_agree_on_the_same_file` | 两条来源对同一个文件必须落到同一个键 |
+| `confirmed_source_still_canonicalizes_dot_components` | 显式确认来源仍然先 canonicalize（语义不能动）|
+
+门禁：`cargo fmt --check` 干净、`cargo test --lib` **272 passed** / 0 failed / 2 ignored、clippy 与基线持平且新增代码零告警。
+
+> ⚠️ **遗留待核（2026-09-13 核对时发现，未擅自改）**：本表「3 条守卫测试 + 变异 ×5」的**归属存疑**。逐提交核对（`git show <rev>:src-tauri/src/repositories/save_repository.rs`）：
+>
+> | 测试 | `aaa772a`（P5 父）| `5e4ea1d`（P5）| `fb51c40` | HEAD |
+> | --- | --- | --- | --- | --- |
+> | `directory_collection_keeps_canonical_paths_and_still_filters` | ✗ | **✗** | ✓ | ✓ |
+> | `directory_and_confirmed_sources_agree_on_the_same_file` | ✗ | **✗** | ✓ | ✓ |
+> | `confirmed_source_still_canonicalizes_dot_components` | ✗ | **✗** | ✓ | ✓ |
+>
+> 即这三条在 P5 那一笔里**并不存在**，首次出现于 `fb51c40`；P5 的提交信息也写着 272 passed（与父提交同数，实测两版均为 272），所以 P5 当时**没有净增用例**。测试本身有效，缺的只是「哪一批产出的」这个出处；**是否改本表归因待主人确认**（另一可能是这些测试在 P5 那轮写好但未提交，随 `fb51c40` 补上）。
