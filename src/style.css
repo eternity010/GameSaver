@@ -474,6 +474,13 @@ h1 { margin-bottom: 0; font-size: 30px; letter-spacing: 0; }
 .scope-note { margin: -5px 0 0; }
 .inline-editor { display: flex; gap: 8px; }
 .inline-editor input { min-width: 0; flex: 1; padding: 8px 10px; border: 1px solid #3a414d; border-radius: 5px; color: var(--text-primary); background: #17191e; }
+/* 目录推断前置（评审 A1 第 2 项）：`ready` 阶段把自动推断出的候选目录先摆出来。
+   与「识别结果」刻意不同调：只读推断没有写入证据，样式上不能显得像已确认的范围。 */
+.inferred-scopes .editor-label strong { display: inline-flex; align-items: center; gap: 6px; }
+.inferred-scope-list { display: flex; flex-direction: column; gap: 6px; margin: 8px 0 0; padding: 0; list-style: none; }
+.inferred-scope-list li { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.inferred-root-label { flex: none; padding: 3px 7px; border: 1px solid #3c4655; border-radius: 4px; color: #9da8b8; background: #252b35; font-size: 11px; }
+.inferred-scope-list code { min-width: 0; overflow: hidden; color: #c5d6f5; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .add-scope-button { justify-self: start; }
 .empty-review, .notes-panel { padding: 16px; border: 1px solid #35404f; border-radius: 7px; background: #1b2028; }
 .empty-review strong, .notes-panel strong { color: var(--text-primary); }

@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref } from "vue";
-import { AlertTriangle, ArrowLeft, Check, CheckCircle2, FolderOpen, Gamepad2, LoaderCircle, Plus, Trash2, X } from "@lucide/vue";
+import { computed, onUnmounted, ref, watch } from "vue";
+import { AlertTriangle, ArrowLeft, Check, CheckCircle2, FolderOpen, FolderSearch, Gamepad2, LoaderCircle, Plus, Trash2, X } from "@lucide/vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   cancelSaveLearning,
@@ -45,6 +45,14 @@ const error = ref("");
 const completedGame = ref<Game | null>(null);
 const confirming = ref(false);
 const previewing = ref(false);
+// 目录推断前置（评审 A1 第 2 项）：选定本体后**自动**跑一次只读推断，把候选目录先摆出来，
+// 让用户在启动游戏之前就能看到「准备保护哪些目录」，而不是跑完一整套学习才发现目录不对。
+// 与 `previewing` 分开：前者是「后台预取」，不该禁用主动作按钮。
+const inferringDrafts = ref(false);
+const inferredDrafts = ref<SaveLearningResult | null>(null);
+// 同一次添加里只自动推一次：`phase` 在「学习失败/取消」后会退回 `ready`，不该重新遍历一遍目录。
+// 换游戏（gameUid 变化）时重置。
+let inferredForGameUid = "";
 const cancelling = ref(false);
 const showLargeConfirmModal = ref(false);
 const largeConfirmMessage = ref("");
@@ -333,6 +341,55 @@ async function previewDraft() {
 }
 
 /**
+ * 目录推断前置（评审 A1 第 2 项）：进入 `ready` 后**自动**推断一次，把候选目录先展示出来。
+ *
+ * 为什么自动而不只留按钮：审阅界面才是用户真正要做判断的地方，原先前置推断挂在按钮上，
+ * 用户不知道点了会发生什么，多数人不会点 —— 于是就变成「跑完一整套学习 + 手动保存一次，
+ * 才发现目录根本不对」。自动跑一次把这份信息提前。
+ *
+ * **不阻塞主动作**：用独立的 `inferringDrafts`，不并入 `previewing` —— 推断期间「启动并开始识别」
+ * 必须仍然可点。推断失败也只是少一块提示（`inferredDrafts` 保持 `null`），不写 `error`、
+ * 不影响继续走完整识别。
+ */
+async function inferDraftsAhead(gameUid: string) {
+  if (!gameUid || inferringDrafts.value || inferredForGameUid === gameUid) return;
+  inferredForGameUid = gameUid;
+  inferringDrafts.value = true;
+  try {
+    inferredDrafts.value = await previewSaveScopes(gameUid);
+  } catch {
+    // 刻意吞掉：这是一次「锦上添花」的后台预取，失败不该在用户还没提要求时就报错。
+    inferredDrafts.value = null;
+  } finally {
+    inferringDrafts.value = false;
+  }
+}
+
+// 进入 `ready` 就自动推断；换游戏时允许重新推断一次。
+watch(
+  () => [phase.value, completedGame.value?.gameUid ?? ""] as const,
+  ([currentPhase, gameUid]) => {
+    if (currentPhase !== "ready" || !gameUid) return;
+    if (inferredForGameUid === gameUid) return;
+    void inferDraftsAhead(gameUid);
+  },
+  { immediate: true },
+);
+
+/**
+ * 用**已推断好**的那份初稿进审阅界面。
+ *
+ * 复用而不是重新请求：面板上已经把结果显示给用户了，点「查看并编辑」却再等一次遍历、
+ * 还可能拿到与刚才展示不一致的清单，属于无谓的不确定。想拿新快照就重新走完整识别。
+ */
+function openInferredDraft() {
+  if (phase.value !== "ready" || !inferredDrafts.value) return;
+  error.value = "";
+  applyInitialLearningResult(inferredDrafts.value);
+  phase.value = "review";
+}
+
+/**
  * 从只读初稿退回完整识别。
  *
  * 没有这个出口的话，用户一旦选了「跳过识别」就只能「放弃添加」重来一遍 —— 想反悔的代价
@@ -548,8 +605,28 @@ onUnmounted(stopPolling);
     <section v-else-if="phase === 'ready' || phase === 'capturing'" class="wizard-form">
       <section class="wizard-section learning-intro"><div class="section-icon"><Gamepad2 :size="22" /></div><div><h2>{{ completedGame?.displayName }} 的存档保护</h2><p>{{ validatingCandidates ? "只验证待确认的候选目录。请在游戏内再次完成一次保存。" : "启动受管游戏，在游戏内完成一次保存。建议保存后退出游戏再点击分析，确保数据完整落盘。" }}</p></div></section>
       <section class="wizard-section"><div class="task-progress-heading"><span>{{ validatingCandidates ? "再次验证会话" : "学习会话" }}</span><strong v-if="session">PID {{ session.rootPid }}</strong><strong v-else>尚未启动</strong></div><p v-if="phase === 'ready'" class="field-note">只会记录本次学习期间的文件变化，不会立即创建正式存档版本。</p><p v-else class="field-note">在游戏内完成一次保存后，建议先退出游戏，再点击分析；也可以直接点击分析。</p><div v-if="phase === 'capturing'" class="capture-state"><span class="loader"></span><strong>{{ validatingCandidates ? "正在验证候选范围" : "正在记录文件变化" }}</strong><span>{{ message }}</span></div></section>
+      <section v-if="phase === 'ready'" class="wizard-section inferred-scopes">
+        <div class="editor-label">
+          <strong><FolderSearch :size="15" /> 已推断的候选目录</strong>
+          <span v-if="inferringDrafts">正在推断</span>
+          <span v-else-if="inferredDrafts">{{ inferredDrafts.scopeDrafts.length }} 个</span>
+        </div>
+        <p v-if="inferringDrafts" class="scope-note">正在按目录名与文件特征推断，不影响你继续启动识别。</p>
+        <template v-else-if="inferredDrafts && inferredDrafts.scopeDrafts.length">
+          <ul class="inferred-scope-list">
+            <li v-for="(draft, index) in inferredDrafts.scopeDrafts.slice(0, 5)" :key="`${draft.scope.rootPath}-${index}`">
+              <span class="inferred-root-label">{{ rootTypeLabel[draft.scope.rootType] ?? draft.scope.rootType }}</span>
+              <code :title="draft.scope.rootPath">{{ draft.scope.rootPath }}</code>
+            </li>
+          </ul>
+          <p v-if="inferredDrafts.scopeDrafts.length > 5" class="scope-note">另有 {{ inferredDrafts.scopeDrafts.length - 5 }} 个候选目录，可在初稿审阅里逐个查看。</p>
+          <p class="scope-note">这是<strong>只读推断</strong>：没有启动游戏、没有任何写入证据，仅按目录名与文件特征判断。可以先看一眼，再启动识别做正式确认。</p>
+          <div class="inline-editor"><button class="secondary-button" type="button" :disabled="previewing" @click="openInferredDraft"><ArrowLeft :size="15" />查看并编辑这份初稿</button></div>
+        </template>
+        <p v-else-if="inferredDrafts" class="scope-note">没有按目录名推断出存档目录：候选目录名里没有出现游戏名时，普通权限发现不了它。启动识别后可以手动添加存档目录。</p>
+      </section>
       <p v-if="error" class="error-message" role="alert">{{ error }}</p>
-      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="cancelling" @click="abandonPendingGame">放弃添加</button><button v-if="phase === 'capturing'" class="secondary-button" type="button" :disabled="cancelling" @click="cancelTaskOrLearning"><LoaderCircle v-if="cancelling" :size="16" class="spin" /><X v-else :size="16" />{{ cancelling ? "正在停止" : `停止${validatingCandidates ? "验证" : "识别"}` }}</button><button v-if="phase === 'ready'" class="secondary-button" type="button" :disabled="previewing" title="不启动游戏，直接按存档目录名与文件特征推断一份待确认的初稿" @click="previewDraft"><LoaderCircle v-if="previewing" :size="16" class="spin" /><FolderOpen v-else :size="16" />{{ previewing ? "正在推断" : "跳过识别，先看初稿" }}</button><button v-if="phase === 'ready'" class="primary-button" type="button" :disabled="previewing" @click="beginLearning"><Gamepad2 :size="17" />启动并开始识别</button><button v-else class="primary-button" type="button" @click="analyze"><Check :size="17" />完成保存，开始{{ validatingCandidates ? "验证" : "分析" }}</button></footer>
+      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="cancelling" @click="abandonPendingGame">放弃添加</button><button v-if="phase === 'capturing'" class="secondary-button" type="button" :disabled="cancelling" @click="cancelTaskOrLearning"><LoaderCircle v-if="cancelling" :size="16" class="spin" /><X v-else :size="16" />{{ cancelling ? "正在停止" : `停止${validatingCandidates ? "验证" : "识别"}` }}</button><button v-if="phase === 'ready'" class="secondary-button" type="button" :disabled="previewing || inferringDrafts" title="不启动游戏，直接按存档目录名与文件特征推断一份待确认的初稿" @click="previewDraft"><LoaderCircle v-if="previewing" :size="16" class="spin" /><FolderOpen v-else :size="16" />{{ previewing ? "正在推断" : "跳过识别，先看初稿" }}</button><button v-if="phase === 'ready'" class="primary-button" type="button" :disabled="previewing" @click="beginLearning"><Gamepad2 :size="17" />启动并开始识别</button><button v-else class="primary-button" type="button" @click="analyze"><Check :size="17" />完成保存，开始{{ validatingCandidates ? "验证" : "分析" }}</button></footer>
     </section>
 
     <section v-else-if="phase === 'analyzing'" class="wizard-form">
