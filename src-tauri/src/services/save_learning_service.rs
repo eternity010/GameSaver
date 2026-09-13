@@ -861,6 +861,25 @@ fn find_candidate_directories(root: &Path, hints: &[String]) -> Vec<PathBuf> {
     candidates
 }
 
+/// 目录发现是否**只**找到了游戏安装目录本身。
+///
+/// 评审 A3：`find_candidate_directories` 靠「目录名里出现游戏名」来找扫描根。目录名不含游戏名时
+/// （日系 / 老游戏常见的 `%APPDATA%\<厂商>\<游戏>`，或与游戏名毫无关系的目录名），普通权限下
+/// 一个根都找不到 —— 症状只是「没有发现变化」，用户既不知道是发现环节出的问题，也很容易误以为
+/// 「改用完整识别就能解决」（其实不能：完整识别走的是同一份发现逻辑）。
+///
+/// **这里刻意不猜。** 自动兜底只能靠「目录名像存档容器」，而 `%APPDATA%` 下同时存在好几个这样的
+/// 目录（别人的存档），猜错就是把别人的存档收进版本库 —— 误收比漏收更难收拾。所以只把失败说清楚、
+/// 把出路指明白，猜的工作留给用户。
+///
+/// 除 ManagedGame 外的根**全部**来自 `find_candidate_directories` 的命中，所以「一个非
+/// ManagedGame 根都没有」等价于「提示词一处都没命中」。
+fn discovered_only_the_install_dir(roots: &[crate::domain::ScanRoot]) -> bool {
+    !roots
+        .iter()
+        .any(|root| root.root_type != SaveRootType::ManagedGame)
+}
+
 fn is_scan_noise_directory(path: &Path) -> bool {
     let name = path
         .file_name()
@@ -1614,10 +1633,18 @@ fn infer_scope_drafts(
     })
     .to_string()];
     if drafts.is_empty() {
-        notes.push(
-            "没有发现符合存档特征的变化，请确认游戏内完成了一次保存，或手动添加存档目录。"
-                .to_string(),
-        );
+        if discovered_only_the_install_dir(roots) {
+            // A3：这时候「换个方式再识别一次」是无效建议 —— 完整识别走的是同一份发现逻辑。
+            notes.push(
+                "没有发现符合存档特征的变化，而且目录发现只找到了游戏安装目录：存档目录的名字里没有出现游戏名时，普通权限发现不了它（改用完整识别也是同一份发现逻辑，同样找不到）。请在确认界面手动添加存档目录，或以管理员身份重试。"
+                    .to_string(),
+            );
+        } else {
+            notes.push(
+                "没有发现符合存档特征的变化，请确认游戏内完成了一次保存，或手动添加存档目录。"
+                    .to_string(),
+            );
+        }
     } else {
         notes.push(format!(
             "默认只保护 {limit_mb} MB 以内的存档文件，大文件、日志与噪音缓存已自动排除。"
@@ -1688,7 +1715,9 @@ fn preview_result(
         ),
     );
     if drafts.is_empty() {
-        notes.push("初稿没有推断出候选范围，建议改用完整识别，或手动添加存档目录。".to_string());
+        // 刻意**不**说「改用完整识别就能解决」：发现失败时它走同一份逻辑，同样找不到。
+        // 真正的解释与出路由 `infer_scope_drafts` 的说明给出，这里只补「初稿为空」这件事。
+        notes.push("初稿没有推断出候选范围；可以在确认界面手动添加存档目录。".to_string());
     }
     let confidence = calculate_learning_confidence(&drafts, PREVIEW_CAPTURE_MODE, None);
     SaveLearningResult {
@@ -1706,9 +1735,10 @@ fn preview_result(
 /// 只读推断一份存档范围初稿（不启动游戏、不采集 ETW）。
 fn preview_scope_drafts(game: &Game) -> Result<SaveLearningResult, String> {
     let roots = discover_scan_roots(game)?;
-    if roots.is_empty() {
-        return Err("没有推断出可扫描的存档目录，请改用完整识别。".to_string());
-    }
+    // 这里**不需要**判空：`discover_scan_roots` 的第一个根恒为游戏安装目录，`retain` 只做去重，
+    // 所以它结构上不可能返回空。原先那句「没有推断出可扫描的存档目录，请改用完整识别」因此是
+    // 不可达的死分支 —— 而且建议本身也是错的（完整识别走的是同一份发现逻辑）。
+    // 「发现失败」改由 `discovered_only_the_install_dir` 在 notes 里说清。
     let snapshot = collect_snapshot(&roots, |_, _| {}, &|| false)?;
     let (drafts, notes) = preview_drafts_from_roots(&roots, &snapshot);
     Ok(preview_result(drafts, notes, roots.len()))
@@ -1964,8 +1994,8 @@ mod tests {
 
     use super::{
         arm_capture_watchdog, calculate_learning_confidence, classify_scope_evidence,
-        directory_matches_hint, discover_save_container_files, infer_scope_drafts,
-        is_etw_candidate, is_transaction_evidence_path, path_is_within_root,
+        directory_matches_hint, discover_save_container_files, discovered_only_the_install_dir,
+        infer_scope_drafts, is_etw_candidate, is_transaction_evidence_path, path_is_within_root,
         preview_drafts_from_roots, preview_result, propose_directory_saves, run_capture_watchdog,
         snapshot_analysis_progress, transaction_evidence, MAX_CANDIDATE_FILE_BYTES,
         MAX_CAPTURE_DURATION,
@@ -2487,6 +2517,106 @@ mod tests {
             result.notes
         );
         assert_eq!(result.confidence, 0, "没有草稿时置信度必须是 0");
+        // A3：发现失败时「改用完整识别」是无效建议（同一份发现逻辑），不能出现在初稿说明里。
+        assert!(
+            !result
+                .notes
+                .iter()
+                .any(|note| note.contains("改用完整识别")),
+            "初稿说明不得建议「改用完整识别」，实际：{:?}",
+            result.notes
+        );
+    }
+
+    /// A3：判定「发现是否只找到了安装目录」只看根类型，不看路径 —— 安装目录本身也可能叫
+    /// `saves` 之类，按路径名判会漏报。
+    #[test]
+    fn install_only_discovery_is_decided_by_root_type() {
+        let root = |root_type: SaveRootType, path: &str| ScanRoot {
+            root_type,
+            physical_path: PathBuf::from(path),
+        };
+
+        assert!(discovered_only_the_install_dir(&[root(
+            SaveRootType::ManagedGame,
+            r"C:\Games\Demo\saves"
+        )]));
+        assert!(!discovered_only_the_install_dir(&[
+            root(SaveRootType::ManagedGame, r"C:\Games\Demo"),
+            root(SaveRootType::AppData, r"C:\Users\P\AppData\Roaming\Demo"),
+        ]));
+    }
+
+    /// A3 的正题：发现只找到安装目录、又没有候选时，说明必须点出真正的病因（目录名不含游戏名），
+    /// 并说清「改用完整识别也没用」—— 否则用户会去重试一次注定失败的完整识别，或者反过来怀疑
+    /// 自己没保存成功。
+    #[test]
+    fn empty_drafts_explain_a_name_mismatch_instead_of_suggesting_a_retry() {
+        let (root, _roots, snapshot) = preview_fixture(
+            "a3-name-mismatch",
+            &[("settings.ini", b"[cfg]"), ("readme.txt", b"hi")],
+        );
+        // 只有安装目录这一个根 —— 正是「提示词一处都没命中」的形态。
+        let install_only = vec![ScanRoot {
+            root_type: SaveRootType::ManagedGame,
+            physical_path: root.clone(),
+        }];
+
+        let (_, drafts, notes) = infer_scope_drafts(
+            &install_only,
+            &snapshot,
+            Some(&HashMap::new()),
+            &HashSet::new(),
+            &[],
+        );
+
+        assert!(
+            drafts.is_empty(),
+            "settings.ini / readme.txt 都不是存档，不该推出范围，实际 {} 个",
+            drafts.len()
+        );
+        let joined = notes.join("\n");
+        assert!(
+            joined.contains("目录发现只找到了游戏安装目录"),
+            "必须点出发现环节的问题，实际说明：{joined}"
+        );
+        assert!(
+            joined.contains("同一份发现逻辑"),
+            "必须说清「改用完整识别也没用」，实际说明：{joined}"
+        );
+        assert!(
+            !joined.contains("请确认游戏内完成了一次保存"),
+            "这是发现失败的场景，不该把用户引去怀疑自己没保存，实际说明：{joined}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 反过来：发现确实找到了安装目录之外的根时，就不能再提「目录名不含游戏名」——
+    /// 否则每个「忘了保存」的用户都会被引到错误的方向上去。
+    #[test]
+    fn empty_drafts_stay_plain_when_discovery_found_more_than_the_install_dir() {
+        let (root, roots, snapshot) =
+            preview_fixture("a3-found-a-root", &[("settings.ini", b"[cfg]")]);
+
+        let (_, drafts, notes) = infer_scope_drafts(
+            &roots, // preview_fixture 给的是 AppData 根，不是 ManagedGame
+            &snapshot,
+            Some(&HashMap::new()),
+            &HashSet::new(),
+            &[],
+        );
+
+        assert!(drafts.is_empty());
+        let joined = notes.join("\n");
+        assert!(
+            !joined.contains("目录发现只找到了游戏安装目录"),
+            "发现是成功的，不该说发现失败，实际说明：{joined}"
+        );
+        assert!(
+            joined.contains("请确认游戏内完成了一次保存"),
+            "应给出普通的「确认是否保存过」说明，实际说明：{joined}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// 提议只该出现在「只认历史清单」的范围上：容器命名的范围本来就整目录收集
