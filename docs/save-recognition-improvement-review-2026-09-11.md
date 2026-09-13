@@ -1,6 +1,7 @@
 # 存档识别与规则生成：性能 / 精准度 / 自动化 审视
 
-> 2026-09-11。范围：`services/save_learning_service.rs`（2696 行）、`services/learning/{etw_capture,native_etw,transactions}.rs`、`repositories/save_repository.rs`（2724 行）、`domain/save_profile.rs`。
+> 2026-09-11。范围：`services/save_learning_service.rs`（2696 → 现 3555 行）、`services/learning/{etw_capture,native_etw,transactions}.rs`、`repositories/save_repository.rs`（2724 → 现 3531 行）、`domain/save_profile.rs`。
+> **行数已按 2026-09-13 实测更新**（本行原记 2696 / 2724）。原记并非随手估的：`save_repository.rs` 的 2724 与审视当时那一版（`00ad9ee`，2026-09-10）**逐行吻合**；`save_learning_service.rs` 的 2696 略高于该版实测的 2514 —— 应是审视当时尚未提交的中间状态。该中间态已不可回溯：`.git` 曾在 2026-09-12 损坏，丢失的工作由 `4c4fa55` 重新落地（`00ad9ee` 是其父提交）。标注方式沿用本文惯例：保留审视当时的数字，另附现值。
 > 目标按主人给的三个方向：**识别性能与精准度**、**规则的性能与精准度**、**提高自动化程度**，并要求覆盖不同经典游戏类型。
 > 本文只做审视与建议，**未改任何代码**。
 
