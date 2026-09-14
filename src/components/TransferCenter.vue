@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, type Component } from "vue";
 import { CheckCircle2, CloudDownload, CloudUpload, History, LoaderCircle, Play, RefreshCw, Trash2, XCircle } from "@lucide/vue";
-import { cancelTask, deleteRemoteBodyPackage, deleteTasks, downloadGameBodyPackage, installCloudGame, repairCloudBodyManifest, startRestoreCloudSaveTask, startUploadSaveVersionTask, type AppTask, type CloudGameSummary, type TaskCategory, uploadGameBodyPackage } from "../api";
+import { cancelTask, confirmAction, deleteRemoteBodyPackage, deleteTasks, downloadGameBodyPackage, installCloudGame, repairCloudBodyManifest, startRestoreCloudSaveTask, startUploadSaveVersionTask, type AppTask, type CloudGameSummary, type TaskCategory, uploadGameBodyPackage } from "../api";
 import type { Game } from "../domain/game";
 import { taskCancelHint, taskCategoryOf, taskPolicyOf, useTaskFeed } from "../taskFeed";
 
@@ -50,7 +50,7 @@ const finishedTransferTasks = computed(() => allTransferTasks.value.filter((task
 async function cancel(task: AppTask) {
   // 不可取消的任务不提供入口（见 `taskPolicyOf`），这里再兜一次，避免误触。
   if (!isActive(task) || !taskPolicyOf(task).cancellable || cancelling.value) return;
-  if (!window.confirm(taskCancelHint(task))) return;
+  if (!(await confirmAction(taskCancelHint(task)))) return;
   cancelling.value = task.taskId;
   try {
     await cancelTask(task.taskId);
@@ -100,7 +100,7 @@ async function retry(task: AppTask) {
 
 async function removeTask(task: AppTask) {
   if (isActive(task) || deleting.value) return;
-  if (!window.confirm(`只删除“${taskTitle(task)}”的任务记录，不会删除游戏本体或云端文件。确定删除吗？`)) return;
+  if (!(await confirmAction(`只删除“${taskTitle(task)}”的任务记录，不会删除游戏本体或云端文件。确定删除吗？`))) return;
   deleting.value = task.taskId;
   actionError.value = "";
   try {
@@ -116,7 +116,7 @@ async function removeTask(task: AppTask) {
 async function clearFinished() {
   const ids = finishedTransferTasks.value.map((task) => task.taskId);
   if (!ids.length || deleting.value) return;
-  if (!window.confirm(`将删除 ${ids.length} 条已结束的传输记录，不会删除游戏本体或云端文件。确定继续吗？`)) return;
+  if (!(await confirmAction(`将删除 ${ids.length} 条已结束的传输记录，不会删除游戏本体或云端文件。确定继续吗？`))) return;
   deleting.value = "all";
   actionError.value = "";
   try {

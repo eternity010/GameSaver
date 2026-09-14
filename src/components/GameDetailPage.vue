@@ -4,7 +4,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { AlertTriangle, Archive, ArrowLeft, Camera, Check, CheckCircle2, Clock3, Cloud, CloudDownload, CloudUpload, Folder, FolderOpen, Gamepad2, HardDrive, ImagePlus, LoaderCircle, Pencil, Play, RefreshCw, RotateCcw, ShieldCheck, Trash2, Upload, X } from "@lucide/vue";
-import { armGameCoverCapture, deleteCloudSaveVersion, deleteGameBodyPackage, deleteSaveVersion, discardGameCoverCapture, getBaiduConfig, getBaiduStatus, getCloudSaveOverview, getGameCover, getGameCoverCaptureUrl, getGameCoverUrl, getGameDetailView, getGameRuntime, getSaveProfile, getTask, launchGame, listGameBodyVersions, openPathInExplorer, packageGameBody, precheckGameLaunch, pruneSaveVersions, removeGameFromLibrary, renameGame, restoreSaveVersion, saveGameCover, startRestoreCloudSaveTask, startUploadSaveVersionTask, uninstallGameBody, updateGameBody, uploadGameBodyPackage, updateSaveProfileKeepVersions, updateSaveProfileScopes } from "../api";
+import { armGameCoverCapture, confirmAction, deleteCloudSaveVersion, deleteGameBodyPackage, deleteSaveVersion, discardGameCoverCapture, getBaiduConfig, getBaiduStatus, getCloudSaveOverview, getGameCover, getGameCoverCaptureUrl, getGameCoverUrl, getGameDetailView, getGameRuntime, getSaveProfile, getTask, launchGame, listGameBodyVersions, openPathInExplorer, packageGameBody, precheckGameLaunch, pruneSaveVersions, removeGameFromLibrary, renameGame, restoreSaveVersion, saveGameCover, startRestoreCloudSaveTask, startUploadSaveVersionTask, uninstallGameBody, updateGameBody, uploadGameBodyPackage, updateSaveProfileKeepVersions, updateSaveProfileScopes } from "../api";
 import type { BaiduConfigView, BaiduStatus } from "../api";
 import { createDefaultSaveScope, gameStatusLabel } from "../domain/game";
 import type { CloudSaveManifestVersion, CloudSaveSyncStatusView, CoverCrop, CoverPosition, Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveProfile, SaveRootType, SaveScope, SaveVersionSummary } from "../domain/game";
@@ -333,9 +333,9 @@ async function openCloudSaveDrawer() {
 async function restoreCloudSave(cloudVersion: CloudSaveManifestVersion) {
   if (busy.value || runtime.value) return;
   if (
-    !window.confirm(
+    !(await confirmAction(
       `从百度网盘还原 ${formatDate(cloudVersion.createdAt)} 的存档。\n还原后存档目录会回到该云端版本的状态：当前存在、但该版本里没有的存档文件会被移除。\n还原前会先保护当前本地存档，确定继续吗？`
-    )
+    ))
   )
     return;
   busy.value = true;
@@ -351,7 +351,7 @@ async function restoreCloudSave(cloudVersion: CloudSaveManifestVersion) {
 
 async function deleteCloudSave(cloudVersion: CloudSaveManifestVersion) {
   if (busy.value || runtime.value) return;
-  if (!window.confirm(`确定从百度网盘中删除 ${formatDate(cloudVersion.createdAt)} 的云端存档吗？`)) return;
+  if (!(await confirmAction(`确定从百度网盘中删除 ${formatDate(cloudVersion.createdAt)} 的云端存档吗？`))) return;
   busy.value = true;
   error.value = "";
   message.value = "正在删除云端存档";
@@ -579,9 +579,9 @@ function handleTaskChanged(payload: { taskId?: string; gameUid?: string } | unde
 async function restoreVersion(version: SaveVersionSummary) {
   if (busy.value || runtime.value) return;
   if (
-    !window.confirm(
+    !(await confirmAction(
       "恢复后存档目录会回到该版本的状态：当前存在、但该版本里没有的存档文件会被移除。\n恢复前会先保护当前存档，确定恢复这个版本吗？"
-    )
+    ))
   )
     return;
   busy.value = true;
@@ -597,7 +597,7 @@ async function restoreVersion(version: SaveVersionSummary) {
 
 async function deleteVersion(version: SaveVersionSummary) {
   if (busy.value || runtime.value) return;
-  if (!window.confirm("删除后将无法从这个版本恢复，确定继续吗？")) return;
+  if (!(await confirmAction("删除后将无法从这个版本恢复，确定继续吗？"))) return;
   busy.value = true;
   error.value = "";
   message.value = "准备删除保存版本";
@@ -611,7 +611,7 @@ async function deleteVersion(version: SaveVersionSummary) {
 
 async function pruneVersions() {
   if (busy.value || runtime.value) return;
-  if (!window.confirm(`仅保留最近 ${keepVersions.value} 个版本，确定清理旧版本吗？`)) return;
+  if (!(await confirmAction(`仅保留最近 ${keepVersions.value} 个版本，确定清理旧版本吗？`))) return;
   busy.value = true;
   error.value = "";
   message.value = "准备清理旧保存版本";
@@ -640,7 +640,7 @@ async function updateBody() {
   const confirmMsg = props.game.health === "broken"
     ? "将使用所选游戏文件夹恢复并更新游戏本体。确定继续吗？"
     : "新版游戏文件夹会覆盖当前受管游戏本体。当前存档会先保护，确定开始更新吗？";
-  if (!window.confirm(confirmMsg)) return;
+  if (!(await confirmAction(confirmMsg))) return;
   busy.value = true;
   error.value = "";
   message.value = "准备更新游戏本体";
@@ -654,7 +654,7 @@ async function updateBody() {
 
 async function packageBody() {
   if (busy.value || runtime.value) return;
-  if (!window.confirm("将当前受管游戏本体压缩为 ZIP，并保存到本地缓存，确定继续吗？")) return;
+  if (!(await confirmAction("将当前受管游戏本体压缩为 ZIP，并保存到本地缓存，确定继续吗？"))) return;
   busy.value = true;
   error.value = "";
   message.value = "准备创建游戏本体包";
@@ -668,7 +668,7 @@ async function packageBody() {
 
 async function uninstallBody() {
   if (busy.value || runtime.value) return;
-  if (!window.confirm("只会删除 GameSaver 管理的本地游戏本体，存档版本、游戏设置和云端版本会保留。确定卸载吗？")) return;
+  if (!(await confirmAction("只会删除 GameSaver 管理的本地游戏本体，存档版本、游戏设置和云端版本会保留。确定卸载吗？"))) return;
   busy.value = true;
   error.value = "";
   message.value = "准备卸载游戏本体";
@@ -684,7 +684,7 @@ async function uninstallBody() {
 
 async function removeFromLibrary() {
   if (busy.value || runtime.value) return;
-  if (!window.confirm(`确定要从游戏库中彻底删除《${props.game.displayName}》吗？\n\n此操作将删除该游戏在 GameSaver 中的所有记录、保护配置及受管文件，无法撤销。`)) return;
+  if (!(await confirmAction(`确定要从游戏库中彻底删除《${props.game.displayName}》吗？\n\n此操作将删除该游戏在 GameSaver 中的所有记录、保护配置及受管文件，无法撤销。`))) return;
   busy.value = true;
   error.value = "";
   message.value = "正在从库中彻底删除游戏";
@@ -700,7 +700,7 @@ async function removeFromLibrary() {
 
 async function deleteBodyPackage(version: GameBodyVersion) {
   if (busy.value || runtime.value || !version.packagePath) return;
-  if (!window.confirm(version.archivePath ? "删除本地 ZIP 后仍保留旧本体目录，确定继续吗？" : "删除本地 ZIP 后将无法从这个本体版本恢复，确定继续吗？")) return;
+  if (!(await confirmAction(version.archivePath ? "删除本地 ZIP 后仍保留旧本体目录，确定继续吗？" : "删除本地 ZIP 后将无法从这个本体版本恢复，确定继续吗？"))) return;
   busy.value = true;
   error.value = "";
   message.value = "准备删除本地本体包";
@@ -714,7 +714,7 @@ async function deleteBodyPackage(version: GameBodyVersion) {
 
 async function uploadBody(version: GameBodyVersion) {
   if (busy.value || runtime.value || !version.packagePath || !baiduReady()) return;
-  if (!window.confirm("将此版本的游戏本体 ZIP 上传到百度网盘，确定继续吗？")) return;
+  if (!(await confirmAction("将此版本的游戏本体 ZIP 上传到百度网盘，确定继续吗？"))) return;
   busy.value = true;
   error.value = "";
   message.value = "准备上传游戏本体包";

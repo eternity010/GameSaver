@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from "vue";
 import { CheckCircle2, CloudDownload, CloudUpload, ExternalLink, FolderOpen, HardDrive, KeyRound, RefreshCw, Save, ShieldCheck, XCircle } from "@lucide/vue";
-import { buildBaiduAuthorizeUrl, exchangeBaiduCode, getBaiduConfig, getBaiduQuota, getBaiduStatus, getCloudAccountStatus, getLibrarySettings, getTask, saveBaiduConfig, setBaiduAutoUpload, startDownloadCloudAccountTask, startSetLibraryRootTask, startUploadCloudAccountTask, updateBaiduSaveSyncSettings } from "../api";
+import { buildBaiduAuthorizeUrl, confirmAction, exchangeBaiduCode, getBaiduConfig, getBaiduQuota, getBaiduStatus, getCloudAccountStatus, getLibrarySettings, getTask, saveBaiduConfig, setBaiduAutoUpload, startDownloadCloudAccountTask, startSetLibraryRootTask, startUploadCloudAccountTask, updateBaiduSaveSyncSettings } from "../api";
 import type { BaiduConfigView, BaiduQuota, BaiduStatus, CloudAccountStatus, LibrarySettings } from "../api";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -52,7 +52,7 @@ async function refresh() {
 
 async function syncCloudAccount(direction: "upload" | "download") {
   if (cloudAccountTaskId.value || !status.value?.authorized) return;
-  if (direction === "download" && !window.confirm("将云端游戏设置合并到本机。现有游戏本体和本机路径不会被删除，但同 UID 的名称、启动配置和存档规则可能更新。继续吗？")) return;
+  if (direction === "download" && !(await confirmAction("将云端游戏设置合并到本机。现有游戏本体和本机路径不会被删除，但同 UID 的名称、启动配置和存档规则可能更新。继续吗？"))) return;
   saving.value = true;
   error.value = "";
   message.value = "";

@@ -302,3 +302,71 @@ pub fn run() {
         eprintln!("GameSaver 运行失败：{error}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// 前端一律不得直接使用 `window.confirm`。
+    ///
+    /// Tauri 的 dialog 插件在初始化时会把它换成一个 async 函数：
+    ///
+    /// ```text
+    /// window.confirm = async function (message) {
+    ///   return await invoke("plugin:dialog|confirm", { message });
+    /// };
+    /// ```
+    ///
+    /// 而插件 2.7.x **只注册了 open / save / message 三个命令，没有 `confirm`** —— 这个调用
+    /// 必然被运行期拒绝（日志里是 `Command plugin:dialog|confirm not allowed by ACL`），却
+    /// 仍然返回一个 **Promise**。于是 `if (!window.confirm(...)) return` 这种同步写法全部静默
+    /// 失效：`!Promise` 恒为 false，那个 `return` 一次都不会执行 —— 彻底删除、有游戏在运行时
+    /// 退出、删除云端版本这类不可逆操作会**不问用户、直接执行**。
+    ///
+    /// 所以前端统一走 `src/api.ts` 的 `confirmAction()`（内部调已授权的
+    /// `plugin:dialog|message`，且必须 `await`）。这条测试就是防止有人再写回去。
+    #[test]
+    fn frontend_never_uses_window_confirm() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../src");
+        let mut offenders = Vec::new();
+        collect_window_confirm_offenders(&root, &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "前端不得直接使用 window.confirm —— 它在 Tauri 里返回 truthy 的 Promise，会让同步守卫静默失效。请改用 api.ts 的 confirmAction()：{offenders:#?}"
+        );
+    }
+
+    fn collect_window_confirm_offenders(dir: &Path, offenders: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_window_confirm_offenders(&path, offenders);
+                continue;
+            }
+            if !matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("ts" | "vue")
+            ) {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            // 注释里提到它是允许的（`api.ts` 的说明就靠这个），只禁止真正的调用。
+            let calls_it = text.lines().any(|line| {
+                let trimmed = line.trim_start();
+                let commented = trimmed.starts_with("//")
+                    || trimmed.starts_with('*')
+                    || trimmed.starts_with("/*");
+                !commented && line.contains("window.confirm")
+            });
+            if calls_it {
+                offenders.push(path);
+            }
+        }
+    }
+}

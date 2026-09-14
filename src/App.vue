@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { AlertTriangle, ChevronLeft, ChevronRight, CloudDownload, CloudUpload, Gamepad2, Library, Plus, Settings, Search, ShieldCheck } from "@lucide/vue";
-import { confirmAppExit, deleteRemoteBodyPackage, discardGameCoverCapture, getElevationStatus, getGameCoverUrl, getGameRuntime, getTask, installCloudGame, launchGame, listCloudGames, listGames, restartAsAdmin } from "./api";
+import { confirmAction, confirmAppExit, deleteRemoteBodyPackage, discardGameCoverCapture, getElevationStatus, getGameCoverUrl, getGameRuntime, getTask, installCloudGame, launchGame, listCloudGames, listGames, restartAsAdmin } from "./api";
 import type { AppTask, ElevationStatus } from "./api";
 import type { CloudGameSummary, CloudGameVersion } from "./api";
 import { gameStatusLabel, type Game } from "./domain/game";
@@ -419,7 +419,9 @@ async function handleExitBlocked(payload: { runningCount?: number } | undefined)
   exitPromptOpen = true;
   try {
     const count = payload?.runningCount ?? 1;
-    const confirmed = window.confirm(
+    // 必须 await：confirmAction 返回 Promise，且 Tauri 已经把 window.confirm 换成了
+    // 一个永远 reject 的 async 函数 —— 同步写法会让「有游戏在运行时退出」这道闸门失效。
+    const confirmed = await confirmAction(
       `有 ${count} 个游戏正在运行。\n\n` +
         "现在关闭 GameSaver，本次游玩的存档将不会被自动提交，也不会生成新的存档版本。\n\n" +
         "仍要关闭吗？",
@@ -542,7 +544,8 @@ async function installAndLaunch(cloudGame: CloudGameSummary, version: CloudGameV
 async function deleteCloudVersion(cloudGame: CloudGameSummary, version: CloudGameVersion) {
   if (cloudInstallUid.value) return;
   const warning = `将永久删除百度网盘中的“${cloudGame.displayName}”版本 ${version.versionId}（${formatBytes(version.size)}）。此操作无法撤销，确定继续吗？`;
-  if (!window.confirm(warning) || !window.confirm("请再次确认：仅云端版本会被删除，本地游戏本体不会受影响。")) return;
+  // 两道确认都必须 await：漏掉 await 时 `!Promise` 恒为 false，两道闸门会一起静默失效。
+  if (!(await confirmAction(warning)) || !(await confirmAction("请再次确认：仅云端版本会被删除，本地游戏本体不会受影响。"))) return;
   cloudInstallUid.value = cloudGame.gameUid;
   cloudInstallProgress.value = 0;
   cloudInstallMessage.value = "准备删除云端版本";

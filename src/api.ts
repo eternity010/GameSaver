@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import type { CoverCrop, CoverPosition, Game, GameBodyVersion, GameCover, GameDetailView, GameRuntime, LaunchPrecheck, SaveLearningResult, SaveLearningSession, SaveProfile, SaveScope, SaveVersion } from "./domain/game";
 
 export interface FrontendErrorReport {
@@ -22,6 +23,39 @@ function errorMessage(reason: unknown): string {
 
 export function reportFrontendError(report: FrontendErrorReport): Promise<void> {
   return invoke<void>("report_frontend_error", { error: report });
+}
+
+/**
+ * 危险操作的统一确认框：**必须 `await`**，一律不要再写 `window.confirm`。
+ *
+ * Tauri 的 dialog 插件在初始化时把 `window.confirm` 换成了一个 async 函数
+ * （见 `tauri-plugin-dialog` 的 init 脚本）：
+ *
+ *     window.confirm = async function (message) {
+ *       return await invoke("plugin:dialog|confirm", { message });
+ *     };
+ *
+ * 而该插件 2.7.x **只注册了 open / save / message 三个命令，没有 `confirm`** —— 这个调用
+ * 必然被运行期拒绝（日志里长这样：`Command plugin:dialog|confirm not allowed by ACL`），
+ * 却仍然**返回一个 Promise**。于是 `if (!window.confirm(...)) return` 这种同步写法全部静默
+ * 失效：`!Promise` 恒为 false，那个 `return` 一次都不会执行 —— 彻底删除、有游戏在运行时退出、
+ * 删除云端版本这类不可逆操作会**不问用户、直接执行**。
+ *
+ * 这里统一改走 `@tauri-apps/plugin-dialog` 的 `confirm()`，它内部调用的是已授权的
+ * `plugin:dialog|message`（`dialog:default` 里就有）。三点约定：
+ *
+ * 1. 必须 `await` —— 漏掉就退回上面那个陷阱，`cargo test --lib` 有守卫测试扫描前端源码，
+ *    禁止再出现 `window.confirm`；
+ * 2. 出错时**按取消处理**（fail-closed）：宁可少做一次危险动作，也不能不问就做；
+ * 3. `=== true` 是刻意的收紧：任何非 `true`（含异常对象、undefined）都当作用户没同意。
+ */
+export async function confirmAction(message: string, title?: string): Promise<boolean> {
+  try {
+    return (await confirm(message, title)) === true;
+  } catch (reason) {
+    console.error("确认框不可用，已按取消处理（本次操作不会执行）", reason);
+    return false;
+  }
 }
 
 function invokeCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
