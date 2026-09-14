@@ -1,4 +1,4 @@
-use crate::services::disk_space;
+use crate::{domain::is_safe_path_segment, services::disk_space};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -66,8 +66,33 @@ struct PackagePlan {
 pub struct BodyPackageService;
 
 impl BodyPackageService {
-    pub fn package_path(cache_root: &Path, game_uid: &str, version_id: &str) -> PathBuf {
-        cache_root.join(game_uid).join(format!("{version_id}.zip"))
+    /// 本地本体包缓存路径。
+    ///
+    /// **两个入参都必须校验**：`version_id` 有一路来自**网盘下载的 `manifest.json`**
+    /// （`CloudManifestService::project` 从清单条目取 `version_id`），而这里原先只是纯
+    /// `join` —— 一个 `version_id = "../../.."` 就能让结果落到缓存根之外，而调用方紧接着
+    /// 会对结果 `remove_file` 与下载写入（`install_cloud_game_task`）。那就是 F1 在存档侧
+    /// 那个远端 `package_path` 出口的**本地镜像**，且本地文件系统对 `..` 的解析是确定的，
+    /// 不必赌服务端行为。
+    ///
+    /// 返回 `Result` 而不是在函数内部 `sanitize`：两个入参都必须是**单层**名字，静默改写会把
+    /// 「攻击」变成「写到别的名字」，报错才是正确的失败方式。这同时让新调用方无法绕过校验。
+    ///
+    /// 路径构造仍用原值（不 `trim`）以保证合法入参下的行为与收窄前逐字节一致；`trim` 只发生
+    /// 在判定内部。
+    pub fn package_path(
+        cache_root: &Path,
+        game_uid: &str,
+        version_id: &str,
+    ) -> Result<PathBuf, String> {
+        for (label, value) in [("游戏标识", game_uid), ("本体版本标识", version_id)] {
+            if !is_safe_path_segment(value) {
+                return Err(format!(
+                    "{label}包含不安全的路径字符，已拒绝本体包操作：{value:?}"
+                ));
+            }
+        }
+        Ok(cache_root.join(game_uid).join(format!("{version_id}.zip")))
     }
 
     pub fn cleanup_temporary_packages(cache_root: &Path) -> Result<usize, String> {
@@ -242,7 +267,7 @@ impl BodyPackageService {
         }
         on_progress(5, &format!("已发现 {} 个本体文件", files.len()));
 
-        let package_path = Self::package_path(cache_root, game_uid, version_id);
+        let package_path = Self::package_path(cache_root, game_uid, version_id)?;
         let parent = package_path
             .parent()
             .ok_or_else(|| "本体包路径无父目录".to_string())?
@@ -1504,5 +1529,58 @@ mod tests {
             }
         }
         PathBuf::from("Z:/gamesaver-probe-cache")
+    }
+
+    /// 本体包路径必须落在缓存根之内 —— **两个入参都要挡**。
+    ///
+    /// `version_id` 有一路来自网盘下载的 `manifest.json`，而这个函数原先只是纯 `join`，
+    /// 调用方紧接着会对结果 `remove_file` 与下载写入。所以这里钉住两件事：
+    /// 合法入参的结果确实在缓存根之下，且任何能移动路径的入参都被拒绝。
+    #[test]
+    fn package_path_rejects_escapes_and_stays_under_the_cache_root() {
+        let root = PathBuf::from(r"E:\lib\body-packages");
+
+        // 合法：结果必须在缓存根之下，且形状不变。
+        let ok = BodyPackageService::package_path(&root, "uid-1", "v1").expect("合法标识应通过");
+        assert_eq!(ok, root.join("uid-1").join("v1.zip"));
+        assert!(ok.starts_with(&root), "结果必须落在缓存根之下：{ok:?}");
+        // 含空格与非 ASCII 的合法标识必须仍然可用。
+        assert!(BodyPackageService::package_path(&root, "uid 1", "版本 1").is_ok());
+
+        // 逃逸：两个入参都要各自挡住。
+        for bad in [
+            "..",
+            ".",
+            "../escape",
+            r"..\escape",
+            "a/b",
+            r"a\b",
+            "",
+            "   ",
+        ] {
+            assert!(
+                BodyPackageService::package_path(&root, "uid-1", bad).is_err(),
+                "接受了不安全的 version_id: {bad:?}"
+            );
+            assert!(
+                BodyPackageService::package_path(&root, bad, "v1").is_err(),
+                "接受了不安全的 game_uid: {bad:?}"
+            );
+        }
+
+        // 绝对路径这一类必须由校验挡住，**不能**指望 `join` 把它限制在根之下。
+        // 这条同时把这个语义实测钉死（先前只有「按 std 文档推断」）。
+        let absolute = "C:/Windows/Temp/evil.zip";
+        assert_eq!(
+            root.join(absolute),
+            PathBuf::from(absolute),
+            "Path::join 遇到绝对路径会替换基路径 —— 这正是绝对路径必须被校验拒绝的原因"
+        );
+        for absolute in [r"C:\Windows\Temp\evil", "/etc/evil"] {
+            assert!(
+                BodyPackageService::package_path(&root, "uid-1", absolute).is_err(),
+                "接受了绝对 version_id: {absolute:?}"
+            );
+        }
     }
 }

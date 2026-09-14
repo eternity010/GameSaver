@@ -15,8 +15,9 @@
 | C2 | 中 | ✅ 已修（§0.3） | 云端清单是「读-改-写」，整个过程没有串行化；退出游戏的自动同步与用户手动同步可并发，导致丢条目 | `cloud_save_service.rs:195-238`、`launch_service.rs:626` |
 | C3 | 中 | ✅ 已修（§0.4） | `download_file` 的临时文件名由目标路径推导（非唯一），并发/重入下载同一目标会撞同一个临时文件；出错路径不清理 | `baidu_netdisk_service.rs:796` |
 | C4 | 低 | 待办 | 云同步命令层（`cloud_save_commands.rs`）**没有任何测试** | 整个文件 388 行 |
+| H1 | **高** | ✅ 已修（§0.5） | 云本体清单的 `version_id` 由远端 `manifest.json` 决定，却未做路径校验就被拼进**本地**缓存路径，随即被 `remove_file` 与下载写入 —— 可删除 / 覆盖本机任意 `*.zip` | `cloud_manifest_service.rs:753`、`baidu_commands.rs:1511`、`game_body_package_service.rs:69` |
 
-> 只剩 C4（覆盖缺口，非缺陷）。已修的四条里，C5 与 C2 都属「一旦发生就要用户承担后果」，C1 与 C3 是加固与资源泄漏。处置顺序见 §6。
+> 云存档侧只剩 C4（覆盖缺口，非缺陷）；云本体侧 H1 已修（§0.5），另有 §7 的四条**尚未处置**的新发现。已修的五条里，C5 与 C2 都属「一旦发生就要用户承担后果」，C1 与 C3 是加固与资源泄漏，而 H1 是唯一一条落在**本地文件系统**上的任意路径删除 / 写入。处置顺序见 §6。
 
 **数据完整性主链路是扎实的** —— 这部分要先说清楚，免得下面的条目造成错误印象：
 
@@ -140,6 +141,44 @@
 - 门禁：`cargo fmt --check` 干净、`cargo test --lib` 290 passed / 0 failed、clippy 0 error 且警告数与基线持平（34）。
 
 **未做的事**：没有造真实并发下载去撞同一个目标（要真实网盘）。三条缺陷的判据都是纯路径/生命周期逻辑，已被单元测试与变异覆盖；但「两个真实并发下载互不干扰」这一点与 C2 一样，只有真实环境能端到端确认。
+
+---
+
+## 0.5 H1 落地记录（2026-09-14）
+
+**怎么发现的**：审云本体下载 / 安装路径时，拿它和刚从 C1、F1 学到的东西对照 —— 同一个仓库里「远端 JSON 不可信」这条已经确立，于是逐个检查「远端字段 → 本地路径」的拼接点。F1 修的是**远端**出口（`package_path` 拿去删远端文件），这一条是它的**本地镜像**。
+
+**问题**：`install_cloud_game_task` 在 `baidu_commands.rs:1506-1511` 取 `package.version_id` 拼本地缓存路径，而这个 `version_id` 可能就是**网盘上 `manifest.json` 里的值**（`CloudManifestService::project` 在 `package_path` 命中远端列表时采用清单里的 `version_id`），`validate` 对它只要求非空。于是：
+
+1. `:1511` `BodyPackageService::package_path` 是纯 `join` → 结果可逃出缓存根；
+2. `:1512` 对结果 `remove_file` → **删除**该路径文件；
+3. `:1523` 把攻击者的 zip **写入**该路径（且写入发生在任何哈希 / 结构校验之前）。
+
+因为后缀被强制成 `.zip`，目标是「本机任意 `*.zip`」。**关键区别**：F1 还要赌百度服务端怎么解析 `..`，而这里是本地文件系统，行为是确定的 —— 不必赌。
+
+**不对称是漏改而非设计**：同一个文件里 `download_body_task:1088` 早就查了 `version_id`（空 / `/` / `\` / `.` / `..`），只有安装这条没查。与 C1（三份重复校验漏了第四处）、E（键的推导源不对）同一形状。
+
+**做法（三层，入口 + 出口 + 去重）**：
+
+| 层 | 改动 |
+|---|---|
+| 出口不可误用 | `BodyPackageService::package_path` 改为**返回 `Result`**，内部对 `game_uid` 与 `version_id` 各做一次 `is_safe_path_segment`。放在函数内而不是调用点：调用点有 5 处，摆在外面迟早漏一个（C1 的教训）。返回 `Result` 而非内部 sanitize：静默改写会把「攻击」变成「写到别的名字」，**报错才是正确的失败方式**；同时让新调用方无法绕过 |
+| 入口拒绝 | `CloudManifestService::validate` 对 `versions[].version_id` 的要求从「非空」提到「安全路径段」，让被污染的清单**在读取时就失败** |
+| 去除重复判定 | `download_body_task` 那份内联检查收敛到 `is_safe_path_segment`（比原内联更严：多拒控制字符并先 `trim`）。保留显式检查而非只靠 `?`，因为这条路径要顺手删掉已下载的临时文件 |
+
+5 个调用点全部更新（`baidu_commands.rs` ×3、`game_body_commands.rs` ×1、服务内 ×1）。
+
+**顺带堵住 H2 的洗白**：`rebuild` 用 `Self::read(...).ok().flatten()` 读旧清单并沿用其中的 `version_id` **回写**新清单（`cloud_manifest_service.rs:504-509`），所以 H1 的污染本来会被本体应用自己"洗白"并持久化。清单一旦在校验处被拒，`existing` 即为 `None`，新清单的 `version_id` 退回本地记录或文件名 —— 污染不再扩散。**但 H2 的另一半（把「读失败」当成「清单不存在」并覆盖式回写、丢掉 `sha256` 等元数据）没有修**，见 §7。
+
+**测试与变异**：
+
+- 新增 2 条测试（300 → 302）：`package_path` 的逃逸拒绝与「结果在缓存根之下」；清单校验对不安全 `version_id` 的拒绝（含反向守卫 —— 含空格与非 ASCII 的合法标识必须仍然通过，避免把校验做过头）。
+- **变异 ×3**：M1 让 `package_path` 的守卫恒假 → 被前一条测试抓到；M2 把 `validate` 还原成「只查非空」→ 被后一条抓到；**M3 把安装出口故意改写成内联 `join`（绕过 `package_path`）→ 测试全绿、clippy 34 不变，无任何信号**。M3 是**故意绕过**，不是误删：误删 `?` 会因为 `Result` 与 `PathBuf` 不匹配而编译失败。这与 F1 披露的残余限制同级（要更强需要 `VerifiedPackagePath` 之类的 newtype，本轮未做）。
+- 门禁：`cargo fmt --check` 干净、`cargo test --lib` **302 passed / 0 failed / 2 ignored**、clippy 0 error 且警告数与基线持平（34）。
+
+**顺带把一条「推断」实测钉死**：`Path::join` 遇到绝对路径会**替换**基路径 —— 此前只有子代理按 std 文档推断，现在有一条断言（在 Windows 上）实测确认。这正是绝对路径必须被校验拒绝、而不能指望 `join` 把结果限制在根之下的原因。
+
+**未做的事**：没有端到端复现（需要真实网盘账号 + 被改写的 `manifest.json`）。可达性是静态推导：前端 `App.vue:534` 只传 `remote_path` / `fs_id`，`install_cloud_game` 只校验 `remote_path`，`version_id` 完全在 Rust 侧由清单决定。威胁模型前提与 F1 相同（网盘上的清单可被改写）。
 
 ---
 
@@ -337,7 +376,54 @@ if staging.exists() {
 | 第 3 批 | ~~**C2** 云同步命令按 `game_uid` 取 `save_operations` 占位~~ **已完成（见 §0.3）** | 小改 |
 | 第 4 批 | ~~**C3** 临时文件名加 UUID + RAII 清理~~ **已完成（见 §0.4）** | 小改 |
 | 第 5 批 | **C4** 为 `cloud_save_commands.rs` 补编排层测试 | 补验证 |
+| 第 6 批 | ~~**H1** 云本体 `version_id` 的本地路径出口：`package_path` 返回 `Result` + 清单入口校验 + 收敛重复判定~~ **已完成（见 §0.5）** | 纯加固，成本低 |
+| 第 7 批 | **§7 的四条**（H2 余下的一半、L1、L2、L3） | 未处置，优先级待定 |
 
 **优先级说明**：C5 当初排在 C2 之前，是因为它的后果最重且成本极低 —— C2 需要一次竞态才发生，而 C5 一旦发生就**永久**卡住该游戏，且错误信息把用户引向无效操作。C1 虽然级别最高，但它的实际可达伤害取决于百度服务端行为（见 §5 存疑项 1），而补上校验的成本接近于零，所以仍排第一。
 
 **C4 的剩余价值已被前四批改变**：它原本的建议是「补编排层测试，可同时钉住 C2 的加锁行为」。C2 落地后，**互斥语义已经由 `app_state` 的 4 条测试钉住**（含双向排斥与持锁判定一致性），C3 的下载临时文件生命周期也有了测试。所以 C4 现在只剩**任务编排**（进度推进、重试载荷、失败/取消的状态迁移）这块仍未覆盖 —— 价值仍在，但不再是「唯一的验证缺口」。
+
+---
+
+## 7. 云本体侧的新发现（未处置）
+
+审云本体这一侧（`cloud_manifest_service.rs` 1024 行 / 6 条测试、`baidu_commands.rs` 2087 行 / 8 条测试）时一并发现下面四条。**本轮只修了 H1，这些都没动** —— 唯一例外是 H2 的「洗白」部分被 §0.5 的入口校验顺带堵住。列在这里是为了让「还没做什么」保持明确。
+
+### H2（中）`rebuild` 把「读失败」当成「清单不存在」并覆盖式回写 —— 未修
+
+`cloud_manifest_service.rs:469-471` 用 `Self::read(...).ok().flatten()` 读旧清单，读失败（网络错误、格式非法）被静默吞掉，随后按远端列表**整体重写** `manifest.json`（`:539`）。后果：其它设备写下的 `sha256`、`file_count`、`total_bytes` 静默丢失。方向应当是「读失败就不要覆盖」，而不是把读失败当成清单不存在。
+
+**注意区分两半**：原来还有「沿用远端清单的 `version_id` 回写、把 H1 的污染洗白」这一半（`:504-509`），**已被 §0.5 的入口校验堵住**（清单被拒 → `existing` 为 `None` → 退回本地记录或文件名）；上面这段「丢元数据」的一半**仍在**。
+
+### L1（低）清单读-改-写没有服务内串行化 —— 未修
+
+`rebuild`（`:460-541`）是 read → build → 整体 `write_manifest`：文件内无锁，`AppState` 也没有清单级锁。互斥只靠 `reserve_transfer(game_uid)`，而 `delete_remote_body_package` 在本地找不到该 uid 时改用 `format!("remote:{game_key}")`（`baidu_commands.rs:520-524`）—— 两把 key 互不可见，于是「云端专属删除」与「同 key 本地游戏的本体写入」可并发对同一目录读-改-写并丢更新。
+
+判低而非中：`project` 对清单问题只降级，`repair_cloud_body_manifest` 可从远端列表重建；且该重叠需要前端传一个「store 里不存在、但同 key 游戏存在」的 uid，正常 UI 走不到。**未能构造端到端复现。**
+
+### L2（低）`cache_folder_name` 的 `:` 碰撞 —— 未修
+
+`cloud_manifest_service.rs:142-149` 做的是 `/ \ :` → `_` 再 `trim_matches('_')`，**不是哈希**（早前一份会话笔记说它「哈希了目录名」，那是错的；本报告从未这样写过）。因为所有调用点的 `remote_dir` 都来自已过 `is_safe_path_segment` 的 `remote_body_dir`，**逃逸不成立**：`/`、`\` 的替换只命中固定前缀，空 / `.` / `..` 不可达，Windows 保留名被固定前缀挡住。
+
+残余：`is_safe_path_segment` 不拒 `:`，于是 `"a:b"` 与 `"a_b"` 映射到同一缓存目录（两者都是合法 key）。后果限于缓存串味，且命中时会重新 `validate` 并要求 `game_key` 精确相等，多数情况自愈为 cache miss。**判定为低，不是漏洞。**
+
+### L3（低）用远端文件元数据缓存本地生成的 catalog —— 未修
+
+`game_commands.rs:105-121`（改显示名时异步触发）把本地的 `catalog_from_game(&game)` 配上网盘列表里的 `fs_id` / `size` / `server_mtime` 存进 `catalog.cache.json`；之后 `read_catalog` 命中缓存（`:394-399`）会返回**本地版本**而不是云端 `game.json`。影响：云游戏列表 / 云安装可能使用本地启动配置而非云端配置（同一 game_key，**非越权**），属语义缺陷。附带记录：缓存有效性判定未含 `RemoteFile.md5`。
+
+### 附带：一处疑似死代码（非安全问题，未确认）
+
+`baidu_commands.rs:111-133` 与 `cover_protocol.rs:98-113` 会读 `cache/<folder>/game.json`、`manifest.json` 来反查 gameKey，但全仓 grep 显示缓存目录只写 `catalog.cache.json` / `manifest.cache.json` / `cover.cache.json` / `cover.jpg` —— 这两段容错分支疑似**永不生效**。未能确认是否存在我未找到的写入者（可能在旧版本或前端）。
+
+### 这一侧判定为干净的部分
+
+同一轮里也逐条核过、**没有**问题的：
+
+- **远端 `package_path` 的所有消费点**（F1 在存档侧的形态）：`project:619-638` 只把它当 HashMap key 与远端列举结果精确匹配，命中只影响展示 / 比对字段；`rebuild:514` 写回的是**远端列表的** `file.path`，不是清单里的 `package_path`；**没有任何** `delete_file` / `upload_file` / `ensure_directory` 以它为输入。
+- **`catalog.executable_relative_path`**（只要求非空）：使用前必经 `normalize_relative`（`game_body_package_service.rs:1108-1131`），拒绝对路径、`..`、`RootDir` / `Prefix` —— fail-closed。
+- **`catalog.working_directory_relative_path`**：`launch_service.rs:287-299` 用 `safe_join`，非法即启动失败 —— fail-closed。
+- **`game_key`（清单与 catalog）**：要求与目录段**精确相等**，`game_uid` 过 `is_valid_game_uid`（仅 alnum / `-` / `_`）。
+- **`display_name`**：只要求非空，但出口已收口 —— 安装路径推出的键在 `baidu_commands.rs:1607` 被 `cloud_install_game_key` 换掉（E）；Rust 侧未发现把它当路径段使用的地方（**前端未审计**）。
+- **缓存读写**：命中条件含 `fs_id` + `size` + `server_mtime` 全等**且**重新 `validate`；`save_cached_*` 只在校验通过后调用。
+- **封面路径**：本地临时名是 UUID，远端输入不参与命名。
+- **`cloud_manifest_service.rs` 非测试代码无 `unwrap()` / `expect()` / `panic!`**；`let _ =` 全部是缓存写入与临时文件清理 —— 问题不在「忽略错误」，而在**校验的覆盖面**。

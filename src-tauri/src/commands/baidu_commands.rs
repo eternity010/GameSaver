@@ -1054,7 +1054,7 @@ fn download_body_task(
         &cache_root,
         &game.game_uid,
         &format!(".download-{temporary_version_id}"),
-    );
+    )?;
     let downloaded_sha256 =
         client.download_file(&remote, &temporary_path, |progress, message| {
             TaskService::update(
@@ -1085,16 +1085,15 @@ fn download_body_task(
         let _ = std::fs::remove_file(&temporary_path);
         return Err("下载的本体包版本与云端版本清单不一致".to_string());
     }
-    if version_id.trim().is_empty()
-        || version_id.contains('/')
-        || version_id.contains('\\')
-        || version_id == "."
-        || version_id == ".."
-    {
+    // 判定收敛到领域层的 `is_safe_path_segment`：这里原先是一份内联的等价检查（空/`/`/`\`/
+    // `.`/`..`），与 `install_cloud_game_task` 那侧构成「一处查、一处漏」的重复判定。收在这里
+    // 之后两侧强度一致，且比内联那份更严（多拒控制字符，并先 `trim`）。
+    // 保留显式检查而不是只靠下面的 `?`：这条路径要顺手删掉已下载的临时文件。
+    if !is_safe_path_segment(&version_id) {
         let _ = std::fs::remove_file(&temporary_path);
         return Err("下载的本体包版本标识无效".to_string());
     }
-    let package_path = BodyPackageService::package_path(&cache_root, &game.game_uid, &version_id);
+    let package_path = BodyPackageService::package_path(&cache_root, &game.game_uid, &version_id)?;
     if package_path.exists() {
         let _ = std::fs::remove_file(&temporary_path);
         return Err("该本体版本已下载到本地，无需重复下载".to_string());
@@ -1508,7 +1507,12 @@ fn install_cloud_game_task(
         .map(|package| package.version_id.clone())
         .unwrap_or_else(|| remote_file_name_without_extension(remote_path));
     let cache_root = state.body_packages_root()?;
-    let package_path = BodyPackageService::package_path(&cache_root, &local_uid, &version_id);
+    // `version_id` 到这里可能来自**网盘下载的清单**（见 `CloudManifestService::project`），
+    // 而下面这个路径紧接着会被 `remove_file` 与下载写入。`package_path` 现在自己校验两个
+    // 路径段，所以这里必须处理它的 `Err` —— 收窄前这一步是不校验的，`version_id` 里一个
+    // `..` 就能把写入/删除带到缓存根之外（这正是 `download_body_task` 早就查过、而这里漏查
+    // 的那一条）。
+    let package_path = BodyPackageService::package_path(&cache_root, &local_uid, &version_id)?;
     if package_path.is_file() {
         let _ = std::fs::remove_file(&package_path);
     }

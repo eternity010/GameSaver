@@ -1,5 +1,5 @@
 use crate::{
-    domain::{Game, GameBodyVersion},
+    domain::{is_safe_path_segment, Game, GameBodyVersion},
     services::{BaiduNetdiskClient, RemoteFile},
 };
 use serde::{Deserialize, Serialize};
@@ -751,7 +751,14 @@ fn validate(manifest: &CloudBodyManifest, remote_dir: &str) -> Result<(), String
         return Err("云端版本清单缺少游戏标识".to_string());
     }
     if manifest.versions.iter().any(|version| {
-        version.version_id.trim().is_empty()
+        // `version_id` 会被拼进**本地**缓存路径（`BodyPackageService::package_path`），所以
+        // 它必须是一段安全路径段，而不只是「非空」。这条是入口处的拒绝：让被污染的清单在
+        // 读取时就失败，而不是等到拼路径时才发现。
+        //
+        // 顺带堵住 `rebuild` 的洗白：它用 `Self::read(...).ok().flatten()` 读旧清单并沿用其中
+        // 的 `version_id` 回写。清单一旦在校验处被拒，`existing` 即为 `None`，新清单的
+        // `version_id` 就退回本地记录或文件名，污染不会被回写扩散。
+        !is_safe_path_segment(&version.version_id)
             || version.package_path.trim().is_empty()
             || version.package_fs_id == 0
             || !version.package_path.to_ascii_lowercase().ends_with(".zip")
@@ -879,6 +886,57 @@ mod tests {
         };
         assert!(validate(&manifest, "/apps/GameSaver/games/game-one/body").is_ok());
         assert!(validate(&manifest, "/apps/GameSaver/games/other-game/body").is_err());
+    }
+
+    /// `version_id` 会被拼进**本地**缓存路径（`BodyPackageService::package_path`），所以清单
+    /// 校验必须拒绝带分隔符或 `..` 的值，而不只是「非空」。
+    ///
+    /// 收窄前这里只查 `trim().is_empty()`，于是一个被改写的 `manifest.json` 就能让安装路径
+    /// 逃出缓存根，随后被 `remove_file` 与下载写入 —— 这是 F1 在**本地**侧的镜像，且本地文件
+    /// 系统对 `..` 的解析是确定的，不必赌服务端行为。
+    #[test]
+    fn validates_manifest_rejects_unsafe_version_id() {
+        let manifest_with = |version_id: &str| CloudBodyManifest {
+            format_version: 1,
+            game_key: "game-one".to_string(),
+            game_uid: "game-1".to_string(),
+            updated_at: "2".to_string(),
+            versions: vec![CloudBodyManifestVersion {
+                version_id: version_id.to_string(),
+                created_at: "2".to_string(),
+                package_path: "/apps/GameSaver/games/game-one/body/v1.zip".to_string(),
+                package_fs_id: 42,
+                package_size: 1,
+                package_sha256: None,
+                file_count: 1,
+                total_bytes: 1,
+            }],
+        };
+        let dir = "/apps/GameSaver/games/game-one/body";
+
+        // 反向守卫：正常的版本标识必须仍然通过（含空格与非 ASCII），别把校验做过头。
+        for safe in ["v1", "2026-09-14T10-00-00", "版本 1"] {
+            assert!(
+                validate(&manifest_with(safe), dir).is_ok(),
+                "rejected safe version_id: {safe:?}"
+            );
+        }
+        // 远端可控的异常值：一个都不许过。
+        for unsafe_id in [
+            "..",
+            ".",
+            "../escape",
+            "..\\escape",
+            "a/b",
+            "a\\b",
+            "",
+            "   ",
+        ] {
+            assert!(
+                validate(&manifest_with(unsafe_id), dir).is_err(),
+                "accepted unsafe version_id: {unsafe_id:?}"
+            );
+        }
     }
 
     #[test]

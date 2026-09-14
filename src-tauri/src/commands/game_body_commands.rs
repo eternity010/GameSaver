@@ -241,7 +241,7 @@ pub fn delete_game_body_package(
     let version_id = version_id.trim().to_string();
     let (game, version, _, _) = load_body_package_context(&state, &game_uid, &version_id)?;
     let package_path =
-        BodyPackageService::package_path(&body_package_cache_root(&app)?, &game_uid, &version_id);
+        BodyPackageService::package_path(&body_package_cache_root(&app)?, &game_uid, &version_id)?;
     reserve_update(&state, &game_uid)?;
     let task_id = match TaskService::create(
         &state,
