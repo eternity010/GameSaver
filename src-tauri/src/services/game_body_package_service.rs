@@ -335,13 +335,22 @@ impl BodyPackageService {
                 .map_err(|err| format!("写入 7-Zip 文件清单失败：{err}"))?;
 
             on_progress(8, "正在使用 7-Zip 压缩游戏本体");
+            // `-mx=5` 是「打包耗时 ↔ 包体积」的取舍，此前是 1（7-Zip 最快档）。
+            // 取 5 的理由：包体积直接决定用户上传/下载要等多久、以及占多少网盘空间，
+            // 而 1→5 的耗时差距在几 GB 的包上通常是几十秒量级，比多传几 GB 划算。
+            // 没有继续拉到 9：现代游戏文件（贴图/音频/视频）多已是压缩格式，再压几乎
+            // 不掉体积，只多花时间 —— 收益要看游戏的文件构成，不是单调的。
+            //
+            // 两处不受这里影响的：追加清单那步仍用 `-mx=0`（见下，小 JSON 压了纯亏时间）；
+            // 磁盘预检 `package_space_requirement` 按**未压缩**源文件总量估算，是无条件
+            // 上界，压缩只会让实际占用更小，所以调这里不需要同步改它。
             run_7zip(
                 archiver,
                 source_root,
                 [
                     "a".to_string(),
                     "-tzip".to_string(),
-                    "-mx=1".to_string(),
+                    "-mx=5".to_string(),
                     "-mmt=on".to_string(),
                     "-bso0".to_string(),
                     "-bsp1".to_string(),
@@ -391,6 +400,8 @@ impl BodyPackageService {
 
             sync_file(&temporary, "刷新 7-Zip 本体包")?;
             on_progress(92, "正在写入本体包清单");
+            // `-mx=0`（不压缩）：只把这一个清单文件追加进已压好的包。它是小 JSON，
+            // 压不出体积收益，却会给整个包多付一次压缩开销。
             run_7zip(
                 archiver,
                 &manifest_root,
