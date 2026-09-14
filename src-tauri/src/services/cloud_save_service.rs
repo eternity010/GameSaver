@@ -1,5 +1,7 @@
 use crate::{
-    domain::{compare_created_at, Game, SaveFileEntry, SaveProfile, SaveVersion},
+    domain::{
+        compare_created_at, is_safe_path_segment, Game, SaveFileEntry, SaveProfile, SaveVersion,
+    },
     repositories::{BaiduConfigRepository, GameRepository, SaveRepository},
     services::{BaiduNetdiskClient, RemoteFile},
 };
@@ -93,16 +95,55 @@ pub struct CloudSaveOverview {
 pub struct CloudSaveService;
 
 impl CloudSaveService {
-    pub fn remote_save_dir(game_key: &str) -> String {
-        format!("{REMOTE_SAVES_ROOT}/{game_key}")
+    /// 校验并返回可以直接拼进远程路径的 game_key。
+    ///
+    /// 为什么必须有这道校验：这些函数的结果会被送进百度的 `path` 参数**直接作用于远端
+    /// 文件**（`delete_cloud_version` 拿它去删远程包），而 `game_key` 的来源里有若干条
+    /// 是外部文本——显示名、云端清单里的 `game_key`。含 `/`、`\`、`..` 的名字会让拼出来
+    /// 的路径离开「本游戏目录」这层，落到别的游戏、甚至 `/apps/GameSaver/` 之外：
+    /// `delete_file` 就会去动那段路径。
+    ///
+    /// 判定复用领域层的 `is_safe_path_segment`（其注释本就写明用于「会被拼进某个根目录
+    /// 之下、只占一层的名字」）。注意它**允许空格**，这是有意的：`derive_game_key` 会
+    /// 保留空格（如 `"black myth"`），而空格在远程路径里是安全的，收紧成字符白名单会
+    /// 误伤这些真实存在的 key。
+    ///
+    /// 调用方必须让这三个构造函数**在任何远端 IO 之前**求值（`?` 直接向上传播），否则
+    /// 输入非法时我们会先动了别的东西才报错。`delete_cloud_version` 就是按这个顺序写的。
+    fn game_key_segment(game_key: &str) -> Result<&str, String> {
+        if !is_safe_path_segment(game_key) {
+            return Err(format!(
+                "游戏标识包含不安全的远程路径字符，已拒绝云端存档操作：{game_key:?}"
+            ));
+        }
+        Ok(game_key.trim())
     }
 
-    pub fn remote_manifest_path(game_key: &str) -> String {
-        format!("{REMOTE_SAVES_ROOT}/{game_key}/manifest.json")
+    pub fn remote_save_dir(game_key: &str) -> Result<String, String> {
+        Ok(format!(
+            "{REMOTE_SAVES_ROOT}/{}",
+            Self::game_key_segment(game_key)?
+        ))
     }
 
-    pub fn remote_package_path(game_key: &str, version_id: &str) -> String {
-        format!("{REMOTE_SAVES_ROOT}/{game_key}/{version_id}.zip")
+    pub fn remote_manifest_path(game_key: &str) -> Result<String, String> {
+        Ok(format!(
+            "{}/manifest.json",
+            Self::remote_save_dir(game_key)?
+        ))
+    }
+
+    pub fn remote_package_path(game_key: &str, version_id: &str) -> Result<String, String> {
+        if !is_safe_path_segment(version_id) {
+            return Err(format!(
+                "存档版本标识包含不安全的远程路径字符，已拒绝云端存档操作：{version_id:?}"
+            ));
+        }
+        Ok(format!(
+            "{}/{}.zip",
+            Self::remote_save_dir(game_key)?,
+            version_id.trim()
+        ))
     }
 
     pub fn package_save_version(
@@ -177,8 +218,8 @@ impl CloudSaveService {
         on_progress(10, "正在打包本地存档");
         let (zip_path, sha256, size) = Self::package_save_version(app, game, profile, version)?;
 
-        let remote_dir = Self::remote_save_dir(&game.game_key);
-        let remote_pkg = Self::remote_package_path(&game.game_key, &version.version_id);
+        let remote_dir = Self::remote_save_dir(&game.game_key)?;
+        let remote_pkg = Self::remote_package_path(&game.game_key, &version.version_id)?;
 
         let upload_result = (|| -> Result<RemoteFile, String> {
             client.ensure_directory(&remote_dir)?;
@@ -420,7 +461,7 @@ impl CloudSaveService {
         game_key: &str,
         game_uid: &str,
     ) -> Result<Option<CloudSaveManifest>, String> {
-        let manifest_path = Self::remote_manifest_path(game_key);
+        let manifest_path = Self::remote_manifest_path(game_key)?;
         let temp_dir = std::env::temp_dir();
         let temp_file = temp_dir.join(format!(
             "save-manifest-fetch-{}.json",
@@ -428,7 +469,7 @@ impl CloudSaveService {
         ));
 
         let files = client
-            .list(&Self::remote_save_dir(game_key))
+            .list(&Self::remote_save_dir(game_key)?)
             .unwrap_or_default();
         let remote_manifest_file = files.iter().find(|f| f.path == manifest_path);
 
@@ -502,7 +543,7 @@ impl CloudSaveService {
             .map_err(|err| format!("序列化云端存档清单失败：{err}"))?;
         fs::write(&temp_file, &raw).map_err(|err| format!("写入临时云端存档清单失败：{err}"))?;
 
-        let remote_manifest = Self::remote_manifest_path(game_key);
+        let remote_manifest = Self::remote_manifest_path(game_key)?;
         let upload_res = client.upload_file(&temp_file, &remote_manifest, |_, _| true);
         let _ = fs::remove_file(&temp_file);
         upload_res.map(|_| ())
@@ -514,7 +555,7 @@ impl CloudSaveService {
         game_uid: &str,
         version_id: &str,
     ) -> Result<CloudSaveManifest, String> {
-        let remote_pkg = Self::remote_package_path(game_key, version_id);
+        let remote_pkg = Self::remote_package_path(game_key, version_id)?;
         let _ = client.delete_file(&remote_pkg);
 
         let mut manifest = Self::fetch_manifest(client, game_key, game_uid)?.unwrap_or_else(|| {
@@ -952,17 +993,63 @@ mod tests {
     #[test]
     fn builds_expected_remote_paths() {
         assert_eq!(
-            CloudSaveService::remote_save_dir("game_test"),
+            CloudSaveService::remote_save_dir("game_test").unwrap(),
             "/apps/GameSaver/saves/game_test"
         );
         assert_eq!(
-            CloudSaveService::remote_manifest_path("game_test"),
+            CloudSaveService::remote_manifest_path("game_test").unwrap(),
             "/apps/GameSaver/saves/game_test/manifest.json"
         );
         assert_eq!(
-            CloudSaveService::remote_package_path("game_test", "v123"),
+            CloudSaveService::remote_package_path("game_test", "v123").unwrap(),
             "/apps/GameSaver/saves/game_test/v123.zip"
         );
+    }
+
+    /// 带空格的 game_key 是真实存在的（`derive_game_key` 保留空格），校验不能误伤它。
+    #[test]
+    fn remote_paths_still_accept_keys_with_spaces() {
+        assert_eq!(
+            CloudSaveService::remote_save_dir("black myth wukong").unwrap(),
+            "/apps/GameSaver/saves/black myth wukong"
+        );
+    }
+
+    /// 这些构造函数的结果会被送进百度的 `path` 参数直接作用于远端文件
+    /// （`delete_cloud_version` 用它删远程包），所以含目录分隔符或 `..` 的输入必须被拒绝，
+    /// 否则路径会离开「本游戏目录」这层。
+    #[test]
+    fn remote_paths_reject_segments_that_escape_the_game_directory() {
+        for game_key in [
+            "../../evil",
+            "..",
+            ".",
+            "a/b",
+            "a\\b",
+            "",
+            "  ",
+            "game\nname",
+        ] {
+            assert!(
+                CloudSaveService::remote_save_dir(game_key).is_err(),
+                "accepted unsafe game_key: {game_key:?}"
+            );
+            assert!(
+                CloudSaveService::remote_manifest_path(game_key).is_err(),
+                "accepted unsafe game_key: {game_key:?}"
+            );
+            assert!(
+                CloudSaveService::remote_package_path(game_key, "v1").is_err(),
+                "accepted unsafe game_key: {game_key:?}"
+            );
+        }
+        // version_id 同样是一段会被拼进远程路径的文本，且它经 IPC 从前端传入。
+        for version_id in ["../../../other-game/x", "..", "a/b", "a\\b", "", "  "] {
+            assert!(
+                CloudSaveService::remote_package_path("game_test", version_id).is_err(),
+                "accepted unsafe version_id: {version_id:?}"
+            );
+        }
     }
 
     #[test]

@@ -1839,11 +1839,12 @@ fn body_package_cache_root(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 pub(crate) fn remote_body_dir(game_key: &str) -> Result<String, String> {
-    let game_key = game_key.trim();
+    // 判定收敛到领域层的 `is_safe_path_segment`：这里原先是一段内联的等价检查，
+    // 与云账号清单校验里那份 `is_valid_game_key` 重复。
     if !is_safe_path_segment(game_key) {
         return Err("gameKey 包含不支持的远程路径字符".to_string());
     }
-    Ok(format!("{REMOTE_ROOT}/{game_key}/body"))
+    Ok(format!("{REMOTE_ROOT}/{}/body", game_key.trim()))
 }
 
 fn validate_remote_package_path(directory: &str, path: &str) -> Result<(), String> {

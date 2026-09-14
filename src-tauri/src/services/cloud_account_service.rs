@@ -1,7 +1,7 @@
 use crate::{
     domain::{
         game::{Game, LaunchConfig},
-        AppStore, GameLifecycle, SaveRootType, SaveScope, UnknownFilePolicy,
+        is_safe_path_segment, AppStore, GameLifecycle, SaveRootType, SaveScope, UnknownFilePolicy,
     },
     services::{BaiduNetdiskClient, RemoteFile},
 };
@@ -382,8 +382,13 @@ pub fn extract_sub_path(scope: &SaveScope, game: Option<&Game>) -> Option<String
     None
 }
 
+/// 校验远程本体包路径是否落在该游戏的目录内。
+///
+/// game_key 的路径段判定改用领域层的 `is_safe_path_segment`：这里原先有一份自己的
+/// `is_valid_game_key`，与 `baidu_commands::remote_body_dir` 的内联判定构成逐条等价的
+/// 拷贝 —— 同一条规则存三份时，任一处加强都会被另两处悄悄绕过。
 fn is_valid_remote_body_path(game_key: &str, path: &str) -> bool {
-    if !is_valid_game_key(game_key) {
+    if !is_safe_path_segment(game_key) {
         return false;
     }
     let prefix = format!("/apps/GameSaver/games/{game_key}/body/");
@@ -396,16 +401,6 @@ fn is_valid_remote_body_path(game_key: &str, path: &str) -> bool {
         && name != "."
         && name != ".."
         && name.to_ascii_lowercase().ends_with(".zip")
-}
-
-fn is_valid_game_key(value: &str) -> bool {
-    let value = value.trim();
-    !value.is_empty()
-        && value != "."
-        && value != ".."
-        && !value.contains('/')
-        && !value.contains('\\')
-        && !value.chars().any(char::is_control)
 }
 
 fn is_valid_relative_path(value: &str) -> bool {
@@ -450,7 +445,7 @@ fn validate(profile: &CloudAccountProfile) -> Result<(), String> {
             || game.display_name.trim().is_empty()
             || game.launch.executable_relative_path.trim().is_empty()
             || !game_ids.insert(game.game_uid.as_str())
-            || !is_valid_game_key(&game.game_key)
+            || !is_safe_path_segment(&game.game_key)
             || !game_keys.insert(game.game_key.as_str())
             || !is_valid_relative_path(&game.launch.executable_relative_path)
             || game

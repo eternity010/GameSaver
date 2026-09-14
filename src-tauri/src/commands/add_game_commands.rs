@@ -1,6 +1,6 @@
 use crate::{
     app_state::AppState,
-    domain::{Game, TaskCategory, TaskStatus},
+    domain::{is_safe_path_segment, Game, TaskCategory, TaskStatus},
     repositories::GameRepository,
     services::{AddGameService, GameLibraryService, TaskService},
 };
@@ -27,7 +27,9 @@ pub fn start_add_game_task(
         return Err("游戏名称不能为空".to_string());
     }
     let game_key = Game::derive_game_key(&game_key);
-    if game_key.is_empty() || game_key.contains('/') || game_key.contains('\\') {
+    // 用领域层的 `is_safe_path_segment` 而不是手写分隔符检查：手写那版漏了 `..` 与 `.`，
+    // 而 game_key 会被拼进远程路径（云端存档目录、本体目录）并直接作用于远端文件。
+    if !is_safe_path_segment(&game_key) {
         return Err("游戏标识不能为空，且不能包含路径分隔符".to_string());
     }
     let executable_relative_path = AddGameService::validate_source(&source, &executable)?;
