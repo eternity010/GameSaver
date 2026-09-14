@@ -13,6 +13,8 @@ use std::{
     time::Duration,
 };
 
+use uuid::Uuid;
+
 const API_BASE: &str = "https://pan.baidu.com";
 const UPLOAD_API_BASE: &str = "https://d.pcs.baidu.com";
 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
@@ -793,9 +795,14 @@ impl BaiduNetdiskClient {
             .parent()
             .ok_or_else(|| "本体包下载路径无父目录".to_string())?;
         fs::create_dir_all(parent).map_err(|err| format!("创建本体包下载目录失败：{err}"))?;
-        let temporary = target_path.with_extension("download.tmp");
+        let temporary = download_temp_path(target_path);
         let file = fs::File::create(&temporary)
             .map_err(|err| format!("创建本体包下载临时文件失败：{err}"))?;
+        // 从建文件起就由守卫负责清理：下面有 5 条提前返回路径（读、写、取消、flush、
+        // sync），逐条手写 remove_file 一定会漏掉几条。提交成功后 disarm。
+        let mut temp_guard = DownloadTempGuard {
+            path: Some(temporary.clone()),
+        };
         let mut output = BufWriter::with_capacity(4 * 1024 * 1024, file);
         let mut hasher = Sha256::new();
         let mut written = 0u64;
@@ -820,8 +827,8 @@ impl BaiduNetdiskClient {
                     remote.size / 1024 / 1024
                 ),
             ) {
+                // `output` 先于守卫析构，Windows 上文件句柄关掉后才能删。
                 drop(output);
-                let _ = fs::remove_file(&temporary);
                 return Err("任务已取消".to_string());
             }
         }
@@ -834,7 +841,6 @@ impl BaiduNetdiskClient {
             .map_err(|err| format!("同步本体包下载文件失败：{err}"))?;
         drop(output);
         if written != remote.size {
-            let _ = fs::remove_file(&temporary);
             return Err(format!(
                 "本体包下载大小不匹配：{} / {}",
                 written, remote.size
@@ -842,6 +848,8 @@ impl BaiduNetdiskClient {
         }
         fs::rename(&temporary, target_path)
             .map_err(|err| format!("提交本体包下载文件失败：{err}"))?;
+        // 已重命名到目标路径，别再让守卫删它。
+        temp_guard.disarm();
         let sha256_hex = hex::encode(hasher.finalize());
         on_progress(100, "本体包下载完成");
         Ok(sha256_hex)
@@ -944,6 +952,55 @@ impl BaiduNetdiskClient {
                 }
             }
             return Ok(response);
+        }
+    }
+}
+
+/// 一次下载所用的临时文件路径：与目标同目录，名字里带随机后缀。
+///
+/// 两条约束决定了这个名字的写法：
+///
+/// 1. **必须唯一**。此前用 `target_path.with_extension("download.tmp")`，同一个目标
+///    路径就会推出同一个临时文件名 —— 并发（或重入）下载同一目标时两边会往同一个
+///    文件里写，互相截断，最后要么哈希校验失败、要么把半截文件 rename 成成品。
+/// 2. **必须与目标同目录**。否则最后那步是跨卷移动，在 Windows 上会退化成「复制 +
+///    删除」，几 GB 的本体包要白白多写一遍磁盘。
+///
+/// 用 `with_file_name` 而不是 `with_extension`：后者会把目标原有的扩展名**替换**掉
+/// （`...v1.0.7.zip` 变成 `...v1.0.download.tmp`），而这里要在原名后面追加。
+fn download_temp_path(target_path: &Path) -> PathBuf {
+    let name = target_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download".to_string());
+    target_path.with_file_name(format!("{name}.{}.download-tmp", Uuid::new_v4().simple()))
+}
+
+/// 下载临时文件的清理守卫。
+///
+/// `download_file` 有 5 条提前返回路径（读、写、取消、flush、sync），逐条手写
+/// `remove_file` 一定会漏 —— 此前漏掉的正是「读取失败」那条，于是一个注定失败、
+/// 又要重试的下载会不断在磁盘上堆残留。提交成功后调 `disarm` 把它排除。
+///
+/// 与 `cloud_save_service::TemporaryFileGuard` 同形，只是那个不带解除语义（它守的
+/// 文件永远不该变成成品）。
+struct DownloadTempGuard {
+    /// `Some` 表示文件仍归守卫管；`None` 表示已提交，别再删。
+    path: Option<PathBuf>,
+}
+
+impl DownloadTempGuard {
+    /// 提交成功后调用：文件已 rename 成目标路径，不再该由守卫删除。
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for DownloadTempGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            // 句柄未关时 Windows 删不掉，而这里是尽力而为的兜底，失败不掩盖真实错误。
+            let _ = fs::remove_file(path);
         }
     }
 }
@@ -1182,7 +1239,10 @@ fn md5_hex(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_auth_failure, md5_hex, token_needs_refresh, BaiduNetdiskClient, BaiduToken};
+    use super::{
+        download_temp_path, is_auth_failure, md5_hex, token_needs_refresh, BaiduNetdiskClient,
+        BaiduToken, DownloadTempGuard,
+    };
     use std::fs;
 
     /// token 夹具：一个临时「AppData」目录，随作用域自动清理。
@@ -1219,6 +1279,74 @@ mod tests {
             expires_at,
             refresh_token: Some("refresh".to_string()),
         }
+    }
+
+    /// 临时名必须唯一、同目录，且不吞掉目标原有的扩展名。
+    ///
+    /// 此前是 `target_path.with_extension("download.tmp")`：同一个目标必然推出同一个
+    /// 临时名，并发或重入下载同一目标时两边往同一个文件里写、互相截断；`with_extension`
+    /// 还会把 `...v1.0.7.zip` 的扩展名替换成 `.download.tmp`。
+    #[test]
+    fn download_temp_paths_are_unique_and_keep_the_target_extension() {
+        let workspace = crate::test_support::TempWorkspace::new("baidu-download-temp");
+        let target = workspace.join("pkg").join("game.v1.0.7.zip");
+
+        let first = download_temp_path(&target);
+        let second = download_temp_path(&target);
+
+        assert_ne!(first, second, "同一目标的两次下载不能拿到同一个临时名");
+        assert_eq!(
+            first.parent(),
+            target.parent(),
+            "临时文件必须与目标同目录，否则最后一步会退化成跨卷复制"
+        );
+        let name = first
+            .file_name()
+            .expect("临时文件应当有文件名")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            name.starts_with("game.v1.0.7.zip."),
+            "临时名应当保留目标原名：{name}"
+        );
+        assert!(
+            name.ends_with(".download-tmp"),
+            "临时名应当以 .download-tmp 结尾：{name}"
+        );
+    }
+
+    /// 未提交的下载失败后，守卫必须把临时文件删掉 —— 这是原先漏得最狠的一条路径
+    /// （读取失败用了 `?` 直接返回，没有清理），而失败的下载正好会被反复重试。
+    #[test]
+    fn download_temp_guard_removes_the_file_on_failure() {
+        let workspace = crate::test_support::TempWorkspace::new("baidu-guard-armed");
+        let path = workspace.join("partial.download-tmp");
+        fs::write(&path, b"half").expect("write partial download");
+        assert!(path.is_file());
+
+        drop(DownloadTempGuard {
+            path: Some(path.clone()),
+        });
+
+        assert!(!path.exists(), "未提交的临时文件必须被清掉");
+    }
+
+    /// 已 rename 成目标路径的下载绝不能被守卫删掉 —— 写错这里会把刚下好的成品删了，
+    /// 而调用方看到的是「下载成功但文件不存在」。
+    #[test]
+    fn download_temp_guard_keeps_a_committed_file() {
+        let workspace = crate::test_support::TempWorkspace::new("baidu-guard-disarmed");
+        let path = workspace.join("committed.download-tmp");
+        fs::write(&path, b"complete").expect("write committed download");
+        let mut guard = DownloadTempGuard {
+            path: Some(path.clone()),
+        };
+
+        // 模拟 rename 成功后的 disarm。
+        guard.disarm();
+        drop(guard);
+
+        assert!(path.is_file(), "已提交的文件不该被守卫删除");
     }
 
     #[test]
