@@ -17,6 +17,12 @@ use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
 const MANIFEST_PATH: &str = ".gamesaver/body-manifest.json";
 const PACKAGE_FORMAT_VERSION: u32 = 1;
+/// 云端安装游戏时用的暂存目录名前缀与后缀，目录名形如 `.{game_uid}.cloud-installing`。
+///
+/// 由 `baidu_commands::download_game_body_package` 创建，由本服务的
+/// `cleanup_interrupted_cloud_installs` 清理 —— 两边共用这两个常量，改一处不会漏另一处。
+pub const CLOUD_INSTALL_STAGING_PREFIX: &str = ".";
+pub const CLOUD_INSTALL_STAGING_SUFFIX: &str = ".cloud-installing";
 /// 单个 ZIP 条目在包里的固定开销（本地头 + 中央目录 + 文件名），用于把「包最多多大」估得保守些。
 const ZIP_ENTRY_OVERHEAD_BYTES: u64 = 256;
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +99,58 @@ impl BodyPackageService {
                     format!("清理本体包临时文件失败（{}）：{err}", path.display())
                 })?;
             }
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// 清理云端安装游戏时留下的暂存目录（`games_root/.{game_uid}.cloud-installing`）。
+    ///
+    /// 这些目录由 `baidu_commands::download_game_body_package` 在把包解到受管目录之前创建，
+    /// 成功路径靠 `fs::rename` 原子提交成受管目录。问题在于**失败路径**：解包中途出错、
+    /// 应用在解包与提交之间被关闭/崩溃，都会把这个目录留下；而重装时那条「暂存目录已存在
+    /// 就拒绝」的判据会让该游戏**永久装不上**，报错还让用户「重启应用」——重启原本并不清理。
+    ///
+    /// 因此由启动恢复来收尾，调用点紧挨 `SaveRepository::recover_interrupted_restores`：
+    /// 此刻还没进入运行期、没有任何安装任务在跑，所以只可能清到上一次进程的残留，不存在
+    /// 与进行中的安装抢文件。
+    pub fn cleanup_interrupted_cloud_installs(games_root: &Path) -> Result<usize, String> {
+        if !games_root.is_dir() {
+            return Ok(0);
+        }
+        let mut candidates = Vec::new();
+        for entry in fs::read_dir(games_root).map_err(|err| format!("扫描游戏库目录失败：{err}"))?
+        {
+            let entry = entry.map_err(|err| format!("读取游戏库目录项失败：{err}"))?;
+            if !entry
+                .file_type()
+                .map_err(|err| format!("读取目录项类型失败：{err}"))?
+                .is_dir()
+            {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(uid) = name
+                .strip_prefix(CLOUD_INSTALL_STAGING_PREFIX)
+                .and_then(|rest| rest.strip_suffix(CLOUD_INSTALL_STAGING_SUFFIX))
+            else {
+                continue;
+            };
+            // 要求中间确实是一个 game_uid：形如 `.cloud-installing` 或 `..cloud-installing`
+            // 这种退化名字不该被当成暂存目录。
+            if uid.is_empty() || uid.contains('.') {
+                continue;
+            }
+            candidates.push(entry.path());
+        }
+        let mut removed = 0;
+        for path in candidates {
+            fs::remove_dir_all(&path).map_err(|err| {
+                format!(
+                    "清理未完成的云端游戏安装暂存目录失败（{}）：{err}",
+                    path.display()
+                )
+            })?;
             removed += 1;
         }
         Ok(removed)
@@ -1327,6 +1385,61 @@ mod tests {
         assert!(!cache.join("game-1/.version.manifest-test").exists());
         assert!(!cache.join("game-1/.version.zip.tmp-test").exists());
         assert!(cache.join("game-1/real.zip").is_file());
+    }
+
+    /// 中断的云端安装会在 games_root 下留下 `.{uid}.cloud-installing`，而重装时那条
+    /// 「暂存目录已存在就拒绝」的判据会让该游戏永久装不上 —— 这个清理就是它的解药。
+    #[test]
+    fn interrupted_cloud_install_staging_directories_are_removed() {
+        let root = temp_workspace("gamesaver-cloud-install-staging");
+        let games = root.join("games");
+        let stale = games.join(".game-1.cloud-installing");
+        fs::create_dir_all(&stale).expect("create stale staging");
+        fs::write(stale.join("game.exe"), b"half-extracted").expect("write partial file");
+        // 已提交成受管目录的、以及碰巧同前缀的无关目录都必须留着。
+        let installed = games.join("game-2");
+        fs::create_dir_all(&installed).expect("create installed game");
+        fs::write(installed.join("game.exe"), b"real").expect("write real game");
+        let unrelated = games.join(".something-else");
+        fs::create_dir_all(&unrelated).expect("create unrelated dotted directory");
+
+        let removed = BodyPackageService::cleanup_interrupted_cloud_installs(&games)
+            .expect("cleanup staging");
+
+        assert_eq!(removed, 1);
+        assert!(!stale.exists());
+        assert!(installed.join("game.exe").is_file());
+        assert!(unrelated.is_dir());
+    }
+
+    /// 退化名字不该被当成暂存目录：`{uid}` 段必须是真实的 uid。
+    #[test]
+    fn cloud_install_staging_cleanup_ignores_degenerate_names() {
+        let root = temp_workspace("gamesaver-cloud-install-degenerate");
+        let games = root.join("games");
+        for name in [
+            ".cloud-installing",
+            "..cloud-installing",
+            ".a.b.cloud-installing",
+        ] {
+            fs::create_dir_all(games.join(name)).expect("create degenerate directory");
+        }
+
+        let removed = BodyPackageService::cleanup_interrupted_cloud_installs(&games)
+            .expect("cleanup staging");
+
+        assert_eq!(removed, 0);
+        assert!(games.join(".cloud-installing").is_dir());
+        assert!(games.join("..cloud-installing").is_dir());
+        assert!(games.join(".a.b.cloud-installing").is_dir());
+    }
+
+    #[test]
+    fn cloud_install_staging_cleanup_tolerates_a_missing_games_root() {
+        let root = temp_workspace("gamesaver-cloud-install-missing-root");
+        let removed = BodyPackageService::cleanup_interrupted_cloud_installs(&root.join("nope"))
+            .expect("missing games root is not an error");
+        assert_eq!(removed, 0);
     }
 
     #[test]

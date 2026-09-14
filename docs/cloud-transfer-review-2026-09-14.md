@@ -8,15 +8,23 @@
 
 ## 0. 结论摘要
 
-| # | 级别 | 问题 | 位置 |
-|---|---|---|---|
-| C1 | **高** | 云存档的远程路径由未校验的 `game_key` / `version_id` 直接拼接；`version_id` 一路来自 IPC，全链路无校验，而 `delete_cloud_version` 会用它**删除远程文件** | `cloud_save_service.rs:96/100/104/517`、`cloud_save_commands.rs:238` |
-| C2 | 中 | 云端清单是「读-改-写」，整个过程没有串行化；退出游戏的自动同步与用户手动同步可并发，导致丢条目 | `cloud_save_service.rs:195-238`、`launch_service.rs:626` |
-| C3 | 中 | `download_file` 的临时文件名由目标路径推导（非唯一），并发/重入下载同一目标会撞同一个临时文件；出错路径不清理 | `baidu_netdisk_service.rs:796` |
-| C5 | 中 | 云端游戏安装的暂存目录 `.cloud-installing` **没有任何清理**，中断后该游戏永久无法再次安装，且报错让用户「重启应用」——重启并不清理 | `baidu_commands.rs:1538-1541`、`lib.rs:76/127` |
-| C4 | 低 | 云同步命令层（`cloud_save_commands.rs`）**没有任何测试** | 整个文件 388 行 |
+| # | 级别 | 状态 | 问题 | 位置 |
+|---|---|---|---|---|
+| C1 | **高** | ✅ 已修（§0.1） | 云存档的远程路径由未校验的 `game_key` / `version_id` 直接拼接；`version_id` 一路来自 IPC，全链路无校验，而 `delete_cloud_version` 会用它**删除远程文件** | `cloud_save_service.rs:96/100/104/517`、`cloud_save_commands.rs:238` |
+| C5 | 中 | ✅ 已修（§0.2） | 云端游戏安装的暂存目录 `.cloud-installing` **没有任何清理**，中断后该游戏永久无法再次安装，且报错让用户「重启应用」——重启并不清理 | `baidu_commands.rs:1538-1541`、`lib.rs:76/127` |
+| C2 | 中 | 待办 | 云端清单是「读-改-写」，整个过程没有串行化；退出游戏的自动同步与用户手动同步可并发，导致丢条目 | `cloud_save_service.rs:195-238`、`launch_service.rs:626` |
+| C3 | 中 | 待办 | `download_file` 的临时文件名由目标路径推导（非唯一），并发/重入下载同一目标会撞同一个临时文件；出错路径不清理 | `baidu_netdisk_service.rs:796` |
+| C4 | 低 | 待办 | 云同步命令层（`cloud_save_commands.rs`）**没有任何测试** | 整个文件 388 行 |
 
-> C2 / C3 / C5 都是中优先级，但**后果差别很大**：C5 一旦发生就永久卡死该游戏且把用户引向无效操作，C2 需要一次竞态、C3 大概率只表现为下载失败。处置顺序见 §6。
+> 剩余三条同属中/低，但**后果差别很大**：C2 需要一次竞态才会丢条目，C3 大概率只表现为下载失败，C4 是覆盖缺口而非缺陷。（C5 曾是最该先修的一条 —— 一旦发生就永久卡死该游戏且把用户引向无效操作，现已修，见 §0.2。）处置顺序见 §6。
+
+**数据完整性主链路是扎实的** —— 这部分要先说清楚，免得下面的条目造成错误印象：
+
+- **每个存档文件都有 SHA-256**：写入版本清单（`cloud_save_service.rs:212`），下载后逐项复核（`:339`），对象以哈希命名存储（`:342` `write_object(app, &hash, &data)`）⇒ 内容寻址，重复上传/下载天然幂等。
+- **下载包整体也有 SHA-256**：`package_sha256` 记录在清单里（`:211`），下载后比对（`:277-282`）。
+- **压缩包读取有解压炸弹防护**：`read_zip_entry_bounded` 同时按「zip 头部声明大小」和「清单声明大小」双重拦截后才读字节（`:328-337`），并有 4 条单元测试覆盖（含「头部撒谎」的情形）。
+- **恢复是事务性的**：先 `protect_current_save_version` 保护当前存档（`:385`），再 `SaveRepository::restore`，失败时 `rollback_restore`，成功才 `finalize_restore`（`:397-411`）。存档目录不会被半写。
+- **凭据处理正确**：`secret_key` 用 Windows DPAPI 加密落盘（`baidu_config_repository.rs:135-168`），API 视图只暴露 `secret_key_configured: bool`，`safe_network_error` 统一剥掉 URL——因为百度强制把 token 放在查询串里（`:960-962` 有专门注释说明为什么必须这么做）。
 
 ---
 
@@ -33,24 +41,37 @@
 | `baidu_commands.rs::remote_body_dir` | 内联的一段等价检查 | 改用领域层 |
 | `add_game_commands.rs:30` | 手写分隔符检查 —— **漏了 `.` 与 `..`** | 改用领域层 |
 
-**一处真实的行为变化**（原计划写的是"零行为变更"，落地后修正）：`add_game_commands` 那处原先只拒绝分隔符与空串，改用领域层后**开始拒绝 `.` 与 `..`**。实际影响仅限显示名恰好为 `.`/`..` 的游戏（这类游戏的远程路径本来就会指错地方），属预期收紧。
+**一处真实的行为变化**（原计划写的是「零行为变更」，落地后修正）：`add_game_commands` 那处原先只拒绝分隔符与空串，改用领域层后**开始拒绝 `.` 与 `..`**。实际影响仅限显示名恰好为 `.`/`..` 的游戏（这类游戏的远程路径本来就会指错地方），属预期收紧。
 
 **验证**：
 
 - 新增 2 条守卫测试（净 +2，276 → 278），其中 `remote_paths_reject_segments_that_escape_the_game_directory` 覆盖 `../../evil` / `..` / `.` / `a/b` / `a\b` / 空串 / 全空格 / 含换行，且对三个构造函数与 `version_id` 分别断言。
-- 另加 `remote_paths_still_accept_keys_with_spaces` —— 钉住"不能误伤"，因为 `derive_game_key` 会保留空格（`"black myth wukong"`），收紧成字符白名单就会打断真实存在的 key。
+- 另加 `remote_paths_still_accept_keys_with_spaces` —— 钉住「不能误伤」，因为 `derive_game_key` 会保留空格（`"black myth wukong"`），收紧成字符白名单就会打断真实存在的 key。
 - **变异 ×2**：分别去掉 `version_id` 与 `game_key` 的校验，两次都精确失败在该守卫测试上；还原后回到 278 通过。
 - 门禁：`cargo fmt --check` 干净、`cargo test --lib` 278 passed / 0 failed、clippy 0 error 且警告数与基线持平。
 
-**顺带确认的事实**（决定这次能收多紧）：生产路径上 `version_id` 恒为 `Uuid::new_v4().to_string()`，`remote_package_path` 只在本地版本上被调用；`fetch_manifest` 的兜底分支虽然会从远程文件名反推 `version_id`，但那条路径不经过远程路径拼接。因此本次可以按"单一路径段"从严判定，不会误伤合法值。
+**顺带确认的事实**（决定这次能收多紧）：生产路径上 `version_id` 恒为 `Uuid::new_v4().to_string()`，`remote_package_path` 只在本地版本上被调用；`fetch_manifest` 的兜底分支虽然会从远程文件名反推 `version_id`，但那条路径不经过远程路径拼接。因此本次可以按「单一路径段」从严判定，不会误伤合法值。
+---
 
-**数据完整性主链路是扎实的** —— 这部分要先说清楚，免得下面的条目造成错误印象：
+## 0.2 C5 落地记录（2026-09-14）
 
-- **每个存档文件都有 SHA-256**：写入版本清单（`cloud_save_service.rs:212`），下载后逐项复核（`:339`），对象以哈希命名存储（`:342` `write_object(app, &hash, &data)`）⇒ 内容寻址，重复上传/下载天然幂等。
-- **下载包整体也有 SHA-256**：`package_sha256` 记录在清单里（`:211`），下载后比对（`:277-282`）。
-- **压缩包读取有解压炸弹防护**：`read_zip_entry_bounded` 同时按「zip 头部声明大小」和「清单声明大小」双重拦截后才读字节（`:328-337`），并有 4 条单元测试覆盖（含「头部撒谎」的情形）。
-- **恢复是事务性的**：先 `protect_current_save_version` 保护当前存档（`:385`），再 `SaveRepository::restore`，失败时 `rollback_restore`，成功才 `finalize_restore`（`:397-411`）。存档目录不会被半写。
-- **凭据处理正确**：`secret_key` 用 Windows DPAPI 加密落盘（`baidu_config_repository.rs:135-168`），API 视图只暴露 `secret_key_configured: bool`，`safe_network_error` 统一剥掉 URL——因为百度强制把 token 放在查询串里（`:960-962` 有专门注释说明为什么必须这么做）。
+**做法**：两层。启动恢复里扫掉残留的暂存目录（治本，覆盖崩溃与强杀），外加一个 RAII 守卫包住「解到暂存 → `rename` 提交」这段窗口（治运行期，让解包或提交失败当场自清，不必等重启）。
+
+- `BodyPackageService::cleanup_interrupted_cloud_installs(games_root)`：只扫 `games_root` 第一层，匹配 `.{game_uid}.cloud-installing`，且要求中间那段确实是 uid（名字里再含 `.` 就跳过，避免把 `.cloud-installing`、`..cloud-installing` 这类退化名字当成暂存目录）。
+- 目录名由 `CLOUD_INSTALL_STAGING_PREFIX` / `CLOUD_INSTALL_STAGING_SUFFIX` 两个 `pub const` 统一，创建侧（`baidu_commands`）与清理侧共用 —— 原先创建侧是硬编码的 `format!(".{local_uid}.cloud-installing")`，两边若各写一份，改一处就会静默失配。
+- 调用点紧挨 `SaveRepository::recover_interrupted_restores`，沿用那里已写明的时序论证：此刻还没进入运行期、没有安装任务在跑，所以只可能清到上一次进程的残留，不存在与进行中的安装抢文件。
+
+**守卫的一个关键细节**：`CloudInstallStagingGuard` 用 `Option<PathBuf>` 而不是「bool + 路径」—— `Some` 即「还归我管」，`rename` 成功后就地置 `None` 解除。写错这里的后果不是「删不掉残留」，而是**把刚装好的游戏本体当成暂存目录删掉**，用户看到的是「安装成功但游戏不见了」。因此专门配了一条测试钉住解除后的行为。
+
+**报错文案修正**：原为「已有未完成的云端游戏安装暂存目录，请重启应用后重试」。这句话在修 C5 之前是错的（重启并不清理，用户照做也没用）。现在改为「若确认没有安装任务在进行，重启应用会自动清理它」—— 前半句是真凶说明（守卫还在时通常意味着确有一次安装在进行），后半句才是本次改动真正兑现的承诺。
+
+**验证**：
+
+- 新增 5 条测试（278 → 283）：暂存目录被清且已提交的受管目录、同前缀无关目录都不受影响；退化名字不误伤；`games_root` 缺失不算错误；守卫武装时删除、解除后保留。
+- **变异 ×2**：让启动清理不删任何东西、以及让 `Drop` 变成空实现，两次都精确失败在对应测试上；还原后回到 283 通过。
+- 门禁：`cargo fmt --check` 干净、`cargo test --lib` 283 passed / 0 failed、clippy 0 error 且警告数与基线持平。
+
+**未做的事**：那条 `staging.exists()` 判据仍然是 check-then-act，两次并发安装同一游戏仍可能双双通过检查（`:1574` 的 `managed_path.exists()` 兜住覆盖，所以不会损坏已装游戏）。这是 C2 一族「云操作没有按游戏串行化」的另一面，留给 C2 一并处理，本次没有扩大范围。
 
 ---
 
@@ -213,8 +234,8 @@ if staging.exists() {
 
 | 批次 | 内容 | 性质 |
 |---|---|---|
-| 第 1 批 | **C1** 三个路径构造函数补 `is_safe_path_segment`，并收敛三份重复校验 | 纯加固，零行为变更 |
-| 第 2 批 | **C5** 启动恢复里清理 `.cloud-installing` 暂存目录，并修正「请重启应用」的文案 | 小改，直接消除需要手工干预的卡死 |
+| 第 1 批 | ~~**C1** 三个路径构造函数补 `is_safe_path_segment`，并收敛三份重复校验~~ **已完成（见 §0.1）** | 纯加固 |
+| 第 2 批 | ~~**C5** 启动恢复里清理 `.cloud-installing` 暂存目录，并修正「请重启应用」的文案~~ **已完成（见 §0.2）** | 小改，直接消除需要手工干预的卡死 |
 | 第 3 批 | **C2** 云同步命令按 `game_uid` 取 `save_operations` 占位 | 小改，需决定「已在同步」时的前端提示文案 |
 | 第 4 批 | **C3** 临时文件名加 UUID + RAII 清理 | 小改 |
 | 第 5 批 | **C4** 为 `cloud_save_commands.rs` 补编排层测试（可同时钉住 C2 的加锁行为） | 补验证 |

@@ -175,6 +175,14 @@ pub fn run() {
                 logging::error(format!("存档恢复残留清理失败：{error}"));
                 eprintln!("GameSaver 存档恢复残留清理失败：{error}");
             }
+            // 同理：云端安装游戏被强杀会留下 `.{game_uid}.cloud-installing` 暂存目录，而重装
+            // 时「暂存目录已存在就拒绝」的判据会让那个游戏永久装不上。这里同样只可能清到上
+            // 一次进程的残留（此刻没有任何安装任务在跑）。
+            if let Err(error) = BodyPackageService::cleanup_interrupted_cloud_installs(&games_root)
+            {
+                logging::error(format!("云端安装暂存目录清理失败：{error}"));
+                eprintln!("GameSaver 云端安装暂存目录清理失败：{error}");
+            }
             if let Err(error) = GameRepository::persist(app.handle(), &store) {
                 logging::error(format!("清理历史游戏本体记录失败：{error}"));
                 eprintln!("GameSaver 清理历史游戏本体记录失败：{error}");

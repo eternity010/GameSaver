@@ -1535,9 +1535,16 @@ fn install_cloud_game_task(
         let _ = std::fs::remove_file(&package_path);
         return Err("任务已取消".to_string());
     }
-    let staging = games_root.join(format!(".{local_uid}.cloud-installing"));
+    let staging = games_root.join(format!(
+        "{}{local_uid}{}",
+        crate::services::game_body_package_service::CLOUD_INSTALL_STAGING_PREFIX,
+        crate::services::game_body_package_service::CLOUD_INSTALL_STAGING_SUFFIX
+    ));
     if staging.exists() {
-        return Err("已有未完成的云端游戏安装暂存目录，请重启应用后重试".to_string());
+        return Err(
+            "已有未完成的云端游戏安装暂存目录；若确认没有安装任务在进行，重启应用会自动清理它。"
+                .to_string(),
+        );
     }
     TaskService::update(
         &state,
@@ -1547,6 +1554,12 @@ fn install_cloud_game_task(
         "正在校验并安装游戏本体",
         None,
     );
+    // 暂存目录在提交（下面的 `fs::rename`）之前一直由这个守卫负责收拾：解包失败、应用
+    // 崩溃都会留下它，而留下的后果是该游戏**永久装不上**。提交成功时置 `None` 解除守卫，
+    // 目录已变成受管目录、不能再删。
+    let mut staging_guard = CloudInstallStagingGuard {
+        path: Some(staging.clone()),
+    };
     let body_manifest = BodyPackageService::extract_package_with_known_hash(
         &package_path,
         &staging,
@@ -1576,6 +1589,8 @@ fn install_cloud_game_task(
     }
     std::fs::rename(&staging, &managed_path)
         .map_err(|error| format!("提交云端游戏安装失败：{error}"))?;
+    // 已提交成受管目录：解除守卫，别把刚装好的游戏删掉。
+    staging_guard.path = None;
     // 游戏对象与封面在此组装：封面要走一次网络下载，放到 store 锁外完成，
     // 避免安装期间长时间占住锁、阻塞其他读写者。
     let mut game = existing.unwrap_or_else(|| {
@@ -1679,6 +1694,22 @@ fn install_cloud_game_task(
         "fileCount": body_manifest.file_count,
         "totalBytes": body_manifest.total_bytes,
     }))
+}
+
+/// 提交前失败就删掉云端安装的暂存目录。
+///
+/// 设成 `Option` 而不是「bool + 路径」：`Some` 即「还归我管」，提交成功后置 `None` 就地
+/// 解除，不需要另一个标志位去解释路径已经不该删了。
+struct CloudInstallStagingGuard {
+    path: Option<PathBuf>,
+}
+
+impl Drop for CloudInstallStagingGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
 }
 
 fn reconcile_local_body_versions(
@@ -1882,7 +1913,46 @@ fn now_iso() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{remote_body_dir, validate_remote_package_path};
+    use super::{remote_body_dir, validate_remote_package_path, CloudInstallStagingGuard};
+
+    /// 提交前失败：守卫必须把暂存目录删掉，否则该游戏会被那条「已存在就拒绝」的判据卡死。
+    #[test]
+    fn staging_guard_removes_the_directory_it_still_owns() {
+        let dir = std::env::temp_dir().join(format!(
+            "gamesaver-guard-armed-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create staging");
+        std::fs::write(dir.join("game.exe"), b"half-extracted").expect("write partial file");
+
+        drop(CloudInstallStagingGuard {
+            path: Some(dir.clone()),
+        });
+
+        assert!(!dir.exists());
+    }
+
+    /// 提交成功后必须解除守卫。这条是这套逻辑最危险的失效方式：写错就会把**刚装好的
+    /// 游戏本体**当成暂存目录删掉，而用户看到的是「安装成功但游戏不见了」。
+    #[test]
+    fn staging_guard_keeps_a_committed_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "gamesaver-guard-disarmed-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create committed directory");
+        std::fs::write(dir.join("game.exe"), b"real").expect("write real game");
+        let mut guard = CloudInstallStagingGuard {
+            path: Some(dir.clone()),
+        };
+
+        // 模拟 `fs::rename` 提交成功后解除守卫。
+        guard.path = None;
+        drop(guard);
+
+        assert!(dir.join("game.exe").is_file());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
 
     #[test]
     fn remote_body_directory_uses_game_key_verbatim() {
