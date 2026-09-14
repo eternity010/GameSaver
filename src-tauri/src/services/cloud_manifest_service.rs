@@ -126,6 +126,61 @@ pub struct CachedEntry<T> {
 
 pub struct CloudManifestService;
 
+/// `fetch` 失败的两种性质。`rebuild` 必须分别处置；`read` 则一视同仁（都当错误）。
+#[derive(Debug)]
+enum FetchFailure {
+    /// 远端有清单，但**取不下来**（下载失败、大小不符、落盘或读取失败）。
+    ///
+    /// 远端那份可能完好，这一趟只是不顺 —— 调用方**不得**覆盖它，否则别的设备写下的
+    /// `sha256` / `file_count` / `total_bytes` 会被一份没有这些字段的新清单静默顶掉。
+    Unavailable(String),
+    /// 拿到了**完整字节**却解析不了 —— 远端那份清单本身坏了。
+    ///
+    /// 为什么能确定「坏的是远端」而不是「我们只下了一半」：`download_file` 收尾会比对
+    /// `written != remote.size`（`baidu_netdisk_service.rs:843`），下载不完整在那一步就
+    /// 报错了，走不到这里。所以这里只剩「字节数对得上、但内容不是合法清单」这一种可能。
+    Unparseable(String),
+}
+
+impl FetchFailure {
+    fn into_message(self) -> String {
+        match self {
+            Self::Unavailable(message) | Self::Unparseable(message) => message,
+        }
+    }
+}
+
+/// 把清单字节解析成清单，失败时分类为 [`FetchFailure::Unparseable`]。
+///
+/// 单独抽出来是为了让「解析失败归成哪一类」也能被离线测到 —— 分类写错（归成
+/// `Unavailable`）会让坏清单被当成「取不下来」，于是修复工具又对最坏的情况失效，
+/// 而那种错误在 `fetch` 里是要真实网盘才跑得到的。
+fn parse_manifest(raw: &[u8]) -> Result<CloudBodyManifest, FetchFailure> {
+    serde_json::from_slice::<CloudBodyManifest>(raw)
+        .map_err(|error| FetchFailure::Unparseable(format!("解析云端版本清单失败：{error}")))
+}
+
+/// `rebuild` 拿到「取旧清单」的结果之后的处置策略。
+///
+/// 抽成独立函数是为了能**离线测**：三种情况必须分开，而这正是此前 `.ok().flatten()`
+/// 的错处 —— 它把前两种都当成了「清单不存在」。
+fn existing_manifest_for_rebuild(
+    fetched: Result<Option<CloudBodyManifest>, FetchFailure>,
+) -> Result<Option<CloudBodyManifest>, String> {
+    match fetched {
+        // 取不下来：远端那份可能完好 → 不覆盖，让调用方报错。
+        Err(FetchFailure::Unavailable(error)) => Err(error),
+        // 拿到了完整字节却解析不了：远端清单本身坏了，没有元数据可沿用，**必须继续重建**。
+        // 否则「修复清单」这个工具对坏得最彻底的清单反而失效，而下载侧对坏清单是硬停的
+        // （`baidu_commands.rs` 的 `download_body_task`），用户就再没有自救手段。
+        Err(FetchFailure::Unparseable(_)) => Ok(None),
+        // 远端确实没有清单：按远端列表新建（正常路径）。
+        Ok(None) => Ok(None),
+        // 能解析但校验不过：正是「修复清单」要修的损坏清单，沿用其中元数据重建。
+        Ok(Some(manifest)) => Ok(Some(manifest)),
+    }
+}
+
 impl CloudManifestService {
     pub fn manifest_path(remote_dir: &str) -> String {
         format!("{remote_dir}/{MANIFEST_FILE_NAME}")
@@ -469,16 +524,13 @@ impl CloudManifestService {
         // 不能用 `.ok().flatten()`：那会把「取不下来 / 解析不了」当成「清单不存在」，
         // 于是静默用一份新清单覆盖旧的，别的设备写下的 sha256 / file_count /
         // total_bytes 就此丢失 —— 之后该版本下载不再比对哈希，**完整性校验被静默降级**。
-        // `fetch` 与 `read` 拆开，正是为了在这里把三种情况分开。
-        let existing = match Self::fetch(client, remote_files, remote_dir, temporary_root) {
-            // 取不下来或解析不了：旧清单可能完好，这一趟只是不顺 → 不覆盖，让调用方报错。
-            Err(error) => return Err(error),
-            // 远端列表里确实没有清单：按远端列表新建（正常路径）。
-            Ok(None) => None,
-            // 能解析但校验不过：**正是「修复清单」要修的损坏清单**，必须继续重建，
-            // 否则一个被改坏的清单会让「修复清单」这个工具本身失效。
-            Ok(Some(manifest)) => Some(manifest),
-        };
+        // 三种情况的处置见 `existing_manifest_for_rebuild`。
+        let existing = existing_manifest_for_rebuild(Self::fetch(
+            client,
+            remote_files,
+            remote_dir,
+            temporary_root,
+        ))?;
         let existing_by_path = existing
             .as_ref()
             .map(|manifest| {
@@ -575,16 +627,18 @@ impl CloudManifestService {
 
     /// 下载并解析远端清单，**不校验内容**。
     ///
-    /// 拆出来的唯一原因：`rebuild` 必须区分「取不下来 / 解析不了」与「能解析但校验
-    /// 不过」。前者说明旧清单可能完好，覆盖它等于静默丢掉别的设备写下的校验值；后者
-    /// 正是「修复清单」要修的损坏清单，必须允许按远端列表重建。`read` 与 `rebuild`
-    /// 因此共用这一段。
+    /// 拆出来的原因：`rebuild` 必须区分「取不下来」与「解析不了」—— 前者说明远端那份
+    /// 可能完好，覆盖它等于静默丢掉别的设备写下的校验值；后者说明远端清单本身坏了，
+    /// 正是「修复清单」要修的对象。`read` 与 `rebuild` 因此共用这一段。
+    ///
+    /// 失败时带回 [`FetchFailure`] 让调用方自己决定：`read` 两种都当错误，`rebuild`
+    /// 只对「取不下来」报错。
     fn fetch(
         client: &BaiduNetdiskClient,
         remote_files: &[RemoteFile],
         remote_dir: &str,
         temporary_root: &Path,
-    ) -> Result<Option<CloudBodyManifest>, String> {
+    ) -> Result<Option<CloudBodyManifest>, FetchFailure> {
         let manifest_path = Self::manifest_path(remote_dir);
         let Some(remote_manifest) = remote_files
             .iter()
@@ -592,18 +646,23 @@ impl CloudManifestService {
         else {
             return Ok(None);
         };
-        fs::create_dir_all(temporary_root)
-            .map_err(|error| format!("创建云端版本清单下载目录失败：{error}"))?;
+        fs::create_dir_all(temporary_root).map_err(|error| {
+            FetchFailure::Unavailable(format!("创建云端版本清单下载目录失败：{error}"))
+        })?;
         let temporary = temporary_root.join(format!(
             ".cloud-manifest-download-{}.json",
             Uuid::new_v4().simple()
         ));
-        let result = (|| -> Result<CloudBodyManifest, String> {
-            client.download_file(remote_manifest, &temporary, |_, _| true)?;
-            let raw =
-                fs::read(&temporary).map_err(|error| format!("读取云端版本清单失败：{error}"))?;
-            serde_json::from_slice::<CloudBodyManifest>(&raw)
-                .map_err(|error| format!("解析云端版本清单失败：{error}"))
+        let result = (|| -> Result<CloudBodyManifest, FetchFailure> {
+            client
+                .download_file(remote_manifest, &temporary, |_, _| true)
+                .map_err(FetchFailure::Unavailable)?;
+            let raw = fs::read(&temporary).map_err(|error| {
+                FetchFailure::Unavailable(format!("读取云端版本清单失败：{error}"))
+            })?;
+            // 走到这里字节数是完整的（`download_file` 已比对 remote.size），
+            // 所以解析失败只可能是远端内容本身不合法。
+            parse_manifest(&raw)
         })();
         let _ = fs::remove_file(&temporary);
         let _ = fs::remove_file(temporary.with_extension("download.tmp"));
@@ -631,7 +690,11 @@ impl CloudManifestService {
                 return Ok(Some(cached));
             }
         }
-        let Some(manifest) = Self::fetch(client, remote_files, remote_dir, temporary_root)? else {
+        // 两种失败对 `read` 一视同仁：解析不了也是错误。绝不能让它退化成「没有清单」——
+        // 那会让下载侧以为没有元数据可校验，等于把完整性校验静默降级。
+        let Some(manifest) = Self::fetch(client, remote_files, remote_dir, temporary_root)
+            .map_err(FetchFailure::into_message)?
+        else {
             return Ok(None);
         };
         // 校验通过才入缓存：缓存命中时会重新校验（`load_cached_manifest`），
@@ -875,8 +938,9 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        game_key_from_body_dir, rebuilt_version_id, validate, CloudBodyManifest,
-        CloudBodyManifestVersion, CloudGameCatalog, CloudManifestService,
+        existing_manifest_for_rebuild, game_key_from_body_dir, parse_manifest, rebuilt_version_id,
+        validate, CloudBodyManifest, CloudBodyManifestVersion, CloudGameCatalog,
+        CloudManifestService, FetchFailure,
     };
     use crate::{
         domain::GameBodyVersion,
@@ -1030,6 +1094,76 @@ mod tests {
             "v9"
         );
         assert_eq!(rebuilt_version_id(None, None, path), "v9");
+    }
+
+    /// `rebuild` 对「取旧清单」的三种结果必须分别处置 —— 这是 H2 的核心，**也是我第一次
+    /// 改错的地方**。
+    ///
+    /// 第一版把「取不下来」与「解析不了」都算作错误、都不覆盖。方向对了一半：取不下来时
+    /// 远端那份可能完好，确实不该覆盖；但**解析不了说明远端清单本身坏了**，而
+    /// `repair_cloud_body_manifest` 正是要修这种清单，下载侧（`download_body_task`）对坏
+    /// 清单又是硬停的 —— 两条加在一起，等于让坏得最彻底的清单**再也修不回来**，用户只能
+    /// 去网页端手改。所以这一条必须继续重建。
+    ///
+    /// 抽成 `existing_manifest_for_rebuild` 就是为了能离线测到这条分支：真跑到 `fetch`
+    /// 里需要让「下载成功但内容非法」，那要真实网盘。
+    #[test]
+    fn rebuild_overwrites_when_the_remote_manifest_is_unparseable_but_not_when_it_is_unavailable() {
+        // 取不下来：必须报错中止，否则会静默丢掉别的设备写下的校验值。
+        let unavailable = existing_manifest_for_rebuild(Err(FetchFailure::Unavailable(
+            "本体包下载大小不匹配".to_string(),
+        )));
+        assert_eq!(
+            unavailable.expect_err("取不下来时必须中止"),
+            "本体包下载大小不匹配"
+        );
+
+        // 解析不了：必须继续重建 —— 「修复清单」要修的正是这种。
+        let unparseable = existing_manifest_for_rebuild(Err(FetchFailure::Unparseable(
+            "解析云端版本清单失败".to_string(),
+        )))
+        .expect("远端清单解析不了时必须继续重建，否则修复工具对最坏的情况反而失效");
+        assert!(unparseable.is_none(), "坏清单没有元数据可沿用");
+
+        // 远端确实没有清单：新建。
+        assert!(existing_manifest_for_rebuild(Ok(None))
+            .expect("清单不存在时应新建")
+            .is_none());
+
+        // 能解析但校验不过：沿用其中元数据（旧值才是版本身份，且要留住 sha256）。
+        let manifest = CloudBodyManifest {
+            format_version: 1,
+            game_key: "game-one".to_string(),
+            game_uid: "uid-one".to_string(),
+            updated_at: "1".to_string(),
+            versions: vec![CloudBodyManifestVersion {
+                version_id: "from-manifest".to_string(),
+                created_at: "2".to_string(),
+                package_path: "/apps/GameSaver/games/game-one/body/v9.zip".to_string(),
+                package_fs_id: 9,
+                package_size: 1,
+                package_sha256: Some("a".repeat(64)),
+                file_count: 1,
+                total_bytes: 1,
+            }],
+        };
+        let reused = existing_manifest_for_rebuild(Ok(Some(manifest)))
+            .expect("能解析时应沿用")
+            .expect("应带回旧清单");
+        assert_eq!(reused.versions[0].version_id, "from-manifest");
+
+        // 再走一遍分类那一段：**坏字节必须被归成「解析不了」**。若归成「取不下来」，
+        // 上面那条 Unparseable 分支就永远走不到，坏清单会被拒绝修复 —— 这是接线，
+        // 与策略分开测，因为 `fetch` 里那一步要真实网盘才跑得到。
+        let classified = parse_manifest(b"{ this is not a manifest");
+        assert!(
+            matches!(classified, Err(FetchFailure::Unparseable(_))),
+            "解析失败必须分类为 Unparseable，否则坏清单会被当成「取不下来」而拒绝修复"
+        );
+        assert!(
+            existing_manifest_for_rebuild(classified.map(Some)).is_ok(),
+            "坏字节必须能走通「按远端列表重建」这条路"
+        );
     }
 
     /// `rebuild` 读不到旧清单时**不能**当成「清单不存在」继续覆盖回写。
