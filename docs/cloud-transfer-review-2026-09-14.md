@@ -293,7 +293,15 @@ if staging.exists() {
 ## 5. 存疑项（未能验证，需环境确认）
 
 1. **C1 的实际可达伤害范围**：百度网盘服务端对 `..`、`.`、空路径段的解析/归一化策略未知，因此「最坏能删到 `/apps/GameSaver/saves/` 之外的什么」无法在本机判定。需要真实网盘环境或百度接口文档确认。
-2. **`game_key` 能否带 `/` 抵达存档路径**：`add_game_commands.rs:30` 在本地添加游戏时**会**拒绝含分隔符的 key；但云端导入路径（`baidu_commands.rs:1591` `derive_game_key(&catalog.game_key)`）只做小写与空白折叠，**不拒绝分隔符**。该 remote catalog 的来源与可信度未追到底，因此这条只算可疑，未计入 C1 的确定部分。
+2. ~~**`game_key` 能否带 `/` 抵达存档路径**~~ —— **已追到底并修复（E）。**
+   原判断：`add_game_commands.rs:30` 在本地添加游戏时**会**拒绝含分隔符的 key；但云端导入路径（`baidu_commands.rs:1591` `derive_game_key(&catalog.game_key)`）只做小写与空白折叠，**不拒绝分隔符**。该 remote catalog 的来源与可信度未追到底，因此这条只算可疑，未计入 C1 的确定部分。
+
+   **追查结果：能抵达，而且我原来的定位偏了。** 真正的推导源不是 `catalog.game_key` 而是 `catalog.display_name` —— 新游戏走 `Game::new_pending(catalog.display_name)`，键由**显示名**推出；而 `validate_catalog` 对 `display_name` 只要求非空（它只对 `catalog.game_key` 要求等于目录段）。`derive_game_key` 不处理分隔符，于是云端一个叫 `Pokemon Red/Blue` 的游戏会存成 `pokemon red/blue`。可达性也没问题：`list_cloud_games:291` 只校验 `catalog.game_key`、不校验 `display_name`，这种游戏照样出现在列表里、照样能点安装。
+
+   **实际后果与预期不同。** C1 落地后这不再是路径逃逸（`is_safe_path_segment` 会拒绝），而是变成一个**功能性死路**：该游戏此后每一个云存档操作都被拒绝，用户永远同步不了存档，且无从修复。C1 把「危险」换成了「不可用」，两边都需要在入口处拦住。
+
+   **同时确认本来就没问题的几处**（避免高估这轮的覆盖面）：`remote_body_dir` 已在两个入口校验；`validate_catalog:772` 已要求 `catalog.game_key` 与目录段精确相等；`cloud_account_service::validate:448` 对导入清单里每个游戏都查 `is_safe_path_segment`，且 `fetch_profile:260` 会调用它 —— 所以**云账号导入路径没有漏洞**，我最初怀疑它是错的；`list_cloud_games:183-185` 会过滤掉目录段不安全的游戏。真正剩下的缺口只有「存进本地 store 的那个键」。
+
 3. **并发上传同一版本是否可能**：自动同步与手动同步若恰好都指向同一 `version_id`，C2 的丢条目不会发生（retain-then-push 对同一 id 幂等）。C2 的成立依赖两条路径取到不同版本，这一点在 UI 上是可能的（手动选历史版本），但我没有实测复现。
 
 ---

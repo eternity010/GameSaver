@@ -1602,9 +1602,9 @@ fn install_cloud_game_task(
         game.game_uid = local_uid.to_string();
         game
     });
-    if game.game_key.trim().is_empty() {
-        game.game_key = Game::derive_game_key(&catalog.game_key);
-    }
+    // 见 `cloud_install_game_key`：新游戏的键来自 `new_pending(catalog.display_name)`，
+    // 而 display_name 只被要求非空、可以含 `/`，所以这里必须收口成已校验的目录段。
+    game.game_key = cloud_install_game_key(&game.game_key, remote_game_key);
     game.display_name = catalog.display_name;
     game.managed_path = managed_path.to_string_lossy().to_string();
     game.lifecycle = GameLifecycle::Active;
@@ -1878,6 +1878,33 @@ pub(crate) fn remote_body_dir(game_key: &str) -> Result<String, String> {
     Ok(format!("{REMOTE_ROOT}/{}/body", game_key.trim()))
 }
 
+/// 云端安装结束后，本地游戏最终该用哪个 `game_key`。
+///
+/// 规则：**只有现有键为空或不安全时**才回填云端目录段；已经安全的键一律不动。
+///
+/// **为什么必须回填。** 收窄前这里写的是「键为空才用 `catalog.game_key` 回填」，而键非空
+/// 时那个键来自 `new_pending(catalog.display_name)`。`display_name` 在
+/// `cloud_manifest_service::validate_catalog` 里**只被要求非空**，可以含 `/`；而
+/// `derive_game_key` 只做空白折叠与小写，不处理任何分隔符。于是云端一个叫
+/// "Pokemon Red/Blue" 的游戏会推出 `"pokemon red/blue"` 存进本地，此后
+/// `CloudSaveService::game_key_segment` 会拒绝它的**每一个**云存档操作 ——
+/// 该游戏永远同步不了存档，而界面上只显示一个用户无从修复的报错。
+///
+/// 目录段才是权威值：`validate_catalog` 要求 `catalog.game_key` 与它精确相等，
+/// 调用方也已用 [`remote_body_dir`] 校验过它。
+///
+/// **为什么不无条件覆盖。** `display_name` 与 `game_key` 本来就可以不同
+/// （`AddGameWizard` 明说「确认后不随显示名称变化」，`merge_profile` 也只改
+/// display_name）。所以「安全但与目录段不同」的已有键是合法状态，静默改成目录段会让
+/// 该游戏原本键下的云存档从界面上消失。本轮只保证「绝不留下不可用的键」。
+fn cloud_install_game_key(current: &str, remote_game_key: &str) -> String {
+    if current.trim().is_empty() || !is_safe_path_segment(current) {
+        remote_game_key.trim().to_string()
+    } else {
+        current.trim().to_string()
+    }
+}
+
 fn validate_remote_package_path(directory: &str, path: &str) -> Result<(), String> {
     let prefix = format!("{directory}/");
     let name = path
@@ -1913,7 +1940,10 @@ fn now_iso() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{remote_body_dir, validate_remote_package_path, CloudInstallStagingGuard};
+    use super::{
+        cloud_install_game_key, is_safe_path_segment, remote_body_dir,
+        validate_remote_package_path, CloudInstallStagingGuard, Game,
+    };
 
     /// 提交前失败：守卫必须把暂存目录删掉，否则该游戏会被那条「已存在就拒绝」的判据卡死。
     #[test]
@@ -1989,5 +2019,69 @@ mod tests {
             "/apps/GameSaver/games/other game/body/v1.zip"
         )
         .is_err());
+    }
+
+    /// 钉住这轮修复的**根因**：`derive_game_key` 只做空白折叠与小写，**不处理路径分隔符**，
+    /// 所以「由显示名现推一个 game_key」在云端场景下不可靠 —— 显示名是远端 JSON 里的任意
+    /// 字符串，而推导结果会被拼进远程路径。
+    #[test]
+    fn a_display_name_is_not_a_safe_source_for_a_game_key() {
+        for display_name in ["Pokemon Red/Blue", "..", ".", r"a\b", "   ", ""] {
+            let derived = Game::derive_game_key(display_name);
+            assert!(
+                !is_safe_path_segment(&derived),
+                "{display_name:?} 推出的 {derived:?} 不该被当成可用的 game_key"
+            );
+        }
+        // 反向守卫：正常显示名推出来的键必须仍然可用（含空格、非 ASCII），别把校验做过头。
+        assert!(is_safe_path_segment(&Game::derive_game_key(
+            "Black Market v1.23"
+        )));
+        assert!(is_safe_path_segment(&Game::derive_game_key(
+            "トビ姫 - inter breed tobihime_cn"
+        )));
+    }
+
+    /// E 的守卫：云端安装绝不能留下一个不可用的 `game_key`。
+    ///
+    /// 收窄前，键非空时用的是 `new_pending(catalog.display_name)` 推出来的键，而
+    /// `display_name` 在 `validate_catalog` 里只被要求非空 —— 于是云端一个叫
+    /// "Pokemon Red/Blue" 的游戏会被存成 `"pokemon red/blue"`，此后它**每一个**云存档操作
+    /// 都被 `CloudSaveService::game_key_segment` 拒绝：永远同步不了存档，而界面上只有一个
+    /// 用户无从修复的报错。
+    #[test]
+    fn cloud_install_replaces_an_unusable_key_with_the_cloud_directory_segment() {
+        let remote_key = "pokemon red";
+        // 各种「由异常显示名推出」的键，模拟 new_pending 的结果。
+        for derived in [
+            Game::derive_game_key("Pokemon Red/Blue"),
+            Game::derive_game_key(".."),
+            Game::derive_game_key("."),
+            Game::derive_game_key(r"a\b"),
+            Game::derive_game_key("   "),
+            String::new(),
+        ] {
+            let resolved = cloud_install_game_key(&derived, remote_key);
+            assert_eq!(
+                resolved, remote_key,
+                "不可用的键 {derived:?} 必须被换成云端目录段"
+            );
+            assert!(
+                is_safe_path_segment(&resolved),
+                "换出来的键必须能用于云端路径：{resolved:?}"
+            );
+        }
+    }
+
+    /// 已经可用的键不得被静默改名：`display_name` 与 `game_key` 本来就可以不同
+    /// （AddGameWizard 明说「确认后不随显示名称变化」），改名会让原键下的云存档从界面上消失。
+    #[test]
+    fn cloud_install_keeps_an_existing_safe_key() {
+        assert_eq!(
+            cloud_install_game_key("black market v1.23", "black_market"),
+            "black market v1.23",
+            "安全但不同于云端目录段的已有键必须保持不变"
+        );
+        assert_eq!(cloud_install_game_key("demo", "demo"), "demo");
     }
 }
