@@ -1,4 +1,8 @@
-use crate::{app_state::AppState, domain::AppTask, services::TaskService};
+use crate::{
+    app_state::AppState,
+    domain::{AppTask, TaskSummary},
+    services::TaskService,
+};
 use tauri::State;
 
 #[tauri::command]
@@ -6,8 +10,10 @@ pub fn get_task(state: State<AppState>, task_id: String) -> Result<AppTask, Stri
     TaskService::get(&state, task_id.trim())
 }
 
+/// 任务列表。只返回 [`TaskSummary`]（不含 `result`）：列表界面不用它，而它占了整份
+/// 负载的 99.5%（实测 2.32 MB）。完整任务用 [`get_task`]。
 #[tauri::command]
-pub fn list_tasks(state: State<AppState>) -> Result<Vec<AppTask>, String> {
+pub fn list_tasks(state: State<AppState>) -> Result<Vec<TaskSummary>, String> {
     TaskService::list(&state)
 }
 

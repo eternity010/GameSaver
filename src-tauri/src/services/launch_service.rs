@@ -2,8 +2,8 @@ use crate::services::process_service::TrackedProcessHandle;
 use crate::{
     app_state::AppState,
     domain::{
-        AppStore, AppTask, Game, GameLifecycle, GameRuntime, GameRuntimeStatus, SaveProfile,
-        SaveVersion, TaskCategory, TaskStatus,
+        AppStore, Game, GameLifecycle, GameRuntime, GameRuntimeStatus, SaveProfile, SaveVersion,
+        TaskCategory, TaskStatus, TaskSummary,
     },
     repositories::{GameRepository, SaveRepository},
     services::{GameLibraryService, TaskService},
@@ -786,7 +786,10 @@ fn resume_session(
 ///
 /// 取最近的一条：同一游戏可能留下多条历史中断记录（每次异常退出各一条），只有最新的
 /// 那条对应「刚刚仍在进行的那场会话」。`TaskService::list` 已按创建时间降序，取首个命中。
-fn find_interrupted_session_task(state: &AppState, game_uid: &str) -> Option<AppTask> {
+///
+/// 只需要 `task_id` 与 `created_at`，所以用列表视图 [`TaskSummary`] 即可 —— 会话任务的
+/// `result` 可能很大，没必要为了找一个 id 把它搬出来。
+fn find_interrupted_session_task(state: &AppState, game_uid: &str) -> Option<TaskSummary> {
     TaskService::list(state).ok()?.into_iter().find(|task| {
         task.task_type == "launch_game"
             && task.game_uid.as_deref() == Some(game_uid)

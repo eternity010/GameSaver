@@ -95,6 +95,10 @@ export interface AppTask {
   gameUid?: string;
   createdAt?: string;
   error?: string;
+  /**
+   * 任务产物。**只有 `getTask()` 会返回它**：`listTasks()` 返回的是列表视图，刻意不含
+   * `result`（它没有体积上限，实测占了整份任务列表 99.5% 的体积）。需要它就单独取。
+   */
   result?: unknown;
   retry?: TaskRetry;
 }
@@ -278,10 +282,25 @@ export function startAddGameTask(input: {
   return invokeCommand<string>("start_add_game_task", input);
 }
 
+/**
+ * 取单个任务，**含 `result` 完整内容**。需要任务产物（例如分析结果、会话草稿）时用这个。
+ */
 export function getTask(taskId: string): Promise<AppTask> {
   return invokeCommand<AppTask>("get_task", { taskId });
 }
 
+/**
+ * 任务列表（按创建时间降序）。
+ *
+ * **不含 `result`**：后端返回的是列表视图（`TaskSummary`），字段与 `AppTask` 一一对应，
+ * 只少了 `result`。原因：`result` 没有体积上限，实测本机 42 条任务合计 2.32 MB，其中
+ * **99.5% 是 `result`**（单个 `analyze_saves` 任务的 `transactionSummary` 就占 600 KB），
+ * 而列表界面一个字段都不用，却每次轮询都要把它搬过 IPC 并在 WebView 里重新解析 ——
+ * 空闲 10s 一次、有活跃任务 2s 一次，每个 `task-changed` 事件还会再触发一次。代价实测为
+ * 主线程一次 14.72ms 的任务紧跟一次 V8 MajorGC。
+ *
+ * 需要 `result` 请用 {@link getTask}。
+ */
 export function listTasks(): Promise<AppTask[]> {
   return invokeCommand<AppTask[]>("list_tasks");
 }

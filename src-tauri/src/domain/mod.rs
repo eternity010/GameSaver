@@ -25,5 +25,5 @@ pub use save_profile::{
 };
 pub use save_version::{SaveFileEntry, SaveVersion};
 pub use store::AppStore;
-pub use task::{AppTask, TaskCategory, TaskRetry, TaskStatus};
+pub use task::{AppTask, TaskCategory, TaskRetry, TaskStatus, TaskSummary};
 pub use timestamp::{compare_created_at, compare_optional_created_at};
