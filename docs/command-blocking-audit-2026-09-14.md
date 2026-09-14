@@ -122,6 +122,15 @@ let client = Client::builder()
 
 ### F3（潜在：云一旦授权就发作）10 个命令在主线程内联网络
 
+> **状态：已修复。** 10 个命令全部改为 `async` + `run_blocking`：阻塞工作由
+> `tauri::async_runtime::spawn_blocking` 放到**阻塞线程池**执行，命令体只剩
+> `run_blocking(move || xxx_blocking(app)).await` 一行，原实现原封不动搬进同文件的
+> `xxx_blocking`。只把命令标成 `async` 是不够的 —— 那会让 `reqwest::blocking` 占住
+> tokio 的 worker 线程（默认与 CPU 核数相同，是给异步任务用的）。
+> 守卫见 `lib.rs` 的 `commands_never_call_the_network_on_the_main_thread`，
+> 它扫 `src/commands/*.rs`，同步命令体内出现网络标记即失败（已做变异验证：塞一行
+> 网络调用进去，它会报出具体文件与命令名）。
+
 全部实测过代码，附带往返次数：
 
 | 命令 | 位置 | 网络内容 |

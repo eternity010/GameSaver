@@ -1,6 +1,6 @@
 use crate::{
     app_state::AppState,
-    commands::game_commands::safe_cover_path,
+    commands::{game_commands::safe_cover_path, run_blocking},
     domain::{
         compare_optional_created_at,
         game::{CloudStatus, LaunchConfig},
@@ -20,8 +20,16 @@ use uuid::Uuid;
 
 const REMOTE_ROOT: &str = "/apps/GameSaver/games";
 
+/// 查询百度网盘连接状态。
+///
+/// 走 [`crate::commands::run_blocking`]：token 过期时这里会真的发起一次刷新请求
+/// （客户端总超时 120 秒），不能在主线程上等。
 #[tauri::command]
-pub fn get_baidu_status(app: AppHandle) -> Result<BaiduConnectionStatus, String> {
+pub async fn get_baidu_status(app: AppHandle) -> Result<BaiduConnectionStatus, String> {
+    run_blocking(move || get_baidu_status_blocking(app)).await
+}
+
+fn get_baidu_status_blocking(app: AppHandle) -> Result<BaiduConnectionStatus, String> {
     let app_data_dir = app_data_dir(&app)?;
     let config = BaiduConfigRepository::load(&app_data_dir)?;
     Ok(BaiduNetdiskClient::connection_status_with_credentials(
@@ -31,8 +39,13 @@ pub fn get_baidu_status(app: AppHandle) -> Result<BaiduConnectionStatus, String>
     ))
 }
 
+/// 查询网盘容量：`load_baidu_client` 可能触发 token 刷新，`quota()` 是一次网络往返。
 #[tauri::command]
-pub fn get_baidu_quota(app: AppHandle) -> Result<BaiduQuota, String> {
+pub async fn get_baidu_quota(app: AppHandle) -> Result<BaiduQuota, String> {
+    run_blocking(move || get_baidu_quota_blocking(app)).await
+}
+
+fn get_baidu_quota_blocking(app: AppHandle) -> Result<BaiduQuota, String> {
     let client = load_baidu_client(&app)?;
     client.quota()
 }
@@ -138,14 +151,27 @@ pub fn get_cloud_game_cover_paths(
     Ok(map)
 }
 
+/// 列出云端游戏。
+///
+/// `client.list(REMOTE_ROOT)` 会拉取整个远端根目录、再在本地分页，是这个文件里最重的
+/// 一次网络往返。`state` 改在阻塞闭包里从 `app` 取。
 #[tauri::command]
-pub fn list_cloud_games(
+pub async fn list_cloud_games(
     app: AppHandle,
-    state: State<AppState>,
     page: Option<usize>,
     page_size: Option<usize>,
     search: Option<String>,
 ) -> Result<CloudGamePage, String> {
+    run_blocking(move || list_cloud_games_blocking(app, page, page_size, search)).await
+}
+
+fn list_cloud_games_blocking(
+    app: AppHandle,
+    page: Option<usize>,
+    page_size: Option<usize>,
+    search: Option<String>,
+) -> Result<CloudGamePage, String> {
+    let state = app.state::<AppState>();
     let client = load_baidu_client(&app)?;
     let page_size = page_size.unwrap_or(9).clamp(1, 50);
     let all_files = match client.list(REMOTE_ROOT) {
@@ -598,11 +624,18 @@ pub fn delete_remote_body_package(
 }
 
 #[tauri::command]
-pub fn list_remote_body_packages(
+pub async fn list_remote_body_packages(
     app: AppHandle,
-    state: State<AppState>,
     game_uid: String,
 ) -> Result<RemoteBodyPackageList, String> {
+    run_blocking(move || list_remote_body_packages_blocking(app, game_uid)).await
+}
+
+fn list_remote_body_packages_blocking(
+    app: AppHandle,
+    game_uid: String,
+) -> Result<RemoteBodyPackageList, String> {
+    let state = app.state::<AppState>();
     let game_uid = game_uid.trim().to_string();
     ensure_game(&state, &game_uid)?;
     let client = load_baidu_client(&app)?;

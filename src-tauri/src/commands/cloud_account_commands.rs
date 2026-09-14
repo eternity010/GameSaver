@@ -1,5 +1,6 @@
 use crate::{
     app_state::AppState,
+    commands::run_blocking,
     domain::{
         game::CloudStatus, Game, GameHealth, GameLifecycle, SaveProfile, SaveScope, TaskCategory,
         TaskStatus,
@@ -19,8 +20,13 @@ pub struct CloudAccountStatusView {
     pub remote_updated_at: Option<u64>,
 }
 
+/// 查询云端账号状态：`list_account_files` 是一次远端目录列举。
 #[tauri::command]
-pub fn get_cloud_account_status(app: AppHandle) -> Result<CloudAccountStatusView, String> {
+pub async fn get_cloud_account_status(app: AppHandle) -> Result<CloudAccountStatusView, String> {
+    run_blocking(move || get_cloud_account_status_blocking(app)).await
+}
+
+fn get_cloud_account_status_blocking(app: AppHandle) -> Result<CloudAccountStatusView, String> {
     let client = load_baidu_client(&app)?;
     let files = list_account_files(&client)?;
     let profile = files

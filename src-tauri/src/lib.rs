@@ -369,4 +369,195 @@ mod tests {
             }
         }
     }
+
+    /// 命令层不许再把网络调用留在**同步**命令里。
+    ///
+    /// 背景（`docs/command-blocking-audit-2026-09-14.md` 的 F3）：`#[tauri::command]` 的同步
+    /// 版本在调用线程里直接执行函数体（tauri-macros `command/wrapper.rs` 的 `body_blocking`），
+    /// 而 IPC 是在 Tauri 主线程上进入的（WebView2 的 `add_WebMessageReceived` 回调在创建
+    /// webview 的线程上触发）。于是同步命令里任何一次网络往返都会让窗口消息循环与后续所有
+    /// IPC 一起停摆 —— 而 `baidu_netdisk_service` 的客户端连接超时 20 秒、总超时 120 秒，
+    /// 一次卡顿就是分钟量级。
+    ///
+    /// 约定：命令体只留 `run_blocking(move || xxx_blocking(app)).await` 一行，阻塞实现放在
+    /// 同文件的 `xxx_blocking` 里（`run_blocking` 见 `commands/mod.rs`）。这条测试就是防止
+    /// 有人再往同步命令里塞网络调用。
+    #[test]
+    fn commands_never_call_the_network_on_the_main_thread() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands");
+        let mut offenders = Vec::new();
+        collect_sync_network_commands(&dir, &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "同步命令里不得出现网络调用 —— 同步命令执行在 Tauri 主线程上，而网络客户端总超时 \
+             120 秒，会连带冻结窗口消息循环与其他所有 IPC。请改成 \
+             `run_blocking(move || xxx_blocking(app)).await`（见 commands/mod.rs）：{offenders:#?}"
+        );
+    }
+
+    /// 每次网络都要先拿到 client，所以这些入口出现在命令体内就说明这一层会真的发请求。
+    const NETWORK_MARKERS: [&str; 5] = [
+        "load_baidu_client(",
+        "BaiduNetdiskClient::",
+        "Client::builder(",
+        "reqwest::blocking",
+        ".send()",
+    ];
+
+    /// 体内直接命中这些名字时网络在下一层（服务层），逐个人工确认过，标记在这里。
+    const SERVICE_NETWORK_MARKERS: [&str; 7] = [
+        "CloudSaveService::get_overview(",
+        "CloudSaveService::fetch_manifest(",
+        "CloudSaveService::delete_cloud_version(",
+        "CloudSaveService::upload_",
+        "CloudSaveService::download_",
+        "CloudSaveService::restore",
+        "list_account_files(",
+    ];
+
+    fn collect_sync_network_commands(dir: &Path, offenders: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_rust = path.extension().and_then(|value| value.to_str()) == Some("rs");
+            let is_module_root =
+                path.file_name().and_then(|value| value.to_str()) == Some("mod.rs");
+            if !is_rust || is_module_root {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let file = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("?")
+                .to_string();
+            let lines = text.lines().collect::<Vec<_>>();
+            for (index, line) in lines.iter().enumerate() {
+                if !line.trim_start().starts_with("#[tauri::command") {
+                    continue;
+                }
+                let Some(rest) = lines.get(index + 1..) else {
+                    continue;
+                };
+                let Some(signature) = rest
+                    .iter()
+                    .position(|candidate| {
+                        let candidate = candidate.trim_start();
+                        candidate.starts_with("pub fn ") || candidate.starts_with("pub async fn ")
+                    })
+                    .map(|offset| index + 1 + offset)
+                else {
+                    continue;
+                };
+                // async 命令已经由 `run_blocking` 把阻塞工作交给阻塞线程池，无需再查。
+                if lines[signature].contains("pub async fn") {
+                    continue;
+                }
+                let Some(body) = rust_function_body(&lines, signature) else {
+                    continue;
+                };
+                let code = strip_rust_comments(&body);
+                let marker = NETWORK_MARKERS
+                    .iter()
+                    .chain(SERVICE_NETWORK_MARKERS.iter())
+                    .find(|marker| code.contains(**marker));
+                if let Some(marker) = marker {
+                    let name = command_name(lines[signature]);
+                    offenders.push(format!("{file}:{name}（体内含 `{marker}`，但不是 async）"));
+                }
+            }
+        }
+    }
+
+    fn command_name(signature: &str) -> String {
+        signature
+            .split("fn ")
+            .nth(1)
+            .and_then(|rest| rest.split(['(', ' ']).next())
+            .unwrap_or("?")
+            .to_string()
+    }
+
+    /// 从签名行开始做花括号配对，取出整个函数（含签名）。
+    fn rust_function_body(lines: &[&str], start: usize) -> Option<String> {
+        let mut depth = 0i32;
+        let mut started = false;
+        let mut body = String::new();
+        for line in lines.get(start..)? {
+            for character in line.chars() {
+                match character {
+                    '{' => {
+                        depth += 1;
+                        started = true;
+                    }
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            body.push_str(line);
+            body.push('\n');
+            if started && depth <= 0 {
+                return Some(body);
+            }
+        }
+        None
+    }
+
+    /// 去掉行注释、块注释与字符串字面量之后再匹配标记。
+    ///
+    /// 必须去注释：代码里到处是「它调用 load_baidu_client」这类说明文字，把注释当代码会让
+    /// 这条守卫天天误报；字符串里同理（错误文案可能提到函数名或路径）。
+    fn strip_rust_comments(text: &str) -> String {
+        let characters = text.chars().collect::<Vec<_>>();
+        let mut output = String::new();
+        let mut index = 0usize;
+        while index < characters.len() {
+            let current = characters[index];
+            let next = characters.get(index + 1).copied().unwrap_or('\0');
+            match (current, next) {
+                ('/', '/') => {
+                    while index < characters.len() && characters[index] != '\n' {
+                        index += 1;
+                    }
+                }
+                ('/', '*') => {
+                    index += 2;
+                    while index < characters.len()
+                        && !(characters[index] == '*'
+                            && character_at(&characters, index + 1) == '/')
+                    {
+                        if characters[index] == '\n' {
+                            output.push('\n');
+                        }
+                        index += 1;
+                    }
+                    index += 2;
+                }
+                ('"', _) => {
+                    index += 1;
+                    while index < characters.len() && characters[index] != '"' {
+                        if characters[index] == '\\' {
+                            index += 1;
+                        }
+                        index += 1;
+                    }
+                    index += 1;
+                    output.push_str("\"\"");
+                }
+                _ => {
+                    output.push(current);
+                    index += 1;
+                }
+            }
+        }
+        output
+    }
+
+    fn character_at(characters: &[char], index: usize) -> char {
+        characters.get(index).copied().unwrap_or('\0')
+    }
 }

@@ -1,4 +1,5 @@
 use crate::{
+    commands::run_blocking,
     repositories::{BaiduConfig, BaiduConfigRepository, BaiduConfigView},
     services::{safe_network_error, BaiduNetdiskClient, BaiduToken},
 };
@@ -98,8 +99,15 @@ pub fn build_baidu_authorize_url(app: AppHandle) -> Result<String, String> {
     Ok(url.to_string())
 }
 
+/// 用授权码换取 token。
+///
+/// 体内 `Client::builder() … .send()` 是一次 OAuth 往返，必须在阻塞线程池上执行。
 #[tauri::command]
-pub fn exchange_baidu_code(app: AppHandle, code: String) -> Result<(), String> {
+pub async fn exchange_baidu_code(app: AppHandle, code: String) -> Result<(), String> {
+    run_blocking(move || exchange_baidu_code_blocking(app, code)).await
+}
+
+fn exchange_baidu_code_blocking(app: AppHandle, code: String) -> Result<(), String> {
     let code = code.trim();
     if code.is_empty() {
         return Err("授权 Code 不能为空".to_string());

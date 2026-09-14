@@ -1,5 +1,6 @@
 use crate::{
     app_state::{AppState, CloudOperationClaim},
+    commands::run_blocking,
     domain::{Game, SaveProfile, SaveVersion, TaskCategory, TaskRetry, TaskStatus},
     repositories::BaiduConfigRepository,
     services::{
@@ -30,12 +31,23 @@ pub fn get_cloud_save_status(
     CloudSaveService::get_sync_status(&app, &game)
 }
 
+/// 云端存档总览。
+///
+/// `CloudSaveService::get_overview` 内部会 `fetch_manifest`（一次网络往返），所以整段
+/// 放到阻塞线程池上；store 锁仍只在读取游戏记录时短暂持有。
 #[tauri::command]
-pub fn get_cloud_save_overview(
+pub async fn get_cloud_save_overview(
     app: AppHandle,
-    state: State<AppState>,
     game_uid: String,
 ) -> Result<CloudSaveOverview, String> {
+    run_blocking(move || get_cloud_save_overview_blocking(app, game_uid)).await
+}
+
+fn get_cloud_save_overview_blocking(
+    app: AppHandle,
+    game_uid: String,
+) -> Result<CloudSaveOverview, String> {
+    let state = app.state::<AppState>();
     let store = state
         .store
         .lock()
@@ -52,11 +64,18 @@ pub fn get_cloud_save_overview(
 }
 
 #[tauri::command]
-pub fn list_cloud_save_versions(
+pub async fn list_cloud_save_versions(
     app: AppHandle,
-    state: State<AppState>,
     game_uid: String,
 ) -> Result<Vec<CloudSaveManifestVersion>, String> {
+    run_blocking(move || list_cloud_save_versions_blocking(app, game_uid)).await
+}
+
+fn list_cloud_save_versions_blocking(
+    app: AppHandle,
+    game_uid: String,
+) -> Result<Vec<CloudSaveManifestVersion>, String> {
+    let state = app.state::<AppState>();
     let store = state
         .store
         .lock()
@@ -167,13 +186,26 @@ pub fn start_upload_save_version_task(
     Ok(task_id)
 }
 
+/// 启动「从云端恢复存档」任务。
+///
+/// 注意这里在 `thread::spawn` **之前**就有一次 `fetch_manifest`（要先把清单取回来才能
+/// 认领并建任务），所以整段必须离开主线程 —— 否则用户点下按钮到任务卡片出现之间，
+/// 整个窗口是僵的。
 #[tauri::command]
-pub fn start_restore_cloud_save_task(
+pub async fn start_restore_cloud_save_task(
     app: AppHandle,
-    state: State<AppState>,
     game_uid: String,
     version_id: String,
 ) -> Result<String, String> {
+    run_blocking(move || start_restore_cloud_save_task_blocking(app, game_uid, version_id)).await
+}
+
+fn start_restore_cloud_save_task_blocking(
+    app: AppHandle,
+    game_uid: String,
+    version_id: String,
+) -> Result<String, String> {
+    let state = app.state::<AppState>();
     let game_uid = game_uid.trim().to_string();
     let store = state
         .store
@@ -253,13 +285,25 @@ pub fn start_restore_cloud_save_task(
     Ok(task_id)
 }
 
+/// 删除云端存档版本。
+///
+/// 这是本层往返最多的一次删除：`delete_file` + `fetch_manifest` + `save_manifest`
+/// 三次网络往返，全都在阻塞线程池上跑。
 #[tauri::command]
-pub fn delete_cloud_save_version(
+pub async fn delete_cloud_save_version(
     app: AppHandle,
-    state: State<AppState>,
     game_uid: String,
     version_id: String,
 ) -> Result<Vec<CloudSaveManifestVersion>, String> {
+    run_blocking(move || delete_cloud_save_version_blocking(app, game_uid, version_id)).await
+}
+
+fn delete_cloud_save_version_blocking(
+    app: AppHandle,
+    game_uid: String,
+    version_id: String,
+) -> Result<Vec<CloudSaveManifestVersion>, String> {
+    let state = app.state::<AppState>();
     let store = state
         .store
         .lock()
