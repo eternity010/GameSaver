@@ -177,6 +177,24 @@ impl SaveRepository {
         version: &SaveVersion,
         on_progress: impl Fn(u8, &str),
     ) -> Result<RestoreReceipt, String> {
+        let objects_root = Self::list_objects_root(app)?;
+        Self::restore_from_objects_root(&objects_root, game, profile, version, on_progress)
+    }
+
+    /// `restore` 的主体，按**对象根目录**寻址。
+    ///
+    /// 拆出来是为了让「恢复执行半段」能被测试：原签名要吃 `&AppHandle`，而恢复逻辑真正需要
+    /// 的只是对象仓库目录。公共入口 `restore` 保持原签名，因此三个命令调用点一行都不用改。
+    ///
+    /// 可测性在这里不是洁癖：这段代码会**搬走并覆盖用户的存档**，还有一整套回滚语义，是全
+    /// 项目破坏性最强的路径，而它此前没有任何测试（规划半段 `build_restore_groups` 有 5 条）。
+    fn restore_from_objects_root(
+        objects_root: &Path,
+        game: &Game,
+        profile: &SaveProfile,
+        version: &SaveVersion,
+        on_progress: impl Fn(u8, &str),
+    ) -> Result<RestoreReceipt, String> {
         if version.game_uid != game.game_uid {
             return Err("保存版本不属于当前游戏".to_string());
         }
@@ -193,7 +211,7 @@ impl SaveRepository {
         let mut completed = 0usize;
         let mut undo_groups = Vec::new();
         for group in groups {
-            match restore_group(app, &group, |count, message| {
+            match restore_group(objects_root, &group, |count, message| {
                 completed += count;
                 on_progress(((completed * 100) / total_files.max(1)) as u8, message);
             }) {
@@ -408,7 +426,8 @@ impl SaveRepository {
     }
 
     pub fn read_object(app: &AppHandle, hash: &str) -> Result<Vec<u8>, String> {
-        let path = object_path(app, hash)?;
+        let objects_root = Self::list_objects_root(app)?;
+        let path = object_path(&objects_root, hash)?;
         if !path.is_file() {
             return Err(format!("存档对象不存在：{hash}"));
         }
@@ -420,7 +439,8 @@ impl SaveRepository {
     }
 
     pub fn object_path(app: &AppHandle, hash: &str) -> Result<PathBuf, String> {
-        object_path(app, hash)
+        let objects_root = Self::list_objects_root(app)?;
+        object_path(&objects_root, hash)
     }
 
     pub fn object_exists(app: &AppHandle, hash: &str) -> bool {
@@ -678,7 +698,7 @@ fn deleted_entry_restore_root(
 }
 
 fn restore_group(
-    app: &AppHandle,
+    objects_root: &Path,
     group: &RestoreGroup,
     mut on_progress: impl FnMut(usize, &str),
 ) -> Result<RestoreUndo, String> {
@@ -700,7 +720,7 @@ fn restore_group(
     let result = (|| -> Result<(), String> {
         fs::create_dir_all(&staging).map_err(|err| format!("创建存档恢复暂存目录失败：{err}"))?;
         for (index, (relative, hash)) in group.entries.iter().enumerate() {
-            let object = object_path(app, hash)?;
+            let object = object_path(objects_root, hash)?;
             if !object.is_file() || sha256_file(&object)? != hash.to_ascii_lowercase() {
                 return Err(format!("存档对象校验失败：{hash}"));
             }
@@ -1259,13 +1279,17 @@ fn can_create_missing_restore_root(root_type: SaveRootType) -> bool {
     )
 }
 
-fn object_path(app: &AppHandle, hash: &str) -> Result<PathBuf, String> {
+/// 对象在仓库里的落盘路径。
+///
+/// 只依赖**对象根目录**、不依赖 `&AppHandle`：`AppHandle` 会把整条 Tauri 运行时拖进单元
+/// 测试的链接依赖，于是「恢复」这条最该被测的路径反而起不了测试。而按哈希定位对象这件事
+/// 本身与 Tauri 毫无关系，所以这里改成按目录寻址，由调用方（`restore` / `read_object` /
+/// `SaveRepository::object_path`）负责先把 `AppHandle` 解析成目录。
+fn object_path(objects_root: &Path, hash: &str) -> Result<PathBuf, String> {
     if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(format!("存档对象哈希无效：{hash}"));
     }
-    Ok(SaveRepository::list_objects_root(app)?
-        .join(&hash[..2])
-        .join(hash))
+    Ok(objects_root.join(&hash[..2]).join(hash))
 }
 
 fn validate_relative(path: &str) -> Result<String, String> {
@@ -1852,7 +1876,7 @@ mod tests {
         build_restore_groups, entry_belongs_to_profile, find_scope_for_entry, find_scope_for_read,
         is_excluded, is_restore_artifact_name, path_is_restore_artifact, removed_relative_paths,
         same_entries, strip_verbatim_prefix, sweep_restore_artifacts, wildcard_matches,
-        RestoreUndo, SaveRepository,
+        RestoreReceipt, RestoreUndo, SaveRepository,
     };
     use crate::domain::{
         AppStore, Game, SaveFileEntry, SaveProfile, SaveRootType, SaveScope, SaveVersion,
@@ -3526,6 +3550,398 @@ mod tests {
             groups[0].entries.len(),
             1,
             "产物条目应被跳过，只恢复真实存档"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 恢复**执行半段**的测试。
+    //
+    // 在此之前，测试只覆盖了规划半段（`build_restore_groups` 有 5 条），而真正会搬走并覆盖
+    // 用户存档、还带一整套回滚语义的 `restore` / `restore_group` / `rollback_restore` /
+    // `finalize_restore` **从未被任何测试调用过**。
+    //
+    // 之所以能测，是因为把 `&AppHandle` 换成了它真正需要的对象仓库目录：带 `AppHandle` 时
+    // 这些函数会把整条 Tauri 运行时拖进测试二进制的链接依赖，测试根本起不来。
+    // ---------------------------------------------------------------------
+
+    /// 恢复测试用的最小 `Game`。范围一律用 `Custom`，因此 `managed_path` 不参与。
+    fn restore_game(uid: &str) -> Game {
+        Game {
+            game_uid: uid.to_string(),
+            game_key: uid.to_string(),
+            display_name: "Restore Fixture".to_string(),
+            managed_path: String::new(),
+            lifecycle: crate::domain::GameLifecycle::Active,
+            health: crate::domain::GameHealth::Ready,
+            cloud_status: crate::domain::game::CloudStatus::LocalOnly,
+            launch: crate::domain::game::LaunchConfig {
+                executable_relative_path: "game.exe".to_string(),
+                arguments: Vec::new(),
+                working_directory_relative_path: None,
+            },
+            cover: None,
+            save_profile_id: None,
+            last_played_at: None,
+            latest_save_version_id: None,
+            added_at: None,
+        }
+    }
+
+    /// 一个「某游戏、某个 Custom 范围下、单个正常（非墓碑）文件」的版本。
+    fn restore_version(
+        game_uid: &str,
+        scope: &SaveScope,
+        relative_path: &str,
+        object_hash: &str,
+    ) -> SaveVersion {
+        SaveVersion {
+            version_id: "v1".to_string(),
+            game_uid: game_uid.to_string(),
+            created_at: "0".to_string(),
+            files: vec![SaveFileEntry {
+                root_type: scope.root_type,
+                root_path: Some(scope.root_path.clone()),
+                relative_path: relative_path.to_string(),
+                object_hash: Some(object_hash.to_string()),
+                size: 0,
+                deleted: false,
+                mtime_ms: None,
+            }],
+            total_bytes: 0,
+        }
+    }
+
+    /// 按 `object_path` 的布局落一个对象，返回它的 sha256。
+    fn write_test_object(objects_root: &std::path::Path, bytes: &[u8]) -> String {
+        let hash = super::sha256_bytes(bytes);
+        let directory = objects_root.join(&hash[..2]);
+        std::fs::create_dir_all(&directory).expect("create object directory");
+        std::fs::write(directory.join(&hash), bytes).expect("write object");
+        hash
+    }
+
+    /// `object_path` 推算出的落盘位置 —— 用来伪造/删除对象。
+    fn test_object_file(objects_root: &std::path::Path, hash: &str) -> std::path::PathBuf {
+        objects_root.join(&hash[..2]).join(hash)
+    }
+
+    /// 数一数存档根目录下有多少个以 `prefix` 开头的条目（恢复产物 `.gamesaver-restore-*`
+    /// / `.gamesaver-rollback-*`）。
+    fn work_dir_count(root: &std::path::Path, prefix: &str) -> usize {
+        std::fs::read_dir(root)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// 调一次恢复并断言成功。
+    ///
+    /// 用 `match` 而不是 `Result::expect`：`RestoreReceipt` 刻意没有实现 `Debug`（它带着
+    /// 用户的路径与撤销记录，不该被顺手打出来），为测试给它加 `Debug` 是本末倒置。
+    fn restore_expecting_success(
+        objects_root: &std::path::Path,
+        game: &Game,
+        profile: &SaveProfile,
+        version: &SaveVersion,
+    ) -> RestoreReceipt {
+        match SaveRepository::restore_from_objects_root(
+            objects_root,
+            game,
+            profile,
+            version,
+            |_, _| {},
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => panic!("恢复应当成功，实际失败：{error}"),
+        }
+    }
+
+    /// 调一次恢复并断言失败，返回错误文本。
+    fn restore_expecting_error(
+        objects_root: &std::path::Path,
+        game: &Game,
+        profile: &SaveProfile,
+        version: &SaveVersion,
+    ) -> String {
+        match SaveRepository::restore_from_objects_root(
+            objects_root,
+            game,
+            profile,
+            version,
+            |_, _| {},
+        ) {
+            Ok(_) => panic!("这次恢复本应失败，却成功了"),
+            Err(error) => error,
+        }
+    }
+
+    /// 正常路径：对象被物化到存档目录，原文件先被备份，`finalize_restore` 再把两个工作目录
+    /// 收干净，且不得动已经就位的存档。
+    #[test]
+    fn restore_installs_objects_and_finalize_cleans_up_its_work_dirs() {
+        let workspace = temp_root("restore-exec-happy");
+        let objects_root = workspace.join("objects").join("sha256");
+        let save_root = workspace.join("saves");
+        std::fs::create_dir_all(&save_root).expect("create save root");
+        std::fs::write(save_root.join("save.dat"), b"OLD SAVE").expect("write old save");
+
+        let hash = write_test_object(&objects_root, b"NEW SAVE");
+        let game = restore_game("g1");
+        let scope = SaveScope::new_manual(save_root.to_string_lossy().to_string());
+        let profile = SaveProfile::new(
+            "g1".to_string(),
+            "hash".to_string(),
+            vec![scope.clone()],
+            100,
+            "0".to_string(),
+        );
+        let version = restore_version("g1", &scope, "save.dat", &hash);
+
+        let receipt = restore_expecting_success(&objects_root, &game, &profile, &version);
+
+        assert_eq!(
+            std::fs::read(save_root.join("save.dat")).expect("read restored"),
+            b"NEW SAVE",
+            "对象内容应当被写进存档目录"
+        );
+        assert_eq!(receipt.undo_groups.len(), 1, "应当产生一个范围的撤销记录");
+        assert!(
+            receipt.undo_groups[0].backed_up_paths.contains("save.dat"),
+            "原有存档必须先被备份，回滚才有依据"
+        );
+        assert!(
+            receipt.undo_groups[0].installed_paths.contains("save.dat"),
+            "新存档应当被记录为已安装"
+        );
+        // finalize 之前两个工作目录都必须在 —— 进程若在此刻被杀，靠它们才能恢复现场。
+        assert_eq!(
+            work_dir_count(&save_root, ".gamesaver-restore-"),
+            1,
+            "暂存目录应当保留到 finalize"
+        );
+        assert_eq!(
+            work_dir_count(&save_root, ".gamesaver-rollback-"),
+            1,
+            "回滚目录应当保留到 finalize"
+        );
+
+        SaveRepository::finalize_restore(receipt);
+
+        assert_eq!(
+            work_dir_count(&save_root, ".gamesaver-restore-"),
+            0,
+            "finalize 应当收掉暂存目录"
+        );
+        assert_eq!(
+            work_dir_count(&save_root, ".gamesaver-rollback-"),
+            0,
+            "finalize 应当收掉回滚目录"
+        );
+        assert_eq!(
+            std::fs::read(save_root.join("save.dat")).expect("read after finalize"),
+            b"NEW SAVE",
+            "finalize 不得动已经就位的存档"
+        );
+    }
+
+    /// 回滚：恢复之后调 `rollback_restore`，用户原来的存档必须**原样回来**。
+    ///
+    /// 这是本项目唯一一条「先把用户文件搬走、失败再搬回来」的路径，回滚方向写反（把备份删了
+    /// 而不是归位）就等于直接删掉用户存档，而它此前没有任何测试。
+    #[test]
+    fn rollback_restore_puts_the_original_save_back() {
+        let workspace = temp_root("restore-exec-rollback");
+        let objects_root = workspace.join("objects").join("sha256");
+        let save_root = workspace.join("saves");
+        std::fs::create_dir_all(&save_root).expect("create save root");
+        std::fs::write(save_root.join("save.dat"), b"OLD SAVE").expect("write old save");
+        // 一个「不在目标版本里」的受保护文件：恢复会把它移走，回滚必须把它**放回来**。
+        std::fs::write(save_root.join("stray.dat"), b"NOT IN VERSION").expect("write stray");
+
+        let hash = write_test_object(&objects_root, b"NEW SAVE");
+        let game = restore_game("g1");
+        let scope = SaveScope::new_manual(save_root.to_string_lossy().to_string());
+        let profile = SaveProfile::new(
+            "g1".to_string(),
+            "hash".to_string(),
+            vec![scope.clone()],
+            100,
+            "0".to_string(),
+        );
+        let version = restore_version("g1", &scope, "save.dat", &hash);
+
+        let receipt = restore_expecting_success(&objects_root, &game, &profile, &version);
+        assert_eq!(
+            std::fs::read(save_root.join("save.dat")).expect("read installed"),
+            b"NEW SAVE"
+        );
+
+        SaveRepository::rollback_restore(receipt).expect("回滚应当成功");
+
+        assert_eq!(
+            std::fs::read(save_root.join("save.dat")).expect("read rolled back"),
+            b"OLD SAVE",
+            "回滚后用户原来的存档必须原样回来"
+        );
+        assert_eq!(
+            work_dir_count(&save_root, ".gamesaver-restore-"),
+            0,
+            "回滚成功后不该留下暂存目录"
+        );
+        assert_eq!(
+            work_dir_count(&save_root, ".gamesaver-rollback-"),
+            0,
+            "回滚成功后不该留下回滚目录"
+        );
+        // 被恢复移走的受保护文件也必须回到原位 —— 回滚要能撤销「删除」这一半，不只是覆盖。
+        assert_eq!(
+            std::fs::read(save_root.join("stray.dat")).expect("stray should be back"),
+            b"NOT IN VERSION",
+            "回滚必须把被移走的受保护文件放回原处"
+        );
+    }
+
+    /// 对象缺失或损坏时，恢复必须在**碰用户存档之前**失败。
+    ///
+    /// 这是「先全部校验、再动用户文件」这个设计的核心保证：如果实现改成边校验边写，用户
+    /// 存档就会在半途被改坏，而报错信息只会说对象有问题 —— 用户不会意识到自己的存档已经
+    /// 被动过。所以这里断言的重点不是报错文本，而是 `save.dat` **一个字节都没变**。
+    #[test]
+    fn restore_refuses_a_broken_object_without_touching_the_users_save() {
+        let workspace = temp_root("restore-exec-broken-object");
+        let objects_root = workspace.join("objects").join("sha256");
+        let save_root = workspace.join("saves");
+        std::fs::create_dir_all(&save_root).expect("create save root");
+        std::fs::write(save_root.join("save.dat"), b"OLD SAVE").expect("write old save");
+
+        let hash = super::sha256_bytes(b"NEW SAVE");
+        let game = restore_game("g1");
+        let scope = SaveScope::new_manual(save_root.to_string_lossy().to_string());
+        let profile = SaveProfile::new(
+            "g1".to_string(),
+            "hash".to_string(),
+            vec![scope.clone()],
+            100,
+            "0".to_string(),
+        );
+        let version = restore_version("g1", &scope, "save.dat", &hash);
+
+        // 情形一：对象文件根本不存在。
+        let error = restore_expecting_error(&objects_root, &game, &profile, &version);
+        assert!(
+            error.contains("存档对象校验失败"),
+            "应当报对象校验失败：{error}"
+        );
+
+        // 情形二：对象文件在，但内容与哈希不符。
+        let object_file = test_object_file(&objects_root, &hash);
+        std::fs::create_dir_all(object_file.parent().expect("object dir")).expect("create dir");
+        std::fs::write(&object_file, b"CORRUPTED").expect("write corrupt object");
+        let error = restore_expecting_error(&objects_root, &game, &profile, &version);
+        assert!(
+            error.contains("存档对象校验失败"),
+            "应当报对象校验失败：{error}"
+        );
+
+        assert_eq!(
+            std::fs::read(save_root.join("save.dat")).expect("read untouched save"),
+            b"OLD SAVE",
+            "校验失败时用户的存档一个字节都不该被动"
+        );
+        assert_eq!(
+            work_dir_count(&save_root, ".gamesaver-restore-"),
+            0,
+            "失败路径应当清掉自己建的暂存目录"
+        );
+        assert_eq!(
+            work_dir_count(&save_root, ".gamesaver-rollback-"),
+            0,
+            "失败路径应当清掉自己建的回滚目录"
+        );
+    }
+
+    /// 版本属于别的游戏时必须拒绝 —— 否则会把 A 游戏的存档写进 B 游戏的目录。
+    #[test]
+    fn restore_rejects_a_version_belonging_to_another_game() {
+        let workspace = temp_root("restore-exec-wrong-game");
+        let objects_root = workspace.join("objects").join("sha256");
+        let save_root = workspace.join("saves");
+        std::fs::create_dir_all(&save_root).expect("create save root");
+        std::fs::write(save_root.join("save.dat"), b"OLD SAVE").expect("write old save");
+
+        let hash = write_test_object(&objects_root, b"OTHER GAME SAVE");
+        let game = restore_game("g1");
+        let scope = SaveScope::new_manual(save_root.to_string_lossy().to_string());
+        let profile = SaveProfile::new(
+            "g1".to_string(),
+            "hash".to_string(),
+            vec![scope.clone()],
+            100,
+            "0".to_string(),
+        );
+        let version = restore_version("g2", &scope, "save.dat", &hash);
+
+        let error = restore_expecting_error(&objects_root, &game, &profile, &version);
+        assert_eq!(error, "保存版本不属于当前游戏");
+        assert_eq!(
+            std::fs::read(save_root.join("save.dat")).expect("read untouched save"),
+            b"OLD SAVE",
+            "拒绝时不得动用户的存档"
+        );
+    }
+
+    /// `restore` 的语义是**精确回到该版本**：范围里多出来、不属于目标版本的受保护文件会被移走，
+    /// 并在 `finalize_restore` 之后真正从磁盘上消失。
+    ///
+    /// 这是恢复里最具破坏性的一半 —— 它会**删用户自己的文件**。此前只有 `removed_relative_paths`
+    /// 的单元测试（针对手工构造的 `RestoreUndo`），没有端到端验证过「文件真的没了」。
+    #[test]
+    fn restore_removes_protected_files_that_are_not_in_the_target_version() {
+        let workspace = temp_root("restore-exec-removal");
+        let objects_root = workspace.join("objects").join("sha256");
+        let save_root = workspace.join("saves");
+        std::fs::create_dir_all(&save_root).expect("create save root");
+        std::fs::write(save_root.join("save.dat"), b"OLD SAVE").expect("write old save");
+        std::fs::write(save_root.join("stray.dat"), b"NOT IN VERSION").expect("write stray");
+
+        let hash = write_test_object(&objects_root, b"NEW SAVE");
+        let game = restore_game("g1");
+        let scope = SaveScope::new_manual(save_root.to_string_lossy().to_string());
+        let profile = SaveProfile::new(
+            "g1".to_string(),
+            "hash".to_string(),
+            vec![scope.clone()],
+            100,
+            "0".to_string(),
+        );
+        let version = restore_version("g1", &scope, "save.dat", &hash);
+
+        let receipt = restore_expecting_success(&objects_root, &game, &profile, &version);
+
+        assert!(
+            !save_root.join("stray.dat").exists(),
+            "不在目标版本里的受保护文件必须被移出存档目录"
+        );
+        assert!(
+            receipt.removed_paths().contains(&"stray.dat".to_string()),
+            "被移走的受保护文件应当记进 removed_paths：{:?}",
+            receipt.removed_paths()
+        );
+
+        SaveRepository::finalize_restore(receipt);
+
+        assert!(
+            !save_root.join("stray.dat").exists(),
+            "finalize 之后被移走的文件不该回来"
+        );
+        assert_eq!(
+            std::fs::read(save_root.join("save.dat")).expect("read restored"),
+            b"NEW SAVE",
+            "目标版本里的文件应当正常就位"
         );
     }
 }
