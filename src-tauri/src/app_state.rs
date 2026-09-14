@@ -304,6 +304,59 @@ impl AppState {
     }
 }
 
+/// 一次云端操作的认领凭据：**在 `Drop` 里释放**。
+///
+/// 为什么需要它：`claim_cloud_operation` 返回的是一个字符串 key，认领与释放要调用方
+/// 手写配对。C2 把这些认领加进 `cloud_save_commands.rs` 时，就漏掉了「认领之后、
+/// 释放之前」的 `?` 早退 —— 那里有三处（凭据读取失败、云端清单取不到、指定版本不
+/// 存在），任何一处命中都不会释放。而 `save_operations` 是**纯内存**集合、进程存活期
+/// 内没有任何清理，于是那个游戏此后每一次云同步都返回「该游戏已有云端同步或本体
+/// 操作正在进行」，**只有重启应用能解** —— 错误文案还把用户引向「稍后再试」。
+/// 这与 C5（暂存目录残留导致永久装不上）是同一类后果。
+///
+/// 所以把释放交给 `Drop`：命令作用域内任何早退（含 `?`）都会释放，不必在每个失败
+/// 分支上手写，也就不可能再漏。
+///
+/// **为什么持 `&AppState` 而不是 `AppHandle`**：持 `AppHandle` 才能把守卫移进工作
+/// 线程，但那会让本文件依赖 `tauri::AppHandle` —— 而 `AppState` 被大量单元测试直接
+/// 构造，测试路径一碰到 Tauri 类型就会把整条窗口运行时链进测试二进制并直接启动失败
+/// （见本文件开头的 `EventEmitter` 注释）。所以守卫只活命令作用域，交接给线程时用
+/// [`disarm`](Self::disarm) 把 key 交出去，由线程照旧在结束时释放。
+///
+/// `#[must_use]`：**把守卫当语句丢掉**（`CloudOperationClaim::claim(..)?;` 不绑定任何
+/// 变量）会让它立刻 `Drop` —— 刚认领就释放，互斥**静默失效**，退回 C2 之前的丢条目
+/// 竞态。这种写法必须报警告，而不是悄悄通过。
+#[must_use = "认领守卫被丢弃就会立刻释放，互斥随之失效；请绑定它（let claim = ...）"]
+pub struct CloudOperationClaim<'a> {
+    state: &'a AppState,
+    /// `disarm` 之后为空串，表示释放责任已交出去。
+    key: String,
+}
+
+impl<'a> CloudOperationClaim<'a> {
+    /// 认领该游戏的云端操作；已被占用时返回 `Err`，不产生守卫。
+    pub fn claim(state: &'a AppState, game_uid: &str) -> Result<Self, String> {
+        let key = state.claim_cloud_operation(game_uid)?;
+        Ok(Self { state, key })
+    }
+
+    /// 交出释放责任，并**把当初认领的那把 key 原样返回**，由工作线程在结束时释放。
+    ///
+    /// 返回 key 而不是让线程用 `cloud_operation_key` 重新推导：这样「释放的」与
+    /// 「认领的」在类型上就是同一个值，读的人不必去核对两处推导是否一致。
+    pub fn disarm(mut self) -> String {
+        std::mem::take(&mut self.key)
+    }
+}
+
+impl Drop for CloudOperationClaim<'_> {
+    fn drop(&mut self) {
+        if !self.key.is_empty() {
+            self.state.release_operation(&self.key);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +458,59 @@ mod tests {
     fn occupied(state: &AppState, game_uid: &str) -> bool {
         let operations = state.save_operations.lock().expect("锁定操作集合");
         state.has_exclusive_operation(&operations, game_uid)
+    }
+
+    /// 认领守卫必须在**任何**早退路径上释放。
+    ///
+    /// 这是 C2 带进来的回归：`cloud_save_commands.rs` 里认领之后有三处 `?` 早退漏了
+    /// `release_operation`，泄漏的 key 让该游戏在此进程内再也发不起云同步 —— 而
+    /// `save_operations` 是纯内存，只有重启才清。
+    #[test]
+    fn a_claim_guard_releases_even_when_the_command_returns_early() {
+        let state = test_state();
+
+        // 模拟命令体：认领之后立刻用 `?` 早退（真实场景是清单取不到 / 版本不存在）。
+        fn command_body(state: &AppState) -> Result<(), String> {
+            let _claim = CloudOperationClaim::claim(state, "uid-1")?;
+            Err("云端清单取不到".to_string())?;
+            Ok(())
+        }
+
+        assert!(command_body(&state).is_err());
+        assert!(
+            !occupied(&state, "uid-1"),
+            "早退后必须已释放，否则该游戏的云同步会被永久挡住"
+        );
+        // 释放干净之后必须能重新认领 —— 这才是用户重试能成功的判据。
+        state
+            .claim_cloud_operation("uid-1")
+            .expect("守卫释放后应当能再次认领");
+    }
+
+    /// `disarm` 交出 key 之后，守卫自己**不能再**释放。
+    ///
+    /// 否则工作线程还在跑、key 就被守卫提前放掉，另一个同步会挤进来 —— 那正是 C2 要防的
+    /// 并发丢条目。所以这里要同时验证两件事：守卫 `Drop` 后仍被持有，且交出的 key 能正常
+    /// 释放（否则线程结束时的释放就成了空操作，key 反而泄漏）。
+    #[test]
+    fn a_disarmed_claim_guard_hands_the_key_over_instead_of_releasing_it() {
+        let state = test_state();
+        let key = CloudOperationClaim::claim(&state, "uid-1")
+            .expect("首次认领应当成功")
+            .disarm();
+
+        assert!(occupied(&state, "uid-1"), "disarm 之后 key 必须仍然被持有");
+        assert!(
+            state.claim_cloud_operation("uid-1").is_err(),
+            "disarm 后仍应挡住第二次操作"
+        );
+
+        // 交出的 key 必须就是当初认领的那把：用它释放后要能重新认领。
+        state.release_operation(&key);
+        assert!(!occupied(&state, "uid-1"), "交出的 key 应当能释放掉占用");
+        state
+            .claim_cloud_operation("uid-1")
+            .expect("释放后应当能再次认领");
     }
 
     /// C2 的核心：同一游戏的两次云端同步必须互斥。

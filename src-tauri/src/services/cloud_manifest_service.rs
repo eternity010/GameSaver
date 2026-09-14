@@ -466,9 +466,19 @@ impl CloudManifestService {
         local_versions: &[GameBodyVersion],
         temporary_root: &Path,
     ) -> Result<CloudBodyManifest, String> {
-        let existing = Self::read(client, remote_files, remote_dir, temporary_root, None)
-            .ok()
-            .flatten();
+        // 不能用 `.ok().flatten()`：那会把「取不下来 / 解析不了」当成「清单不存在」，
+        // 于是静默用一份新清单覆盖旧的，别的设备写下的 sha256 / file_count /
+        // total_bytes 就此丢失 —— 之后该版本下载不再比对哈希，**完整性校验被静默降级**。
+        // `fetch` 与 `read` 拆开，正是为了在这里把三种情况分开。
+        let existing = match Self::fetch(client, remote_files, remote_dir, temporary_root) {
+            // 取不下来或解析不了：旧清单可能完好，这一趟只是不顺 → 不覆盖，让调用方报错。
+            Err(error) => return Err(error),
+            // 远端列表里确实没有清单：按远端列表新建（正常路径）。
+            Ok(None) => None,
+            // 能解析但校验不过：**正是「修复清单」要修的损坏清单**，必须继续重建，
+            // 否则一个被改坏的清单会让「修复清单」这个工具本身失效。
+            Ok(Some(manifest)) => Some(manifest),
+        };
         let existing_by_path = existing
             .as_ref()
             .map(|manifest| {
@@ -503,10 +513,7 @@ impl CloudManifestService {
                     });
                 let existing = existing_by_path.get(&file.path).copied();
                 CloudBodyManifestVersion {
-                    version_id: existing
-                        .map(|version| version.version_id.clone())
-                        .or_else(|| local.map(|version| version.version_id.clone()))
-                        .unwrap_or_else(|| file_name_without_extension(&file.path)),
+                    version_id: rebuilt_version_id(existing, local, &file.path),
                     created_at: existing
                         .map(|version| version.created_at.clone())
                         .or_else(|| local.map(|version| version.created_at.clone()))
@@ -566,6 +573,43 @@ impl CloudManifestService {
         result
     }
 
+    /// 下载并解析远端清单，**不校验内容**。
+    ///
+    /// 拆出来的唯一原因：`rebuild` 必须区分「取不下来 / 解析不了」与「能解析但校验
+    /// 不过」。前者说明旧清单可能完好，覆盖它等于静默丢掉别的设备写下的校验值；后者
+    /// 正是「修复清单」要修的损坏清单，必须允许按远端列表重建。`read` 与 `rebuild`
+    /// 因此共用这一段。
+    fn fetch(
+        client: &BaiduNetdiskClient,
+        remote_files: &[RemoteFile],
+        remote_dir: &str,
+        temporary_root: &Path,
+    ) -> Result<Option<CloudBodyManifest>, String> {
+        let manifest_path = Self::manifest_path(remote_dir);
+        let Some(remote_manifest) = remote_files
+            .iter()
+            .find(|file| file.path == manifest_path && !file.is_dir)
+        else {
+            return Ok(None);
+        };
+        fs::create_dir_all(temporary_root)
+            .map_err(|error| format!("创建云端版本清单下载目录失败：{error}"))?;
+        let temporary = temporary_root.join(format!(
+            ".cloud-manifest-download-{}.json",
+            Uuid::new_v4().simple()
+        ));
+        let result = (|| -> Result<CloudBodyManifest, String> {
+            client.download_file(remote_manifest, &temporary, |_, _| true)?;
+            let raw =
+                fs::read(&temporary).map_err(|error| format!("读取云端版本清单失败：{error}"))?;
+            serde_json::from_slice::<CloudBodyManifest>(&raw)
+                .map_err(|error| format!("解析云端版本清单失败：{error}"))
+        })();
+        let _ = fs::remove_file(&temporary);
+        let _ = fs::remove_file(temporary.with_extension("download.tmp"));
+        result.map(Some)
+    }
+
     pub fn read(
         client: &BaiduNetdiskClient,
         remote_files: &[RemoteFile],
@@ -587,28 +631,16 @@ impl CloudManifestService {
                 return Ok(Some(cached));
             }
         }
-        fs::create_dir_all(temporary_root)
-            .map_err(|error| format!("创建云端版本清单下载目录失败：{error}"))?;
-        let temporary = temporary_root.join(format!(
-            ".cloud-manifest-download-{}.json",
-            Uuid::new_v4().simple()
-        ));
-        let result = (|| -> Result<CloudBodyManifest, String> {
-            client.download_file(remote_manifest, &temporary, |_, _| true)?;
-            let raw =
-                fs::read(&temporary).map_err(|error| format!("读取云端版本清单失败：{error}"))?;
-            let manifest = serde_json::from_slice::<CloudBodyManifest>(&raw)
-                .map_err(|error| format!("解析云端版本清单失败：{error}"))?;
-            validate(&manifest, remote_dir)?;
-            if let Some(cache_root) = cache_root {
-                let _ =
-                    Self::save_cached_manifest(cache_root, remote_dir, remote_manifest, &manifest);
-            }
-            Ok(manifest)
-        })();
-        let _ = fs::remove_file(&temporary);
-        let _ = fs::remove_file(temporary.with_extension("download.tmp"));
-        result.map(Some)
+        let Some(manifest) = Self::fetch(client, remote_files, remote_dir, temporary_root)? else {
+            return Ok(None);
+        };
+        // 校验通过才入缓存：缓存命中时会重新校验（`load_cached_manifest`），
+        // 所以这里存进去的必须是校验过的内容。
+        validate(&manifest, remote_dir)?;
+        if let Some(cache_root) = cache_root {
+            let _ = Self::save_cached_manifest(cache_root, remote_dir, remote_manifest, &manifest);
+        }
+        Ok(Some(manifest))
     }
 
     pub fn project(
@@ -812,6 +844,27 @@ fn file_name_without_extension(path: &str) -> String {
         .to_string()
 }
 
+/// 重建清单时，某个条目的版本标识该取哪个来源（按可信度排序）。
+///
+/// `existing` 来自**可能没过校验**的旧清单 —— `rebuild` 刻意沿用损坏清单里的元数据
+/// （否则一个被改坏的清单会让「修复清单」失效）。所以它的 `version_id` 不能直接采信：
+/// 这个字段会被拼进**本地缓存路径**（`BodyPackageService::package_path`）。只有安全
+/// 路径段才沿用，否则退回本地记录或文件名这两个可信来源。
+///
+/// 这条判定与 `validate` 里那条同一个谓词，是**出口侧的兜底**：`rebuild` 用的这份清单
+/// 绕过了 `validate`，不能只靠入口那一处挡。
+fn rebuilt_version_id(
+    existing: Option<&CloudBodyManifestVersion>,
+    local: Option<&GameBodyVersion>,
+    file_path: &str,
+) -> String {
+    existing
+        .filter(|version| is_safe_path_segment(&version.version_id))
+        .map(|version| version.version_id.clone())
+        .or_else(|| local.map(|version| version.version_id.clone()))
+        .unwrap_or_else(|| file_name_without_extension(file_path))
+}
+
 fn now_iso() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -822,10 +875,13 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        game_key_from_body_dir, validate, CloudBodyManifest, CloudBodyManifestVersion,
-        CloudGameCatalog, CloudManifestService,
+        game_key_from_body_dir, rebuilt_version_id, validate, CloudBodyManifest,
+        CloudBodyManifestVersion, CloudGameCatalog, CloudManifestService,
     };
-    use crate::{domain::GameBodyVersion, services::RemoteFile};
+    use crate::{
+        domain::GameBodyVersion,
+        services::{BaiduNetdiskClient, BaiduToken, RemoteFile},
+    };
     use std::fs;
 
     fn version() -> GameBodyVersion {
@@ -937,6 +993,104 @@ mod tests {
                 "accepted unsafe version_id: {unsafe_id:?}"
             );
         }
+    }
+
+    /// 重建清单时不能盲信旧清单里的 `version_id`。
+    ///
+    /// `rebuild` 刻意沿用**没过校验**的损坏清单里的元数据（否则一个被改坏的清单会让
+    /// 「修复清单」这个工具本身失效），所以这个字段必须在这里再过一次路径段判定 ——
+    /// 它会被拼进本地缓存路径。这是出口侧的兜底，不能只靠 `validate` 那一处。
+    #[test]
+    fn rebuild_adopts_a_version_id_only_when_it_is_a_safe_path_segment() {
+        let manifest_version = |version_id: &str| CloudBodyManifestVersion {
+            version_id: version_id.to_string(),
+            created_at: "2".to_string(),
+            package_path: "/apps/GameSaver/games/game-one/body/v9.zip".to_string(),
+            package_fs_id: 9,
+            package_size: 1,
+            package_sha256: None,
+            file_count: 1,
+            total_bytes: 1,
+        };
+        let path = "/apps/GameSaver/games/game-one/body/v9.zip";
+
+        // 安全：沿用旧清单的值 —— 它才是版本身份，别的设备靠它对上号。
+        assert_eq!(
+            rebuilt_version_id(Some(&manifest_version("from-manifest")), None, path),
+            "from-manifest"
+        );
+        // 不安全：不沿用（否则污染会被本体应用自己洗进新清单），退回本地记录。
+        assert_eq!(
+            rebuilt_version_id(Some(&manifest_version("../escape")), Some(&version()), path),
+            "v1"
+        );
+        // 旧清单不安全且没有本地记录：退回文件名。
+        assert_eq!(
+            rebuilt_version_id(Some(&manifest_version("../escape")), None, path),
+            "v9"
+        );
+        assert_eq!(rebuilt_version_id(None, None, path), "v9");
+    }
+
+    /// `rebuild` 读不到旧清单时**不能**当成「清单不存在」继续覆盖回写。
+    ///
+    /// 收窄前是 `.ok().flatten()`：读失败 → `None` → 按远端列表重建并写回，别的设备写下
+    /// 的 `sha256` / `file_count` / `total_bytes` 静默丢失，该版本此后下载不再比对哈希。
+    ///
+    /// 判据怎么做到离线的：让 `temporary_root` 指向一个**存在的文件**，`fetch` 会在任何
+    /// 网络动作之前就失败。此时「中止」与「继续覆盖」会停在不同阶段，而两处文案不同
+    /// （取清单那步是"下载目录"，回写那步是"临时目录"）—— 断言错误来自**取清单**那一步，
+    /// 就证明确实中止了，没有走到覆盖回写。
+    #[test]
+    fn rebuild_aborts_instead_of_overwriting_when_the_old_manifest_cannot_be_read() {
+        let placeholder = std::env::temp_dir().join(format!(
+            "gamesaver-manifest-rebuild-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::write(&placeholder, b"not a directory").expect("写入占位文件");
+
+        let client = BaiduNetdiskClient::new(BaiduToken {
+            access_token: "test-access-token".to_string(),
+            expires_at: None,
+            refresh_token: None,
+        })
+        .expect("构造测试客户端");
+        let remote_dir = "/apps/GameSaver/games/game-one/body";
+        let remote_files = vec![
+            RemoteFile {
+                path: format!("{remote_dir}/manifest.json"),
+                fs_id: 1,
+                size: 1,
+                md5: None,
+                is_dir: false,
+                server_mtime: None,
+            },
+            RemoteFile {
+                path: format!("{remote_dir}/v9.zip"),
+                fs_id: 9,
+                size: 1,
+                md5: None,
+                is_dir: false,
+                server_mtime: None,
+            },
+        ];
+
+        let error = CloudManifestService::rebuild(
+            &client,
+            remote_dir,
+            "game-one",
+            "game-1",
+            &remote_files,
+            &[],
+            &placeholder,
+        )
+        .expect_err("读不到旧清单时必须中止，而不是覆盖回写");
+
+        assert!(
+            error.contains("下载目录"),
+            "必须中止在取清单这一步（不覆盖旧清单），实际错误：{error}"
+        );
+        let _ = fs::remove_file(&placeholder);
     }
 
     #[test]

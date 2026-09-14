@@ -1,5 +1,5 @@
 use crate::{
-    app_state::AppState,
+    app_state::{AppState, CloudOperationClaim},
     domain::{Game, SaveProfile, SaveVersion, TaskCategory, TaskRetry, TaskStatus},
     repositories::BaiduConfigRepository,
     services::{
@@ -119,21 +119,20 @@ pub fn start_upload_save_version_task(
     // 退出游戏时的自动同步与用户手动同步正是可以并发的两条路径，所以这里必须互斥。
     // 认领在 `drop(store)` 之后、发起任务之前：既避开持着 store 锁去抢操作锁，也让
     // 「已被占用」能在真正干活之前就返回。
-    let claim = state.claim_cloud_operation(&game_uid)?;
+    //
+    // 认领走 `CloudOperationClaim` 守卫而不是裸 key：下面任何一步失败都会自动释放。
+    // 收窄前这里是手写配对，`?` 早退会漏掉释放，而泄漏的 key 是纯内存、只有重启才清。
+    let claim = CloudOperationClaim::claim(&state, &game_uid)?;
 
-    let task_id = match begin_sync(
+    let task_id = begin_sync(
         &state,
         &format!("上传【{}】游戏存档至百度网盘", game.display_name),
         &game.game_uid,
-    ) {
-        Ok(task_id) => task_id,
-        Err(error) => {
-            state.release_operation(&claim);
-            return Err(error);
-        }
-    };
+    )?;
     let task_id_for_thread = task_id.clone();
     let app_for_thread = app.clone();
+    // 交接给工作线程：`disarm` 之后守卫不再释放，由线程在结束时释放这把 key。
+    let claim_key = claim.disarm();
 
     std::thread::spawn(move || {
         let result = upload_save_worker(
@@ -146,7 +145,9 @@ pub fn start_upload_save_version_task(
         );
         // 释放必须早于 `finish_sync`：任务状态一旦推送成功，前端就可能立刻发起下一次
         // 同步，此刻若 key 还没释放，用户会莫名收到「已有同步任务正在进行」。
-        app_for_thread.state::<AppState>().release_operation(&claim);
+        app_for_thread
+            .state::<AppState>()
+            .release_operation(&claim_key);
         finish_sync(
             &app_for_thread,
             &task_id_for_thread,
@@ -196,8 +197,11 @@ pub fn start_restore_cloud_save_task(
     // 认领必须在**读云端清单之前**：上传路径会把超出 keep_limit 的历史版本从清单里
     // 裁掉并删除对应远程包。若先挑好版本再认领，中间那次上传可能刚好把我们要还原的
     // 那份删掉，于是拿着一个已不存在的 remote_version 去下载。
-    // 同上：先认领，`begin_sync` 失败则立刻释放。
-    let claim = state.claim_cloud_operation(&game_uid)?;
+    //
+    // 认领走 `CloudOperationClaim` 守卫：下面三次 `?` 早退（凭据读取失败、清单取不到、
+    // 指定版本不存在）都会经 `Drop` 释放。收窄前这里是手写配对，这三处**全都会漏**，
+    // 而泄漏的 key 是纯内存、只有重启才清 —— 用户重试永远撞「已有同步任务正在进行」。
+    let claim = CloudOperationClaim::claim(&state, &game_uid)?;
 
     let client = load_baidu_client(&app)?;
     let manifest = CloudSaveService::fetch_manifest(&client, &game.game_key, &game.game_uid)?
@@ -209,19 +213,15 @@ pub fn start_restore_cloud_save_task(
         .ok_or_else(|| "未找到指定的云端存档版本".to_string())?
         .clone();
 
-    let task_id = match begin_sync(
+    let task_id = begin_sync(
         &state,
         &format!("从云端还原【{}】游戏存档", game.display_name),
         &game_uid,
-    ) {
-        Ok(task_id) => task_id,
-        Err(error) => {
-            state.release_operation(&claim);
-            return Err(error);
-        }
-    };
+    )?;
     let task_id_for_thread = task_id.clone();
     let app_for_thread = app.clone();
+    // 交接给工作线程：`disarm` 之后守卫不再释放，由线程在结束时释放这把 key。
+    let claim_key = claim.disarm();
 
     std::thread::spawn(move || {
         let result = restore_save_worker(
@@ -232,7 +232,9 @@ pub fn start_restore_cloud_save_task(
             &remote_version,
         );
         // 同上传：先放掉 key 再推送任务状态，别让紧随其后的操作被自己的 key 挡住。
-        app_for_thread.state::<AppState>().release_operation(&claim);
+        app_for_thread
+            .state::<AppState>()
+            .release_operation(&claim_key);
         finish_sync(
             &app_for_thread,
             &task_id_for_thread,
@@ -273,10 +275,12 @@ pub fn delete_cloud_save_version(
     drop(store);
 
     // 删除同样是「读清单 → 裁掉一条 → 整体写回」，必须与上传/还原互斥；否则一次
-    // 并发上传的条目会被这次写回整条抹掉。这里没有工作线程，认领与释放在同一个
-    // 函数里，失败路径由 `?` 直接返回 —— 所以必须保证 `delete_cloud_version` 之后
-    // 先释放再返回，下面两行刻意不留其他分支。
-    let claim = state.claim_cloud_operation(&game_uid)?;
+    // 并发上传的条目会被这次写回整条抹掉。
+    //
+    // 认领走 `CloudOperationClaim` 守卫，整个函数不再有手写释放：这里没有工作线程，
+    // 守卫在函数返回时 `Drop` 即释放 —— 包括 `load_baidu_client` 与 `delete_cloud_version`
+    // 两处 `?` 早退。收窄前作者只想到了后者，漏了前者。
+    let _claim = CloudOperationClaim::claim(&state, &game_uid)?;
 
     let client = load_baidu_client(&app)?;
     let deleted = CloudSaveService::delete_cloud_version(
@@ -285,7 +289,6 @@ pub fn delete_cloud_save_version(
         &game.game_uid,
         &version_id,
     );
-    state.release_operation(&claim);
     Ok(deleted?.versions)
 }
 
