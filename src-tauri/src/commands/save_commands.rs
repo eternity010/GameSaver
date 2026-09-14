@@ -584,7 +584,25 @@ pub fn discard_pending_game(
         let _ = fs::rename(&quarantine, &managed_path);
     }
     if result.is_ok() {
-        let _ = fs::remove_dir_all(quarantine);
+        // 隔离目录此时已经和游戏库解耦（上面的 rename 是元数据操作，很快），真正的删除放到
+        // 后台线程：它可能是刚复制进来的整份游戏本体（GB 级 / 上万个文件），留在命令体里
+        // 会让 Tauri 主线程连同窗口消息循环与后续所有 IPC 一起停摆。
+        // 审计依据：docs/command-blocking-audit-2026-09-14.md 的 F2。
+        //
+        // 删除失败只记日志、不建任务：用户可见的结果（游戏已从待设置列表消失）在命令返回时
+        // 就已经完成，这里只是收拾一个已被摘除引用的目录；建任务要同步落盘 tasks.json
+        // （实测 2.8 MB）还会多出一张「未知游戏」的卡片，不划算。兜底交给启动清扫 ——
+        // GameBodyUpdateService 的 `cleanup_stale_update_artifacts` 会回收残留的
+        // `.<uid>.discarding`（与 `.updating` 同一套机制）。
+        let quarantine_for_thread = quarantine.clone();
+        std::thread::spawn(move || match fs::remove_dir_all(&quarantine_for_thread) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => crate::logging::error(format!(
+                "放弃待设置游戏后清理隔离目录失败（{}）：{error}",
+                quarantine_for_thread.display()
+            )),
+        });
     }
     result
 }

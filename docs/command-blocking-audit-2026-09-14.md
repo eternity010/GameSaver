@@ -111,14 +111,44 @@ let client = Client::builder()
 这一条正好接在上一轮的确认框修复之后：现在用户点「从库中移除」→ 确认框（已修好，
 真的会拦）→ **确认之后就是这段冻结**。
 
-### F2（当前发作）另外两处主线程删除
+### F2（当前发作）主线程删除
+
+> **状态：已修复。** `discard_pending_game` 的 `remove_dir_all(quarantine)` 挪进
+> `std::thread::spawn`；`fs::rename`（元数据操作，很快）与 store 更新仍留在同步段，
+> 保证"游戏已从待设置列表消失"在命令返回时就成立。
+> 与下面第 5 节建议的偏差要写清楚：这次**没有**把删除任务化，因为
+> `TaskService::create` 会同步落盘 tasks.json（实测 2.8 MB），而这里收拾的只是一个
+> 已被摘除引用的隔离目录，建任务还会多出一张「未知游戏」的卡片 —— 不划算。
+> 后台删除失败改为 `logging::error`，兜底交给启动清扫：
+> `GameBodyUpdateService::cleanup_stale_update_artifacts` 现在也回收 `.<uid>.discarding`
+> （与 `.updating` 同一套机制；**这是本轮补的**，之前这一类残留全项目没人收，
+> 只有 `.discarding` 一个临时目录不在任何清扫里）。
+> 守卫见 `lib.rs` 的 `commands_never_delete_directory_trees_on_the_main_thread`，
+> 同步命令体内出现 `remove_dir_all(` 且不在 `thread::spawn` / `spawn_blocking` 闭包内即失败
+> （已做变异验证：把它移回同步段，守卫报出
+> `save_commands.rs:discard_pending_game（体内含 remove_dir_all(，且不在 thread::spawn 闭包内）`）。
+>
+> **量级（本机实测）**：脚本已入库为 `docs/command-blocking-audit-2026-09-14-delbench.rs`
+> （用 std 的同名函数，在**游戏所在卷 E:** 上跑 20,000 个文件 / 625 MB）：
+> `fs::remove_dir_all` **8,762 ms（438 µs/文件）**，按最大游戏 20,717 个文件折算 **≈ 9 秒**；
+> 同一棵树 `fs::rename` 只要 **8~19 ms**。也就是说修前每放弃一个待设置游戏，主线程要停
+> 约 9 秒，而 rename 留在同步段的代价只有十几毫秒。
+> 附带一条测量教训：同一段代码在 %TEMP%（C: 盘、刚写完的树）上 rename 要 933 ms，
+> 换到游戏卷上只剩 8 ms —— 这类测量必须放在真实卷上做，否则会得出反向结论。
 
 - `commands/save_commands.rs:545` `discard_pending_game`：`:566` `fs::rename` 到隔离区、
   `:587` `remove_dir_all(quarantine)`。同样是**可能 GB 级的删除**在主线程。
   比 F1 好的一点是它用了 rename 隔离（`discard` 语义更接近原子）。
-- `commands/add_game_commands.rs:137` / `:160` `start_add_game_task`：**失败路径**上主线程
-  `remove_dir_all(&copy_result.managed_path)` —— 复制到一半失败时，要删掉的正是刚复制
-  出来的那份（可达 GB 级），仍然在主线程。
+
+> **更正：本文件初版在这里多写了一条，是我的错。**
+> 初版把 `commands/add_game_commands.rs:137` / `:160` `start_add_game_task` 的两次
+> `remove_dir_all` 也算作主线程删除。**它是假阳性**：该命令在 `:108` 就
+> `std::thread::spawn` 出去了，两次删除都在任务工作线程里执行，主线程一次都没被阻塞。
+> 错因在分类器：它取的是「`#[tauri::command]` 函数体全文」，而花括号配对会把函数体内
+> **嵌套的闭包**一并算进来，于是线程内的调用被当成了命令体的直接调用。
+> 教训是这类"体内含某标记"的静态判断必须区分闭包边界 —— 本轮补的守卫因此显式算了
+> `thread::spawn` / `spawn_blocking` 闭包覆盖的区间，而不是只看字符串在不在体内。
+> F2 的真实范围只有上面一处，已修完。
 
 ### F3（潜在：云一旦授权就发作）10 个命令在主线程内联网络
 
@@ -227,6 +257,14 @@ URL 字符串，不发请求。
 
 ### 守卫：加一条源码扫描测试
 
+> **状态：已实现。** 实际落地成两条独立的测试（都在 `lib.rs`）：
+> `commands_never_call_the_network_on_the_main_thread`（F3，扫网络标记，同步命令体内命中即失败）
+> 与 `commands_never_delete_directory_trees_on_the_main_thread`（F2，扫 `remove_dir_all(`，
+> 豁免 `thread::spawn` / `spawn_blocking` 闭包内的调用）。两条都做过变异验证。
+> 与下面原始建议的偏差：删除那条没有按"体内出现 `TaskService::create`"来豁免 ——
+> 标志物和安全性并不是一回事（`discard_pending_game` 就是"后台删除但不建任务"），
+> 判据改成"这次调用是否真的在后台闭包里执行"更贴近要防的东西。
+
 仓库已有先例（`lib.rs` 里那条 `frontend_never_uses_window_confirm`，扫描 `.ts/.vue`）。
 同一套路可以扫 Rust：**凡是体内调用了网络构造函数（`load_baidu_client`、
 `BaiduNetdiskClient::`、`Client::builder`、`.send(`）或批量删除（`remove_dir_all`）的
@@ -259,6 +297,8 @@ URL 字符串，不发请求。
   `list_game_body_versions`、`get_game_cover`、`remove_game_from_library`、
   `discard_pending_game`
   （第 17 条 `build_baidu_authorize_url` 已排除：`reqwest::Url::parse` 不发请求）
+  （A 段只表示"命令体全文里出现了这些标记"，不代表阻塞就发生在主线程：
+  `start_add_game_task` 的两次删除在 `:108` 的 `thread::spawn` 闭包内 —— 见 F2 的更正）
 - **B 段（一层调用可达，多为假阳性）**：29 条，已逐条剔除同名碰撞；其中确认为真的只有
   `get_cloud_save_overview`、`update_save_profile_keep_versions`（已归入 F3/F4）
 - **C 段（体内与一层调用都干净）**：27 条，含 `list_games`、`get_game_detail_view`、

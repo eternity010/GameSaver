@@ -439,6 +439,13 @@ fn cleanup_stale_update_artifacts(games_root: &Path) -> Result<(), String> {
             }
         } else if name.starts_with('.') && name.contains(".uninstalling-") {
             fs::remove_dir_all(&path).map_err(|err| format!("清理残留游戏卸载目录失败：{err}"))?;
+        } else if name.starts_with('.') && name.ends_with(".discarding") {
+            // `discard_pending_game`（commands/save_commands.rs）放弃待设置游戏时，先把本体
+            // rename 成 `.<uid>.discarding`（元数据操作，很快），再从 store 摘除，最后在后台
+            // 线程里删掉它 —— 那份本体可能整份都是刚复制进来的（GB 级）。进程在后台删除期间
+            // 被杀、或删除本身失败，就会留下这个目录。走到这一步游戏已经不在库里，
+            // 没有任何记录还会指向它，直接回收即可。
+            fs::remove_dir_all(&path).map_err(|err| format!("清理残留游戏放弃目录失败：{err}"))?;
         }
     }
     Ok(())
@@ -580,6 +587,34 @@ mod tests {
         assert!(!staging.exists());
         assert!(!archive.exists());
         assert!(!journal.exists());
+    }
+
+    /// 放弃待设置游戏留下的 `.<uid>.discarding` 隔离目录必须被启动清扫收掉。
+    ///
+    /// 这是 `discard_pending_game` 把删除挪到后台线程之后唯一的兜底路径：后台删除失败、
+    /// 或者进程在删除期间被杀，隔离目录就留在游戏根目录里了。同时钉住安全性 ——
+    /// 清扫只认前缀点号的临时目录，真实游戏目录一个字节都不能碰。
+    #[test]
+    fn recovery_reaps_a_discarded_pending_body_without_touching_real_games() {
+        let root = temp_workspace("gamesaver-discard-recovery");
+        let games_root = root.join("games");
+        let quarantined = games_root.join(".game-1.discarding");
+        let live_game = games_root.join("game-2");
+        fs::create_dir_all(quarantined.join("data")).expect("create quarantine");
+        fs::create_dir_all(&live_game).expect("create live game");
+        fs::write(live_game.join("state.txt"), b"keep").expect("write live file");
+
+        GameBodyUpdateService::recover_pending_updates(
+            &games_root,
+            &std::collections::HashSet::new(),
+        )
+        .expect("recover pending updates");
+
+        assert!(!quarantined.exists(), "放弃游戏的隔离目录应被回收");
+        assert!(
+            live_game.join("state.txt").exists(),
+            "真实游戏目录不得被清扫碰掉"
+        );
     }
 
     #[test]

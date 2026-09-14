@@ -395,6 +395,27 @@ mod tests {
         );
     }
 
+    /// 命令层同样不许把**批量删除**留在同步命令的主线程上。
+    ///
+    /// `remove_dir_all` 删的是整棵目录树：托管本体、待放弃的隔离目录都可能是 GB 级
+    /// （实测单个游戏 7.3 GB / 20,717 个文件）。允许的写法是把它放进 `thread::spawn` 的
+    /// 闭包里 —— `remove_game_from_library` 的任务化与 `discard_pending_game` 的后台清理
+    /// 都是这个形状，所以这里只查**落在后台闭包之外**的那些调用。
+    ///
+    /// 只查 `remove_dir_all`：删单个文件是有界的，代价可以忽略。
+    #[test]
+    fn commands_never_delete_directory_trees_on_the_main_thread() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands");
+        let mut offenders = Vec::new();
+        collect_main_thread_deletions(&dir, &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "同步命令体内不得直接删除目录树 —— 它可能是 GB 级的本体，会把 Tauri 主线程\
+             （连同窗口消息循环与后续所有 IPC）一起按停。请放进 thread::spawn 的闭包里，\
+             或照 remove_game_from_library 任务化：{offenders:#?}"
+        );
+    }
+
     /// 每次网络都要先拿到 client，所以这些入口出现在命令体内就说明这一层会真的发请求。
     const NETWORK_MARKERS: [&str; 5] = [
         "load_baidu_client(",
@@ -415,7 +436,9 @@ mod tests {
         "list_account_files(",
     ];
 
-    fn collect_sync_network_commands(dir: &Path, offenders: &mut Vec<String>) {
+    /// 遍历 `src/commands/*.rs` 里的每个 `#[tauri::command]`，把
+    /// （文件名、命令名、是否 async、整个函数体）交给回调。
+    fn for_each_command(dir: &Path, mut visit: impl FnMut(&str, &str, bool, &str)) {
         let Ok(entries) = fs::read_dir(dir) else {
             return;
         };
@@ -453,24 +476,127 @@ mod tests {
                 else {
                     continue;
                 };
-                // async 命令已经由 `run_blocking` 把阻塞工作交给阻塞线程池，无需再查。
-                if lines[signature].contains("pub async fn") {
-                    continue;
-                }
                 let Some(body) = rust_function_body(&lines, signature) else {
                     continue;
                 };
-                let code = strip_rust_comments(&body);
-                let marker = NETWORK_MARKERS
+                visit(
+                    &file,
+                    &command_name(lines[signature]),
+                    lines[signature].contains("pub async fn"),
+                    &body,
+                );
+            }
+        }
+    }
+
+    fn collect_sync_network_commands(dir: &Path, offenders: &mut Vec<String>) {
+        for_each_command(dir, |file, name, is_async, body| {
+            // async 命令已经把阻塞工作交给阻塞线程池（`run_blocking`），无需再查。
+            if is_async {
+                return;
+            }
+            let code = strip_rust_comments(body);
+            let marker = NETWORK_MARKERS
+                .iter()
+                .chain(SERVICE_NETWORK_MARKERS.iter())
+                .find(|marker| code.contains(**marker));
+            if let Some(marker) = marker {
+                offenders.push(format!("{file}:{name}（体内含 `{marker}`，但不是 async）"));
+            }
+        });
+    }
+
+    fn collect_main_thread_deletions(dir: &Path, offenders: &mut Vec<String>) {
+        for_each_command(dir, |file, name, is_async, body| {
+            if is_async {
+                return;
+            }
+            let code = strip_rust_comments(body);
+            if let Some(marker) = deletion_outside_background(&code) {
+                offenders.push(format!(
+                    "{file}:{name}（体内含 `{marker}`，且不在 thread::spawn 闭包内）"
+                ));
+            }
+        });
+    }
+
+    /// 返回第一个**落在后台闭包之外**的 `remove_dir_all`；全在 `thread::spawn` /
+    /// `spawn_blocking` 的闭包内则返回 `None`。
+    fn deletion_outside_background(code: &str) -> Option<&'static str> {
+        const MARKER: &str = "remove_dir_all(";
+        let characters = code.chars().collect::<Vec<_>>();
+        let zones = background_zones(&characters);
+        let needle = MARKER.chars().collect::<Vec<_>>();
+        let mut index = 0usize;
+        while index + needle.len() <= characters.len() {
+            if characters[index..index + needle.len()] == needle[..] {
+                if !zones
                     .iter()
-                    .chain(SERVICE_NETWORK_MARKERS.iter())
-                    .find(|marker| code.contains(**marker));
-                if let Some(marker) = marker {
-                    let name = command_name(lines[signature]);
-                    offenders.push(format!("{file}:{name}（体内含 `{marker}`，但不是 async）"));
+                    .any(|(start, end)| index >= *start && index < *end)
+                {
+                    return Some(MARKER);
+                }
+                index += needle.len();
+            } else {
+                index += 1;
+            }
+        }
+        None
+    }
+
+    /// 找出 `thread::spawn` / `spawn_blocking` 的闭包在函数体里覆盖的字符区间。
+    fn background_zones(characters: &[char]) -> Vec<(usize, usize)> {
+        let mut zones = Vec::new();
+        for needle_text in ["thread::spawn", "spawn_blocking"] {
+            let needle = needle_text.chars().collect::<Vec<_>>();
+            let mut index = 0usize;
+            while index + needle.len() <= characters.len() {
+                if characters[index..index + needle.len()] != needle[..] {
+                    index += 1;
+                    continue;
+                }
+                let after = index + needle.len();
+                // 闭包体从 needle 之后的第一个 `{` 开始（中间只会有 `move ||` 之类）。
+                let Some(open) =
+                    (after..characters.len()).find(|position| characters[*position] == '{')
+                else {
+                    break;
+                };
+                // 但闭包体不一定写成块：`move || match fs::remove_dir_all(..) { .. }` 这种写法里
+                // 调用出现在花括号**之前**，所以区间要从闭包体真正的开头算起 —— 有 `||` 就从它
+                // 后面开始，否则退回第一个 `{`。
+                let body_start = (after..open)
+                    .find(|position| {
+                        characters[*position] == '|'
+                            && characters.get(*position + 1).copied() == Some('|')
+                    })
+                    .map(|position| position + 2)
+                    .unwrap_or(open);
+                let mut depth = 0i32;
+                let mut close = None;
+                for (offset, character) in characters[open..].iter().enumerate() {
+                    match character {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(open + offset);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                match close {
+                    Some(close) => {
+                        zones.push((body_start, close + 1));
+                        index = close + 1;
+                    }
+                    None => break,
                 }
             }
         }
+        zones
     }
 
     fn command_name(signature: &str) -> String {
