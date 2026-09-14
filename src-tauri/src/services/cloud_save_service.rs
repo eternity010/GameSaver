@@ -1,4 +1,5 @@
 use crate::{
+    commands::baidu_commands::validate_remote_package_path,
     domain::{
         compare_created_at, is_safe_path_segment, Game, SaveFileEntry, SaveProfile, SaveVersion,
     },
@@ -146,6 +147,54 @@ impl CloudSaveService {
         ))
     }
 
+    /// 校验云端清单里的 `package_path` **可证明地**落在本游戏的云存档目录内。
+    ///
+    /// 上面三个构造函数管的是「我们拼出去」的路径；这一条管的是**从服务端回来的**路径。
+    /// 两者必须都管：`fetch_manifest` 把下载到的 `manifest.json` 反序列化后**不校验任何
+    /// 字段**就返回，于是 `versions[].package_path` 是纯粹的远端输入，却会原样流进
+    /// `delete_file`（超出 `keep_limit` 剪枝时）和下载构造处。
+    ///
+    /// 为什么不能在出口处「相信百度会归一化 `..`」：服务端对 `..`、`.`、空路径段的解析
+    /// 策略无法在本机验证（见 `docs/cloud-transfer-review-2026-09-14.md` §5 存疑项 1），
+    /// 所以这里不去猜服务端，而是要求路径**可证明地**只占本游戏目录下的一层。判定复用
+    /// `validate_remote_package_path`（本体包同一条规则），不另写第二份安全检查。
+    ///
+    /// 与本文件 `MAX_SAVE_PACKAGE_ENTRY_BYTES` 的立场一致：远端清单本身不可信 —— 那里防的
+    /// 是伪造大小撑爆内存，这里防的是伪造路径作用于目录之外。
+    ///
+    /// **返回值是有意设计的**：调用方必须用它、而不是回头再读 `package_path` 字段。这样
+    /// 「删掉这一行守卫」会让下游编译失败 —— 否则删掉一行 `...?;` 语句既没有测试能发现
+    /// （两个出口都吃 `&AppHandle`，无法单元测试），也未必触发 clippy 的 unused 告警
+    /// （只要还有别的调用点用到这个函数就不会告警）。
+    fn verified_package_path<'a>(game_key: &str, package_path: &'a str) -> Result<&'a str, String> {
+        let directory = Self::remote_save_dir(game_key)?;
+        validate_remote_package_path(&directory, package_path).map_err(|error| {
+            format!("云端存档清单里的包路径不属于当前游戏，已拒绝云端操作：{error}")
+        })?;
+        Ok(package_path)
+    }
+
+    /// 把剪枝候选分成「可以安全删除」与「必须留回清单」两部分。
+    ///
+    /// 单独拆出来是为了可测：`upload_save_version` 吃 `&AppHandle` 与网络客户端，没法单元
+    /// 测试，而这里承载的正是本轮的两个行为承诺 —— 未证明属于本游戏的路径**绝不删**，
+    /// 且它的清单条目**不静默丢失**。
+    fn split_prunable_versions(
+        game_key: &str,
+        pruned: Vec<CloudSaveManifestVersion>,
+    ) -> (Vec<CloudSaveManifestVersion>, Vec<CloudSaveManifestVersion>) {
+        let mut deletable = Vec::new();
+        let mut kept = Vec::new();
+        for version in pruned {
+            if Self::verified_package_path(game_key, &version.package_path).is_ok() {
+                deletable.push(version);
+            } else {
+                kept.push(version);
+            }
+        }
+        (deletable, kept)
+    }
+
     pub fn package_save_version(
         app: &AppHandle,
         game: &Game,
@@ -271,9 +320,15 @@ impl CloudSaveService {
 
         if manifest.versions.len() > keep_limit && keep_limit > 0 {
             let pruned = manifest.versions.split_off(keep_limit);
-            for old_ver in pruned {
+            let (deletable, kept) = Self::split_prunable_versions(&game.game_key, pruned);
+            // `package_path` 来自下载的清单，未经验证就删是拿远端输入直接作用于远端文件。
+            for old_ver in deletable {
                 let _ = client.delete_file(&old_ver.package_path);
             }
+            // 验不过的条目留在清单里：`keep_limit` 只是软上限，而静默丢掉用户的存档版本条目
+            // 是实打实的损失。回填的是尾部最老的条目，不影响上面已按 `versions.first()`
+            // 定下的 `latest_version_id`。
+            manifest.versions.extend(kept);
         }
 
         Self::save_manifest(client, &game.game_key, &manifest)?;
@@ -288,6 +343,11 @@ impl CloudSaveService {
         remote_version: &CloudSaveManifestVersion,
         on_progress: impl Fn(u8, &str) -> bool,
     ) -> Result<SaveVersion, String> {
+        // 与本文件其它出口保持同一纪律：任何远端 IO 之前先求值，验不过就什么都不动。
+        // 下面构造 `RemoteFile` 时必须用这个返回值，不要回头再读 `remote_version.package_path`
+        // —— 那会让这一行守卫变成可以悄悄删掉而不破坏编译的东西。
+        let verified_package_path =
+            Self::verified_package_path(&game.game_key, &remote_version.package_path)?;
         let temp_dir = std::env::temp_dir();
         let target_zip =
             temp_dir.join(format!("gamesaver-save-dl-{}.zip", Uuid::new_v4().simple()));
@@ -295,7 +355,7 @@ impl CloudSaveService {
 
         on_progress(15, "正在从百度网盘下载存档包");
         let remote_file = RemoteFile {
-            path: remote_version.package_path.clone(),
+            path: verified_package_path.to_string(),
             fs_id: remote_version.package_fs_id,
             size: remote_version.package_size,
             md5: None,
@@ -1050,6 +1110,87 @@ mod tests {
                 "accepted unsafe version_id: {version_id:?}"
             );
         }
+    }
+
+    /// 出口守卫：云端清单里的 `package_path` 是**下载来的 JSON 字段** —— `fetch_manifest`
+    /// 反序列化后不校验任何字段就返回。它必须被证明落在本游戏的云存档目录内，才允许用于
+    /// 剪枝删除与下载导入，否则就是把远端输入直接作用到远端文件上。
+    #[test]
+    fn manifest_package_paths_must_stay_inside_the_games_save_directory() {
+        let directory = CloudSaveService::remote_save_dir("black myth wukong").unwrap();
+        assert_eq!(directory, "/apps/GameSaver/saves/black myth wukong");
+
+        // 规范形状：`upload_save_version` 回填的是上传返回的路径，而 `upload_file` 原样回显
+        // 我们传进去的 `remote_package_path`（baidu_netdisk_service.rs 的 `path: remote_path`），
+        // 所以正常清单就是长这样。含空格的目录必须能过 —— 非 ASCII 同理。
+        for path in [
+            format!("{directory}/v1.zip"),
+            format!("{directory}/2026-09-14T10-00-00.zip"),
+        ] {
+            assert!(
+                CloudSaveService::verified_package_path("black myth wukong", &path).is_ok(),
+                "rejected a legitimate package path: {path:?}"
+            );
+            // 返回的必须是原样可用的路径 —— 调用方直接拿它去构造 RemoteFile，
+            // 而不是回头再读字段（那会让守卫变成可以悄悄删掉的东西）。
+            assert_eq!(
+                CloudSaveService::verified_package_path("black myth wukong", &path).unwrap(),
+                path.as_str(),
+                "守卫必须回传原路径"
+            );
+        }
+
+        // 远端可控的异常值：一个都不许过。
+        for path in [
+            format!("{directory}/../../../other/evil.zip"),
+            format!("{directory}/../evil.zip"),
+            format!("{directory}/sub/v1.zip"),
+            format!("{directory}/v1.txt"),
+            format!("{directory}/"),
+            "/apps/GameSaver/saves/other game/v1.zip".to_string(),
+            "/apps/GameSaver/games/black myth wukong/body/v1.zip".to_string(),
+            "v1.zip".to_string(),
+            String::new(),
+        ] {
+            assert!(
+                CloudSaveService::verified_package_path("black myth wukong", &path).is_err(),
+                "accepted an untrusted package path: {path:?}"
+            );
+        }
+    }
+
+    /// 剪枝的两个承诺：**不可验证的路径绝不删**，且**它的清单条目不静默丢失**。
+    /// 这是本轮唯一会动远端文件的出口，所以两个方向都要钉住。
+    #[test]
+    fn pruning_keeps_versions_whose_package_path_cannot_be_verified() {
+        let mut legitimate = remote_version("v-legit");
+        legitimate.package_path = "/apps/GameSaver/saves/test-game/v-legit.zip".to_string();
+        let mut hostile = remote_version("v-hostile");
+        hostile.package_path = "/apps/GameSaver/saves/other-game/v-hostile.zip".to_string();
+        let mut escape = remote_version("v-escape");
+        escape.package_path = "/apps/GameSaver/saves/test-game/../../evil.zip".to_string();
+
+        let (deletable, kept) = CloudSaveService::split_prunable_versions(
+            "test-game",
+            vec![legitimate, hostile, escape],
+        );
+
+        assert_eq!(deletable.len(), 1, "只有可验证的那一条才允许删");
+        assert_eq!(deletable[0].version_id, "v-legit");
+        assert_eq!(
+            kept.len(),
+            2,
+            "不可验证的条目必须留回清单，不能静默丢掉用户的版本记录"
+        );
+        assert_eq!(
+            kept.iter()
+                .map(|version| version.version_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v-hostile", "v-escape"],
+            "留回的条目要保持原有相对顺序"
+        );
+        // 反向守卫：绝不因为「验不过」而把条目直接丢掉 —— 输入输出总数必须守恒。
+        assert_eq!(deletable.len() + kept.len(), 3);
     }
 
     #[test]

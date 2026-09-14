@@ -1905,7 +1905,7 @@ fn cloud_install_game_key(current: &str, remote_game_key: &str) -> String {
     }
 }
 
-fn validate_remote_package_path(directory: &str, path: &str) -> Result<(), String> {
+pub(crate) fn validate_remote_package_path(directory: &str, path: &str) -> Result<(), String> {
     let prefix = format!("{directory}/");
     let name = path
         .strip_prefix(&prefix)
