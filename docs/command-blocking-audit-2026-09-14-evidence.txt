@@ -1,0 +1,193 @@
+命令总数 73；async 0；创建任务的 21
+
+############ A. 体内【直接】含严格标记（证据行可逐条核验） ############
+
+● start_add_game_task  (commands/add_game_commands.rs:14)  189 行  创建任务:是
+    [大文件IO] :137  let _ = fs::remove_dir_all(&copy_result.managed_path);
+    [大文件IO] :160  let _ = fs::remove_dir_all(&copy_result.managed_path);
+
+● get_baidu_status  (commands/baidu_commands.rs:24)  9 行  创建任务:否
+    [网络] :27  Ok(BaiduNetdiskClient::connection_status_with_credentials(
+
+● get_baidu_quota  (commands/baidu_commands.rs:35)  4 行  创建任务:否
+    [网络] :36  let client = load_baidu_client(&app)?;
+
+● get_cloud_game_cover  (commands/baidu_commands.rs:41)  22 行  创建任务:否
+    [大文件IO] :56  std::fs::read(cover_file)
+
+● get_cloud_game_cover_paths  (commands/baidu_commands.rs:90)  50 行  创建任务:否
+    [大文件IO] :99  let Ok(entries) = std::fs::read_dir(&cache_root) else {
+    [大文件IO] :115  if let Ok(content) = std::fs::read_to_string(&catalog_file) {
+    [大文件IO] :125  if let Ok(content) = std::fs::read_to_string(&manifest_file) {
+
+● list_cloud_games  (commands/baidu_commands.rs:142)  257 行  创建任务:否
+    [网络] :149  let client = load_baidu_client(&app)?;
+    [大文件IO] :193  if let Ok(content) = std::fs::read(&catalog_file) {
+
+● list_remote_body_packages  (commands/baidu_commands.rs:601)  56 行  创建任务:否
+    [网络] :608  let client = load_baidu_client(&app)?;
+
+● build_baidu_authorize_url  (commands/baidu_config_commands.rs:88)  12 行  创建任务:否
+    [网络] :91  let mut url = reqwest::Url::parse(&format!("{OAUTH_BASE}/authorize"))
+
+● exchange_baidu_code  (commands/baidu_config_commands.rs:102)  56 行  创建任务:否
+    [网络] :109  let client = Client::builder()
+    [网络] :125  .send()
+    [网络] :149  BaiduNetdiskClient::save_token(
+
+● get_cloud_account_status  (commands/cloud_account_commands.rs:23)  12 行  创建任务:否
+    [网络] :24  let client = load_baidu_client(&app)?;
+
+● list_cloud_save_versions  (commands/cloud_save_commands.rs:55)  21 行  创建任务:否
+    [网络] :72  let client = load_baidu_client(&app)?;
+
+● start_restore_cloud_save_task  (commands/cloud_save_commands.rs:171)  84 行  创建任务:是
+    [网络] :205  let client = load_baidu_client(&app)?;
+
+● delete_cloud_save_version  (commands/cloud_save_commands.rs:257)  35 行  创建任务:否
+    [网络] :279  // 守卫在函数返回时 `Drop` 即释放 —— 包括 `load_baidu_client` 与 `delete_cloud_version`
+    [网络] :283  let client = load_baidu_client(&app)?;
+
+● list_game_body_versions  (commands/game_body_commands.rs:24)  39 行  创建任务:否
+    [大文件IO] :57  .and_then(|path| std::fs::metadata(path).ok())
+
+● get_game_cover  (commands/game_commands.rs:210)  22 行  创建任务:否
+    [大文件IO] :228  fs::read(path)
+
+● remove_game_from_library  (commands/game_commands.rs:527)  106 行  创建任务:否
+    [大文件IO] :579  let _ = fs::remove_dir_all(&managed_path);
+    [大文件IO] :586  let _ = fs::remove_dir_all(&versions_dir);
+    [大文件IO] :590  let _ = fs::remove_dir_all(&covers_dir);
+    [大文件IO] :594  let _ = fs::remove_dir_all(&staging);
+    [大文件IO] :607  let _ = fs::remove_dir_all(&package_cache);
+
+● discard_pending_game  (commands/save_commands.rs:545)  46 行  创建任务:否
+    [大文件IO] :566  fs::rename(&managed_path, &quarantine)
+    [大文件IO] :584  let _ = fs::rename(&quarantine, &managed_path);
+    [大文件IO] :587  let _ = fs::remove_dir_all(quarantine);
+
+############ B. 体内无直接标记，但调用的服务函数里有（需人工核调用是否真的发生） ############
+
+○ install_cloud_game  (commands/baidu_commands.rs:401)  91 行  创建任务:是
+    → finish                             services/save_learning_service.rs:343  [子进程] :364 let dir_pids = crate::services::process_service::find_processes_in_directory(
+
+○ delete_remote_body_package  (commands/baidu_commands.rs:494)  105 行  创建任务:是
+    → finish                             services/save_learning_service.rs:343  [子进程] :364 let dir_pids = crate::services::process_service::find_processes_in_directory(
+
+○ repair_cloud_body_manifest  (commands/baidu_commands.rs:659)  75 行  创建任务:是
+    → finish                             services/save_learning_service.rs:343  [子进程] :364 let dir_pids = crate::services::process_service::find_processes_in_directory(
+
+○ upload_game_body_package  (commands/baidu_commands.rs:736)  104 行  创建任务:是
+    → finish                             services/save_learning_service.rs:343  [子进程] :364 let dir_pids = crate::services::process_service::find_processes_in_directory(
+
+○ download_game_body_package  (commands/baidu_commands.rs:842)  85 行  创建任务:是
+    → finish                             services/save_learning_service.rs:343  [子进程] :364 let dir_pids = crate::services::process_service::find_processes_in_directory(
+
+○ save_baidu_config  (commands/baidu_config_commands.rs:26)  33 行  创建任务:否
+    → load                               repositories/game_repository.rs:30  [大文件IO] :48 let mut hasher = Sha256::new();
+
+○ set_baidu_auto_upload  (commands/baidu_config_commands.rs:61)  8 行  创建任务:否
+    → load                               repositories/game_repository.rs:30  [大文件IO] :48 let mut hasher = Sha256::new();
+
+○ update_baidu_save_sync_settings  (commands/baidu_config_commands.rs:71)  15 行  创建任务:否
+    → load                               repositories/game_repository.rs:30  [大文件IO] :48 let mut hasher = Sha256::new();
+
+○ get_cloud_save_overview  (commands/cloud_save_commands.rs:34)  19 行  创建任务:否
+    → get_overview                       services/cloud_save_service.rs:646  [网络] :672 let client = BaiduNetdiskClient::load_from_app_data(&data_dir);
+
+○ start_upload_save_version_task  (commands/cloud_save_commands.rs:78)  91 行  创建任务:是
+    → load                               repositories/game_repository.rs:30  [大文件IO] :48 let mut hasher = Sha256::new();
+
+○ update_game_body  (commands/game_body_commands.rs:65)  81 行  创建任务:是
+    → validate_source                    services/game_body_update_service.rs:175  [大文件IO] :192 for entry in WalkDir::new(&source).follow_links(false) {
+    → finish                             services/save_learning_service.rs:343  [子进程] :364 let dir_pids = crate::services::process_service::find_processes_in_directory(
+
+○ package_game_body  (commands/game_body_commands.rs:148)  84 行  创建任务:是
+    → finish                             services/save_learning_service.rs:343  [子进程] :364 let dir_pids = crate::services::process_service::find_processes_in_directory(
+
+○ delete_game_body_package  (commands/game_body_commands.rs:234)  59 行  创建任务:是
+    → finish                             services/save_learning_service.rs:343  [子进程] :364 let dir_pids = crate::services::process_service::find_processes_in_directory(
+
+○ uninstall_game_body  (commands/game_body_commands.rs:295)  60 行  创建任务:是
+    → finish                             services/save_learning_service.rs:343  [子进程] :364 let dir_pids = crate::services::process_service::find_processes_in_directory(
+
+○ rename_game  (commands/game_commands.rs:51)  27 行  创建任务:否
+    → persist                            repositories/game_repository.rs:57  [大文件IO] :64 let mut hasher = Sha256::new();
+
+○ arm_game_cover_capture  (commands/game_commands.rs:164)  36 行  创建任务:否
+    → new                                services/baidu_netdisk_service.rs:1260  [大文件IO] :1262 fs::create_dir_all(workspace.join("app-data")).expect("create temp token dir");
+    → new                                test_support.rs:37  [大文件IO] :41 std::fs::create_dir_all(&path).expect("create test workspace");
+
+○ discard_game_cover_capture  (commands/game_commands.rs:202)  6 行  创建任务:否
+    → discard                            services/cover_capture_service.rs:125  [大文件IO] :127 let _ = fs::remove_file(path);
+
+○ get_game_cover_paths  (commands/game_commands.rs:259)  20 行  创建任务:否
+    → new                                services/baidu_netdisk_service.rs:1260  [大文件IO] :1262 fs::create_dir_all(workspace.join("app-data")).expect("create temp token dir");
+    → new                                test_support.rs:37  [大文件IO] :41 std::fs::create_dir_all(&path).expect("create test workspace");
+
+○ start_set_library_root_task  (commands/library_commands.rs:45)  107 行  创建任务:是
+    → validate_target                    services/library_service.rs:34  [大文件IO] :48 let has_unmanaged_entries = fs::read_dir(target)
+    → finish                             services/save_learning_service.rs:343  [子进程] :364 let dir_pids = crate::services::process_service::find_processes_in_directory(
+
+○ start_save_learning_task  (commands/save_commands.rs:19)  112 行  创建任务:是
+    → finish                             services/save_learning_service.rs:343  [子进程] :364 let dir_pids = crate::services::process_service::find_processes_in_directory(
+
+○ start_save_candidate_verification_task  (commands/save_commands.rs:133)  120 行  创建任务:是
+    → finish                             services/save_learning_service.rs:343  [子进程] :364 let dir_pids = crate::services::process_service::find_processes_in_directory(
+
+○ start_finish_save_learning_task  (commands/save_commands.rs:255)  93 行  创建任务:是
+    → finish                             services/save_learning_service.rs:343  [子进程] :364 let dir_pids = crate::services::process_service::find_processes_in_directory(
+
+○ confirm_save_profile  (commands/save_commands.rs:403)  124 行  创建任务:否
+    → new                                services/baidu_netdisk_service.rs:1260  [大文件IO] :1262 fs::create_dir_all(workspace.join("app-data")).expect("create temp token dir");
+    → new                                test_support.rs:37  [大文件IO] :41 std::fs::create_dir_all(&path).expect("create test workspace");
+    → persist                            repositories/game_repository.rs:57  [大文件IO] :64 let mut hasher = Sha256::new();
+
+○ update_save_profile_keep_versions  (commands/save_commands.rs:714)  44 行  创建任务:否
+    → persist                            repositories/game_repository.rs:57  [大文件IO] :64 let mut hasher = Sha256::new();
+    → collect_garbage                    repositories/save_repository.rs:312  [大文件IO] :331 for prefix in fs::read_dir(&root).map_err(|err| format!("读取存档对象目录失败：{err}"))?
+
+○ update_save_profile_scopes  (commands/save_commands.rs:760)  44 行  创建任务:否
+    → persist                            repositories/game_repository.rs:57  [大文件IO] :64 let mut hasher = Sha256::new();
+
+○ open_path_in_explorer  (commands/save_commands.rs:806)  18 行  创建任务:否
+    → new                                services/baidu_netdisk_service.rs:1260  [大文件IO] :1262 fs::create_dir_all(workspace.join("app-data")).expect("create temp token dir");
+    → new                                test_support.rs:37  [大文件IO] :41 std::fs::create_dir_all(&path).expect("create test workspace");
+
+○ restore_save_version  (commands/save_version_commands.rs:12)  72 行  创建任务:是
+    → finish                             services/save_learning_service.rs:343  [子进程] :364 let dir_pids = crate::services::process_service::find_processes_in_directory(
+
+○ delete_save_version  (commands/save_version_commands.rs:86)  64 行  创建任务:是
+    → finish                             services/save_learning_service.rs:343  [子进程] :364 let dir_pids = crate::services::process_service::find_processes_in_directory(
+
+○ prune_save_versions  (commands/save_version_commands.rs:152)  65 行  创建任务:是
+    → finish                             services/save_learning_service.rs:343  [子进程] :364 let dir_pids = crate::services::process_service::find_processes_in_directory(
+
+############ C. 干净的命令（体内与一层调用都没有网络/子进程/大文件IO） ############
+  get_elevation_status                   commands/admin_commands.rs:12
+  restart_as_admin                       commands/admin_commands.rs:20
+  confirm_app_exit                       commands/app_commands.rs:13
+  get_cloud_game_cover_path              commands/baidu_commands.rs:65
+  get_baidu_config                       commands/baidu_config_commands.rs:21
+  start_upload_cloud_account_task        commands/cloud_account_commands.rs:37
+  start_download_cloud_account_task      commands/cloud_account_commands.rs:64
+  get_cloud_save_status                  commands/cloud_save_commands.rs:13
+  report_frontend_error                  commands/diagnostics_commands.rs:22
+  list_games                             commands/game_commands.rs:16
+  get_game                               commands/game_commands.rs:25
+  save_game_cover                        commands/game_commands.rs:129
+  get_game_cover_path                    commands/game_commands.rs:234
+  get_game_detail_view                   commands/game_commands.rs:739
+  precheck_game_launch                   commands/launch_commands.rs:9
+  launch_game                            commands/launch_commands.rs:21
+  get_game_runtime                       commands/launch_commands.rs:30
+  list_save_versions                     commands/launch_commands.rs:43
+  get_library_settings                   commands/library_commands.rs:26
+  cancel_save_learning                   commands/save_commands.rs:350
+  get_default_save_exclusions            commands/save_commands.rs:389
+  preview_save_scopes                    commands/save_commands.rs:667
+  get_save_profile                       commands/save_commands.rs:690
+  get_task                               commands/task_commands.rs:9
+  list_tasks                             commands/task_commands.rs:16
+  cancel_task                            commands/task_commands.rs:21
+  delete_tasks                           commands/task_commands.rs:26

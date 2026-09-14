@@ -1,8 +1,8 @@
 use crate::{
     app_state::AppState,
-    domain::{compare_created_at, CoverCrop, CoverPosition, GameCover},
+    domain::{compare_created_at, CoverCrop, CoverPosition, GameCover, TaskCategory, TaskStatus},
     repositories::GameRepository,
-    services::{CoverCaptureService, GameBodyUpdateService, GameLibraryService},
+    services::{CoverCaptureService, GameBodyUpdateService, GameLibraryService, TaskService},
 };
 use std::{
     fs,
@@ -523,6 +523,155 @@ fn release_cover_operation(state: &AppState, game_uid: &str) {
     state.release_operation(&AppState::game_operation_key(game_uid));
 }
 
+/// 一项待删除的目录。`label` 只用于任务消息与失败项描述。
+struct RemovalTarget {
+    label: &'static str,
+    path: PathBuf,
+}
+
+/// 删除一个目录或单个文件；**不存在视为成功**（本来就没有），其余错误按
+/// `标签（路径）：原因` 收集起来交给调用方上报。
+///
+/// 返回 `None` 表示已删掉或本来就没有。
+fn remove_if_present(label: &str, path: &Path, is_dir: bool) -> Option<String> {
+    let result = if is_dir {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    match result {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => Some(format!("{label}（{}）：{error}", path.display())),
+    }
+}
+
+/// 进度按「已完成步数 / 总步数」摊到 5~90，把 100 留给任务收尾。
+fn progress_after(done: usize, total: usize) -> u8 {
+    if total == 0 {
+        return 90;
+    }
+    (5 + (done * 85) / total).min(90) as u8
+}
+
+/// 依次删除清单里的目录（外加可选的更新日志文件），返回**未能删除**的条目。
+///
+/// 每步通过 `on_step` 上报进度，让「正在删除游戏文件」这件事在任务列表里可见，
+/// 而不是一个没有任何反馈的长阻塞。
+fn remove_game_files(
+    targets: &[RemovalTarget],
+    journal: Option<&Path>,
+    mut on_step: impl FnMut(u8, &str),
+) -> Vec<String> {
+    let total = targets.len() + usize::from(journal.is_some());
+    let mut failures = Vec::new();
+    let mut done = 0usize;
+    for target in targets {
+        on_step(
+            progress_after(done, total),
+            &format!("正在删除{}", target.label),
+        );
+        if let Some(failure) = remove_if_present(target.label, &target.path, true) {
+            failures.push(failure);
+        }
+        done += 1;
+    }
+    if let Some(path) = journal {
+        on_step(progress_after(done, total), "正在清理更新日志");
+        if let Some(failure) = remove_if_present("更新日志", path, false) {
+            failures.push(failure);
+        }
+    }
+    failures
+}
+
+/// 算出要删的路径清单。**必须在游戏被摘除之前调用** —— 摘除之后 store 里就没有
+/// `managed_path` 可读了。
+fn collect_removal_targets(
+    app: &AppHandle,
+    state: &AppState,
+    game_uid: &str,
+) -> Result<(String, Vec<RemovalTarget>, Option<PathBuf>), String> {
+    let (display_name, managed_path) = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "锁定游戏库数据失败".to_string())?;
+        let game = store
+            .games
+            .iter()
+            .find(|g| g.game_uid == game_uid)
+            .ok_or_else(|| "游戏不存在".to_string())?;
+        (game.display_name.clone(), PathBuf::from(&game.managed_path))
+    };
+
+    let mut targets = vec![RemovalTarget {
+        label: "托管游戏目录",
+        path: managed_path,
+    }];
+    let mut journal = None;
+    if let Ok(games_root) = state.games_root() {
+        targets.push(RemovalTarget {
+            label: "存档版本目录",
+            path: games_root.join(".versions").join(game_uid),
+        });
+        targets.push(RemovalTarget {
+            label: "封面目录",
+            path: games_root.join("covers").join(game_uid),
+        });
+        targets.push(RemovalTarget {
+            label: "更新暂存目录",
+            path: games_root.join(format!(".{game_uid}.updating")),
+        });
+        journal = Some(GameBodyUpdateService::journal_path(&games_root, game_uid));
+    }
+    if let Ok(app_data_dir) = app.path().app_data_dir() {
+        targets.push(RemovalTarget {
+            label: "本体包缓存",
+            path: app_data_dir
+                .join("cache")
+                .join("body_packages")
+                .join(game_uid),
+        });
+    }
+    Ok((display_name, targets, journal))
+}
+
+/// 把游戏及其存档配置、版本、本体版本记录一起从 store 摘除并落盘。
+///
+/// 走 [`AppState::with_store_mut`] 的「读 → 改 → 持久化 → 提交」单次加锁契约，
+/// 而不是先 `lock().clone()` 取快照、再 `lock()` 整体覆盖写回。
+fn detach_game_from_store(app: &AppHandle, state: &AppState, game_uid: &str) -> Result<(), String> {
+    state.with_store_mut(|candidate| {
+        candidate.games.retain(|item| item.game_uid != game_uid);
+        candidate
+            .save_profiles
+            .retain(|item| item.game_uid != game_uid);
+        candidate
+            .save_versions
+            .retain(|item| item.game_uid != game_uid);
+        candidate
+            .body_versions
+            .retain(|item| item.game_uid != game_uid);
+        GameRepository::persist(app, candidate)
+    })
+}
+
+/// 从库中移除游戏。
+///
+/// 分两段做，顺序不可颠倒：
+///
+/// 1. **同步段**（本函数体）：校验 → 认领整游戏独占 → 建任务 → 从 store 摘除并落盘。
+///    走出这个函数时游戏已经不在库里，前端 `await` 之后刷新就能看到结果 —— 这也是它
+///    保持同步命令的原因：同步命令的执行线程就是 Tauri 主线程（见 tauri-macros 的
+///    `body_blocking`），所以这一段必须只剩毫秒级工作。
+/// 2. **后台段**（下面的 `thread::spawn`）：删本体、存档版本、封面、更新暂存、本体包缓存。
+///    托管本体可以非常大 —— 实测本机单个游戏 7.3 GB / 20,717 个文件、全库 35.52 GB /
+///    29,485 个文件 —— 放在命令体里会让窗口消息循环与后续所有 IPC 一起停摆。
+///
+/// 删除失败**不再被 `let _ =` 吞掉**：失败项写进任务结果，任务消息里说明「有几处未能
+/// 删除」。否则游戏已从库里消失、空间却还占着，没有任何地方会告诉用户。
+/// 审计依据：`docs/command-blocking-audit-2026-09-14.md` 的 F1。
 #[tauri::command]
 pub fn remove_game_from_library(
     app: AppHandle,
@@ -540,93 +689,112 @@ pub fn remove_game_from_library(
         }
     }
 
+    // 认领「整游戏独占」：本体更新、封面处理、存档维护撞的是同一个 key。
+    // 删除要持续到后台线程结束，所以这里不用 Drop 守卫，改由线程的两条出口显式释放。
     reserve_cover_operation(&state, &game_uid)?;
-    struct OperationGuard<'a> {
-        state: &'a AppState,
-        game_uid: String,
-    }
-    impl<'a> Drop for OperationGuard<'a> {
-        fn drop(&mut self) {
-            release_cover_operation(self.state, &self.game_uid);
+
+    let (display_name, targets, journal) = match collect_removal_targets(&app, &state, &game_uid) {
+        Ok(value) => value,
+        Err(error) => {
+            release_cover_operation(&state, &game_uid);
+            return Err(error);
         }
-    }
-    let _guard = OperationGuard {
-        state: &state,
-        game_uid: game_uid.clone(),
     };
 
-    let (game, games_root_opt, app_data_dir_opt) = {
-        let store = state
-            .store
-            .lock()
-            .map_err(|_| "锁定游戏库数据失败".to_string())?;
-        let game = store
-            .games
-            .iter()
-            .find(|g| g.game_uid == game_uid)
-            .cloned()
-            .ok_or_else(|| "游戏不存在".to_string())?;
-        (
-            game,
-            state.games_root().ok(),
-            app.path().app_data_dir().ok(),
-        )
+    let task_id = match TaskService::create(
+        &state,
+        "remove_game_from_library",
+        TaskCategory::Maintenance,
+        Some(game_uid.clone()),
+        &format!("正在从库中移除【{display_name}】"),
+    ) {
+        Ok(task_id) => task_id,
+        Err(error) => {
+            release_cover_operation(&state, &game_uid);
+            return Err(error);
+        }
     };
 
-    // 1. Clean up managed directory if it exists
-    let managed_path = PathBuf::from(&game.managed_path);
-    if managed_path.exists() {
-        let _ = fs::remove_dir_all(&managed_path);
+    // 先从 store 摘除：库里立刻看不到这个游戏，不必等文件删完。
+    // 反过来的顺序（先删文件、后摘除）会在崩溃时留下「库里还在、本体已删一半」的游戏。
+    if let Err(error) = detach_game_from_store(&app, &state, &game_uid) {
+        TaskService::finish(
+            &state,
+            &task_id,
+            TaskStatus::Failed,
+            100,
+            "从库中移除游戏失败",
+            None,
+            Some(error.clone()),
+        );
+        release_cover_operation(&state, &game_uid);
+        return Err(error);
     }
 
-    // 2. Clean up versions, covers, update journal, staging
-    if let Some(ref games_root) = games_root_opt {
-        let versions_dir = games_root.join(".versions").join(&game_uid);
-        if versions_dir.exists() {
-            let _ = fs::remove_dir_all(&versions_dir);
+    let app_handle = app.clone();
+    let task_id_for_thread = task_id.clone();
+    let game_uid_for_thread = game_uid.clone();
+    std::thread::spawn(move || {
+        let state = app_handle.state::<AppState>();
+        TaskService::update(
+            &state,
+            &task_id_for_thread,
+            TaskStatus::Running,
+            5,
+            "正在删除游戏文件",
+            None,
+        );
+        let failures = remove_game_files(&targets, journal.as_deref(), |progress, label| {
+            TaskService::update(
+                &state,
+                &task_id_for_thread,
+                TaskStatus::Running,
+                progress,
+                label,
+                None,
+            );
+        });
+        release_cover_operation(&state, &game_uid_for_thread);
+        let total = targets.len() + usize::from(journal.is_some());
+        let removed = total - failures.len();
+        if failures.is_empty() {
+            TaskService::finish(
+                &state,
+                &task_id_for_thread,
+                TaskStatus::Success,
+                100,
+                format!("已从库中移除【{display_name}】"),
+                Some(serde_json::json!({ "removedPaths": removed })),
+                None,
+            );
+        } else {
+            // 主操作（从库里移除）已经成功，所以状态仍记 Success —— 与既有的
+            // `delete_save_version`「保存版本已删除，但对象回收未完成」保持一致。
+            // 失败点不能静默：任务卡片始终显示 `message`，所以把**是哪个目录**没删掉写进去；
+            // 完整路径与原因进 result。Success 任务不渲染 `error` 那一行（TransferCenter
+            // 只在 failed/interrupted 时显示），因此这里不传 error。
+            let failed_labels = failures
+                .iter()
+                .map(|item| {
+                    item.split_once('（')
+                        .map(|(label, _)| label)
+                        .unwrap_or(item.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("、");
+            TaskService::finish(
+                &state,
+                &task_id_for_thread,
+                TaskStatus::Success,
+                100,
+                format!(
+                    "已从库中移除【{display_name}】，但{failed_labels}未能删除，可能仍占用磁盘空间"
+                ),
+                Some(serde_json::json!({ "removedPaths": removed, "failedPaths": failures })),
+                None,
+            );
         }
-        let covers_dir = games_root.join("covers").join(&game_uid);
-        if covers_dir.exists() {
-            let _ = fs::remove_dir_all(&covers_dir);
-        }
-        let staging = games_root.join(format!(".{game_uid}.updating"));
-        if staging.exists() {
-            let _ = fs::remove_dir_all(&staging);
-        }
-        let journal = GameBodyUpdateService::journal_path(games_root, &game_uid);
-        let _ = GameBodyUpdateService::clear_journal(&journal);
-    }
-
-    // 3. Clean up cached body packages if any
-    if let Some(ref app_data_dir) = app_data_dir_opt {
-        let package_cache = app_data_dir
-            .join("cache")
-            .join("body_packages")
-            .join(&game_uid);
-        if package_cache.exists() {
-            let _ = fs::remove_dir_all(&package_cache);
-        }
-    }
-
-    // 4. Update store and persist
-    let mut store = state
-        .store
-        .lock()
-        .map_err(|_| "锁定游戏库数据失败".to_string())?;
-    let mut candidate = store.clone();
-    candidate.games.retain(|item| item.game_uid != game_uid);
-    candidate
-        .save_profiles
-        .retain(|item| item.game_uid != game_uid);
-    candidate
-        .save_versions
-        .retain(|item| item.game_uid != game_uid);
-    candidate
-        .body_versions
-        .retain(|item| item.game_uid != game_uid);
-
-    GameRepository::persist(&app, &candidate)?;
-    *store = candidate;
+    });
 
     Ok(())
 }
@@ -872,5 +1040,88 @@ mod tests {
         assert!(validate_game_display_name("Game\nName").is_err());
         assert!(validate_game_display_name("Game\r\nName").is_err());
         assert!(validate_game_display_name("Game\0Name").is_err());
+    }
+}
+
+/// 从库中移除游戏时那套文件删除的守卫。
+///
+/// 这些测试守的是上一版最要命的那个性质：**失败被 `let _ =` 吞掉**。
+/// 一旦有人把 `remove_if_present` 改回忽略错误、或者把失败清单丢掉，
+/// `undeletable_paths_are_reported_instead_of_swallowed` 会立刻失败。
+#[cfg(test)]
+mod removal_tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("gamesaver-remove-{name}-{}", Uuid::new_v4()))
+    }
+
+    fn managed_target(path: &Path) -> RemovalTarget {
+        RemovalTarget {
+            label: "托管游戏目录",
+            path: path.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn removes_directory_trees_and_reports_progress() {
+        let root = temp_path("tree");
+        fs::create_dir_all(root.join("nested/deep")).expect("建临时目录");
+        fs::write(root.join("nested/deep/file.bin"), b"content").expect("写临时文件");
+
+        let mut progress = Vec::new();
+        let failures = remove_game_files(&[managed_target(&root)], None, |value, label| {
+            progress.push((value, label.to_string()));
+        });
+
+        assert!(failures.is_empty(), "不该有失败项：{failures:?}");
+        assert!(!root.exists(), "目录树应当已被删除");
+        assert_eq!(progress.len(), 1, "每删一项应上报一次进度");
+        assert!(
+            (5..=90).contains(&progress[0].0),
+            "进度应落在 5~90（100 留给任务收尾）：{:?}",
+            progress[0]
+        );
+    }
+
+    #[test]
+    fn missing_paths_are_treated_as_success() {
+        let root = temp_path("missing");
+        let journal = root.join("no-such-journal.json");
+        let failures = remove_game_files(&[managed_target(&root)], Some(&journal), |_, _| {});
+        assert!(
+            failures.is_empty(),
+            "本来就不存在的路径不该算失败（否则每次移除都会报假警）：{failures:?}"
+        );
+    }
+
+    #[test]
+    fn undeletable_paths_are_reported_instead_of_swallowed() {
+        // 拿一个「文件」当目录删：remove_dir_all 必然失败。这正是原先 `let _ =` 会吞掉的情况，
+        // 结果是游戏已从库里消失、空间还占着，而没有任何地方告诉用户。
+        let file = temp_path("file");
+        fs::write(&file, b"x").expect("写临时文件");
+
+        let failures = remove_game_files(&[managed_target(&file)], None, |_, _| {});
+
+        assert_eq!(failures.len(), 1, "删除失败必须被报告：{failures:?}");
+        assert!(
+            failures[0].contains("托管游戏目录"),
+            "失败项应带上标签便于定位：{failures:?}"
+        );
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn progress_stays_within_bounds_for_any_step_count() {
+        for total in 0..8usize {
+            for done in 0..=total {
+                let value = progress_after(done, total);
+                assert!(
+                    (5..=90).contains(&value),
+                    "total={total} done={done} 时进度越界：{value}"
+                );
+            }
+        }
     }
 }
