@@ -88,8 +88,93 @@ impl AppState {
         Ok(value)
     }
 
-    /// 当前正在运行（含启动中 / 保存中）的游戏数量。
+    /// 「该游戏有独占操作在进行」的共用 key。
     ///
+    /// `save_operations` 是一张字符串集合，各处以不同前缀区分操作种类；**没有前缀的
+    /// key 就是「整游戏独占」**，由本体更新、封面处理、保存版本维护与确保存档路径共用。
+    /// 新增整游戏独占操作时必须用这个构造函数，别再手写 `game_uid.to_string()` ——
+    /// 判定方式散成几份时，任一处加强都会被另一处绕过。
+    pub fn game_operation_key(game_uid: &str) -> String {
+        game_uid.trim().to_string()
+    }
+
+    /// 云端存档同步的独占 key。
+    ///
+    /// 刻意**不**复用整游戏独占 key：云端同步可以在游戏运行期间进行（手动上传、还原），
+    /// 而本体更新那类操作会拒绝「游戏运行中」。两者共用一把 key 会让云端操作被
+    /// `running_games` 那类无关判据挡掉。云端同步需要真正互斥的只有「同一游戏的另一次
+    /// 云端同步」，因为云端清单是读-改-写。
+    pub fn cloud_operation_key(game_uid: &str) -> String {
+        format!("cloud:{}", game_uid.trim())
+    }
+
+    /// 该游戏是否已持有整游戏独占或云端同步的任意一把 key。
+    ///
+    /// 判定**不区分两把 key 的种类**：它们互斥，且每种操作一次只该有一个。因此
+    /// 「集合里存在该游戏的任何操作」就等于「占用中」。
+    fn any_operation_for(&self, operations: &HashSet<String>, game_uid: &str) -> bool {
+        let game_uid = game_uid.trim();
+        operations.contains(&Self::game_operation_key(game_uid))
+            || operations.contains(&Self::cloud_operation_key(game_uid))
+    }
+
+    /// 认领一次整游戏独占操作。已被占用时返回 `Err`，调用方不该继续。
+    ///
+    /// 除整游戏独占外也拒绝**云端同步进行中**：两边会读写同一份本地存档目录（云端
+    /// 上传/还原要打包或落盘存档，本体更新与封面处理要动受管目录与封面），必须互相
+    /// 可见。判据放在插入**之前**：`insert` 会真的写进去，发现冲突再回滚等于制造一个
+    /// 短暂的半认领状态，让并发调用看到「无冲突」。
+    pub fn claim_operation(&self, game_uid: &str, busy: &str) -> Result<(), String> {
+        let mut operations = self
+            .save_operations
+            .lock()
+            .map_err(|_| "锁定游戏操作状态失败".to_string())?;
+        if self.any_operation_for(&operations, game_uid) {
+            return Err(busy.to_string());
+        }
+        operations.insert(Self::game_operation_key(game_uid));
+        Ok(())
+    }
+
+    /// 认领该游戏的云端同步独占权。返回需要交给释放方的 key。
+    ///
+    /// 返回 key 而不是 RAII 凭据：凭据要活到工作线程结束，而 Tauri 命令签名里的
+    /// `State<AppState>` 只是短命引用，借用它构造的凭据移不进线程（`state does not
+    /// live long enough`）。工作线程本来就能用 `app.state::<AppState>()` 取到同一个
+    /// `AppState`，于是沿用项目里既有的「认领 → 起线程 → 线程内释放」写法，
+    /// 与 `save_version_commands::reserve_maintenance` 一致。
+    pub fn claim_cloud_operation(&self, game_uid: &str) -> Result<String, String> {
+        let mut operations = self
+            .save_operations
+            .lock()
+            .map_err(|_| "锁定游戏操作状态失败".to_string())?;
+        if self.any_operation_for(&operations, game_uid) {
+            return Err("该游戏已有云端同步或本体操作正在进行".to_string());
+        }
+        let key = Self::cloud_operation_key(game_uid);
+        operations.insert(key.clone());
+        Ok(key)
+    }
+
+    /// 释放一次独占操作。幂等，且**不**因「没认领过」报错 —— 失败路径上重复释放
+    /// 不该再抛一个掩盖真实原因的错误。
+    pub fn release_operation(&self, key: &str) {
+        if let Ok(mut operations) = self.save_operations.lock() {
+            operations.remove(key);
+        }
+    }
+
+    /// 该游戏是否有云端同步或整游戏独占操作在进行（自行取锁）。
+    ///
+    /// 持锁调用方直接把 `MutexGuard` 传进来即可 —— `&MutexGuard<HashSet<_>>` 会自动
+    /// 解引用成 `&HashSet<_>`。之所以不另开一个「持锁版本」，是因为
+    /// `save_operations` 是普通 `std::sync::Mutex`、不可重入：多一个长得像「安全版」
+    /// 的方法，就多一次在持锁状态下误调自行取锁版本而自锁死的机会。
+    pub fn has_exclusive_operation(&self, operations: &HashSet<String>, game_uid: &str) -> bool {
+        self.any_operation_for(operations, game_uid)
+    }
+
+    /// 当前正在运行（含启动中 / 保存中）的游戏数量。
     /// 锁中毒时按 0 处理：这只影响「是否拦截退出」的判定，不应让关闭流程
     /// 因为一次计数读取失败而卡住。
     pub fn running_game_count(&self) -> usize {
@@ -314,6 +399,113 @@ mod tests {
             started_at: None,
             task_id: None,
         }
+    }
+
+    /// 走「持锁判定」那条路径问一次占用状态，与 `launch` 的调用形态一致。
+    fn occupied(state: &AppState, game_uid: &str) -> bool {
+        let operations = state.save_operations.lock().expect("锁定操作集合");
+        state.has_exclusive_operation(&operations, game_uid)
+    }
+
+    /// C2 的核心：同一游戏的两次云端同步必须互斥。
+    ///
+    /// 云端清单是「读-改-写」，两次并发会各自读到同一份旧清单、后写的那次把先写的
+    /// 条目整条丢掉。退出游戏时的自动同步与用户手动同步正是可以并发的两条路径。
+    #[test]
+    fn a_second_cloud_sync_for_the_same_game_is_rejected() {
+        let state = test_state();
+        let first = state
+            .claim_cloud_operation("uid-1")
+            .expect("首次认领应当成功");
+
+        let error = state
+            .claim_cloud_operation("uid-1")
+            .expect_err("同一游戏的第二次云端同步必须被拒绝");
+        assert_eq!(error, "该游戏已有云端同步或本体操作正在进行");
+
+        // 释放后必须能再次认领，否则一次失败就会把该游戏的云端功能永久锁死。
+        state.release_operation(&first);
+        state
+            .claim_cloud_operation("uid-1")
+            .expect("释放后应当可以重新认领");
+    }
+
+    /// 不同游戏之间不能互相阻塞。
+    #[test]
+    fn cloud_sync_claims_are_per_game() {
+        let state = test_state();
+        let first = state
+            .claim_cloud_operation("uid-1")
+            .expect("uid-1 认领应当成功");
+        state
+            .claim_cloud_operation("uid-2")
+            .expect("另一个游戏的云端同步不该被 uid-1 挡住");
+        assert!(occupied(&state, "uid-1"));
+        assert!(occupied(&state, "uid-2"));
+        state.release_operation(&first);
+        assert!(!occupied(&state, "uid-1"));
+        assert!(occupied(&state, "uid-2"), "释放一个不该影响另一个");
+    }
+
+    /// 云端同步与整游戏独占**互相排斥**，且判定要同时覆盖两把 key。
+    ///
+    /// 为什么必须是两把不同的 key：云端同步可以在游戏运行期间进行（手动上传、还原），
+    /// 而本体更新那类操作会拒绝「游戏运行中」；共用一把 key 会让云端操作被
+    /// `running_games` 那类无关判据挡掉。
+    ///
+    /// 为什么又必须互相可见：两边会读写同一份本地存档目录 —— 云端上传要打包存档、
+    /// 本体更新要动受管目录。所以任意一方在进行时，另一方都该被拒绝。
+    #[test]
+    fn exclusive_operations_and_cloud_sync_block_each_other() {
+        let state = test_state();
+
+        // 整游戏独占在先 → 云端同步被拒。
+        state
+            .claim_operation("uid-1", "占用")
+            .expect("整游戏独占认领应当成功");
+        assert!(occupied(&state, "uid-1"));
+        assert!(!occupied(&state, "uid-2"), "其他游戏不受影响");
+        assert!(
+            state.claim_cloud_operation("uid-1").is_err(),
+            "整游戏独占进行中不该放行云端同步"
+        );
+
+        // 双向：释放后再让云端先占，整游戏独占也必须被拒。
+        state.release_operation(&AppState::game_operation_key("uid-1"));
+        assert!(!occupied(&state, "uid-1"));
+        let cloud_key = state
+            .claim_cloud_operation("uid-1")
+            .expect("云端同步认领应当成功");
+        assert!(occupied(&state, "uid-1"));
+        assert!(
+            state.claim_operation("uid-1", "占用").is_err(),
+            "云端同步进行中不该放行本体/封面操作"
+        );
+
+        state.release_operation(&cloud_key);
+        assert!(!occupied(&state, "uid-1"), "全部释放后应恢复空闲");
+        state
+            .claim_operation("uid-1", "占用")
+            .expect("释放后整游戏独占应当可以认领");
+    }
+
+    /// 持锁判定（启动游戏那条路径的形态）与 `claim_*` 的结论必须一致。
+    ///
+    /// `has_exclusive_operation` 刻意只提供「传 guard 进来」这一种形态：`save_operations`
+    /// 是普通 `Mutex`、不可重入，多一个自行取锁的同名方法就多一次自锁死的机会。
+    #[test]
+    fn locked_view_agrees_with_claims() {
+        let state = test_state();
+        assert!(!occupied(&state, "uid-1"), "初始应空闲");
+
+        state
+            .claim_operation("uid-1", "占用")
+            .expect("整游戏独占认领应当成功");
+        assert!(occupied(&state, "uid-1"), "认领后持锁判定必须为真");
+        assert!(!occupied(&state, "uid-2"), "另一个游戏不该被判为占用");
+
+        state.release_operation(&AppState::game_operation_key("uid-1"));
+        assert!(!occupied(&state, "uid-1"));
     }
 
     /// 会话的「开始」必须是原子的：检查与写入在同一次加锁内完成，否则同一游戏

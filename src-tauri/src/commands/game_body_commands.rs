@@ -1084,13 +1084,6 @@ fn load_update_context(
 }
 
 fn reserve_update(state: &AppState, game_uid: &str) -> Result<(), String> {
-    let mut operations = state
-        .save_operations
-        .lock()
-        .map_err(|_| "lock save operation state failed".to_string())?;
-    if operations.contains(game_uid) {
-        return Err("该游戏已有本体或存档操作正在进行".to_string());
-    }
     if state
         .running_games
         .lock()
@@ -1099,8 +1092,7 @@ fn reserve_update(state: &AppState, game_uid: &str) -> Result<(), String> {
     {
         return Err("游戏运行中，暂时不能更新游戏本体".to_string());
     }
-    operations.insert(game_uid.to_string());
-    Ok(())
+    state.claim_operation(game_uid, "该游戏已有本体或存档操作正在进行")
 }
 
 fn active_body_package_task(state: &AppState, game_uid: &str) -> Option<String> {
@@ -1117,9 +1109,7 @@ fn active_body_package_task(state: &AppState, game_uid: &str) -> Option<String> 
 }
 
 fn release_update(state: &AppState, game_uid: &str) {
-    if let Ok(mut operations) = state.save_operations.lock() {
-        operations.remove(game_uid);
-    }
+    state.release_operation(&AppState::game_operation_key(game_uid));
 }
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {

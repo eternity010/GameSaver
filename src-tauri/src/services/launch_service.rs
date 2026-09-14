@@ -80,7 +80,12 @@ impl LaunchService {
             .save_operations
             .lock()
             .map_err(|_| "lock save operation state failed".to_string())?;
-        if operation_lock.contains(&game_uid) {
+        // 同时看整游戏独占与云端同步两种 key：云端上传/还原会读写本地存档目录，
+        // 与「启动游戏时提交存档」是同一份数据。原先只查无前缀的 key，于是云端
+        // 操作进行中仍能启动游戏 —— 那正是两边互相踩的窗口。
+        // 直接把持着的 guard 传进去（`&MutexGuard` 解引用成 `&HashSet`）：此刻已持有
+        // `save_operations` 锁，方法内部不会再取一次锁。
+        if state.has_exclusive_operation(&operation_lock, &game_uid) {
             return Err("游戏正在进行存档版本操作".to_string());
         }
         if let Ok(sessions) = state.learning_sessions.lock() {

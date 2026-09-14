@@ -516,20 +516,11 @@ fn cleanup_old_cover(
 }
 
 fn reserve_cover_operation(state: &AppState, game_uid: &str) -> Result<(), String> {
-    let mut operations = state
-        .save_operations
-        .lock()
-        .map_err(|_| "锁定游戏操作状态失败".to_string())?;
-    if !operations.insert(game_uid.to_string()) {
-        return Err("该游戏已有其他操作正在进行".to_string());
-    }
-    Ok(())
+    state.claim_operation(game_uid, "该游戏已有其他操作正在进行")
 }
 
 fn release_cover_operation(state: &AppState, game_uid: &str) {
-    if let Ok(mut operations) = state.save_operations.lock() {
-        operations.remove(game_uid);
-    }
+    state.release_operation(&AppState::game_operation_key(game_uid));
 }
 
 #[tauri::command]

@@ -113,11 +113,25 @@ pub fn start_upload_save_version_task(
         .map(|c| c.cloud_save_keep_limit)
         .unwrap_or(10);
 
-    let task_id = begin_sync(
+    // 云端清单是「读-改-写」：一次上传会 fetch 清单、插入自己这条、再整体写回。
+    // 两次并发的云端操作会各自读到同一份旧清单，后写的那次把先写的条目**整条丢掉**，
+    // 而丢掉的那份包已经上传到网盘、又不在清单里，于是永远无法在界面上删除。
+    // 退出游戏时的自动同步与用户手动同步正是可以并发的两条路径，所以这里必须互斥。
+    // 认领在 `drop(store)` 之后、发起任务之前：既避开持着 store 锁去抢操作锁，也让
+    // 「已被占用」能在真正干活之前就返回。
+    let claim = state.claim_cloud_operation(&game_uid)?;
+
+    let task_id = match begin_sync(
         &state,
         &format!("上传【{}】游戏存档至百度网盘", game.display_name),
         &game.game_uid,
-    )?;
+    ) {
+        Ok(task_id) => task_id,
+        Err(error) => {
+            state.release_operation(&claim);
+            return Err(error);
+        }
+    };
     let task_id_for_thread = task_id.clone();
     let app_for_thread = app.clone();
 
@@ -130,6 +144,9 @@ pub fn start_upload_save_version_task(
             &version,
             keep_limit,
         );
+        // 释放必须早于 `finish_sync`：任务状态一旦推送成功，前端就可能立刻发起下一次
+        // 同步，此刻若 key 还没释放，用户会莫名收到「已有同步任务正在进行」。
+        app_for_thread.state::<AppState>().release_operation(&claim);
         finish_sync(
             &app_for_thread,
             &task_id_for_thread,
@@ -176,6 +193,12 @@ pub fn start_restore_cloud_save_task(
         .clone();
     drop(store);
 
+    // 认领必须在**读云端清单之前**：上传路径会把超出 keep_limit 的历史版本从清单里
+    // 裁掉并删除对应远程包。若先挑好版本再认领，中间那次上传可能刚好把我们要还原的
+    // 那份删掉，于是拿着一个已不存在的 remote_version 去下载。
+    // 同上：先认领，`begin_sync` 失败则立刻释放。
+    let claim = state.claim_cloud_operation(&game_uid)?;
+
     let client = load_baidu_client(&app)?;
     let manifest = CloudSaveService::fetch_manifest(&client, &game.game_key, &game.game_uid)?
         .ok_or_else(|| "未找到云端存档清单".to_string())?;
@@ -186,7 +209,6 @@ pub fn start_restore_cloud_save_task(
         .ok_or_else(|| "未找到指定的云端存档版本".to_string())?
         .clone();
 
-    crate::commands::save_version_commands::reserve_maintenance(&state, &game_uid)?;
     let task_id = match begin_sync(
         &state,
         &format!("从云端还原【{}】游戏存档", game.display_name),
@@ -194,13 +216,12 @@ pub fn start_restore_cloud_save_task(
     ) {
         Ok(task_id) => task_id,
         Err(error) => {
-            crate::commands::save_version_commands::release_maintenance(&state, &game_uid);
+            state.release_operation(&claim);
             return Err(error);
         }
     };
     let task_id_for_thread = task_id.clone();
     let app_for_thread = app.clone();
-    let game_uid_for_thread = game_uid.clone();
 
     std::thread::spawn(move || {
         let result = restore_save_worker(
@@ -210,10 +231,8 @@ pub fn start_restore_cloud_save_task(
             &profile,
             &remote_version,
         );
-        crate::commands::save_version_commands::release_maintenance(
-            &app_for_thread.state::<AppState>(),
-            &game_uid_for_thread,
-        );
+        // 同上传：先放掉 key 再推送任务状态，别让紧随其后的操作被自己的 key 挡住。
+        app_for_thread.state::<AppState>().release_operation(&claim);
         finish_sync(
             &app_for_thread,
             &task_id_for_thread,
@@ -253,14 +272,21 @@ pub fn delete_cloud_save_version(
         .clone();
     drop(store);
 
+    // 删除同样是「读清单 → 裁掉一条 → 整体写回」，必须与上传/还原互斥；否则一次
+    // 并发上传的条目会被这次写回整条抹掉。这里没有工作线程，认领与释放在同一个
+    // 函数里，失败路径由 `?` 直接返回 —— 所以必须保证 `delete_cloud_version` 之后
+    // 先释放再返回，下面两行刻意不留其他分支。
+    let claim = state.claim_cloud_operation(&game_uid)?;
+
     let client = load_baidu_client(&app)?;
-    let manifest = CloudSaveService::delete_cloud_version(
+    let deleted = CloudSaveService::delete_cloud_version(
         &client,
         &game.game_key,
         &game.game_uid,
         &version_id,
-    )?;
-    Ok(manifest.versions)
+    );
+    state.release_operation(&claim);
+    Ok(deleted?.versions)
 }
 
 fn upload_save_worker(

@@ -500,13 +500,6 @@ fn ensure_maintenance_allowed(state: &AppState, game_uid: &str) -> Result<(), St
 }
 
 pub(crate) fn reserve_maintenance(state: &AppState, game_uid: &str) -> Result<(), String> {
-    let mut operations = state
-        .save_operations
-        .lock()
-        .map_err(|_| "lock save operation state failed".to_string())?;
-    if operations.contains(game_uid) {
-        return Err("该游戏已有存档版本操作正在进行".to_string());
-    }
     if state
         .running_games
         .lock()
@@ -515,12 +508,9 @@ pub(crate) fn reserve_maintenance(state: &AppState, game_uid: &str) -> Result<()
     {
         return Err("游戏运行中，暂时不能操作保存版本".to_string());
     }
-    operations.insert(game_uid.to_string());
-    Ok(())
+    state.claim_operation(game_uid, "该游戏已有存档版本操作正在进行")
 }
 
 pub(crate) fn release_maintenance(state: &AppState, game_uid: &str) {
-    if let Ok(mut operations) = state.save_operations.lock() {
-        operations.remove(game_uid);
-    }
+    state.release_operation(&AppState::game_operation_key(game_uid));
 }
