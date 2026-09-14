@@ -388,6 +388,12 @@ h1 { margin-bottom: 0; font-size: 30px; letter-spacing: 0; }
 .detail-loading { min-height: 460px; }
 .empty-icon { display: grid; place-items: center; width: 58px; height: 58px; margin-bottom: 4px; border-radius: 8px; color: var(--brand); background: #252b35; }
 .loader { width: 25px; height: 25px; border: 3px solid #3b4350; border-top-color: var(--brand); border-radius: 50%; animation: spin .8s linear infinite; }
+/* 刷新旧列表时的行内提示：尺寸必须小于全屏 .loader，否则工具栏会被撑高 */
+.loader-inline { width: 11px; height: 11px; border-width: 2px; }
+.library-refreshing { display: inline-flex; align-items: center; gap: 5px; margin-left: 10px; color: var(--text-secondary); font-size: 12px; white-space: nowrap; }
+/* 刷新失败但仍有旧列表可显示：提示条挂在列表上方，不整页替换 */
+.library-refresh-error { display: flex; align-items: center; gap: 8px; max-width: 1320px; margin: 0 auto 14px; padding: 10px 13px; border: 1px solid #633c42; border-radius: 5px; color: var(--danger); background: #2b1d22; font-size: 13px; }
+.library-refresh-error span { flex: 1; overflow-wrap: anywhere; }
 .error-state strong { color: var(--danger); }
 .wizard-page { max-width: 840px; margin: 0 auto; }
 .wizard-header { display: flex; align-items: flex-start; gap: 14px; padding-bottom: 28px; }

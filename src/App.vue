@@ -29,6 +29,10 @@ const activeSort = ref<LibrarySort>(validSorts.includes(savedSort) ? savedSort :
 const search = ref("");
 const loading = ref(true);
 const error = ref("");
+/** 列表是否已有一次成功结果；只有它为真时刷新才保留旧列表而不是显示全屏加载。 */
+const gamesLoaded = ref(false);
+/** 上一次成功拉取的时间戳，用于 TTL 判断。 */
+let gamesLoadedAt = 0;
 const selectedGame = ref<Game | null>(null);
 const selectedGameError = ref("");
 const pendingCoverCapture = ref<{ captureId: string; gameUid: string } | null>(null);
@@ -46,6 +50,21 @@ const storeTotalPages = ref(1);
 const storeHasMore = ref(false);
 const STORE_PAGE_SIZE = 9;
 const LIBRARY_PAGE_SIZE = 9;
+/**
+ * 游戏库列表的缓存有效期。
+ *
+ * 与商店不同，游戏库此前**完全没有**缓存守卫：任何一次 `loadGames()` 都真发请求，
+ * 并在等待期间用全屏「正在加载游戏库」把已经拿到的列表整个盖掉。而列表绝大多数
+ * 时候没有变化（16 个游戏 → 一次 IPC + 约 32 次文件系统健康探测）。
+ *
+ * 这里给一个**短 TTL**而不是永久缓存：后端的游戏状态会在没有任何用户动作时变化
+ * ——云存档同步结束、启动会话结束、本体更新、自动清理——永久缓存会把这些变化挡在
+ * 外面。TTL 到点后的重新拉取会保留旧列表（见模板），所以用户不会再看到全屏加载。
+ *
+ * 会真正改动列表的动作（添加/安装/卸载/删除/改名/封面/存档目录）一律走 `force`，
+ * 不受 TTL 影响。
+ */
+const GAMES_CACHE_TTL_MS = 30_000;
 const libraryPage = ref(1);
 const elevationStatus = ref<ElevationStatus | null>(null);
 const elevationLoading = ref(false);
@@ -257,26 +276,58 @@ function loadGameCovers(list: Game[]) {
   coverUrls.value = nextUrls;
 }
 
-async function loadGames() {
+/**
+ * 正在拉列表且已有旧数据 —— 来自工具栏「刷新」或详情页动作。此时保留旧列表、只在
+ * 工具栏出行内提示；`loading` 为真但**没有**旧数据时才是首次加载，仍走全屏面板。
+ */
+const refreshing = computed(() => loading.value && gamesLoaded.value);
+/** 有旧数据可显示时的刷新失败：改为列表上方的提示条，不整页替换掉列表。 */
+const refreshingError = computed(() => Boolean(error.value) && gamesLoaded.value);
+
+/**
+ * 把最新列表同步给「当前选中的游戏」，并在它已被删除时退出详情页。
+ * 缓存命中也要走这一步 —— 否则详情页会拿着一个旧对象。
+ */
+function syncSelectedGame(loaded: Game[]) {
+  if (!selectedGame.value) return;
+  const refreshedGame = loaded.find((game) => game.gameUid === selectedGame.value?.gameUid);
+  selectedGame.value = refreshedGame || null;
+  if (!refreshedGame && activePage.value === "detail") {
+    activePage.value = "library";
+  }
+}
+
+/**
+ * 拉取游戏库。
+ *
+ * `force` 为真时忽略缓存 —— 所有会改动列表的用户动作都必须走这条；TTL 只用来挡住
+ * 纯粹的重复拉取（切页面、事件抖动）。
+ */
+async function loadGames(force = false) {
+  // 缓存命中：不发请求，也不碰 `loading`。`loading` 只在**从没有过数据**时才置真，
+  // 所以刷新期间旧列表继续显示，由工具栏的行内提示表达「正在刷新」。
+  if (!force && gamesLoaded.value && Date.now() - gamesLoadedAt < GAMES_CACHE_TTL_MS) {
+    syncSelectedGame(games.value);
+    return;
+  }
   const generation = ++gamesLoadGeneration;
-  loading.value = true;
+  loading.value = !gamesLoaded.value;
   error.value = "";
   try {
     const loaded = await listGames();
     if (generation !== gamesLoadGeneration) return;
     games.value = loaded;
+    gamesLoaded.value = true;
+    gamesLoadedAt = Date.now();
     libraryPage.value = Math.min(libraryPage.value, Math.max(1, Math.ceil(loaded.length / LIBRARY_PAGE_SIZE)));
-    if (selectedGame.value) {
-      const refreshedGame = loaded.find((game) => game.gameUid === selectedGame.value?.gameUid);
-      selectedGame.value = refreshedGame || null;
-      if (!refreshedGame && activePage.value === "detail") {
-        activePage.value = "library";
-      }
-    }
+    syncSelectedGame(loaded);
     void loadGameCovers(loaded);
   } catch (reason) {
     if (generation !== gamesLoadGeneration) return;
     error.value = String(reason);
+    // 失败也要记时间，否则紧接着的每次导航都会再打一次后端（失败时反而最费）。
+    // 已有数据时保留旧列表：一次刷新失败不该让整个库变成错误页。
+    gamesLoadedAt = Date.now();
   } finally {
     if (generation === gamesLoadGeneration) {
       loading.value = false;
@@ -538,7 +589,7 @@ async function watchCloudInstall(taskId: string, cloudGame: CloudGameSummary) {
   if (task.status === "success") {
     cloudInstallUid.value = "";
     cloudInstallNotice.value = "安装完成，游戏已加入游戏库。可以从游戏库手动启动。";
-    await loadGames();
+    await loadGames(true);
     await loadStore(true, storePage.value);
     return;
   }
@@ -555,9 +606,10 @@ async function finishAddGame(completedGame?: Game) {
   activePage.value = "library";
   activeView.value = "all";
   search.value = "";
-  await loadGames();
+  // 必须 force：添加流程刚改过列表，缓存守卫会把新游戏挡住。
+  await loadGames(true);
   if (completedGame && !games.value.some((game) => game.gameUid === completedGame.gameUid)) {
-    await loadGames();
+    await loadGames(true);
   }
 }
 </script>
@@ -615,7 +667,7 @@ async function finishAddGame(completedGame?: Game) {
       </header>
 
       <AddGameWizard v-if="activePage === 'add'" @back="activePage = 'library'" @completed="finishAddGame" />
-      <GameDetailPage v-else-if="activePage === 'detail' && selectedGame" :key="selectedGame.gameUid" :game="selectedGame" :cover-url="selectedGame ? coverUrls[selectedGame.gameUid] : ''" :initial-error="selectedGameError" :pending-cover-capture="pendingCoverCapture" @back="activePage = 'library'" @settings="activePage = 'settings'" @refresh="loadGames" @capture-handled="finishPendingCoverCapture" />
+      <GameDetailPage v-else-if="activePage === 'detail' && selectedGame" :key="selectedGame.gameUid" :game="selectedGame" :cover-url="selectedGame ? coverUrls[selectedGame.gameUid] : ''" :initial-error="selectedGameError" :pending-cover-capture="pendingCoverCapture" @back="activePage = 'library'" @settings="activePage = 'settings'" @refresh="loadGames(true)" @capture-handled="finishPendingCoverCapture" />
       <GameStorePage v-else-if="activePage === 'store'" :games="cloudGames" :search="search" :loading="storeLoading" :load-error="storeError" :install-uid="cloudInstallUid" :install-progress="cloudInstallProgress" :install-message="cloudInstallMessage" :install-error="cloudInstallError" :install-notice="cloudInstallNotice" :page="storePage" :page-size="STORE_PAGE_SIZE" :total-count="storeTotalCount" :total-pages="storeTotalPages" :has-more="storeHasMore" @install="installAndLaunch" @delete-version="deleteCloudVersion" @retry="refreshStore" @refresh="refreshStore" @page-change="changeStorePage" />
       <TransferCenter v-else-if="activePage === 'transfers'" :games="games" :cloud-games="cloudGames" />
       <PlatformSettings v-else-if="activePage === 'settings'" />
@@ -624,6 +676,7 @@ async function finishAddGame(completedGame?: Game) {
       <div class="library-toolbar" role="tablist" aria-label="游戏库视图">
         <button v-for="view in ([['all', '可启动'], ['attention', '需要处理']] as const)" :key="view[0]" class="view-tab" :class="{ active: activeView === view[0] }" type="button" @click="activeView = view[0]">{{ view[1] }}</button>
         <span v-if="filteredGames.length" class="library-count">{{ filteredGames.length }} 个游戏</span>
+        <span v-if="refreshing" class="library-refreshing" role="status"><span class="loader loader-inline"></span>正在刷新</span>
 
         <div class="library-sort">
           <label for="library-sort-select" class="sort-label">排序：</label>
@@ -636,13 +689,15 @@ async function finishAddGame(completedGame?: Game) {
           </select>
         </div>
 
-        <button class="refresh-button" type="button" @click="loadGames">刷新</button>
+        <button class="refresh-button" type="button" :disabled="loading" @click="loadGames(true)">{{ loading ? "刷新中" : "刷新" }}</button>
       </div>
 
-      <div v-if="loading" class="state-panel"><span class="loader"></span><strong>正在加载游戏库</strong></div>
-      <div v-else-if="error" class="state-panel error-state"><strong>游戏库加载失败</strong><p>{{ error }}</p><button type="button" @click="loadGames">重试</button></div>
-      <div v-else-if="!filteredGames.length" class="state-panel empty-state"><div class="empty-icon"><Gamepad2 :size="28" /></div><strong>{{ libraryEmptyTitle }}</strong><p>{{ libraryEmptyDescription }}</p><button v-if="!games.length || activeView === 'all'" class="primary-button" type="button" @click="openAddGame"><Plus :size="17" /> 添加游戏</button><button v-else-if="activeView === 'attention' && readyGameCount > 0" type="button" @click="activeView = 'all'">查看可启动游戏</button></div>
-      <div v-else class="game-grid">
+      <div v-if="loading && !gamesLoaded" class="state-panel"><span class="loader"></span><strong>正在加载游戏库</strong></div>
+      <div v-else-if="error && !gamesLoaded" class="state-panel error-state"><strong>游戏库加载失败</strong><p>{{ error }}</p><button type="button" @click="loadGames(true)">重试</button></div>
+      <div v-else>
+        <div v-if="refreshingError" class="library-refresh-error" role="alert"><AlertTriangle :size="16" /><span>{{ error }}</span><button type="button" @click="loadGames(true)">重试</button></div>
+        <div v-if="!filteredGames.length" class="state-panel empty-state"><div class="empty-icon"><Gamepad2 :size="28" /></div><strong>{{ libraryEmptyTitle }}</strong><p>{{ libraryEmptyDescription }}</p><button v-if="!games.length || activeView === 'all'" class="primary-button" type="button" @click="openAddGame"><Plus :size="17" /> 添加游戏</button><button v-else-if="activeView === 'attention' && readyGameCount > 0" type="button" @click="activeView = 'all'">查看可启动游戏</button></div>
+        <div v-else class="game-grid">
         <article v-for="game in pagedGames" :key="game.gameUid" class="game-card" tabindex="0" @click="openGame(game)" @keyup.enter="openGame(game)">
           <div class="game-card-cover">
             <img v-if="coverUrls[game.gameUid]" :src="coverUrls[game.gameUid]" :alt="`${game.displayName} 封面`" loading="lazy" @error="delete coverUrls[game.gameUid]" />
@@ -692,6 +747,7 @@ async function finishAddGame(completedGame?: Game) {
           第 {{ libraryPage }} / {{ libraryPageCount }} 页（共 {{ filteredGames.length }} 项）
         </span>
       </nav>
+      </div>
       </template>
     </section>
   </main>
