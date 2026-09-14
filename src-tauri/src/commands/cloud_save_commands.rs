@@ -145,11 +145,10 @@ pub fn start_upload_save_version_task(
         );
         // 释放必须早于 `finish_sync`：任务状态一旦推送成功，前端就可能立刻发起下一次
         // 同步，此刻若 key 还没释放，用户会莫名收到「已有同步任务正在进行」。
-        app_for_thread
-            .state::<AppState>()
-            .release_operation(&claim_key);
+        let state = app_for_thread.state::<AppState>();
+        state.release_operation(&claim_key);
         finish_sync(
-            &app_for_thread,
+            &state,
             &task_id_for_thread,
             result,
             &format!("【{}】游戏存档已成功同步至百度网盘", game.display_name),
@@ -232,11 +231,10 @@ pub fn start_restore_cloud_save_task(
             &remote_version,
         );
         // 同上传：先放掉 key 再推送任务状态，别让紧随其后的操作被自己的 key 挡住。
-        app_for_thread
-            .state::<AppState>()
-            .release_operation(&claim_key);
+        let state = app_for_thread.state::<AppState>();
+        state.release_operation(&claim_key);
         finish_sync(
-            &app_for_thread,
+            &state,
             &task_id_for_thread,
             result,
             &format!("【{}】云端存档已成功还原至本地", game.display_name),
@@ -368,22 +366,26 @@ fn begin_sync(state: &AppState, title: &str, game_uid: &str) -> Result<String, S
     Ok(task_id)
 }
 
+/// 把一次同步的结果写成任务的终态。
+///
+/// 吃 `&AppState` 而不是 `&AppHandle`：它本来只用 `app.state::<AppState>()` 取一下绑定，
+/// 把这一步移到调用方之后，这一层就能直接测 —— 终态、错误文案、重试载荷都是在这里拼的。
+/// 与 `8d09f9f` 的接缝同款做法：**外层解析依赖，内层只吃解出来的值**。
 fn finish_sync(
-    app: &AppHandle,
+    state: &AppState,
     task_id: &str,
     result: Result<(), String>,
     success_message: &str,
     failed_prefix: &str,
     retry: TaskRetry,
 ) {
-    let state = app.state::<AppState>();
     match result {
         Ok(_) => {
             // 必须用 finish 而不是 update：update 只改内存、不落盘，任务终态和 error
             // 永远写不进 tasks.json。重启后加载兜底会把它标成「异常中断」——一次成功的
             // 同步看起来像故障，一次真实的失败则连原因都丢了。
             TaskService::finish(
-                &state,
+                state,
                 task_id,
                 TaskStatus::Success,
                 100,
@@ -394,9 +396,9 @@ fn finish_sync(
         }
         Err(error) => {
             // 只在失败时补重试参数，让传输中心的「重试」按钮有东西可点。
-            let _ = TaskService::set_retry(&state, task_id, retry);
+            let _ = TaskService::set_retry(state, task_id, retry);
             TaskService::finish(
-                &state,
+                state,
                 task_id,
                 TaskStatus::Failed,
                 100,
@@ -414,4 +416,135 @@ fn load_baidu_client(app: &AppHandle) -> Result<BaiduNetdiskClient, String> {
         .app_data_dir()
         .map_err(|err| format!("解析应用数据目录失败：{err}"))?;
     BaiduNetdiskClient::load_from_app_data(&app_data_dir)
+}
+
+/// 编排层的测试。
+///
+/// 这一层此前**零测试**（本文件 414 行）。补的范围刻意收在「不需要 Tauri 与网络」的
+/// 那段：`begin_sync` / `finish_sync` 是任务状态机与重试载荷的拼装处，而它们只需要
+/// `&AppState` —— `TaskService` 全部方法都只吃 `&AppState`，事件推送走的是
+/// `AppState` 里注入的函数指针，所以整条链在测试里跑得起来，不必碰 `AppHandle`
+/// （一碰就会把窗口运行时链进测试二进制并直接启动失败，见 `app_state.rs` 开头）。
+///
+/// **不测**的是 `upload_save_worker` / `restore_save_worker`：它们要把 `AppHandle`
+/// 一路传进 `CloudSaveService::{upload_save_version, download_and_restore_cloud_save}`，
+/// 而那两支又继续传给 `package_save_version`、`protect_current_save_version`、
+/// `SaveRepository::restore`、`GameRepository::persist`。要测就得在最破坏性的那几条
+/// 路径上做四、五层接缝重构 + 注入假 client，而收益与 `cloud_save_service` 已有的
+/// 16 条测试高度重叠（workers 本身只是「更新任务 → 取 client → 调服务」的胶水）。
+/// 这是**有意不做**，不是遗漏。
+#[cfg(test)]
+mod tests {
+    use super::{begin_sync, finish_sync};
+    use crate::{
+        app_state::AppState,
+        domain::{AppStore, TaskCategory, TaskRetry, TaskStatus},
+        repositories::TaskRepository,
+        services::TaskService,
+        test_support::TempWorkspace,
+    };
+
+    fn test_state(dir: &TempWorkspace) -> AppState {
+        AppState::new(
+            AppStore::default(),
+            dir.to_path_buf(),
+            std::collections::HashMap::new(),
+            dir.join("tasks.json"),
+        )
+    }
+
+    fn retry() -> TaskRetry {
+        TaskRetry {
+            operation: "sync_cloud_save".to_string(),
+            game_uid: "game-1".to_string(),
+            game_key: None,
+            version_id: Some("version-1".to_string()),
+            remote_path: None,
+            remote_fs_id: None,
+        }
+    }
+
+    /// `begin_sync` 建出的任务必须带「云端存档同步」分类。
+    ///
+    /// 分类不是装饰：它决定任务是否进传输中心、能否取消、是否计入角标（见
+    /// `TaskCategory` 的注释 —— 这里写错，用户就看不到进度也没法取消）。
+    #[test]
+    fn begin_sync_creates_a_running_cloud_save_task() {
+        let dir = TempWorkspace::new("cloud-save-commands");
+        let state = test_state(&dir);
+
+        let task_id =
+            begin_sync(&state, "上传【样例】游戏存档至百度网盘", "game-1").expect("创建同步任务");
+        let task = TaskService::get(&state, &task_id).expect("任务应当存在");
+
+        assert_eq!(task.task_type, "sync_cloud_save");
+        assert_eq!(task.category, Some(TaskCategory::CloudSaveSync));
+        assert_eq!(task.game_uid.as_deref(), Some("game-1"));
+        assert_eq!(task.status, TaskStatus::Running);
+        assert_eq!(task.progress, 0);
+        assert_eq!(task.message, "任务已创建");
+    }
+
+    /// 成功路径：终态 Success、进度 100、**不**挂重试载荷。
+    ///
+    /// 落盘那一条断言守的是**这一层的选择**：`TaskService` 自己已有测试证明 `finish`
+    /// 会落盘，但那只证明得了 helper —— 若有人把 `finish_sync` 改回 `update`，
+    /// helper 的测试照样全绿。这里断的是「本函数用的是 `finish`」。
+    #[test]
+    fn finish_sync_records_success_and_persists_it() {
+        let dir = TempWorkspace::new("cloud-save-commands");
+        let state = test_state(&dir);
+        let task_id =
+            begin_sync(&state, "上传【样例】游戏存档至百度网盘", "game-1").expect("创建同步任务");
+
+        finish_sync(
+            &state,
+            &task_id,
+            Ok(()),
+            "【样例】游戏存档已成功同步至百度网盘",
+            "【样例】游戏存档云端同步失败",
+            retry(),
+        );
+
+        let task = TaskService::get(&state, &task_id).expect("任务应当存在");
+        assert_eq!(task.status, TaskStatus::Success);
+        assert_eq!(task.progress, 100);
+        assert_eq!(task.message, "【样例】游戏存档已成功同步至百度网盘");
+        assert!(task.error.is_none(), "成功路径不该记录 error");
+        assert!(task.retry.is_none(), "成功路径不该挂重试载荷");
+
+        let reloaded = TaskRepository::load(&state.tasks_path).expect("重新读取任务记录");
+        let persisted = reloaded
+            .get(&task_id)
+            .expect("终态必须落盘，否则重启后会被兜底标成「异常中断」");
+        assert_eq!(persisted.status, TaskStatus::Success);
+    }
+
+    /// 失败路径：终态 Failed、文案拼成「前缀：原因」、error 记下原因，且**必须**挂上
+    /// 重试载荷 —— 传输中心那个「重试」按钮就靠它才有东西可点。
+    #[test]
+    fn finish_sync_records_failure_with_prefix_and_retry() {
+        let dir = TempWorkspace::new("cloud-save-commands");
+        let state = test_state(&dir);
+        let task_id =
+            begin_sync(&state, "上传【样例】游戏存档至百度网盘", "game-1").expect("创建同步任务");
+
+        finish_sync(
+            &state,
+            &task_id,
+            Err("token 已失效".to_string()),
+            "【样例】游戏存档已成功同步至百度网盘",
+            "【样例】游戏存档云端同步失败",
+            retry(),
+        );
+
+        let task = TaskService::get(&state, &task_id).expect("任务应当存在");
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.message, "【样例】游戏存档云端同步失败：token 已失效");
+        assert_eq!(task.error.as_deref(), Some("token 已失效"));
+        let retry = task.retry.expect("失败必须挂重试载荷");
+        assert_eq!(retry.operation, "sync_cloud_save");
+        assert_eq!(retry.game_uid, "game-1");
+        assert_eq!(retry.version_id.as_deref(), Some("version-1"));
+    }
 }
