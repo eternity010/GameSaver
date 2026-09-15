@@ -2350,6 +2350,57 @@ mod tests {
         ));
     }
 
+    /// 2026-09-15 真实误报的回归护栏：一次建档里 ETW 追加了两个错误范围
+    /// （LocalLow 的资源索引库、Steam 模拟器的状态文件），用户只保留了第三个。
+    ///
+    /// 路径原样取自那次会话，审计依据 `docs/save-recognition-audit-2026-09-15.md`。
+    #[test]
+    fn real_world_index_and_emulator_state_files_are_not_save_candidates() {
+        // 成因 A：`%LOCALAPPDATA%`→`LocalLow` 下游戏自己的数据目录。这里是资源归档索引
+        // （archiveList.sqlite）与安装级配置库（<uuid>.sqlite），名字与路径都没有任何线索，
+        // 改动前仅凭 `.sqlite` / `.db` / `.vdf` 扩展名进候选。
+        let local_low = r"C:\Users\Player\AppData\LocalLow\5 shrimps\Ancient Cultivatrix";
+        for name in [
+            "archiveList.sqlite",
+            "b0476da758b34407915359dc20f8050a.sqlite",
+            "settings.db",
+            "telemetry.vdf",
+        ] {
+            let path = format!(r"{local_low}\{name}");
+            assert!(!is_etw_candidate(&path), "不应是候选：{path}");
+            assert!(!is_save_candidate(&path), "不应是候选：{path}");
+        }
+
+        // 对照组：库 / 配置扩展名**另有依据**时仍然成立，不能误伤真存档。
+        assert!(is_etw_candidate(&format!(r"{local_low}\save.db")));
+        assert!(is_etw_candidate(&format!(r"{local_low}\profile.sqlite")));
+        assert!(is_etw_candidate(&format!(
+            r"{local_low}\SaveData\blob.sqlite"
+        )));
+
+        // 成因 B：Steam 模拟器 appid 目录里的模拟器状态文件（RUNE 的成就 / 排行榜各 32 字节）。
+        let rune = r"C:\Users\Public\Documents\Steam\RUNE\1903340";
+        for name in [
+            "achievements.ini",
+            "leaderboards.ini",
+            "steam_emu.ini",
+            "steam_appid.txt",
+        ] {
+            let path = format!(r"{rune}\{name}");
+            assert!(!is_etw_candidate(&path), "不应是候选：{path}");
+            assert!(!is_save_candidate(&path), "不应是候选：{path}");
+        }
+
+        // 对照组：模拟器里真正的存档（Goldberg / RUNE 的 remote）必须仍然算候选。
+        assert!(is_etw_candidate(&format!(r"{rune}\remote\slot1.sav")));
+        assert!(is_save_candidate(&format!(r"{rune}\remote\slot1.sav")));
+
+        // 那次会话里唯一正确的范围：347 字节的 JSON 靠 `save` 容器成立（扩展名不在白名单里）。
+        assert!(is_etw_candidate(
+            r"E:\GameSaverGames\games\564f9729-8f6f-4f01-9bd9-c6b6f461b597\Ancient Cultivatrix_Data\save\_settingData.json"
+        ));
+    }
+
     #[test]
     fn recognizes_common_save_container_names() {
         assert!(is_save_container_directory(Path::new(

@@ -13,9 +13,22 @@ use std::path::Path;
 use super::path_utils::normalize_path;
 
 /// 直接认作存档的扩展名。
-pub(crate) const SAVE_EXTENSIONS: [&str; 10] = [
-    "sav", "save", "db", "sqlite", "es3", "sl2", "ess", "savegame", "state", "vdf",
-];
+///
+/// 这张表只放**专属存档**格式：命中即成立，不需要其它线索。
+///
+/// `db` / `sqlite` / `vdf` 原先也在这张表里，2026-09-15 的识别误报复盘把它们摘了出去
+/// （见 `docs/save-recognition-audit-2026-09-15.md` 的成因 A）：它们是缓存、索引、遥测、
+/// 设置最常用的格式（`vdf` 更是 Steam 自己的配置格式），只看扩展名就会把
+/// `archiveList.sqlite`、`<uuid>.sqlite` 这类**资源索引 / 安装配置库**当成存档收进保护范围
+/// —— 实测那两处误报正是"文件名无线索、路径无线索、父目录不是容器"，
+/// 唯一成立的就是扩展名。
+///
+/// 它们现在仍可能被接受，但必须另有依据——文件名命中 [`NAME_HINTS`]（如 `save.db`）、
+/// 或落在命名容器 / 存档语义路径段下（如 `<范围>\SaveData\x.sqlite`）：
+/// 这层语义已由 [`is_save_candidate`] 收尾处的
+/// `has_save_container || has_save_path_hint || has_file_hint` 提供，不需要额外判定。
+pub(crate) const SAVE_EXTENSIONS: [&str; 7] =
+    ["sav", "save", "es3", "sl2", "ess", "savegame", "state"];
 /// 资源类扩展名：出现即排除，它们几乎不可能是存档。
 pub(crate) const RESOURCE_EXTENSIONS: [&str; 12] = [
     "dll", "exe", "pak", "pdb", "png", "jpg", "jpeg", "webp", "ogg", "wav", "mp3", "ttf",
@@ -115,6 +128,16 @@ pub(crate) fn should_ignore_event_path(path: &Path) -> bool {
         "/code cache/",
         "/player.log",
         "/player-prev.log",
+        // Steam 模拟器（RUNE / CODEX / OnlineFix / Goldberg 等）自身的状态文件：它们由注入
+        // 游戏进程的 DLL 写入，ETW 看到的就是"游戏进程写了它"，但属于模拟器配置而非存档。
+        // 实测误报：`…\Steam\RUNE\1903340\achievements.ini` 与 `leaderboards.ini` 各 32 字节，
+        // 却因为 appid 目录被判为命名容器而成了候选。
+        // 审计依据：docs/save-recognition-audit-2026-09-15.md 的成因 B。
+        "\\achievements.ini",
+        "\\leaderboards.ini",
+        "\\steam_emu.ini",
+        "\\steam_appid.txt",
+        "\\steam_settings\\",
     ]
     .iter()
     .any(|fragment| text.contains(fragment))
