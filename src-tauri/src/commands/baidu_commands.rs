@@ -2,16 +2,14 @@ use crate::{
     app_state::AppState,
     commands::{game_commands::safe_cover_path, run_blocking},
     domain::{
-        compare_optional_created_at,
-        game::{CloudStatus, LaunchConfig},
-        is_safe_path_segment, Game, GameBodyVersion, GameHealth, GameLifecycle, TaskCategory,
-        TaskRetry, TaskStatus,
+        compare_optional_created_at, is_safe_path_segment, Game, GameBodyVersion, GameLifecycle,
+        TaskCategory, TaskRetry, TaskStatus,
     },
     repositories::{BaiduConfigRepository, GameRepository},
     services::{
         BaiduConnectionStatus, BaiduNetdiskClient, BaiduQuota, BodyPackageService, CachedEntry,
         CloudGameCatalog, CloudGamePage, CloudGameSummary, CloudManifestService,
-        GameLibraryService, RemoteBodyPackageList, RemoteFile, TaskService,
+        GameBodyInstallService, GameLibraryService, RemoteBodyPackageList, RemoteFile, TaskService,
     },
 };
 use std::path::{Path, PathBuf};
@@ -19,6 +17,7 @@ use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
 const REMOTE_ROOT: &str = "/apps/GameSaver/games";
+const BODY_MANIFEST_PENDING_PREFIX: &str = "本体包已上传，但云端版本清单更新失败：";
 
 /// 查询百度网盘连接状态。
 ///
@@ -431,28 +430,49 @@ pub fn install_cloud_game(
     game_key: Option<String>,
     remote_path: String,
     remote_fs_id: Option<u64>,
+    replace_existing: Option<bool>,
 ) -> Result<String, String> {
     let game_uid = game_uid.trim().to_string();
     let game_key = game_key
         .filter(|value| !value.trim().is_empty())
-        .map(|value| Game::derive_game_key(&value));
+        .map(|value| value.trim().to_string());
     let remote_path = remote_path.trim().to_string();
     let remote_game_key = game_key
         .as_deref()
         .ok_or_else(|| "云端游戏缺少 gameKey，无法定位本体包".to_string())?;
     let directory = remote_body_dir(remote_game_key)?;
     validate_remote_package_path(&directory, &remote_path)?;
-    reserve_transfer(&state, &game_uid)?;
+    let games_root = state.games_root()?;
+    let target = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "读取本地游戏信息失败".to_string())?;
+        GameBodyInstallService::resolve_target(
+            &store,
+            &games_root,
+            &game_uid,
+            remote_game_key,
+            replace_existing.unwrap_or(false),
+        )?
+    };
+    let install_key = format!("install:{}", target.game_key);
+    state.claim_operation(&install_key, "该云端游戏已有安装任务正在进行")?;
+    if let Err(error) = reserve_transfer(&state, &target.game_uid) {
+        state.release_operation(&install_key);
+        return Err(error);
+    }
     let task_id = match TaskService::create(
         &state,
         "install_cloud_game",
         TaskCategory::BodyTransfer,
-        Some(game_uid.clone()),
+        Some(target.game_uid.clone()),
         "准备安装云端游戏",
     ) {
         Ok(task_id) => task_id,
         Err(error) => {
-            release_transfer(&state, &game_uid);
+            release_transfer(&state, &target.game_uid);
+            state.release_operation(&install_key);
             return Err(error);
         }
     };
@@ -468,7 +488,17 @@ pub fn install_cloud_game(
             remote_fs_id,
         },
     ) {
-        release_transfer(&state, &game_uid);
+        release_transfer(&state, &target.game_uid);
+        state.release_operation(&install_key);
+        TaskService::finish(
+            &state,
+            &task_id,
+            TaskStatus::Failed,
+            0,
+            "创建云端安装任务失败",
+            None,
+            Some(error.clone()),
+        );
         return Err(error);
     }
     let app_handle = app.clone();
@@ -478,21 +508,46 @@ pub fn install_cloud_game(
             &app_handle,
             &task_id_for_thread,
             &game_uid,
-            game_key.as_deref(),
+            &target,
             &remote_path,
             remote_fs_id,
         );
-        release_transfer(&app_handle.state(), &game_uid);
+        let recovery_pending = app_handle
+            .state::<AppState>()
+            .games_root()
+            .map(|root| {
+                root.join(format!(".{}.cloud-install.json", target.game_uid))
+                    .exists()
+            })
+            .unwrap_or(true);
+        if recovery_pending {
+            crate::logging::warn(format!(
+                "游戏 {} 的安装事务尚未清理，已保留操作锁，请重启应用恢复",
+                target.game_uid
+            ));
+        } else {
+            release_transfer(&app_handle.state(), &target.game_uid);
+        }
+        app_handle
+            .state::<AppState>()
+            .release_operation(&install_key);
         match result {
-            Ok(summary) => TaskService::finish(
-                &app_handle.state(),
-                &task_id_for_thread,
-                TaskStatus::Success,
-                100,
-                "游戏本体已安装",
-                Some(summary),
-                None,
-            ),
+            Ok(summary) => {
+                let message = if recovery_pending {
+                    "游戏已安装，清理尚未完成，请重启应用恢复后继续操作"
+                } else {
+                    "游戏本体已安装"
+                };
+                TaskService::finish(
+                    &app_handle.state(),
+                    &task_id_for_thread,
+                    TaskStatus::Success,
+                    100,
+                    message,
+                    Some(summary),
+                    None,
+                )
+            }
             Err(error) if error == "任务已取消" => TaskService::finish(
                 &app_handle.state(),
                 &task_id_for_thread,
@@ -849,19 +904,42 @@ pub fn upload_game_body_package(
                 )
             }
             Err(error) => {
+                let manifest_pending = error.starts_with(BODY_MANIFEST_PENDING_PREFIX);
                 let _ = update_upload_record(
                     &app_handle,
                     &game_uid,
                     &version.version_id,
-                    "failed",
+                    if manifest_pending {
+                        "manifest_pending"
+                    } else {
+                        "failed"
+                    },
                     None,
                 );
+                if manifest_pending {
+                    let _ = TaskService::set_retry(
+                        &app_handle.state(),
+                        &task_id_for_thread,
+                        TaskRetry {
+                            operation: "repair_cloud_body_manifest".to_string(),
+                            game_uid: game_uid.clone(),
+                            game_key: None,
+                            version_id: None,
+                            remote_path: None,
+                            remote_fs_id: None,
+                        },
+                    );
+                }
                 TaskService::finish(
                     &app_handle.state(),
                     &task_id_for_thread,
                     TaskStatus::Failed,
                     100,
-                    "游戏本体包上传失败",
+                    if manifest_pending {
+                        "本体包已上传，云端版本清单待修复"
+                    } else {
+                        "游戏本体包上传失败"
+                    },
                     None,
                     Some(error),
                 )
@@ -991,11 +1069,10 @@ fn upload_body_task(
             quota.free / 1024 / 1024
         ));
     }
-    BodyPackageService::validate_package_for_upload(
+    BodyPackageService::validate_package_structure_for_upload(
         package_path,
-        &game.game_uid,
+        version,
         &game.launch.executable_relative_path,
-        version.sha256.as_deref(),
     )?;
     let client = load_baidu_client(app)?;
     let directory = remote_body_dir(&game.game_key)?;
@@ -1004,22 +1081,27 @@ fn upload_body_task(
         &state,
         task_id,
         TaskStatus::Running,
-        5,
-        "正在连接百度网盘",
+        2,
+        "正在校验本体包并准备上传",
         None,
     );
     let remote_path = format!("{directory}/{}.zip", version.version_id);
-    let remote = client.upload_file(package_path, &remote_path, |progress, message| {
-        TaskService::update(
-            &state,
-            task_id,
-            TaskStatus::Running,
-            progress,
-            message,
-            None,
-        );
-        !TaskService::is_cancelled(&state, task_id)
-    })?;
+    let remote = client.upload_file(
+        package_path,
+        &remote_path,
+        version.sha256.as_deref(),
+        |progress, message| {
+            TaskService::update(
+                &state,
+                task_id,
+                TaskStatus::Running,
+                progress.min(90),
+                message,
+                None,
+            );
+            !TaskService::is_cancelled(&state, task_id)
+        },
+    )?;
     update_upload_record(
         app,
         &game.game_uid,
@@ -1027,7 +1109,25 @@ fn upload_body_task(
         "synced",
         Some(&remote),
     )?;
-    sync_cloud_manifest(app, &state, &client, &game.game_uid)?;
+    TaskService::update(
+        &state,
+        task_id,
+        TaskStatus::Running,
+        92,
+        "本体包已上传，正在更新云端版本清单",
+        None,
+    );
+    if let Err(error) = sync_cloud_manifest(app, &state, &client, &game.game_uid) {
+        return Err(format!("{BODY_MANIFEST_PENDING_PREFIX}{error}"));
+    }
+    TaskService::update(
+        &state,
+        task_id,
+        TaskStatus::Running,
+        98,
+        "云端版本清单已更新",
+        None,
+    );
     Ok(serde_json::json!({
         "versionId": version.version_id,
         "remotePath": remote.path,
@@ -1448,7 +1548,7 @@ fn install_cloud_game_task(
     app: &AppHandle,
     task_id: &str,
     game_uid: &str,
-    game_key: Option<&str>,
+    target: &crate::services::game_body_install_service::CloudInstallTarget,
     remote_path: &str,
     remote_fs_id: Option<u64>,
 ) -> Result<serde_json::Value, String> {
@@ -1463,8 +1563,7 @@ fn install_cloud_game_task(
         "正在读取云端游戏信息",
         None,
     );
-    let remote_game_key =
-        game_key.ok_or_else(|| "云端游戏缺少 gameKey，无法定位本体包".to_string())?;
+    let remote_game_key = target.game_key.as_str();
     let directory = remote_body_dir(remote_game_key)?;
     let remote_files = client.list(&directory)?;
     let remote = remote_files
@@ -1486,6 +1585,9 @@ fn install_cloud_game_task(
         Some(&cache_root),
     )?
     .ok_or_else(|| "云端游戏缺少启动信息，请在本地重新上传一次游戏本体包".to_string())?;
+    if catalog.game_uid != game_uid || catalog.game_key != remote_game_key {
+        return Err("云端游戏信息已变化，请刷新商店后重试".to_string());
+    }
     let manifest = CloudManifestService::read(
         &client,
         &remote_files,
@@ -1493,62 +1595,33 @@ fn install_cloud_game_task(
         &temporary_root,
         Some(&cache_root),
     )
-    .ok()
-    .flatten();
-    let existing = state
-        .store
-        .lock()
-        .map_err(|_| "读取本地游戏信息失败".to_string())?
-        .games
-        .iter()
-        .find(|game| game_key.is_some_and(|key| game.game_key == key) || game.game_uid == game_uid)
-        .cloned();
-    let local_uid = existing
-        .as_ref()
-        .map(|game| game.game_uid.clone())
-        .unwrap_or_else(|| game_uid.to_string());
-    let local_versions = state
-        .store
-        .lock()
-        .map_err(|_| "读取本地本体版本信息失败".to_string())?
-        .body_versions
-        .iter()
-        .filter(|version| version.game_uid == local_uid)
-        .cloned()
-        .collect::<Vec<_>>();
-    let package = CloudManifestService::project(&remote_files, manifest.as_ref(), &local_versions)
-        .packages
-        .into_iter()
-        .find(|package| package.path == remote.path && package.fs_id == remote.fs_id);
+    .map_err(|error| format!("云端版本清单读取失败，已停止安装：{error}"))?
+    .ok_or_else(|| "云端版本清单不存在，请先修复清单或重新上传本体包".to_string())?;
+    let package = GameBodyInstallService::package_entry(&manifest, &remote, remote_game_key)?;
     let expected_sha256 = package
-        .as_ref()
-        .and_then(|package| package.package_sha256.as_deref());
+        .package_sha256
+        .as_deref()
+        .ok_or_else(|| "云端本体包缺少 SHA-256".to_string())?;
+    let local_uid = target.game_uid.clone();
     let games_root = state.games_root()?;
-    let managed_path = existing
-        .as_ref()
-        .map(|game| PathBuf::from(&game.managed_path))
-        .unwrap_or_else(|| games_root.join(&local_uid));
-    if existing.as_ref().is_some_and(|game| {
-        Path::new(&game.managed_path)
-            .join(&game.launch.executable_relative_path)
-            .is_file()
-    }) {
-        return Err("这个游戏已经安装，无需重复下载".to_string());
-    }
-    let version_id = package
-        .as_ref()
-        .map(|package| package.version_id.clone())
-        .unwrap_or_else(|| remote_file_name_without_extension(remote_path));
+    let managed_path = target.managed_path.clone();
+    let version_id = package.version_id.clone();
     let cache_root = state.body_packages_root()?;
-    // `version_id` 到这里可能来自**网盘下载的清单**（见 `CloudManifestService::project`），
-    // 而下面这个路径紧接着会被 `remove_file` 与下载写入。`package_path` 现在自己校验两个
-    // 路径段，所以这里必须处理它的 `Err` —— 收窄前这一步是不校验的，`version_id` 里一个
-    // `..` 就能把写入/删除带到缓存根之外（这正是 `download_body_task` 早就查过、而这里漏查
-    // 的那一条）。
-    let package_path = BodyPackageService::package_path(&cache_root, &local_uid, &version_id)?;
-    if package_path.is_file() {
-        let _ = std::fs::remove_file(&package_path);
+    crate::services::disk_space::ensure_available_space(
+        &cache_root,
+        remote.size.saturating_add(package.total_bytes),
+    )?;
+    if TaskService::is_cancelled(&state, task_id) {
+        return Err("任务已取消".to_string());
     }
+    let transaction_id = Uuid::new_v4().to_string();
+    let package_path =
+        GameBodyInstallService::install_package_path(&cache_root, &local_uid, &transaction_id)?;
+    let journal_path = games_root.join(format!(".{local_uid}.cloud-install.json"));
+    let mut package_guard = CloudInstallPackageGuard {
+        path: Some(package_path.clone()),
+        journal_path: journal_path.clone(),
+    };
     TaskService::update(
         &state,
         task_id,
@@ -1562,7 +1635,7 @@ fn install_cloud_game_task(
             &state,
             task_id,
             TaskStatus::Running,
-            5 + progress.saturating_mul(3) / 4,
+            5 + ((u16::from(progress) * 74) / 100) as u8,
             message,
             None,
         );
@@ -1597,19 +1670,19 @@ fn install_cloud_game_task(
     let mut staging_guard = CloudInstallStagingGuard {
         path: Some(staging.clone()),
     };
-    let body_manifest = BodyPackageService::extract_package_with_known_hash(
+    let body_manifest = BodyPackageService::extract_cloud_package(
         &package_path,
         &staging,
-        &local_uid,
+        &version_id,
         &catalog.executable_relative_path,
         expected_sha256,
-        Some(&downloaded_sha256),
+        &downloaded_sha256,
         |progress, message| {
             TaskService::update(
                 &state,
                 task_id,
                 TaskStatus::Running,
-                82 + progress / 6,
+                82 + ((u16::from(progress) * 13) / 100) as u8,
                 message,
                 None,
             )
@@ -1620,38 +1693,34 @@ fn install_cloud_game_task(
         let _ = std::fs::remove_dir_all(&staging);
         return Err("任务已取消".to_string());
     }
-    std::fs::create_dir_all(&games_root).map_err(|error| format!("创建游戏库目录失败：{error}"))?;
-    if managed_path.exists() {
-        return Err("游戏受管目录已存在，未覆盖现有文件".to_string());
+    if body_manifest.file_count != package.file_count
+        || body_manifest.total_bytes != package.total_bytes
+    {
+        return Err("本体包内容与云端版本清单不一致".to_string());
     }
-    std::fs::rename(&staging, &managed_path)
-        .map_err(|error| format!("提交云端游戏安装失败：{error}"))?;
-    // 已提交成受管目录：解除守卫，别把刚装好的游戏删掉。
-    staging_guard.path = None;
+    let profiles = state
+        .store
+        .lock()
+        .map_err(|_| "读取存档保护范围失败".to_string())?
+        .save_profiles
+        .iter()
+        .filter(|profile| profile.game_uid == local_uid)
+        .cloned()
+        .collect::<Vec<_>>();
+    TaskService::update(
+        &state,
+        task_id,
+        TaskStatus::Running,
+        96,
+        "正在保留当前本地存档",
+        None,
+    );
+    GameBodyInstallService::preserve_managed_saves(target, &profiles, &staging, || {
+        TaskService::is_cancelled(&state, task_id)
+    })?;
     // 游戏对象与封面在此组装：封面要走一次网络下载，放到 store 锁外完成，
     // 避免安装期间长时间占住锁、阻塞其他读写者。
-    let mut game = existing.unwrap_or_else(|| {
-        let mut game = Game::new_pending(
-            &catalog.display_name,
-            managed_path.to_string_lossy(),
-            &catalog.executable_relative_path,
-        );
-        game.game_uid = local_uid.to_string();
-        game
-    });
-    // 见 `cloud_install_game_key`：新游戏的键来自 `new_pending(catalog.display_name)`，
-    // 而 display_name 只被要求非空、可以含 `/`，所以这里必须收口成已校验的目录段。
-    game.game_key = cloud_install_game_key(&game.game_key, remote_game_key);
-    game.display_name = catalog.display_name;
-    game.managed_path = managed_path.to_string_lossy().to_string();
-    game.lifecycle = GameLifecycle::Active;
-    game.health = GameHealth::NeedsAttention;
-    game.cloud_status = CloudStatus::Synced;
-    game.launch = LaunchConfig {
-        executable_relative_path: catalog.executable_relative_path,
-        arguments: catalog.arguments,
-        working_directory_relative_path: catalog.working_directory_relative_path,
-    };
+    let mut game = GameBodyInstallService::installed_game(target, &catalog);
     if game.cover.is_none() {
         let manifest_cache_root = app_data_dir.join("cloud-manifest-cache");
         if let Ok(Some(cover_bytes)) = CloudManifestService::read_cover(
@@ -1689,10 +1758,7 @@ fn install_cloud_game_task(
     let body_version = GameBodyVersion {
         version_id: version_id.clone(),
         game_uid: local_uid.to_string(),
-        created_at: package
-            .as_ref()
-            .and_then(|package| package.created_at.clone())
-            .unwrap_or_else(now_iso),
+        created_at: package.created_at.clone(),
         archive_path: String::new(),
         file_count: body_manifest.file_count,
         total_bytes: body_manifest.total_bytes,
@@ -1704,32 +1770,111 @@ fn install_cloud_game_task(
         remote_fs_id: Some(remote.fs_id),
         remote_size: Some(remote.size),
     };
-    state.with_store_mut(|candidate| {
-        if let Some(existing_game) = candidate
-            .games
-            .iter_mut()
-            .find(|item| item.game_uid == local_uid)
+    if TaskService::is_cancelled(&state, task_id) {
+        return Err("任务已取消".to_string());
+    }
+    let mut previous_package = None;
+    TaskService::update(
+        &state,
+        task_id,
+        TaskStatus::Running,
+        99,
+        "正在提交游戏安装",
+        None,
+    );
+    let cleanup_pending = GameBodyInstallService::commit_install(
+        &games_root,
+        &cache_root,
+        target,
+        &transaction_id,
+        &version_id,
+        || {
+            state.with_store_mut(|candidate| {
+                if candidate
+                    .games
+                    .iter()
+                    .any(|item| item.game_key == target.game_key && item.game_uid != local_uid)
+                {
+                    return Err("本地游戏关联已变化，已停止安装".to_string());
+                }
+                if let Some(existing_game) = candidate
+                    .games
+                    .iter_mut()
+                    .find(|item| item.game_uid == local_uid)
+                {
+                    if target.existing.is_none()
+                        || existing_game.game_key != target.game_key
+                        || crate::domain::path_utils::normalize_path(Path::new(
+                            &existing_game.managed_path,
+                        )) != crate::domain::path_utils::normalize_path(&managed_path)
+                    {
+                        return Err("本地游戏记录已变化，已停止安装".to_string());
+                    }
+                    existing_game.lifecycle = game.lifecycle.clone();
+                    existing_game.health = game.health.clone();
+                    existing_game.cloud_status = game.cloud_status.clone();
+                    existing_game.launch = game.launch.clone();
+                    if existing_game.cover.is_none() {
+                        existing_game.cover = game.cover.clone();
+                    }
+                } else {
+                    if target.existing.is_some() {
+                        return Err("本地游戏已被移除，已停止安装".to_string());
+                    }
+                    GameLibraryService::register_pending(candidate, game.clone())?;
+                }
+                previous_package = candidate
+                    .body_versions
+                    .iter()
+                    .find(|version| {
+                        version.game_uid == local_uid && version.version_id == version_id
+                    })
+                    .and_then(|version| version.package_path.clone());
+                candidate.body_versions.retain(|version| {
+                    !(version.game_uid == local_uid && version.version_id == version_id)
+                });
+                candidate.body_versions.push(body_version);
+                GameRepository::persist(app, candidate)
+                    .map_err(|error| format!("保存已安装游戏记录失败：{error}"))
+            })
+        },
+    )?;
+    staging_guard.path = None;
+    package_guard.path = None;
+    if let Some(previous) = previous_package {
+        let previous = PathBuf::from(previous);
+        let current = crate::domain::path_utils::normalize_path(&previous);
+        let referenced = state
+            .store
+            .lock()
+            .map(|store| {
+                store.body_versions.iter().any(|version| {
+                    version.package_path.as_ref().is_some_and(|path| {
+                        crate::domain::path_utils::normalize_path(Path::new(path)) == current
+                    })
+                })
+            })
+            .unwrap_or(true);
+        if !referenced
+            && previous.parent().is_some_and(|parent| {
+                crate::domain::path_utils::normalize_path(parent)
+                    == crate::domain::path_utils::normalize_path(&cache_root.join(&local_uid))
+            })
         {
-            *existing_game = game.clone();
-        } else {
-            GameLibraryService::register_pending(candidate, game.clone())?;
+            if let Err(error) = std::fs::remove_file(&previous) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    crate::logging::warn(format!("安装完成，旧 ZIP 缓存待清理：{error}"));
+                }
+            }
         }
-        candidate
-            .body_versions
-            .retain(|version| !(version.game_uid == local_uid && version.version_id == version_id));
-        candidate.body_versions.push(body_version);
-        if let Err(error) = GameRepository::persist(app, candidate) {
-            let _ = std::fs::remove_dir_all(&managed_path);
-            return Err(format!("保存已安装游戏记录失败：{error}"));
-        }
-        Ok(())
-    })?;
+    }
     Ok(serde_json::json!({
         "gameUid": local_uid,
         "versionId": version_id,
         "managedPath": managed_path,
         "fileCount": body_manifest.file_count,
         "totalBytes": body_manifest.total_bytes,
+        "cleanupPending": cleanup_pending,
     }))
 }
 
@@ -1744,7 +1889,34 @@ struct CloudInstallStagingGuard {
 impl Drop for CloudInstallStagingGuard {
     fn drop(&mut self) {
         if let Some(path) = &self.path {
+            let journal = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix('.'))
+                .and_then(|name| name.strip_suffix(".cloud-installing"))
+                .and_then(|uid| {
+                    path.parent()
+                        .map(|root| root.join(format!(".{uid}.cloud-install.json")))
+                });
+            if journal.is_some_and(|journal| journal.exists()) {
+                return;
+            }
             let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+struct CloudInstallPackageGuard {
+    path: Option<PathBuf>,
+    journal_path: PathBuf,
+}
+
+impl Drop for CloudInstallPackageGuard {
+    fn drop(&mut self) {
+        if !self.journal_path.exists() {
+            if let Some(path) = &self.path {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 }
@@ -1858,29 +2030,25 @@ fn ensure_game(state: &AppState, game_uid: &str) -> Result<(), String> {
 }
 
 fn reserve_transfer(state: &AppState, game_uid: &str) -> Result<(), String> {
-    let mut operations = state
-        .save_operations
-        .lock()
-        .map_err(|_| "lock save operation state failed".to_string())?;
-    if operations.contains(game_uid) {
-        return Err("该游戏已有本体或存档操作正在进行".to_string());
-    }
-    if state
+    state.claim_operation(game_uid, "该游戏已有本体或存档操作正在进行")?;
+    let running = state
         .running_games
         .lock()
-        .map_err(|_| "lock running game state failed".to_string())?
-        .contains_key(game_uid)
-    {
-        return Err("游戏运行中，暂时不能传输游戏本体".to_string());
+        .map(|games| games.contains_key(game_uid))
+        .map_err(|_| "lock running game state failed".to_string());
+    match running {
+        Ok(false) => Ok(()),
+        other => {
+            state.release_operation(&AppState::game_operation_key(game_uid));
+            Err(other
+                .err()
+                .unwrap_or_else(|| "游戏运行中，暂时不能传输游戏本体".to_string()))
+        }
     }
-    operations.insert(game_uid.to_string());
-    Ok(())
 }
 
 fn release_transfer(state: &AppState, game_uid: &str) {
-    if let Ok(mut operations) = state.save_operations.lock() {
-        operations.remove(game_uid);
-    }
+    state.release_operation(&AppState::game_operation_key(game_uid));
 }
 
 pub(crate) fn load_baidu_client(app: &AppHandle) -> Result<BaiduNetdiskClient, String> {
@@ -1915,33 +2083,6 @@ pub(crate) fn remote_body_dir(game_key: &str) -> Result<String, String> {
     Ok(format!("{REMOTE_ROOT}/{}/body", game_key.trim()))
 }
 
-/// 云端安装结束后，本地游戏最终该用哪个 `game_key`。
-///
-/// 规则：**只有现有键为空或不安全时**才回填云端目录段；已经安全的键一律不动。
-///
-/// **为什么必须回填。** 收窄前这里写的是「键为空才用 `catalog.game_key` 回填」，而键非空
-/// 时那个键来自 `new_pending(catalog.display_name)`。`display_name` 在
-/// `cloud_manifest_service::validate_catalog` 里**只被要求非空**，可以含 `/`；而
-/// `derive_game_key` 只做空白折叠与小写，不处理任何分隔符。于是云端一个叫
-/// "Pokemon Red/Blue" 的游戏会推出 `"pokemon red/blue"` 存进本地，此后
-/// `CloudSaveService::game_key_segment` 会拒绝它的**每一个**云存档操作 ——
-/// 该游戏永远同步不了存档，而界面上只显示一个用户无从修复的报错。
-///
-/// 目录段才是权威值：`validate_catalog` 要求 `catalog.game_key` 与它精确相等，
-/// 调用方也已用 [`remote_body_dir`] 校验过它。
-///
-/// **为什么不无条件覆盖。** `display_name` 与 `game_key` 本来就可以不同
-/// （`AddGameWizard` 明说「确认后不随显示名称变化」，`merge_profile` 也只改
-/// display_name）。所以「安全但与目录段不同」的已有键是合法状态，静默改成目录段会让
-/// 该游戏原本键下的云存档从界面上消失。本轮只保证「绝不留下不可用的键」。
-fn cloud_install_game_key(current: &str, remote_game_key: &str) -> String {
-    if current.trim().is_empty() || !is_safe_path_segment(current) {
-        remote_game_key.trim().to_string()
-    } else {
-        current.trim().to_string()
-    }
-}
-
 pub(crate) fn validate_remote_package_path(directory: &str, path: &str) -> Result<(), String> {
     let prefix = format!("{directory}/");
     let name = path
@@ -1959,15 +2100,6 @@ pub(crate) fn validate_remote_package_path(directory: &str, path: &str) -> Resul
     Ok(())
 }
 
-fn remote_file_name_without_extension(path: &str) -> String {
-    Path::new(path)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("cloud-game")
-        .to_string()
-}
-
 fn now_iso() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1978,9 +2110,82 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        cloud_install_game_key, is_safe_path_segment, remote_body_dir,
-        validate_remote_package_path, CloudInstallStagingGuard, Game,
+        is_safe_path_segment, remote_body_dir, reserve_transfer, validate_remote_package_path,
+        CloudInstallPackageGuard, CloudInstallStagingGuard, Game,
     };
+
+    #[test]
+    fn transfer_reservation_respects_cloud_save_operations() {
+        let root = crate::test_support::TempWorkspace::new("cloud-install-operation-lock");
+        let state = crate::app_state::AppState::new(
+            crate::domain::AppStore::default(),
+            root.to_path_buf(),
+            std::collections::HashMap::new(),
+            root.join("tasks.json"),
+        );
+        let key = state
+            .claim_cloud_operation("local-game")
+            .expect("cloud save lock");
+        assert!(reserve_transfer(&state, "local-game").is_err());
+        let operations = state.save_operations.lock().expect("operations");
+        assert!(operations.contains(&key));
+        assert!(!operations.contains("local-game"));
+    }
+
+    #[test]
+    fn transfer_reservation_releases_its_claim_for_a_running_game() {
+        let root = crate::test_support::TempWorkspace::new("cloud-install-running-lock");
+        let state = crate::app_state::AppState::new(
+            crate::domain::AppStore::default(),
+            root.to_path_buf(),
+            std::collections::HashMap::new(),
+            root.join("tasks.json"),
+        );
+        state.running_games.lock().expect("running games").insert(
+            "local-game".to_string(),
+            crate::domain::GameRuntime {
+                game_uid: "local-game".to_string(),
+                status: crate::domain::GameRuntimeStatus::Running,
+                pid: Some(1),
+                started_at: None,
+                task_id: None,
+            },
+        );
+        assert!(reserve_transfer(&state, "local-game").is_err());
+        assert!(state.save_operations.lock().expect("operations").is_empty());
+    }
+
+    #[test]
+    fn unresolved_install_journals_preserve_owned_recovery_artifacts() {
+        let root = crate::test_support::TempWorkspace::new("cloud-install-recovery-guards");
+        let staging = root.join(".local-game.cloud-installing");
+        let journal_path = root.join(".local-game.cloud-install.json");
+        let package = root.join("downloaded.zip");
+        std::fs::create_dir_all(&staging).expect("staging");
+        std::fs::write(&journal_path, b"pending transaction").expect("journal");
+        std::fs::write(&package, b"zip").expect("package");
+        drop(CloudInstallStagingGuard {
+            path: Some(staging.clone()),
+        });
+        drop(CloudInstallPackageGuard {
+            path: Some(package.clone()),
+            journal_path,
+        });
+        assert!(staging.is_dir());
+        assert!(package.is_file());
+    }
+
+    #[test]
+    fn failed_download_install_removes_its_uncommitted_zip() {
+        let root = crate::test_support::TempWorkspace::new("cloud-install-zip-guard");
+        let package = root.join("downloaded.zip");
+        std::fs::write(&package, b"zip").expect("package");
+        drop(CloudInstallPackageGuard {
+            path: Some(package.clone()),
+            journal_path: root.join("missing-journal.json"),
+        });
+        assert!(!package.exists());
+    }
 
     /// 提交前失败：守卫必须把暂存目录删掉，否则该游戏会被那条「已存在就拒绝」的判据卡死。
     #[test]
@@ -2077,48 +2282,5 @@ mod tests {
         assert!(is_safe_path_segment(&Game::derive_game_key(
             "トビ姫 - inter breed tobihime_cn"
         )));
-    }
-
-    /// E 的守卫：云端安装绝不能留下一个不可用的 `game_key`。
-    ///
-    /// 收窄前，键非空时用的是 `new_pending(catalog.display_name)` 推出来的键，而
-    /// `display_name` 在 `validate_catalog` 里只被要求非空 —— 于是云端一个叫
-    /// "Pokemon Red/Blue" 的游戏会被存成 `"pokemon red/blue"`，此后它**每一个**云存档操作
-    /// 都被 `CloudSaveService::game_key_segment` 拒绝：永远同步不了存档，而界面上只有一个
-    /// 用户无从修复的报错。
-    #[test]
-    fn cloud_install_replaces_an_unusable_key_with_the_cloud_directory_segment() {
-        let remote_key = "pokemon red";
-        // 各种「由异常显示名推出」的键，模拟 new_pending 的结果。
-        for derived in [
-            Game::derive_game_key("Pokemon Red/Blue"),
-            Game::derive_game_key(".."),
-            Game::derive_game_key("."),
-            Game::derive_game_key(r"a\b"),
-            Game::derive_game_key("   "),
-            String::new(),
-        ] {
-            let resolved = cloud_install_game_key(&derived, remote_key);
-            assert_eq!(
-                resolved, remote_key,
-                "不可用的键 {derived:?} 必须被换成云端目录段"
-            );
-            assert!(
-                is_safe_path_segment(&resolved),
-                "换出来的键必须能用于云端路径：{resolved:?}"
-            );
-        }
-    }
-
-    /// 已经可用的键不得被静默改名：`display_name` 与 `game_key` 本来就可以不同
-    /// （AddGameWizard 明说「确认后不随显示名称变化」），改名会让原键下的云存档从界面上消失。
-    #[test]
-    fn cloud_install_keeps_an_existing_safe_key() {
-        assert_eq!(
-            cloud_install_game_key("black market v1.23", "black_market"),
-            "black market v1.23",
-            "安全但不同于云端目录段的已有键必须保持不变"
-        );
-        assert_eq!(cloud_install_game_key("demo", "demo"), "demo");
     }
 }

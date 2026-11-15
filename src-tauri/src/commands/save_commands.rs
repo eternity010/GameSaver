@@ -1,5 +1,6 @@
 use crate::{
     app_state::AppState,
+    commands::save_version_commands::{release_maintenance, reserve_maintenance},
     domain::{
         ActiveLearningSession, GameLifecycle, SaveLearningResult, SaveProfile, SaveScope,
         TaskCategory, TaskStatus,
@@ -735,15 +736,74 @@ pub fn update_save_profile_keep_versions(
     game_uid: String,
     keep_versions: usize,
 ) -> Result<SaveProfile, String> {
-    let game_uid = game_uid.trim();
+    let game_uid = game_uid.trim().to_string();
     let keep_versions = keep_versions.clamp(1, 100);
-    let (updated_profile, pruned_versions) = {
+    reserve_maintenance(&state, &game_uid)?;
+    let result = (|| {
+        let (updated_profile, pruned_versions) = {
+            let mut store = state
+                .store
+                .lock()
+                .map_err(|_| "lock GameSaver store failed".to_string())?;
+            let game = GameLibraryService::find(&store, &game_uid)
+                .ok_or_else(|| "游戏不存在".to_string())?;
+            let mut candidate = store.clone();
+            let profile = candidate
+                .save_profiles
+                .iter_mut()
+                .find(|p| {
+                    p.game_uid == game_uid
+                        && game.save_profile_id.as_deref() == Some(p.profile_id.as_str())
+                        && p.enabled
+                })
+                .ok_or_else(|| "未找到存档保护配置".to_string())?;
+            profile.keep_versions = keep_versions;
+            profile.updated_at = now_iso();
+            let updated_profile = profile.clone();
+
+            let pruned =
+                SaveRepository::prune_game_save_versions(&mut candidate, &game_uid, keep_versions);
+
+            GameRepository::persist(&app, &candidate)?;
+            *store = candidate;
+            (updated_profile, pruned)
+        };
+        // 版本清单已落盘，此时回收旧对象才安全（顺序不可颠倒，见
+        // SaveRepository::prune_game_save_versions）；放在守卫块之外，顺带让 store 锁早于
+        // GC 的全盘扫描释放。
+        if let Some(versions) = pruned_versions.as_ref() {
+            let _ = SaveRepository::collect_garbage(&app, versions);
+        }
+        Ok(updated_profile)
+    })();
+    release_maintenance(&state, &game_uid);
+    result
+}
+
+#[tauri::command]
+pub fn update_save_profile_scopes(
+    app: AppHandle,
+    state: State<AppState>,
+    game_uid: String,
+    mut scopes: Vec<SaveScope>,
+) -> Result<SaveProfile, String> {
+    let game_uid = game_uid.trim().to_string();
+    if scopes.is_empty() {
+        return Err("存档保护范围不能为空".to_string());
+    }
+    for scope in &mut scopes {
+        scope.ensure_default_exclusions_if_empty();
+        validate_scope(scope)?;
+    }
+
+    reserve_maintenance(&state, &game_uid)?;
+    let result = (|| {
         let mut store = state
             .store
             .lock()
             .map_err(|_| "lock GameSaver store failed".to_string())?;
         let game =
-            GameLibraryService::find(&store, game_uid).ok_or_else(|| "游戏不存在".to_string())?;
+            GameLibraryService::find(&store, &game_uid).ok_or_else(|| "游戏不存在".to_string())?;
         let mut candidate = store.clone();
         let profile = candidate
             .save_profiles
@@ -754,70 +814,21 @@ pub fn update_save_profile_keep_versions(
                     && p.enabled
             })
             .ok_or_else(|| "未找到存档保护配置".to_string())?;
-        profile.keep_versions = keep_versions;
+
+        profile.scopes = scopes;
         profile.updated_at = now_iso();
         let updated_profile = profile.clone();
 
-        let pruned =
-            SaveRepository::prune_game_save_versions(&mut candidate, game_uid, keep_versions);
-
         GameRepository::persist(&app, &candidate)?;
         *store = candidate;
-        (updated_profile, pruned)
-    };
-    // 版本清单已落盘，此时回收旧对象才安全（顺序不可颠倒，见
-    // SaveRepository::prune_game_save_versions）；放在守卫块之外，顺带让 store 锁早于
-    // GC 的全盘扫描释放。
-    if let Some(versions) = pruned_versions.as_ref() {
-        let _ = SaveRepository::collect_garbage(&app, versions);
-    }
-    Ok(updated_profile)
-}
-
-#[tauri::command]
-pub fn update_save_profile_scopes(
-    app: AppHandle,
-    state: State<AppState>,
-    game_uid: String,
-    mut scopes: Vec<SaveScope>,
-) -> Result<SaveProfile, String> {
-    let game_uid = game_uid.trim();
-    if scopes.is_empty() {
-        return Err("存档保护范围不能为空".to_string());
-    }
-    for scope in &mut scopes {
-        scope.ensure_default_exclusions_if_empty();
-        validate_scope(scope)?;
-    }
-
-    let mut store = state
-        .store
-        .lock()
-        .map_err(|_| "lock GameSaver store failed".to_string())?;
-    let game =
-        GameLibraryService::find(&store, game_uid).ok_or_else(|| "游戏不存在".to_string())?;
-    let mut candidate = store.clone();
-    let profile = candidate
-        .save_profiles
-        .iter_mut()
-        .find(|p| {
-            p.game_uid == game_uid
-                && game.save_profile_id.as_deref() == Some(p.profile_id.as_str())
-                && p.enabled
-        })
-        .ok_or_else(|| "未找到存档保护配置".to_string())?;
-
-    profile.scopes = scopes;
-    profile.updated_at = now_iso();
-    let updated_profile = profile.clone();
-
-    GameRepository::persist(&app, &candidate)?;
-    *store = candidate;
-    crate::logging::info(format!(
-        "存档保护范围已更新：game_uid={game_uid} profile_id={}",
-        updated_profile.profile_id
-    ));
-    Ok(updated_profile)
+        crate::logging::info(format!(
+            "存档保护范围已更新：game_uid={game_uid} profile_id={}",
+            updated_profile.profile_id
+        ));
+        Ok(updated_profile)
+    })();
+    release_maintenance(&state, &game_uid);
+    result
 }
 
 #[tauri::command]

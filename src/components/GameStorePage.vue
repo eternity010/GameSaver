@@ -125,8 +125,8 @@ function packageSize(bytes: number): string {
 }
 
 function downloadLabel(game: CloudGameSummary): string {
-  if (game.installed) return "已在游戏库";
-  return props.installUid === game.gameUid ? "安装中" : "下载并安装";
+  if (props.installUid === game.gameUid) return "安装中";
+  return game.installed ? "下载并替换本地版本" : "下载并安装";
 }
 
 function versionStatus(version: CloudGameVersion): string {
@@ -305,7 +305,7 @@ onUnmounted(() => {
             </div>
             <div class="store-detail-summary">
               <span class="store-status-label" :class="{ installed: selectedGame.installed }">{{ selectedGame.installed ? "已在游戏库" : "可下载" }}</span>
-              <p>{{ selectedGame.installed ? "本地游戏仍由游戏库管理；云端版本可在此查看或删除。" : "选择一个云端版本后下载并安装到游戏库。" }}</p>
+              <p>{{ selectedGame.installed ? "可选择云端版本，确认后替换本地唯一版本；已配置的受保护存档会保留。" : "选择一个云端版本后下载并安装到游戏库。" }}</p>
               <dl class="store-detail-facts">
                 <div><dt>云端版本</dt><dd>{{ selectedGame.versions.length }} 个</dd></div>
                 <div><dt>游戏文件</dt><dd>{{ selectedGame.fileCount?.toLocaleString() || "未知" }} 个</dd></div>
@@ -337,7 +337,7 @@ onUnmounted(() => {
 
         <footer class="store-detail-footer">
           <div class="store-detail-selection"><span>已选择</span><strong>{{ selectedVersion.versionId }}</strong><small>{{ packageSize(selectedVersion.size) }}</small></div>
-          <button class="primary-button" type="button" :disabled="!!installUid || selectedGame.installed" @click="emit('install', selectedGame, selectedVersion)"><CloudDownload :size="16" />{{ downloadLabel(selectedGame) }}</button>
+          <button class="primary-button" type="button" :disabled="!!installUid" @click="emit('install', selectedGame, selectedVersion)"><CloudDownload :size="16" />{{ downloadLabel(selectedGame) }}</button>
         </footer>
       </section>
     </div>

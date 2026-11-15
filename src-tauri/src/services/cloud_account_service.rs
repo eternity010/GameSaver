@@ -221,7 +221,7 @@ impl CloudAccountService {
                 .map_err(|error| format!("写入云端账号清单临时文件失败：{error}"))?;
             file.sync_all()
                 .map_err(|error| format!("刷新云端账号清单临时文件失败：{error}"))?;
-            client.upload_file(&temporary, REMOTE_PROFILE_PATH, |_, _| true)?;
+            client.upload_file(&temporary, REMOTE_PROFILE_PATH, None, |_, _| true)?;
             Ok(())
         })();
         let _ = fs::remove_file(&temporary);

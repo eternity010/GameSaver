@@ -249,12 +249,6 @@ fn restore_version_task(
             let protected_id = protected.version_id.clone();
             candidate.save_versions.push(protected);
 
-            let pruned = SaveRepository::prune_game_save_versions(
-                candidate,
-                &game.game_uid,
-                profile.keep_versions,
-            );
-
             let Some(game_record) = candidate
                 .games
                 .iter_mut()
@@ -262,7 +256,16 @@ fn restore_version_task(
             else {
                 return Err("游戏记录不存在".to_string());
             };
+            // 先把即将保护的版本设为当前本地基线，再剪枝。否则剪枝只能看到恢复前的
+            // latest，可能额外保留一版已经不再代表磁盘内容的旧版本。
             game_record.latest_save_version_id = Some(protected_id);
+
+            let pruned = SaveRepository::prune_game_save_versions_preserving(
+                candidate,
+                &game.game_uid,
+                profile.keep_versions,
+                &[version.version_id.as_str()],
+            );
             GameRepository::persist(app, candidate)?;
             Ok(pruned)
         });
@@ -354,6 +357,14 @@ fn delete_versions_task(
         None,
     );
     let versions = state.with_store_mut(|candidate| {
+        let latest_id = candidate
+            .games
+            .iter()
+            .find(|game| game.game_uid == game_uid)
+            .and_then(|game| game.latest_save_version_id.as_deref());
+        if latest_id.is_some_and(|latest| version_ids.iter().any(|id| id == latest)) {
+            return Err("不能删除当前本地存档对应的版本，请先恢复其他版本".to_string());
+        }
         let before = candidate.save_versions.len();
         candidate.save_versions.retain(|version| {
             !(version.game_uid == game_uid
@@ -435,7 +446,7 @@ fn load_version_context(
             store
                 .save_versions
                 .iter()
-                .find(|version| &version.version_id == id)
+                .find(|version| version.game_uid == game_uid && &version.version_id == id)
         })
         .cloned();
     Ok((game, profile, version, latest))
@@ -449,12 +460,20 @@ fn ensure_version_exists(state: &AppState, game_uid: &str, version_id: &str) -> 
     if !store.games.iter().any(|game| game.game_uid == game_uid) {
         return Err("游戏不存在".to_string());
     }
+    let game = store
+        .games
+        .iter()
+        .find(|game| game.game_uid == game_uid)
+        .ok_or_else(|| "游戏不存在".to_string())?;
     if !store
         .save_versions
         .iter()
         .any(|version| version.game_uid == game_uid && version.version_id == version_id)
     {
         return Err("保存版本不存在".to_string());
+    }
+    if game.latest_save_version_id.as_deref() == Some(version_id) {
+        return Err("不能删除当前本地存档对应的版本，请先恢复其他版本".to_string());
     }
     Ok(())
 }
@@ -480,9 +499,15 @@ fn versions_to_remove(
         compare_created_at(&right.created_at, &left.created_at)
             .then(right.version_id.cmp(&left.version_id))
     });
+    let latest_id = store
+        .games
+        .iter()
+        .find(|game| game.game_uid == game_uid)
+        .and_then(|game| game.latest_save_version_id.as_deref());
     Ok(versions
         .into_iter()
         .skip(keep_versions)
+        .filter(|version| Some(version.version_id.as_str()) != latest_id)
         .map(|version| version.version_id.clone())
         .collect())
 }

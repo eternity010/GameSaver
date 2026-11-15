@@ -273,7 +273,7 @@ impl CloudSaveService {
         let upload_result = (|| -> Result<RemoteFile, String> {
             client.ensure_directory(&remote_dir)?;
             on_progress(30, "正在上传存档包到百度网盘");
-            client.upload_file(&zip_path, &remote_pkg, |pct, msg| {
+            client.upload_file(&zip_path, &remote_pkg, None, |pct, msg| {
                 on_progress(30 + (pct as f32 * 0.5) as u8, msg)
             })
         })();
@@ -320,10 +320,18 @@ impl CloudSaveService {
 
         if manifest.versions.len() > keep_limit && keep_limit > 0 {
             let pruned = manifest.versions.split_off(keep_limit);
-            let (deletable, kept) = Self::split_prunable_versions(&game.game_key, pruned);
+            let (deletable, mut kept) = Self::split_prunable_versions(&game.game_key, pruned);
             // `package_path` 来自下载的清单，未经验证就删是拿远端输入直接作用于远端文件。
             for old_ver in deletable {
-                let _ = client.delete_file(&old_ver.package_path);
+                if let Err(error) = client.delete_file(&old_ver.package_path) {
+                    // 远端删除失败时必须把条目留在清单里。否则清单看似完成了剪枝，
+                    // 实际 ZIP 仍占空间且用户再也无法从界面管理它。
+                    crate::logging::warn(format!(
+                        "云端旧存档回收失败，保留清单条目：version_id={} error={error}",
+                        old_ver.version_id
+                    ));
+                    kept.push(old_ver);
+                }
             }
             // 验不过的条目留在清单里：`keep_limit` 只是软上限，而静默丢掉用户的存档版本条目
             // 是实打实的损失。回填的是尾部最老的条目，不影响上面已按 `versions.first()`
@@ -411,6 +419,9 @@ impl CloudSaveService {
 
         let mut imported_version = meta.version;
         imported_version.game_uid = game.game_uid.clone();
+        // 对象在版本清单提交前必须保持活跃引用。否则另一个游戏的剪枝/回收任务可能在
+        // 下载导入过程中把刚写入、但尚未出现在 store.json 的对象当成孤立文件删除。
+        let _pending_objects = SaveRepository::hold_pending_objects(&imported_version)?;
         let mut imported_paths = HashSet::new();
 
         for i in 0..total_entries {
@@ -452,11 +463,13 @@ impl CloudSaveService {
 
         let state = app.state::<crate::app_state::AppState>();
         state.with_store_mut(|store| {
-            if !store
-                .save_versions
-                .iter()
-                .any(|v| v.version_id == imported_version.version_id && v.game_uid == game.game_uid)
-            {
+            if let Some(existing) = store.save_versions.iter().find(|v| {
+                v.version_id == imported_version.version_id && v.game_uid == game.game_uid
+            }) {
+                if serde_json::to_vec(existing).ok() != serde_json::to_vec(&imported_version).ok() {
+                    return Err("云端存档版本 ID 与本地已有版本冲突，已拒绝覆盖".to_string());
+                }
+            } else {
                 store.save_versions.push(imported_version.clone());
                 GameRepository::persist(app, store)?;
             }
@@ -604,7 +617,7 @@ impl CloudSaveService {
         fs::write(&temp_file, &raw).map_err(|err| format!("写入临时云端存档清单失败：{err}"))?;
 
         let remote_manifest = Self::remote_manifest_path(game_key)?;
-        let upload_res = client.upload_file(&temp_file, &remote_manifest, |_, _| true);
+        let upload_res = client.upload_file(&temp_file, &remote_manifest, None, |_, _| true);
         let _ = fs::remove_file(&temp_file);
         upload_res.map(|_| ())
     }
@@ -616,8 +629,6 @@ impl CloudSaveService {
         version_id: &str,
     ) -> Result<CloudSaveManifest, String> {
         let remote_pkg = Self::remote_package_path(game_key, version_id)?;
-        let _ = client.delete_file(&remote_pkg);
-
         let mut manifest = Self::fetch_manifest(client, game_key, game_uid)?.unwrap_or_else(|| {
             CloudSaveManifest {
                 format_version: MANIFEST_VERSION,
@@ -628,6 +639,18 @@ impl CloudSaveService {
                 versions: Vec::new(),
             }
         });
+
+        if !manifest
+            .versions
+            .iter()
+            .any(|version| version.version_id == version_id)
+        {
+            return Err("指定的云端存档版本不存在".to_string());
+        }
+
+        // 先确认远端包删除成功，再提交清单。不能先删清单，否则网络/权限失败时会
+        // 造成「界面看不见、网盘仍占空间」的孤儿包。
+        client.delete_file(&remote_pkg)?;
 
         manifest.versions.retain(|v| v.version_id != version_id);
         manifest.latest_version_id = manifest.versions.first().map(|v| v.version_id.clone());

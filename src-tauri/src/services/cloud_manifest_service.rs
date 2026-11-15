@@ -381,7 +381,7 @@ impl CloudManifestService {
                 .map_err(|error| format!("写入云端封面临时文件失败：{error}"))?;
             file.sync_all()
                 .map_err(|error| format!("刷新云端封面临时文件失败：{error}"))?;
-            client.upload_file(&temporary, &Self::cover_path(remote_dir), |_, _| true)?;
+            client.upload_file(&temporary, &Self::cover_path(remote_dir), None, |_, _| true)?;
             Ok(())
         })();
         let _ = fs::remove_file(&temporary);
@@ -425,7 +425,9 @@ impl CloudManifestService {
                 .map_err(|error| format!("写入云端游戏信息临时文件失败：{error}"))?;
             file.sync_all()
                 .map_err(|error| format!("刷新云端游戏信息临时文件失败：{error}"))?;
-            client.upload_file(&temporary, &Self::catalog_path(remote_dir), |_, _| true)?;
+            client.upload_file(&temporary, &Self::catalog_path(remote_dir), None, |_, _| {
+                true
+            })?;
             Ok(())
         })();
         let _ = fs::remove_file(&temporary);
@@ -618,7 +620,12 @@ impl CloudManifestService {
                 .map_err(|error| format!("写入云端版本清单临时文件失败：{error}"))?;
             file.sync_all()
                 .map_err(|error| format!("刷新云端版本清单临时文件失败：{error}"))?;
-            client.upload_file(&temporary, &Self::manifest_path(remote_dir), |_, _| true)?;
+            client.upload_file(
+                &temporary,
+                &Self::manifest_path(remote_dir),
+                None,
+                |_, _| true,
+            )?;
             Ok(())
         })();
         let _ = fs::remove_file(&temporary);

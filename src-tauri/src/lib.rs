@@ -13,7 +13,7 @@ use app_state::AppState;
 use repositories::{GameRepository, LibraryConfigRepository, SaveRepository, TaskRepository};
 use services::{
     learning::cleanup_stale_captures, BodyPackageService, CoverCaptureService,
-    GameBodyUpdateService, InstanceService, LaunchService,
+    GameBodyInstallService, GameBodyUpdateService, InstanceService, LaunchService,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -78,6 +78,19 @@ pub fn run() {
                 eprintln!("GameSaver 本体包临时文件清理失败：{error}");
             }
             let store = GameRepository::load(app.handle())?;
+            let cloud_installs_recovered = match GameBodyInstallService::recover_pending_installs(
+                &games_root,
+                &body_package_root,
+                &store,
+            ) {
+                Ok(_) => true,
+                Err(error) => {
+                    logging::error(format!("云端安装事务恢复未完成，相关游戏暂时锁定：{error}"));
+                    false
+                }
+            };
+            let pending_install_games =
+                GameBodyInstallService::pending_install_game_uids(&games_root)?;
             let removed_restore_archives =
                 match GameBodyUpdateService::cleanup_removed_restore_archives(&games_root) {
                     Ok(paths) => paths,
@@ -124,12 +137,14 @@ pub fn run() {
                         .to_ascii_lowercase()
                 })
                 .collect::<HashSet<_>>();
-            if let Err(error) = BodyPackageService::cleanup_orphan_packages(
-                &body_package_root,
-                &referenced_packages,
-            ) {
-                logging::error(format!("孤立本体包清理失败：{error}"));
-                eprintln!("GameSaver 孤立本体包清理失败：{error}");
+            if cloud_installs_recovered {
+                if let Err(error) = BodyPackageService::cleanup_orphan_packages(
+                    &body_package_root,
+                    &referenced_packages,
+                ) {
+                    logging::error(format!("孤立本体包清理失败：{error}"));
+                    eprintln!("GameSaver 孤立本体包清理失败：{error}");
+                }
             }
             let tasks_path = TaskRepository::path(&data_dir);
             let tasks = match TaskRepository::load(&tasks_path) {
@@ -178,21 +193,23 @@ pub fn run() {
             // 同理：云端安装游戏被强杀会留下 `.{game_uid}.cloud-installing` 暂存目录，而重装
             // 时「暂存目录已存在就拒绝」的判据会让那个游戏永久装不上。这里同样只可能清到上
             // 一次进程的残留（此刻没有任何安装任务在跑）。
-            if let Err(error) = BodyPackageService::cleanup_interrupted_cloud_installs(&games_root)
-            {
-                logging::error(format!("云端安装暂存目录清理失败：{error}"));
-                eprintln!("GameSaver 云端安装暂存目录清理失败：{error}");
+            if cloud_installs_recovered {
+                if let Err(error) =
+                    BodyPackageService::cleanup_interrupted_cloud_installs(&games_root)
+                {
+                    logging::error(format!("云端安装暂存目录清理失败：{error}"));
+                    eprintln!("GameSaver 云端安装暂存目录清理失败：{error}");
+                }
             }
             if let Err(error) = GameRepository::persist(app.handle(), &store) {
                 logging::error(format!("清理历史游戏本体记录失败：{error}"));
                 eprintln!("GameSaver 清理历史游戏本体记录失败：{error}");
             }
-            app.manage(AppState::new(
-                store,
-                library_root,
-                tasks,
-                PathBuf::from(tasks_path),
-            ));
+            let state = AppState::new(store, library_root, tasks, PathBuf::from(tasks_path));
+            for uid in pending_install_games {
+                state.claim_operation(&uid, "游戏安装事务待恢复")?;
+            }
+            app.manage(state);
             // 注入事件推送器：此后任务与游戏运行时状态的变化会主动推给前端，
             // 各组件的高频轮询因此得以降级为低频兜底。
             //

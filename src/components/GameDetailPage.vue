@@ -1302,12 +1302,12 @@ onUnmounted(() => {
         <div v-else class="version-list">
           <article v-for="(version, index) in versions" :key="version.versionId" class="version-row">
             <div class="version-icon"><Clock3 :size="17" /></div>
-            <div class="version-copy"><strong>{{ index === 0 ? "最近一次保存" : "保存版本" }}</strong><span>{{ formatDate(version.createdAt) }}</span></div>
+            <div class="version-copy"><strong>{{ version.isCurrent ? "当前本地版本" : (index === 0 ? "最近创建的版本" : "保存版本") }}</strong><span>{{ formatDate(version.createdAt) }}</span></div>
             <div class="version-meta"><strong>{{ version.fileCount }} 个文件</strong><span>{{ formatBytes(version.totalBytes) }}</span></div>
             <div class="version-actions">
               <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime || !baiduReady()" title="上传这个保存版本到百度网盘" @click="uploadSave(version)"><CloudUpload :size="15" />上传云端</button>
               <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" title="恢复这个保存版本" @click="restoreVersion(version)"><RotateCcw :size="15" />恢复</button>
-              <button class="icon-button danger-button" type="button" :disabled="busy || !!runtime" title="删除这个保存版本" :aria-label="`删除 ${formatDate(version.createdAt)} 保存版本`" @click="deleteVersion(version)"><Trash2 :size="15" /></button>
+              <button class="icon-button danger-button" type="button" :disabled="busy || !!runtime || version.isCurrent" :title="version.isCurrent ? '当前本地版本不能直接删除，请先恢复其他版本' : '删除这个保存版本'" :aria-label="`删除 ${formatDate(version.createdAt)} 保存版本`" @click="deleteVersion(version)"><Trash2 :size="15" /></button>
             </div>
           </article>
         </div>

@@ -386,6 +386,31 @@ impl SaveRepository {
         game_uid: &str,
         keep_versions: usize,
     ) -> Option<Vec<SaveVersion>> {
+        Self::prune_game_save_versions_preserving(store, game_uid, keep_versions, &[])
+    }
+
+    /// 剪枝时额外保留指定版本。
+    ///
+    /// `latest_save_version_id` 表示「当前磁盘内容对应的基线」，不一定是创建时间最新的
+    /// 版本（用户恢复旧版本后就是这种情况）。因此它和调用方传入的恢复目标都必须被视为
+    /// 活跃引用；否则清理后指针虽然还能被修到某个版本，但那个版本并不代表磁盘上的内容，
+    /// 下一次退出游戏就会产生错误差异。
+    pub(crate) fn prune_game_save_versions_preserving(
+        store: &mut AppStore,
+        game_uid: &str,
+        keep_versions: usize,
+        extra_preserved_ids: &[&str],
+    ) -> Option<Vec<SaveVersion>> {
+        let current_id = store
+            .games
+            .iter()
+            .find(|game| game.game_uid == game_uid)
+            .and_then(|game| game.latest_save_version_id.as_deref());
+        let preserved_ids: HashSet<&str> = extra_preserved_ids
+            .iter()
+            .copied()
+            .chain(current_id)
+            .collect();
         let to_remove: HashSet<String> = if keep_versions == 0 {
             HashSet::new()
         } else {
@@ -399,10 +424,20 @@ impl SaveRepository {
                 compare_created_at(&right.created_at, &left.created_at)
                     .then(right.version_id.cmp(&left.version_id))
             });
+            let mut retained_count = 0usize;
             game_versions
                 .into_iter()
-                .skip(keep_versions)
-                .map(|version| version.version_id)
+                .filter_map(|version| {
+                    if preserved_ids.contains(version.version_id.as_str()) {
+                        return None;
+                    }
+                    if retained_count < keep_versions {
+                        retained_count += 1;
+                        None
+                    } else {
+                        Some(version.version_id)
+                    }
+                })
                 .collect()
         };
         if !to_remove.is_empty() {
@@ -425,10 +460,22 @@ impl SaveRepository {
         Self::write_object_locked(app, hash, bytes)
     }
 
+    /// 暂时保护一份尚未写入版本清单的对象集合，避免并发 GC 把导入/提交中的对象删掉。
+    pub(crate) fn hold_pending_objects(
+        version: &SaveVersion,
+    ) -> Result<PendingObjectsGuard, String> {
+        protect_pending_objects(version)?;
+        Ok(PendingObjectsGuard {
+            version: version.clone(),
+        })
+    }
+
     pub fn read_object(app: &AppHandle, hash: &str) -> Result<Vec<u8>, String> {
         let objects_root = Self::list_objects_root(app)?;
         let path = object_path(&objects_root, hash)?;
-        if !path.is_file() {
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|_| format!("存档对象不存在：{hash}"))?;
+        if !is_regular_object_file(&metadata) {
             return Err(format!("存档对象不存在：{hash}"));
         }
         let bytes = fs::read(&path).map_err(|err| format!("读取存档对象失败：{err}"))?;
@@ -445,28 +492,35 @@ impl SaveRepository {
 
     pub fn object_exists(app: &AppHandle, hash: &str) -> bool {
         match Self::object_path(app, hash) {
-            Ok(path) => path.is_file(),
+            Ok(path) => fs::symlink_metadata(&path)
+                .ok()
+                .filter(|metadata| is_regular_object_file(metadata))
+                .and_then(|_| sha256_file(&path).ok())
+                .is_some_and(|actual| actual == hash.to_ascii_lowercase()),
             Err(_) => false,
         }
     }
 
     fn write_object_locked(app: &AppHandle, hash: &str, bytes: &[u8]) -> Result<(), String> {
+        let hash = hash.trim().to_ascii_lowercase();
+        let target_hash = object_path(&Self::list_objects_root(app)?, &hash)?;
+        if sha256_bytes(bytes) != hash {
+            return Err(format!("存档对象内容与哈希不一致：{hash}"));
+        }
         let root = Self::list_objects_root(app)?;
         let directory = root.join(&hash[..2]);
-        let target = directory.join(hash);
-        if target.is_file() {
-            let metadata =
-                fs::metadata(&target).map_err(|err| format!("读取存档对象失败：{err}"))?;
-            if metadata.len() == bytes.len() as u64 {
+        let target = target_hash;
+        if let Ok(metadata) = fs::symlink_metadata(&target) {
+            if is_regular_object_file(&metadata) && sha256_file(&target)? == hash {
                 return Ok(());
             }
-            return Err(format!(
-                "存档对象完整性校验失败，拒绝覆盖已有对象：{}",
-                target.display()
-            ));
+            if !is_regular_object_file(&metadata) {
+                return Err(format!("存档对象路径不是普通文件：{}", target.display()));
+            }
         }
         fs::create_dir_all(&directory).map_err(|err| format!("创建存档对象目录失败：{err}"))?;
         let temporary = directory.join(format!(".{hash}.tmp-{}", Uuid::new_v4().simple()));
+        let displaced = directory.join(format!(".{hash}.corrupt-{}", Uuid::new_v4().simple()));
         let result = (|| -> Result<(), String> {
             let mut file = fs::File::create(&temporary)
                 .map_err(|err| format!("创建存档对象临时文件失败：{err}"))?;
@@ -474,11 +528,35 @@ impl SaveRepository {
                 .map_err(|err| format!("写入存档对象失败：{err}"))?;
             file.sync_all()
                 .map_err(|err| format!("刷新存档对象失败：{err}"))?;
-            fs::rename(&temporary, &target).map_err(|err| format!("提交存档对象失败：{err}"))?;
+            let had_existing = fs::symlink_metadata(&target).is_ok();
+            if had_existing {
+                fs::rename(&target, &displaced)
+                    .map_err(|err| format!("暂存损坏存档对象失败：{err}"))?;
+            }
+            if let Err(error) = fs::rename(&temporary, &target) {
+                if had_existing {
+                    let _ = fs::rename(&displaced, &target);
+                }
+                return Err(format!("提交存档对象失败：{error}"));
+            }
+            if had_existing {
+                let _ = fs::remove_file(&displaced);
+            }
             Ok(())
         })();
         let _ = fs::remove_file(&temporary);
+        let _ = fs::remove_file(&displaced);
         result
+    }
+}
+
+pub(crate) struct PendingObjectsGuard {
+    version: SaveVersion,
+}
+
+impl Drop for PendingObjectsGuard {
+    fn drop(&mut self) {
+        release_pending_objects(&self.version);
     }
 }
 
@@ -1019,7 +1097,10 @@ fn restore_rollback_contents(root: &Path, rollback: &Path) -> Result<(), String>
     }
 }
 
-fn collect_protected_paths(root: &Path, scope: &SaveScope) -> Result<HashSet<String>, String> {
+pub(crate) fn collect_protected_paths(
+    root: &Path,
+    scope: &SaveScope,
+) -> Result<HashSet<String>, String> {
     let mut paths = HashSet::new();
     for relative in &scope.confirmed_files {
         let relative = validate_relative(relative)?;
@@ -1624,6 +1705,12 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     }
 }
 
+fn is_regular_object_file(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_file()
+        && !metadata.file_type().is_symlink()
+        && !is_reparse_point(metadata)
+}
+
 fn scope_includes_relative(relative_path: &str, scope: &SaveScope) -> bool {
     let relative_path = normalize_relative(relative_path);
     scope
@@ -1943,12 +2030,12 @@ mod tests {
         assert_eq!(store.save_versions.len(), 2);
     }
 
-    /// V5 回归：剪枝若删掉 `latest_save_version_id` 指向的那一版，指针必须当场修好。
+    /// 当前本地内容对应的版本必须跨过剪枝保留，即使它不是创建时间最新的一版。
     ///
     /// 悬垂指针不会立刻报错，而是让 `commit` 丢掉比对基线 —— 此后每次游戏退出都无条件
     /// 新建版本，版本库持续无意义膨胀，且违反设计文档「没有变化时不创建新版本」。
     #[test]
-    fn prune_repairs_a_latest_pointer_it_orphans() {
+    fn prune_preserves_the_version_representing_current_disk_contents() {
         let mut game = Game::new_pending("A", "C:/games/a", "a.exe");
         game.game_uid = "game-a".to_string();
         game.latest_save_version_id = Some("a1".to_string());
@@ -1957,18 +2044,43 @@ mod tests {
             save_versions: vec![
                 version("game-a", "a1", "1700000001"),
                 version("game-a", "a2", "1700000002"),
+                version("game-a", "a3", "1700000003"),
             ],
             ..AppStore::default()
         };
 
-        SaveRepository::prune_game_save_versions(&mut store, "game-a", 1)
+        let alive = SaveRepository::prune_game_save_versions(&mut store, "game-a", 1)
             .expect("超出保留数应发生剪枝");
 
         assert_eq!(
             store.games[0].latest_save_version_id.as_deref(),
-            Some("a2"),
-            "指针指向的 a1 被剪掉后应回退到最新一版"
+            Some("a1"),
+            "当前本地内容对应的版本被保留后，指针不得漂移"
         );
+        assert!(
+            alive.iter().any(|version| version.version_id == "a1"),
+            "当前本地内容对应的版本必须仍在版本库"
+        );
+    }
+
+    #[test]
+    fn prune_preserves_an_explicit_restore_target() {
+        let mut store = AppStore {
+            save_versions: vec![
+                version("game-a", "a1", "1700000001"),
+                version("game-a", "a2", "1700000002"),
+                version("game-a", "a3", "1700000003"),
+            ],
+            ..AppStore::default()
+        };
+
+        let alive =
+            SaveRepository::prune_game_save_versions_preserving(&mut store, "game-a", 1, &["a1"])
+                .expect("超出保留数应发生剪枝");
+
+        assert!(alive.iter().any(|version| version.version_id == "a1"));
+        assert!(alive.iter().any(|version| version.version_id == "a3"));
+        assert!(!alive.iter().any(|version| version.version_id == "a2"));
     }
 
     /// V8 回归：保留策略必须按 `created_at` 的**时间**语义挑最新，而不是按字符串比。

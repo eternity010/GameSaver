@@ -103,6 +103,7 @@ export interface SaveVersionSummary {
   createdAt: string;
   totalBytes: number;
   fileCount: number;
+  isCurrent: boolean;
 }
 
 export interface SaveProfile {

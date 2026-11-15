@@ -813,6 +813,7 @@ pub struct SaveVersionSummary {
     pub created_at: String,
     pub total_bytes: u64,
     pub file_count: usize,
+    pub is_current: bool,
 }
 
 impl From<&crate::domain::SaveVersion> for SaveVersionSummary {
@@ -822,6 +823,7 @@ impl From<&crate::domain::SaveVersion> for SaveVersionSummary {
             created_at: version.created_at.clone(),
             total_bytes: version.total_bytes,
             file_count: version.files.len(),
+            is_current: false,
         }
     }
 }
@@ -844,11 +846,16 @@ pub fn query_game_detail_view(
     let game = GameLibraryService::find(store, game_uid).ok_or_else(|| "游戏不存在".to_string())?;
     let precheck = crate::services::LaunchService::precheck(store, game_uid)?;
 
+    let current_version_id = game.latest_save_version_id.as_deref();
     let mut versions = store
         .save_versions
         .iter()
         .filter(|version| version.game_uid == game_uid)
-        .map(SaveVersionSummary::from)
+        .map(|version| {
+            let mut summary = SaveVersionSummary::from(version);
+            summary.is_current = Some(version.version_id.as_str()) == current_version_id;
+            summary
+        })
         .collect::<Vec<_>>();
     versions.sort_by(|left, right| compare_created_at(&right.created_at, &left.created_at));
 

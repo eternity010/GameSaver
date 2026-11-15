@@ -557,15 +557,33 @@ impl BaiduNetdiskClient {
         &self,
         local_path: &Path,
         remote_path: &str,
+        expected_sha256: Option<&str>,
         on_progress: impl Fn(u8, &str) -> bool + Send,
     ) -> Result<RemoteFile, String> {
         let metadata =
             fs::metadata(local_path).map_err(|err| format!("读取待上传本体包失败：{err}"))?;
         let total_size = metadata.len();
+        let initial_modified = metadata.modified().ok();
         if total_size == 0 {
             return Err("不能上传空的本体包".to_string());
         }
-        let block_md5 = block_md5_list(local_path, total_size)?;
+        let (block_md5, actual_sha256) = block_md5_list(local_path, total_size, |processed| {
+            let percent = ((processed as u128 * 100) / total_size.max(1) as u128) as u8;
+            let progress = 2 + (u16::from(percent) * 3 / 100) as u8;
+            on_progress(progress.min(5), "正在计算本体包分片校验")
+        })?;
+        if let Some(expected) = expected_sha256.filter(|value| !value.trim().is_empty()) {
+            if !actual_sha256.eq_ignore_ascii_case(expected.trim()) {
+                return Err("上传前本体 ZIP 哈希校验失败，文件可能已被修改".to_string());
+            }
+        }
+        let current_metadata =
+            fs::metadata(local_path).map_err(|err| format!("重新读取待上传本体包失败：{err}"))?;
+        if current_metadata.len() != total_size
+            || current_metadata.modified().ok() != initial_modified
+        {
+            return Err("本体 ZIP 在上传前发生变化，请重新创建本体包".to_string());
+        }
         let block_list = serde_json::to_string(&block_md5)
             .map_err(|err| format!("生成百度分片清单失败：{err}"))?;
         let url = format!("{API_BASE}/rest/2.0/xpan/file");
@@ -620,6 +638,9 @@ impl BaiduNetdiskClient {
             format!("https://{host}")
         };
         let chunk_count = block_md5.len();
+        if !on_progress(8, "已完成本体包校验，正在准备上传") {
+            return Err("任务已取消".to_string());
+        }
         let concurrency = UPLOAD_CONCURRENCY.min(chunk_count);
         let next_chunk = AtomicUsize::new(0);
         let completed_count = AtomicUsize::new(0);
@@ -662,6 +683,16 @@ impl BaiduNetdiskClient {
                             let mut err_guard = first_error.lock().unwrap();
                             if err_guard.is_none() {
                                 *err_guard = Some(format!("读取本体包分片失败：{err}"));
+                            }
+                            break;
+                        }
+                        if md5_hex(&bytes) != block_md5[index] {
+                            aborted.store(true, Ordering::Relaxed);
+                            let mut err_guard = first_error.lock().unwrap();
+                            if err_guard.is_none() {
+                                *err_guard = Some(
+                                    "本体 ZIP 在上传过程中发生变化，请重新创建本体包".to_string(),
+                                );
                             }
                             break;
                         }
@@ -1113,19 +1144,30 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-fn block_md5_list(path: &Path, total_size: u64) -> Result<Vec<String>, String> {
+fn block_md5_list(
+    path: &Path,
+    total_size: u64,
+    on_progress: impl Fn(u64) -> bool,
+) -> Result<(Vec<String>, String), String> {
     let mut file = fs::File::open(path).map_err(|err| format!("打开本体包失败：{err}"))?;
     let mut result = Vec::new();
+    let mut hasher = Sha256::new();
     let mut remaining = total_size;
+    let mut processed = 0u64;
     let mut buffer = vec![0u8; CHUNK_SIZE as usize];
     while remaining > 0 {
         let length = remaining.min(CHUNK_SIZE) as usize;
         file.read_exact(&mut buffer[..length])
             .map_err(|err| format!("读取本体包分片失败：{err}"))?;
+        hasher.update(&buffer[..length]);
         result.push(md5_hex(&buffer[..length]));
         remaining -= length as u64;
+        processed = processed.saturating_add(length as u64);
+        if !on_progress(processed) {
+            return Err("任务已取消".to_string());
+        }
     }
-    Ok(result)
+    Ok((result, hex::encode(hasher.finalize())))
 }
 
 fn parse_value<T: for<'de> Deserialize<'de>>(
@@ -1240,9 +1282,10 @@ fn md5_hex(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        download_temp_path, is_auth_failure, md5_hex, token_needs_refresh, BaiduNetdiskClient,
-        BaiduToken, DownloadTempGuard,
+        block_md5_list, download_temp_path, is_auth_failure, md5_hex, token_needs_refresh,
+        BaiduNetdiskClient, BaiduToken, DownloadTempGuard, CHUNK_SIZE,
     };
+    use sha2::{Digest, Sha256};
     use std::fs;
 
     /// token 夹具：一个临时「AppData」目录，随作用域自动清理。
@@ -1449,6 +1492,26 @@ mod tests {
             "57edf4a22be3c955ac49da2e2107b67a"
         );
         assert_eq!(md5_hex(b"GameSaver"), "f28205fc3f14a3b8bfa43c894db2a24b");
+    }
+
+    #[test]
+    fn block_md5_list_returns_sha256_and_boundary_md5s() {
+        let workspace = crate::test_support::TempWorkspace::new("baidu-block-checksums");
+        let path = workspace.join("package.zip");
+        let data = (0..(CHUNK_SIZE as usize + 17))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&path, &data).expect("write checksum fixture");
+
+        let (blocks, sha256) =
+            block_md5_list(&path, data.len() as u64, |_| true).expect("calculate block checksums");
+        let mut hasher = Sha256::new();
+        hasher.update(&data);
+
+        assert_eq!(blocks.len(), 2, "4MB 边界后应产生第二个分片");
+        assert_eq!(blocks[0], md5_hex(&data[..CHUNK_SIZE as usize]));
+        assert_eq!(blocks[1], md5_hex(&data[CHUNK_SIZE as usize..]));
+        assert_eq!(sha256, hex::encode(hasher.finalize()));
     }
 
     #[test]

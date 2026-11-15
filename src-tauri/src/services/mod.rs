@@ -5,6 +5,7 @@ pub mod cloud_manifest_service;
 pub mod cloud_save_service;
 pub mod cover_capture_service;
 pub mod disk_space;
+pub mod game_body_install_service;
 pub mod game_body_package_service;
 pub mod game_body_update_service;
 pub mod game_library_service;
@@ -30,6 +31,7 @@ pub use cloud_save_service::{
     CloudSaveManifestVersion, CloudSaveOverview, CloudSaveService, CloudSaveSyncStatusView,
 };
 pub use cover_capture_service::{CaptureArmView, CoverCaptureService};
+pub use game_body_install_service::GameBodyInstallService;
 pub use game_body_package_service::BodyPackageService;
 pub use game_body_update_service::GameBodyUpdateService;
 pub use game_library_service::GameLibraryService;

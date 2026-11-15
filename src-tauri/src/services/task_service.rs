@@ -124,7 +124,13 @@ impl TaskService {
         let updated = if let Ok(mut tasks) = state.tasks.lock() {
             if let Some(task) = tasks.get_mut(task_id) {
                 task.status = status;
-                task.progress = progress.min(100);
+                task.progress = if matches!(task.status, TaskStatus::Failed | TaskStatus::Cancelled)
+                    && progress >= 100
+                {
+                    task.progress.min(99)
+                } else {
+                    progress.min(100)
+                };
                 task.message = message;
                 task.result = result;
                 task.error = error;
@@ -375,6 +381,68 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Running);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_or_cancelled_tasks_keep_the_last_real_progress() {
+        let dir = temp_root();
+        let state = test_state(&dir);
+        let task_id = TaskService::create(
+            &state,
+            "upload_game_body_package",
+            TaskCategory::BodyTransfer,
+            Some("game-1".to_string()),
+            "准备上传",
+        )
+        .expect("create task");
+
+        TaskService::update(
+            &state,
+            &task_id,
+            TaskStatus::Running,
+            37,
+            "正在上传第 3 个分片",
+            None,
+        );
+        TaskService::finish(
+            &state,
+            &task_id,
+            TaskStatus::Failed,
+            100,
+            "上传失败",
+            None,
+            Some("网络中断".to_string()),
+        );
+        assert_eq!(
+            TaskService::get(&state, &task_id)
+                .expect("failed task")
+                .progress,
+            37
+        );
+
+        TaskService::update(
+            &state,
+            &task_id,
+            TaskStatus::Running,
+            52,
+            "重新开始上传",
+            None,
+        );
+        TaskService::finish(
+            &state,
+            &task_id,
+            TaskStatus::Cancelled,
+            100,
+            "已取消",
+            None,
+            None,
+        );
+        assert_eq!(
+            TaskService::get(&state, &task_id)
+                .expect("cancelled task")
+                .progress,
+            52
+        );
     }
 
     /// 分类是前端分流任务的唯一依据，创建时必须落盘——否则前端拿到 `null`，

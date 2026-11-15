@@ -72,7 +72,13 @@ async function retry(task: AppTask) {
     if (retryInfo.operation === "upload_game_body_package" && retryInfo.versionId) {
       newTaskId = await uploadGameBodyPackage(retryInfo.gameUid, retryInfo.versionId);
     } else if (retryInfo.operation === "install_cloud_game" && retryInfo.remotePath) {
-      newTaskId = await installCloudGame(retryInfo.gameUid, retryInfo.gameKey, retryInfo.remotePath, retryInfo.remoteFsId);
+      const localGame = props.games.find((game) => retryInfo.gameKey
+        ? game.gameKey === retryInfo.gameKey : game.gameUid === retryInfo.gameUid);
+      const replaceExisting = Boolean(localGame);
+      if (replaceExisting && !(await confirmAction(
+        `重试将重新下载并替换“${localGame!.displayName}”的本地游戏本体。已配置的受保护存档会保留，其他游戏文件会被替换。确定继续吗？`,
+      ))) return;
+      newTaskId = await installCloudGame(retryInfo.gameUid, retryInfo.gameKey, retryInfo.remotePath, retryInfo.remoteFsId, replaceExisting);
     } else if (retryInfo.operation === "download_game_body_package" && retryInfo.remotePath) {
       newTaskId = await downloadGameBodyPackage(retryInfo.gameUid, retryInfo.remotePath, retryInfo.remoteFsId);
     } else if (retryInfo.operation === "delete_remote_body_package" && retryInfo.remotePath) {
@@ -88,7 +94,12 @@ async function retry(task: AppTask) {
       throw new Error("该任务缺少可重试参数");
     }
     if (newTaskId && newTaskId !== task.taskId) {
-      await deleteTasks([task.taskId]);
+      try {
+        await deleteTasks([task.taskId]);
+      } catch (reason) {
+        // 新任务已经创建并会继续执行；旧记录清理失败不应让用户误以为重试没有启动。
+        actionError.value = `重试已启动，但旧任务记录清理失败：${String(reason)}`;
+      }
     }
     await refresh();
   } catch (reason) {
@@ -267,7 +278,7 @@ onUnmounted(() => {
           <div class="transfer-icon"><component :is="taskIcon(task)" :size="20" /></div>
           <div class="transfer-copy"><div class="transfer-title"><strong>{{ taskTitle(task) }}</strong><span>{{ statusLabel(task.status) }}</span></div><p>{{ gameName(task.gameUid) }}</p><small>{{ task.message }} · {{ formatTaskTime(task.createdAt) }}</small><p v-if="task.status === 'failed' || task.status === 'interrupted'" class="transfer-error">{{ formatError(task) }}</p></div>
           <div class="transfer-progress"><strong>{{ isSessionTask(task) ? "运行中" : `${task.progress}%` }}</strong><div v-if="!isSessionTask(task)" class="progress-track"><span :style="{ width: `${task.progress}%` }"></span></div></div>
-          <div class="transfer-card-actions"><button v-if="isActive(task) && taskPolicyOf(task).cancellable" class="secondary-button compact-button" type="button" :disabled="cancelling === task.taskId" @click="cancel(task)"><LoaderCircle v-if="cancelling === task.taskId" :size="15" class="spin" /><XCircle v-else :size="15" />取消</button><span v-else-if="isActive(task)" class="transfer-locked" title="该任务在完成前无法安全取消：中途放弃会留下不一致的状态">不可取消</span><button v-else-if="(task.status === 'failed' || task.status === 'cancelled' || task.status === 'interrupted') && task.retry" class="secondary-button compact-button" type="button" :disabled="retrying === task.taskId" @click="retry(task)"><LoaderCircle v-if="retrying === task.taskId" :size="15" class="spin" /><component :is="retryIcon(task)" v-else :size="15" />重试</button><CheckCircle2 v-if="task.status === 'success'" class="transfer-success-icon" :size="20" /><button v-if="!isActive(task)" class="icon-button danger-button" type="button" :disabled="deleting === task.taskId || deleting === 'all'" title="删除任务记录" aria-label="删除任务记录" @click="removeTask(task)"><LoaderCircle v-if="deleting === task.taskId" :size="15" class="spin" /><Trash2 v-else :size="15" /></button></div>
+          <div class="transfer-card-actions"><button v-if="isActive(task) && taskPolicyOf(task).cancellable" class="secondary-button compact-button" type="button" :disabled="cancelling === task.taskId" @click="cancel(task)"><LoaderCircle v-if="cancelling === task.taskId" :size="15" class="spin" /><XCircle v-else :size="15" />取消</button><span v-else-if="isActive(task)" class="transfer-locked" title="该任务在完成前无法安全取消：中途放弃会留下不一致的状态">不可取消</span><button v-else-if="(task.status === 'failed' || task.status === 'cancelled' || task.status === 'interrupted') && task.retry" class="secondary-button compact-button" type="button" :disabled="!!retrying" @click="retry(task)"><LoaderCircle v-if="retrying === task.taskId" :size="15" class="spin" /><component :is="retryIcon(task)" v-else :size="15" />重试</button><CheckCircle2 v-if="task.status === 'success'" class="transfer-success-icon" :size="20" /><button v-if="!isActive(task)" class="icon-button danger-button" type="button" :disabled="deleting === task.taskId || deleting === 'all'" title="删除任务记录" aria-label="删除任务记录" @click="removeTask(task)"><LoaderCircle v-if="deleting === task.taskId" :size="15" class="spin" /><Trash2 v-else :size="15" /></button></div>
         </article>
       </div>
     </template>

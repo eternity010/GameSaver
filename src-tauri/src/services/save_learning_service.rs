@@ -223,21 +223,9 @@ impl SaveLearningService {
                 }
             ),
         );
-        on_progress(
-            8,
-            if validation_only {
-                "正在记录待确认存档的保存前快照"
-            } else {
-                "正在记录保存前快照基线"
-            },
-        );
-        let baseline = Some(collect_snapshot(
-            &roots,
-            |progress, message| on_progress(8 + (progress as u32 * 45 / 100) as u8, message),
-            &is_cancelled,
-        )?);
         let session_id = Uuid::new_v4().to_string();
         let mut etw_start_error = None;
+        on_progress(8, "正在启动 ETW 存档事件采集");
         let etw_capture = match try_start_etw_capture(app, &session_id) {
             Ok(handle) => {
                 on_progress(56, "ETW 已启动，准备记录游戏文件操作");
@@ -245,24 +233,37 @@ impl SaveLearningService {
             }
             Err(error) => {
                 etw_start_error = Some(error);
-                on_progress(
-                    56,
-                    if validation_only {
-                        "ETW 不可用，将使用候选目录快照继续验证"
-                    } else {
-                        "ETW 不可用，将使用快照差异继续学习"
-                    },
-                );
+                on_progress(10, "ETW 不可用，正在建立快照回退基线");
                 None
             }
         };
+
+        let baseline = if etw_capture.is_some() {
+            None
+        } else {
+            Some(collect_snapshot(
+                &roots,
+                |progress, message| on_progress(12 + (progress as u32 * 41 / 100) as u8, message),
+                &is_cancelled,
+            )?)
+        };
+
         if etw_capture.is_some() {
             on_progress(
                 57,
                 if validation_only {
-                    "ETW 优先验证：同时具备快照基线兜底"
+                    "ETW 优先验证：跳过启动前全量 baseline"
                 } else {
-                    "ETW 优先模式：同时具备快照基线兜底"
+                    "ETW 优先模式：跳过启动前全量 baseline"
+                },
+            );
+        } else {
+            on_progress(
+                56,
+                if validation_only {
+                    "快照回退基线已建立，准备验证候选范围"
+                } else {
+                    "快照回退基线已建立，准备启动游戏"
                 },
             );
         }
@@ -405,20 +406,19 @@ impl SaveLearningService {
         }
         if etw_files.is_empty() {
             event_capture_mode = "snapshot".to_string();
-            notes.push("未捕获到有效 ETW 文件，已自动使用快照差异比对".to_string());
+            if active.baseline.is_some() {
+                notes.push("未捕获到有效 ETW 文件，已自动使用快照差异比对".to_string());
+            } else {
+                notes.push(
+                    "ETW 未捕获到符合存档特征的写入文件，没有可用的保存前 baseline，未执行全量快照回退"
+                        .to_string(),
+                );
+            }
         }
+        let mut effective_roots = active.roots.clone();
         if event_capture_mode == "etw" && !active.validation_only {
-            let etw_relevant_roots: Vec<_> = active
-                .roots
-                .iter()
-                .filter(|r| {
-                    r.root_type == SaveRootType::ManagedGame
-                        || etw_files
-                            .iter()
-                            .any(|path| path_is_within_root(path, &r.physical_path))
-                })
-                .cloned()
-                .collect();
+            effective_roots = etw_effective_roots(&active.roots, &etw_files);
+            let etw_relevant_roots = effective_roots.clone();
             let fallback_files = discover_save_container_files(&etw_relevant_roots, &is_cancelled)?;
             if !fallback_files.is_empty() {
                 let existing_count = etw_files.len();
@@ -447,45 +447,37 @@ impl SaveLearningService {
                 crate::logging::info("存档学习容器兜底：未找到常见存档容器");
             }
         }
-        let mut effective_roots = active.roots.clone();
-        if !etw_files.is_empty() && !active.validation_only {
-            let managed_path = active
-                .roots
-                .iter()
-                .find(|r| r.root_type == SaveRootType::ManagedGame)
-                .map(|r| r.physical_path.as_path());
-            for etw_file in &etw_files {
-                let path = Path::new(etw_file);
-                if !effective_roots
-                    .iter()
-                    .any(|r| path_is_within_root(etw_file, &r.physical_path))
-                {
-                    if let Some(inferred) = infer_scan_root_for_etw_file(path, managed_path) {
-                        effective_roots.push(inferred);
-                    }
-                }
-            }
-            let mut seen = HashSet::new();
-            effective_roots.retain(|r| seen.insert(normalize_path(&r.physical_path)));
-        }
-
         let baseline = active.baseline.as_ref();
         let final_snapshot = if etw_files.is_empty() {
-            collect_snapshot(
-                &effective_roots,
-                |progress, message| on_progress(snapshot_analysis_progress(progress), message),
-                &is_cancelled,
-            )?
-        } else {
-            on_progress(45, "ETW 已定位文件，正在读取目标文件状态");
-            let targeted = collect_targeted_snapshot(&effective_roots, &etw_files, &is_cancelled)?;
-            if targeted.is_empty() {
-                notes.push("ETW 文件无法直接读取，已回退完整快照差异".to_string());
+            if baseline.is_some() {
                 collect_snapshot(
                     &effective_roots,
                     |progress, message| on_progress(snapshot_analysis_progress(progress), message),
                     &is_cancelled,
                 )?
+            } else {
+                HashMap::new()
+            }
+        } else {
+            on_progress(45, "ETW 已定位文件，正在读取目标文件状态");
+            let targeted = collect_targeted_snapshot(&effective_roots, &etw_files, &is_cancelled)?;
+            if targeted.is_empty() {
+                if baseline.is_some() {
+                    notes.push("ETW 文件无法直接读取，已回退完整快照差异".to_string());
+                    collect_snapshot(
+                        &effective_roots,
+                        |progress, message| {
+                            on_progress(snapshot_analysis_progress(progress), message)
+                        },
+                        &is_cancelled,
+                    )?
+                } else {
+                    notes.push(
+                        "ETW 文件无法直接读取，且没有保存前 baseline，无法执行快照差异回退"
+                            .to_string(),
+                    );
+                    HashMap::new()
+                }
             } else {
                 targeted
             }
@@ -1118,6 +1110,50 @@ fn infer_scan_root_for_etw_file(
         }
     }
     None
+}
+
+/// ETW-first 结束分析只保留受管游戏目录和 ETW 实际命中的外部目录。
+///
+/// 启动前按名称发现的目录仍用于快照回退，但 ETW 已经给出事实证据后，不能再把
+/// 所有自动发现目录带入容器兜底扫描，否则其他游戏的 AppData/LocalLow 也会被加入候选。
+fn etw_effective_roots(
+    active_roots: &[crate::domain::ScanRoot],
+    etw_files: &HashSet<String>,
+) -> Vec<crate::domain::ScanRoot> {
+    let mut roots = Vec::new();
+    let managed_path = active_roots
+        .iter()
+        .find(|root| root.root_type == SaveRootType::ManagedGame)
+        .map(|root| root.physical_path.as_path());
+
+    if let Some(managed_root) = active_roots
+        .iter()
+        .find(|root| root.root_type == SaveRootType::ManagedGame)
+    {
+        roots.push(managed_root.clone());
+    }
+
+    for etw_file in etw_files {
+        if !is_etw_candidate(etw_file) {
+            continue;
+        }
+
+        if let Some(root) = active_roots
+            .iter()
+            .filter(|root| path_is_within_root(etw_file, &root.physical_path))
+            .max_by_key(|root| root.physical_path.components().count())
+        {
+            roots.push(root.clone());
+        } else if let Some(inferred) =
+            infer_scan_root_for_etw_file(Path::new(etw_file), managed_path)
+        {
+            roots.push(inferred);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    roots.retain(|root| seen.insert(normalize_path(&root.physical_path)));
+    roots
 }
 
 fn game_name_hints(game: &Game) -> Vec<String> {
@@ -2049,8 +2085,8 @@ mod tests {
     use super::{
         arm_capture_watchdog, calculate_learning_confidence, classify_scope_evidence,
         collect_snapshot, collect_targeted_snapshot, discover_save_container_files,
-        discovered_only_the_install_dir, find_candidate_directories, infer_scope_drafts,
-        is_etw_candidate, is_transaction_evidence_path, path_is_within_root,
+        discovered_only_the_install_dir, etw_effective_roots, find_candidate_directories,
+        infer_scope_drafts, is_etw_candidate, is_transaction_evidence_path, path_is_within_root,
         preview_drafts_from_roots, preview_result, propose_directory_saves, run_capture_watchdog,
         snapshot_analysis_progress, transaction_evidence, MAX_CANDIDATE_FILE_BYTES,
         MAX_CAPTURE_DURATION,
@@ -2467,6 +2503,46 @@ mod tests {
             .iter()
             .any(|path| path.ends_with(r"\savedata\playerdata0.sav")));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn etw_effective_roots_ignores_unmatched_discovered_roots() {
+        let workspace = temp_root("etw-roots");
+        let managed = workspace.join("managed-game");
+        let discovered_other_game = workspace.join("other-game-save");
+        let external_save = workspace.join("external-save");
+        fs::create_dir_all(&managed).expect("create managed root");
+        fs::create_dir_all(&discovered_other_game).expect("create discovered root");
+        fs::create_dir_all(&external_save).expect("create external root");
+
+        let roots = vec![
+            ScanRoot {
+                root_type: SaveRootType::ManagedGame,
+                physical_path: managed.clone(),
+            },
+            ScanRoot {
+                root_type: SaveRootType::LocalAppData,
+                physical_path: discovered_other_game.clone(),
+            },
+            ScanRoot {
+                root_type: SaveRootType::Documents,
+                physical_path: external_save.clone(),
+            },
+        ];
+        let etw_files = HashSet::from([
+            normalize_path(&managed.join("save.sav")),
+            normalize_path(&external_save.join("slot.sav")),
+        ]);
+
+        let effective = etw_effective_roots(&roots, &etw_files);
+        let effective_paths: HashSet<String> = effective
+            .iter()
+            .map(|root| normalize_path(&root.physical_path))
+            .collect();
+
+        assert!(effective_paths.contains(&normalize_path(&managed)));
+        assert!(effective_paths.contains(&normalize_path(&external_save)));
+        assert!(!effective_paths.contains(&normalize_path(&discovered_other_game)));
     }
 
     /// R2：只认「学习那一刻的文件清单」的范围，必须把目录里**已经存在**的疑似存档列成

@@ -526,8 +526,8 @@ export function getCloudGameCover(gameKey: string): Promise<number[] | null> {
   return invokeCommand<number[] | null>("get_cloud_game_cover", { gameKey });
 }
 
-export function installCloudGame(gameUid: string, gameKey: string | undefined, remotePath: string, remoteFsId?: number): Promise<string> {
-  return invokeCommand<string>("install_cloud_game", { gameUid, gameKey, remotePath, remoteFsId });
+export function installCloudGame(gameUid: string, gameKey: string | undefined, remotePath: string, remoteFsId?: number, replaceExisting = false): Promise<string> {
+  return invokeCommand<string>("install_cloud_game", { gameUid, gameKey, remotePath, remoteFsId, replaceExisting });
 }
 
 export function listRemoteBodyPackages(gameUid: string): Promise<RemoteBodyPackageList> {

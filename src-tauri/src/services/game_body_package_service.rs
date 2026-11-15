@@ -1,4 +1,7 @@
-use crate::{domain::is_safe_path_segment, services::disk_space};
+use crate::{
+    domain::{is_safe_path_segment, GameBodyVersion},
+    services::disk_space,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -568,21 +571,6 @@ impl BodyPackageService {
         result
     }
 
-    pub fn validate_package(
-        package_path: &Path,
-        game_uid: &str,
-        executable_relative_path: &str,
-        expected_package_sha256: Option<&str>,
-    ) -> Result<BodyPackageManifest, String> {
-        Self::validate_package_with_known_hash(
-            package_path,
-            game_uid,
-            executable_relative_path,
-            expected_package_sha256,
-            None,
-        )
-    }
-
     pub fn validate_package_with_known_hash(
         package_path: &Path,
         game_uid: &str,
@@ -599,6 +587,43 @@ impl BodyPackageService {
                 return Err("本体 ZIP 哈希校验失败".to_string());
             }
         }
+        Self::validate_package_contents(
+            package_path,
+            Some(game_uid),
+            None,
+            executable_relative_path,
+        )
+    }
+
+    /// 只校验 ZIP 结构与清单，不重复读取整个包计算哈希。
+    ///
+    /// 上传前的 SHA-256 会和百度分片 MD5 在同一次顺序读取中完成；结构校验仍然保留，
+    /// 这样既不会把损坏 ZIP 送上云端，也不会因为重复哈希让上传迟迟不开始。
+    pub fn validate_package_structure_for_upload(
+        package_path: &Path,
+        version: &GameBodyVersion,
+        executable_relative_path: &str,
+    ) -> Result<(), String> {
+        let verified_remote_package = version.remote_path.is_some()
+            && version.remote_fs_id.is_some()
+            && version.sha256.as_ref().is_some_and(|hash| {
+                hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+        Self::validate_package_contents(
+            package_path,
+            (!verified_remote_package).then_some(version.game_uid.as_str()),
+            Some(&version.version_id),
+            executable_relative_path,
+        )
+        .map(|_| ())
+    }
+
+    fn validate_package_contents(
+        package_path: &Path,
+        game_uid: Option<&str>,
+        version_id: Option<&str>,
+        executable_relative_path: &str,
+    ) -> Result<BodyPackageManifest, String> {
         let file =
             fs::File::open(package_path).map_err(|err| format!("打开本体 ZIP 失败：{err}"))?;
         let reader = BufReader::with_capacity(512 * 1024, file);
@@ -608,8 +633,15 @@ impl BodyPackageService {
         if manifest.format_version != PACKAGE_FORMAT_VERSION {
             return Err(format!("不支持的本体包格式：{}", manifest.format_version));
         }
-        if manifest.game_uid != game_uid {
+        if !is_safe_path_segment(&manifest.game_uid)
+            || game_uid.is_some_and(|uid| manifest.game_uid != uid)
+        {
             return Err("本体包不属于当前游戏".to_string());
+        }
+        if !is_safe_path_segment(&manifest.version_id)
+            || version_id.is_some_and(|version| manifest.version_id != version)
+        {
+            return Err("本体包版本与本地版本记录不一致".to_string());
         }
         let executable = normalize_relative(executable_relative_path)?;
         if manifest.file_count != manifest.files.len() || manifest.file_count == 0 {
@@ -624,22 +656,6 @@ impl BodyPackageService {
         }
         validate_archive_entries(&archive, &manifest)?;
         Ok(manifest)
-    }
-
-    pub fn validate_package_for_upload(
-        package_path: &Path,
-        game_uid: &str,
-        executable_relative_path: &str,
-        expected_package_sha256: Option<&str>,
-    ) -> Result<(), String> {
-        if let Some(expected) = expected_package_sha256 {
-            let actual_hash = hash_file(package_path)?;
-            if actual_hash != expected {
-                return Err("本体 ZIP 哈希校验失败".to_string());
-            }
-            return Ok(());
-        }
-        Self::validate_package(package_path, game_uid, executable_relative_path, None).map(|_| ())
     }
 
     #[allow(dead_code)]
@@ -674,8 +690,66 @@ impl BodyPackageService {
         on_progress: impl Fn(u8, &str),
         is_cancelled: impl Fn() -> bool,
     ) -> Result<BodyPackageManifest, String> {
+        Self::extract_checked_package(
+            package_path,
+            staging_root,
+            Some(game_uid),
+            None,
+            executable_relative_path,
+            expected_package_sha256,
+            known_package_sha256,
+            on_progress,
+            is_cancelled,
+        )
+    }
+
+    pub fn extract_cloud_package(
+        package_path: &Path,
+        staging_root: &Path,
+        version_id: &str,
+        executable_relative_path: &str,
+        expected_sha256: &str,
+        downloaded_sha256: &str,
+        on_progress: impl Fn(u8, &str),
+        is_cancelled: impl Fn() -> bool,
+    ) -> Result<BodyPackageManifest, String> {
+        if expected_sha256.len() != 64
+            || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("云端本体包缺少有效的 SHA-256，无法安全安装".to_string());
+        }
+        Self::extract_checked_package(
+            package_path,
+            staging_root,
+            None,
+            Some(version_id),
+            executable_relative_path,
+            Some(expected_sha256),
+            Some(downloaded_sha256),
+            on_progress,
+            is_cancelled,
+        )
+    }
+
+    fn extract_checked_package(
+        package_path: &Path,
+        staging_root: &Path,
+        game_uid: Option<&str>,
+        version_id: Option<&str>,
+        executable_relative_path: &str,
+        expected_package_sha256: Option<&str>,
+        known_package_sha256: Option<&str>,
+        on_progress: impl Fn(u8, &str),
+        is_cancelled: impl Fn() -> bool,
+    ) -> Result<BodyPackageManifest, String> {
         let expected_executable = normalize_relative(executable_relative_path)?;
+        if staging_root.exists() {
+            return Err("本体恢复暂存目录已存在".to_string());
+        }
         let result = (|| -> Result<BodyPackageManifest, String> {
+            if is_cancelled() {
+                return Err("任务已取消".to_string());
+            }
             let actual_package_hash = match known_package_sha256 {
                 Some(known) if !known.is_empty() => known.to_string(),
                 _ => hash_file(package_path)?,
@@ -684,7 +758,7 @@ impl BodyPackageService {
                 return Err("本体 ZIP 哈希为空".to_string());
             }
             if let Some(expected) = expected_package_sha256 {
-                if actual_package_hash != expected {
+                if !actual_package_hash.eq_ignore_ascii_case(expected) {
                     return Err("本体 ZIP 哈希校验失败".to_string());
                 }
             }
@@ -697,8 +771,15 @@ impl BodyPackageService {
             if manifest.format_version != PACKAGE_FORMAT_VERSION {
                 return Err(format!("不支持的本体包格式：{}", manifest.format_version));
             }
-            if manifest.game_uid != game_uid {
+            if !is_safe_path_segment(&manifest.game_uid)
+                || game_uid.is_some_and(|uid| manifest.game_uid != uid)
+            {
                 return Err("本体包不属于当前游戏".to_string());
+            }
+            if !is_safe_path_segment(&manifest.version_id)
+                || version_id.is_some_and(|id| manifest.version_id != id)
+            {
+                return Err("本体包版本与云端版本清单不一致".to_string());
             }
             if manifest.file_count != manifest.files.len() || manifest.file_count == 0 {
                 return Err("本体包清单中的文件数量无效".to_string());
@@ -711,13 +792,28 @@ impl BodyPackageService {
                 return Err("本体包缺少游戏启动程序".to_string());
             }
             validate_archive_entries(&archive, &manifest)?;
-            if staging_root.exists() {
-                return Err("本体恢复暂存目录已存在".to_string());
+            let declared_bytes = manifest.files.iter().try_fold(0u64, |total, item| {
+                total
+                    .checked_add(item.size)
+                    .ok_or_else(|| "本体包总大小无效".to_string())
+            })?;
+            if declared_bytes != manifest.total_bytes {
+                return Err("本体包总大小校验失败".to_string());
             }
+            for expected in &manifest.files {
+                let entry = archive
+                    .by_name(&expected.relative_path)
+                    .map_err(|error| format!("读取本体 ZIP 条目失败：{error}"))?;
+                if entry.size() != expected.size {
+                    return Err(format!("本体文件大小不一致：{}", expected.relative_path));
+                }
+            }
+            disk_space::ensure_available_space(staging_root, manifest.total_bytes)?;
             fs::create_dir_all(staging_root)
                 .map_err(|err| format!("创建本体恢复暂存目录失败：{err}"))?;
             let extract_result = (|| -> Result<(), String> {
                 let mut written_bytes = 0u64;
+                let mut last_progress = 8u8;
                 for (index, expected) in manifest.files.iter().enumerate() {
                     if is_cancelled() {
                         return Err("任务已取消".to_string());
@@ -741,6 +837,9 @@ impl BodyPackageService {
                     let mut size = 0u64;
                     let mut buffer = vec![0u8; 1024 * 1024];
                     loop {
+                        if is_cancelled() {
+                            return Err("任务已取消".to_string());
+                        }
                         let read = input.read(&mut buffer).map_err(|err| {
                             format!("解压本体文件失败（{}）：{err}", expected.relative_path)
                         })?;
@@ -751,6 +850,27 @@ impl BodyPackageService {
                             format!("写入本体恢复文件失败（{}）：{err}", expected.relative_path)
                         })?;
                         size = size.saturating_add(read as u64);
+                        if size > expected.size {
+                            return Err(format!("本体文件大小不一致：{}", expected.relative_path));
+                        }
+                        let completed = written_bytes.saturating_add(size);
+                        let progress = 8
+                            + ((u128::from(completed) * 90)
+                                / u128::from(manifest.total_bytes.max(1)))
+                                as u8;
+                        if progress > last_progress {
+                            last_progress = progress;
+                            on_progress(
+                                progress.min(98),
+                                &format!(
+                                    "正在解压本体文件 {}/{}（{} / {} MB）",
+                                    index + 1,
+                                    manifest.files.len(),
+                                    completed / 1024 / 1024,
+                                    manifest.total_bytes / 1024 / 1024,
+                                ),
+                            );
+                        }
                     }
                     output.sync_all().map_err(|err| {
                         format!("刷新本体恢复文件失败（{}）：{err}", expected.relative_path)
@@ -763,7 +883,11 @@ impl BodyPackageService {
                         format!("提交本体恢复文件失败（{}）：{err}", expected.relative_path)
                     })?;
                     written_bytes = written_bytes.saturating_add(size);
-                    let progress = 8 + (((index + 1) * 90) / manifest.files.len().max(1)) as u8;
+                    let progress = if manifest.total_bytes == 0 {
+                        8 + (((index + 1) * 90) / manifest.files.len().max(1)) as u8
+                    } else {
+                        last_progress
+                    };
                     on_progress(
                         progress.min(98),
                         &format!("正在解压本体文件 {}/{}", index + 1, manifest.files.len()),
@@ -1252,6 +1376,196 @@ mod tests {
     /// `label` 保留各用例原本的语义（`body-package` / `body-space` / …）。
     fn temp_workspace(label: &str) -> crate::test_support::TempWorkspace {
         crate::test_support::TempWorkspace::new(label)
+    }
+
+    fn cloud_extraction_fixture(root: &std::path::Path) -> (PathBuf, String) {
+        use std::io::Write;
+        let path = root.join("cloud-package.zip");
+        let resource = vec![42u8; 4 * 1024 * 1024];
+        let manifest = super::BodyPackageManifest {
+            format_version: 1,
+            game_uid: "uploader-game".to_string(),
+            version_id: "version-1".to_string(),
+            file_count: 2,
+            total_bytes: 3 + resource.len() as u64,
+            excluded_items: Vec::new(),
+            files: vec![
+                BodyPackageFile {
+                    relative_path: "game.exe".to_string(),
+                    size: 3,
+                },
+                BodyPackageFile {
+                    relative_path: "large-resource.pak".to_string(),
+                    size: resource.len() as u64,
+                },
+            ],
+        };
+        let mut writer = zip::ZipWriter::new(fs::File::create(&path).expect("zip"));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer
+            .start_file("game.exe", options)
+            .expect("executable entry");
+        writer.write_all(b"exe").expect("executable");
+        writer
+            .start_file("large-resource.pak", options)
+            .expect("resource entry");
+        writer.write_all(&resource).expect("resource");
+        writer
+            .start_file(super::MANIFEST_PATH, options)
+            .expect("manifest entry");
+        writer
+            .write_all(&serde_json::to_vec(&manifest).expect("manifest json"))
+            .expect("manifest");
+        writer.finish().expect("finish zip");
+        let hash = super::hash_file(&path).expect("zip hash");
+        (path, hash)
+    }
+
+    #[test]
+    fn cloud_extraction_binds_to_the_verified_version_instead_of_a_local_uid() {
+        let root = temp_workspace("cloud-extraction-source-identity");
+        let (path, hash) = cloud_extraction_fixture(&root);
+        let staging = root.join("staging");
+        let manifest = BodyPackageService::extract_cloud_package(
+            &path,
+            &staging,
+            "version-1",
+            "game.exe",
+            &hash,
+            &hash,
+            |_, _| {},
+            || false,
+        )
+        .expect("cloud extraction");
+        assert_eq!(manifest.game_uid, "uploader-game");
+        assert_eq!(
+            fs::read(staging.join("game.exe")).expect("installed executable"),
+            b"exe"
+        );
+        let error = BodyPackageService::extract_package_with_known_hash(
+            &path,
+            &root.join("strict"),
+            "local-game",
+            "game.exe",
+            Some(&hash),
+            Some(&hash),
+            |_, _| {},
+            || false,
+        )
+        .expect_err("local validation stays strict");
+        assert!(error.contains("不属于当前游戏"));
+    }
+
+    #[test]
+    fn cloud_extraction_rejects_hash_and_version_mismatches() {
+        let root = temp_workspace("cloud-extraction-verified-version");
+        let (path, hash) = cloud_extraction_fixture(&root);
+        for (version, expected_hash) in [
+            ("version-1", String::new()),
+            ("version-1", "00".repeat(32)),
+            ("version-2", hash.clone()),
+        ] {
+            let staging = root.join("staging");
+            assert!(BodyPackageService::extract_cloud_package(
+                &path,
+                &staging,
+                version,
+                "game.exe",
+                &expected_hash,
+                &hash,
+                |_, _| {},
+                || false
+            )
+            .is_err());
+            assert!(!staging.exists());
+        }
+    }
+
+    #[test]
+    fn a_verified_cloud_package_can_be_reuploaded_after_local_uid_rebinding() {
+        let root = temp_workspace("cloud-package-reupload-identity");
+        let (path, hash) = cloud_extraction_fixture(&root);
+        let mut version = crate::domain::GameBodyVersion {
+            version_id: "version-1".to_string(),
+            game_uid: "local-game".to_string(),
+            created_at: "1".to_string(),
+            archive_path: String::new(),
+            file_count: 2,
+            total_bytes: 4 * 1024 * 1024 + 3,
+            package_path: Some(path.to_string_lossy().into_owned()),
+            sha256: Some(hash),
+            excluded_items: Vec::new(),
+            upload_status: Some("synced".to_string()),
+            remote_path: Some("/games/stable-key/body/version-1.zip".to_string()),
+            remote_fs_id: Some(1),
+            remote_size: Some(fs::metadata(&path).expect("zip metadata").len()),
+        };
+        BodyPackageService::validate_package_structure_for_upload(&path, &version, "game.exe")
+            .expect("reupload known cloud package");
+        version.version_id = "different-version".to_string();
+        assert!(BodyPackageService::validate_package_structure_for_upload(
+            &path, &version, "game.exe"
+        )
+        .is_err());
+        version.version_id = "version-1".to_string();
+        version.remote_path = None;
+        assert!(BodyPackageService::validate_package_structure_for_upload(
+            &path, &version, "game.exe"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cancellation_during_a_single_large_file_removes_partial_extraction() {
+        let root = temp_workspace("cloud-extraction-mid-file-cancel");
+        let (path, hash) = cloud_extraction_fixture(&root);
+        let staging = root.join("staging");
+        let cancelled = std::cell::Cell::new(false);
+        let observed = std::cell::RefCell::new(Vec::new());
+        let error = BodyPackageService::extract_cloud_package(
+            &path,
+            &staging,
+            "version-1",
+            "game.exe",
+            &hash,
+            &hash,
+            |progress, _| {
+                observed.borrow_mut().push(progress);
+                if progress > 8 && progress < 98 {
+                    cancelled.set(true);
+                }
+            },
+            || cancelled.get(),
+        )
+        .expect_err("mid-file cancellation");
+        assert_eq!(error, "任务已取消");
+        assert!(cancelled.get());
+        assert!(!observed.borrow().contains(&100));
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn a_preexisting_staging_directory_is_never_deleted_on_validation_failure() {
+        let root = temp_workspace("cloud-extraction-existing-staging");
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging).expect("existing staging");
+        fs::write(staging.join("keep.dat"), b"existing").expect("existing file");
+        assert!(BodyPackageService::extract_package_with_known_hash(
+            &root.join("missing.zip"),
+            &staging,
+            "game",
+            "game.exe",
+            None,
+            None,
+            |_, _| {},
+            || false
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(staging.join("keep.dat")).expect("kept file"),
+            b"existing"
+        );
     }
 
     #[test]

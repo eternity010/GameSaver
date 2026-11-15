@@ -394,10 +394,6 @@ fn finish_game_session(
             let file_count = version.files.len();
             candidate.save_versions.push(version);
 
-            let keep_versions = profile.map(|p| p.keep_versions).unwrap_or(5);
-            let pruned =
-                SaveRepository::prune_game_save_versions(candidate, &game.game_uid, keep_versions);
-
             let Some(game_record) = candidate
                 .games
                 .iter_mut()
@@ -405,8 +401,14 @@ fn finish_game_session(
             else {
                 return Err("游戏记录不存在".to_string());
             };
+            // 新提交的版本马上就代表当前磁盘内容。先更新基线再剪枝，避免保留策略把
+            // 上一次恢复的旧版本误当成仍然需要保护的本地版本。
             game_record.latest_save_version_id = Some(version_id.clone());
             game_record.last_played_at = Some(now);
+
+            let keep_versions = profile.map(|p| p.keep_versions).unwrap_or(5);
+            let pruned =
+                SaveRepository::prune_game_save_versions(candidate, &game.game_uid, keep_versions);
             GameRepository::persist(app, candidate)?;
             Ok((
                 serde_json::json!({ "created": true, "versionId": version_id, "fileCount": file_count }),
@@ -471,15 +473,14 @@ fn wait_for_game_session(
 
     let refresh_processes =
         |pids: &mut HashSet<u32>, handles: &mut HashMap<u32, TrackedProcessHandle>| {
-            // 1. Expand process tree via Toolhelp snapshot (parent -> child)
-            let _ = crate::services::learning::extend_tracked_process_tree(pids);
+            let tree_result = crate::services::learning::extend_tracked_process_tree(pids);
 
-            // 2. Discover any process whose executable image is located within managed_path (handles UAC/detached launchers)
+            // 即使进程树快照失败，也继续扫描受管目录；这样异常收尾至少还能拿到
+            // 游戏目录内的子进程，避免只终止根进程后留下无人跟踪的游戏。
             let dir_pids =
                 crate::services::process_service::find_processes_in_directory(managed_path);
             pids.extend(dir_pids);
 
-            // 3. For any newly discovered PID (except root_pid and ignored crash handlers), open and hold handle
             for &pid in pids.iter() {
                 if pid != root_pid && !handles.contains_key(&pid) {
                     if let Some(handle) = TrackedProcessHandle::open(pid) {
@@ -502,10 +503,15 @@ fn wait_for_game_session(
                     }
                 }
             }
+
+            tree_result.map_err(|error| format!("刷新游戏进程树失败：{error}"))
         };
 
     // Initial scan to catch immediate launcher sub-processes
-    refresh_processes(&mut tracked_pids, &mut tracked_handles);
+    if let Err(error) = refresh_processes(&mut tracked_pids, &mut tracked_handles) {
+        terminate_session(root, root_exited, &mut tracked_handles);
+        return Err(error);
+    }
 
     loop {
         if TaskService::is_cancelled(state, task_id) {
@@ -518,20 +524,29 @@ fn wait_for_game_session(
 
         // Check root process exit status
         if !root_exited {
-            match root.probe()? {
-                RootProbe::Exited(status) => {
+            match root.probe() {
+                Ok(RootProbe::Exited(status)) => {
                     root_exited = true;
                     root_status = status;
-                    // When root exits, perform immediate refresh to catch any final spawned process
-                    refresh_processes(&mut tracked_pids, &mut tracked_handles);
+                    if let Err(error) = refresh_processes(&mut tracked_pids, &mut tracked_handles) {
+                        terminate_session(root, root_exited, &mut tracked_handles);
+                        return Err(error);
+                    }
                 }
-                RootProbe::Running => {}
+                Ok(RootProbe::Running) => {}
+                Err(error) => {
+                    terminate_session(root, root_exited, &mut tracked_handles);
+                    return Err(format!("等待游戏退出失败，已尝试终止游戏进程：{error}"));
+                }
             }
         }
 
         // Periodic process tree and directory scan (every 1 second)
         if last_scan.elapsed() >= Duration::from_secs(1) {
-            refresh_processes(&mut tracked_pids, &mut tracked_handles);
+            if let Err(error) = refresh_processes(&mut tracked_pids, &mut tracked_handles) {
+                terminate_session(root, root_exited, &mut tracked_handles);
+                return Err(error);
+            }
             last_scan = Instant::now();
         }
 
