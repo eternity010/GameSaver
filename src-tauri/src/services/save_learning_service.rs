@@ -1,19 +1,23 @@
-use crate::domain::path_utils::{normalize_path, strip_verbatim_prefix};
+use crate::domain::{
+    known_folders::{documents_root, public_documents_root},
+    path_utils::{normalize_path, strip_verbatim_prefix},
+};
 use crate::domain::save_candidate::{
     is_generic_config_file, is_noise_path, is_save_candidate, is_save_container_directory,
     path_has_save_container_ancestor, path_has_segment, should_ignore_event_path, NAME_HINTS,
     RESOURCE_EXTENSIONS, SAVE_EXTENSIONS,
 };
 use crate::domain::{
-    ActiveLearningSession, EtwCaptureHandle, FileFingerprint, Game, LearningSessionView,
+    EtwCaptureHandle, FileFingerprint, Game, LearningSessionView,
     LearningStatus, SaveCandidateEvidenceLevel, SaveLearningResult, SaveRootType, SaveScope,
     SaveScopeDraft, UnknownFilePolicy, DEFAULT_EXCLUDE_DIRECTORIES, DEFAULT_EXCLUDE_PATTERNS,
     DEFAULT_MAX_FILE_BYTES,
 };
 use crate::services::learning::{
-    collect_related_files_by_trace, extend_tracked_process_tree, stop_etw_capture,
-    try_start_etw_capture, FileOperation, FileOperationKind,
+    collect_related_files_by_trace, stop_etw_capture, try_start_etw_capture, FileOperation,
+    FileOperationKind,
 };
+use crate::services::process_service::LearningProcessTracker;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env, fs,
@@ -53,6 +57,7 @@ const PREVIEW_CAPTURE_MODE: &str = "preview";
 /// 用户忘了结束会话时触发。触发后**已采到的证据全部保留**，用户仍可正常点分析，此后的写入
 /// 由快照差异兜底。
 const MAX_CAPTURE_DURATION: Duration = Duration::from_secs(30 * 60);
+const PROCESS_HANDOFF_GRACE: Duration = Duration::from_secs(10);
 const GENERIC_NAME_BLACKLIST: [&str; 38] = [
     "game",
     "games",
@@ -127,6 +132,19 @@ fn is_managed_game_asset_dir(entry_path: &Path) -> bool {
     )
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveLearningSession {
+    pub view: LearningSessionView,
+    pub roots: Vec<crate::domain::ScanRoot>,
+    pub baseline: Option<HashMap<String, FileFingerprint>>,
+    pub tracked_processes: Arc<Mutex<LearningProcessTracker>>,
+    pub process_tracker_stop: Arc<AtomicBool>,
+    pub process_tracker_done: Arc<AtomicBool>,
+    pub etw_capture: Option<EtwCaptureHandle>,
+    pub etw_start_error: Option<String>,
+    pub validation_only: bool,
+}
+
 pub struct SaveLearningService;
 
 impl SaveLearningService {
@@ -138,7 +156,7 @@ impl SaveLearningService {
         preview_scope_drafts(game)
     }
 
-    pub fn start(
+    pub(crate) fn start(
         app: &AppHandle,
         game: &Game,
         on_progress: impl Fn(u8, &str),
@@ -154,7 +172,7 @@ impl SaveLearningService {
         )
     }
 
-    pub fn start_candidate_verification(
+    pub(crate) fn start_candidate_verification(
         app: &AppHandle,
         game: &Game,
         scopes: &[SaveScope],
@@ -304,18 +322,16 @@ impl SaveLearningService {
             }
         };
         let root_pid = child.id();
-        let mut tracked_pid_set = HashSet::from([root_pid]);
-        if let Err(error) = extend_tracked_process_tree(&mut tracked_pid_set) {
-            etw_start_error.get_or_insert(format!("进程树扩展失败：{error}"));
-        }
         let managed_path = PathBuf::from(&game.managed_path);
-        let dir_pids = crate::services::process_service::find_processes_in_directory(&managed_path);
-        tracked_pid_set.extend(dir_pids);
-        let tracked_pids = Arc::new(Mutex::new(sorted_pids(tracked_pid_set)));
+        let mut tracker = LearningProcessTracker::from_child(&child);
+        if let Err(error) = tracker.refresh(Some(&managed_path)) {
+            crate::logging::warn(format!("首次读取存档学习进程树失败：{error}"));
+        }
+        let tracked_processes = Arc::new(Mutex::new(tracker));
         let process_tracker_stop = Arc::new(AtomicBool::new(false));
         let process_tracker_done = Arc::new(AtomicBool::new(false));
         spawn_process_tracker(
-            Arc::clone(&tracked_pids),
+            Arc::clone(&tracked_processes),
             Arc::clone(&process_tracker_stop),
             Arc::clone(&process_tracker_done),
             Some(managed_path),
@@ -332,7 +348,7 @@ impl SaveLearningService {
             view,
             roots,
             baseline,
-            tracked_pids,
+            tracked_processes,
             process_tracker_stop,
             process_tracker_done,
             etw_capture,
@@ -341,7 +357,7 @@ impl SaveLearningService {
         })
     }
 
-    pub fn finish(
+    pub(crate) fn finish(
         active: &ActiveLearningSession,
         on_progress: impl Fn(u8, &str),
         is_cancelled: impl Fn() -> bool,
@@ -349,28 +365,9 @@ impl SaveLearningService {
         on_progress(10, "正在读取保存后的文件状态");
         active.process_tracker_stop.store(true, Ordering::Release);
         wait_for_process_tracker(&active.process_tracker_done);
-        let mut tracked_pid_set = active
-            .tracked_pids
-            .lock()
+        let any_running = active.tracked_processes.lock()
             .map_err(|_| "读取游戏进程树失败".to_string())?
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>();
-        let _ = extend_tracked_process_tree(&mut tracked_pid_set);
-        if let Some(managed_root) = active
-            .roots
-            .iter()
-            .find(|r| r.root_type == crate::domain::SaveRootType::ManagedGame)
-        {
-            let dir_pids = crate::services::process_service::find_processes_in_directory(
-                &managed_root.physical_path,
-            );
-            tracked_pid_set.extend(dir_pids);
-        }
-        let tracked_pids = sorted_pids(tracked_pid_set);
-        let any_running = tracked_pids
-            .iter()
-            .any(|&pid| crate::services::process_service::is_process_running(pid));
+            .any_alive();
         if any_running {
             crate::logging::info(
                 "分析存档时检测到游戏进程仍在运行，等待短缓冲以确保磁盘写入完成...",
@@ -387,10 +384,18 @@ impl SaveLearningService {
             } else {
                 "ETW 优先模式：依据 ETW 写入证据生成候选范围".to_string()
             });
+            let mut tracker = active.tracked_processes.lock()
+                .map_err(|_| "读取游戏进程树失败".to_string())?;
+            let managed = active.roots.iter()
+                .find(|root| root.root_type == SaveRootType::ManagedGame)
+                .map(|root| root.physical_path.as_path());
+            if let Err(error) = tracker.refresh(managed) {
+                notes.push(format!("最后一次刷新游戏进程树失败：{error}"));
+            }
             match collect_related_files_by_trace(
                 Some(&capture.trace_name),
                 Some(&capture.etl_path.to_string_lossy()),
-                &tracked_pids,
+                move |capture_end| tracker.lifetimes(capture_end),
             ) {
                 Ok(collection) => {
                     event_capture_mode = "etw".to_string();
@@ -398,7 +403,7 @@ impl SaveLearningService {
                     etw_operations = collection.operations;
                     notes.extend(collection.logs);
                 }
-                Err(error) => notes.push(format!("ETW 解析失败，已回退快照差异：{error}")),
+                Err(error) => notes.push(format!("无法使用 ETW 证据：{error}")),
             }
             let _ = std::fs::remove_file(&capture.etl_path);
         } else if let Some(error) = active.etw_start_error.as_ref() {
@@ -522,43 +527,6 @@ fn snapshot_analysis_progress(scan_progress: u8) -> u8 {
     10 + ((u16::from(scan_progress) * 4 / 5) as u8)
 }
 
-fn sorted_pids(pids: HashSet<u32>) -> Vec<u32> {
-    let mut values = pids.into_iter().collect::<Vec<_>>();
-    values.sort_unstable();
-    values
-}
-
-#[cfg(target_os = "windows")]
-fn any_process_alive(pids: &[u32]) -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    const STILL_ACTIVE: u32 = 259;
-    for &pid in pids {
-        if pid == 0 {
-            continue;
-        }
-        unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if !handle.is_null() {
-                let mut exit_code = 0u32;
-                let result = GetExitCodeProcess(handle, &mut exit_code);
-                CloseHandle(handle);
-                if result != 0 && exit_code == STILL_ACTIVE {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-#[cfg(not(target_os = "windows"))]
-fn any_process_alive(_pids: &[u32]) -> bool {
-    true
-}
-
 /// 到点后停止 ETW 会话，给 `.etl` 一个上界。
 ///
 /// `sleep` / `stop` 做成注入点，是为了让「到点真的会去停会话」可被测试钉住 —— 否则这条
@@ -601,26 +569,32 @@ fn arm_capture_watchdog(capture: Option<&EtwCaptureHandle>, arm: impl FnOnce(Str
 }
 
 fn spawn_process_tracker(
-    tracked_pids: Arc<Mutex<Vec<u32>>>,
+    tracked_processes: Arc<Mutex<LearningProcessTracker>>,
     stop: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     managed_path: Option<PathBuf>,
 ) {
     thread::spawn(move || {
         let mut iterations: usize = 0;
+        let mut idle_since = None;
         loop {
-            let all_exited = if let Ok(mut current) = tracked_pids.lock() {
-                let alive = any_process_alive(&current);
-                if alive || current.is_empty() {
-                    refresh_tracked_processes(&mut current, managed_path.as_deref());
+            let all_exited = if let Ok(mut current) = tracked_processes.lock() {
+                let alive = current.any_alive();
+                if should_refresh_tracked_processes(
+                    &mut idle_since,
+                    Instant::now(),
+                    alive,
+                    current.is_empty(),
+                ) {
+                    let _ = current.refresh(managed_path.as_deref());
                 }
                 !current.is_empty() && !alive
             } else {
                 false
             };
             if stop.load(Ordering::Acquire) {
-                if let Ok(mut current) = tracked_pids.lock() {
-                    refresh_tracked_processes(&mut current, managed_path.as_deref());
+                if let Ok(mut current) = tracked_processes.lock() {
+                    let _ = current.refresh(managed_path.as_deref());
                 }
                 done.store(true, Ordering::Release);
                 break;
@@ -638,14 +612,17 @@ fn spawn_process_tracker(
     });
 }
 
-fn refresh_tracked_processes(current: &mut Vec<u32>, managed_path: Option<&Path>) {
-    let mut process_set = current.iter().copied().collect::<HashSet<_>>();
-    let _ = extend_tracked_process_tree(&mut process_set);
-    if let Some(dir) = managed_path {
-        let dir_pids = crate::services::process_service::find_processes_in_directory(dir);
-        process_set.extend(dir_pids);
+fn should_refresh_tracked_processes(
+    idle_since: &mut Option<Instant>,
+    now: Instant,
+    any_alive: bool,
+    no_tracked_pids: bool,
+) -> bool {
+    if any_alive || no_tracked_pids {
+        *idle_since = None;
+        return true;
     }
-    *current = sorted_pids(process_set);
+    now.saturating_duration_since(*idle_since.get_or_insert(now)) < PROCESS_HANDOFF_GRACE
 }
 
 fn wait_for_process_tracker(done: &AtomicBool) {
@@ -699,17 +676,16 @@ fn discover_scan_roots(game: &Game) -> Result<Vec<crate::domain::ScanRoot>, Stri
             });
         }
     }
+    if let Some(documents) = documents_root().filter(|path| path.is_dir()) {
+        for path in find_candidate_directories(&documents, &hints) {
+            roots.push(crate::domain::ScanRoot {
+                root_type: SaveRootType::Documents,
+                physical_path: path,
+            });
+        }
+    }
     if let Ok(profile) = env::var("USERPROFILE") {
         let profile_root = PathBuf::from(profile);
-        let documents = profile_root.join("Documents");
-        if documents.is_dir() {
-            for path in find_candidate_directories(&documents, &hints) {
-                roots.push(crate::domain::ScanRoot {
-                    root_type: SaveRootType::Documents,
-                    physical_path: path,
-                });
-            }
-        }
         let saved_games = profile_root.join("Saved Games");
         if saved_games.is_dir() {
             for path in find_candidate_directories(&saved_games, &hints) {
@@ -729,11 +705,7 @@ fn discover_scan_roots(game: &Game) -> Result<Vec<crate::domain::ScanRoot>, Stri
             }
         }
     }
-    if let Ok(public) = env::var("PUBLIC")
-        .or_else(|_| env::var("SystemDrive").map(|d| format!(r"{d}\Users\Public")))
-    {
-        let public_root = PathBuf::from(public);
-        let public_documents = public_root.join("Documents");
+    if let Some(public_documents) = public_documents_root() {
         if public_documents.is_dir() {
             for path in find_candidate_directories(&public_documents, &hints) {
                 roots.push(crate::domain::ScanRoot {
@@ -1005,6 +977,8 @@ fn is_scan_noise_directory(path: &Path) -> bool {
 fn infer_scan_root_for_etw_file(
     file_path: &Path,
     managed_path: Option<&Path>,
+    documents: Option<&Path>,
+    public_documents: Option<&Path>,
 ) -> Option<crate::domain::ScanRoot> {
     let norm_file = normalize_path(file_path);
 
@@ -1053,22 +1027,14 @@ fn infer_scan_root_for_etw_file(
     });
     let local_low = profile_root.join("AppData").join("LocalLow");
     let saved_games = profile_root.join("Saved Games");
-    let documents = profile_root.join("Documents");
-    let public_documents = env::var_os("PUBLIC")
-        .or_else(|| {
-            env::var_os("SystemDrive")
-                .map(|d| format!(r"{}\Users\Public", d.to_string_lossy()).into())
-        })
-        .map(|p| PathBuf::from(p).join("Documents"));
-
     let bases: [(Option<PathBuf>, SaveRootType); 8] = [
         (Some(local_low), SaveRootType::LocalLow),
         (Some(saved_games), SaveRootType::SavedGames),
         (app_data, SaveRootType::AppData),
         (local_app_data, SaveRootType::LocalAppData),
         (program_data, SaveRootType::ProgramData),
-        (Some(documents), SaveRootType::Documents),
-        (public_documents, SaveRootType::Documents),
+        (documents.map(Path::to_path_buf), SaveRootType::Documents),
+        (public_documents.map(Path::to_path_buf), SaveRootType::Documents),
         (Some(profile_root.clone()), SaveRootType::UserProfile),
     ];
 
@@ -1121,6 +1087,8 @@ fn etw_effective_roots(
     etw_files: &HashSet<String>,
 ) -> Vec<crate::domain::ScanRoot> {
     let mut roots = Vec::new();
+    let documents = documents_root();
+    let public_documents = public_documents_root();
     let managed_path = active_roots
         .iter()
         .find(|root| root.root_type == SaveRootType::ManagedGame)
@@ -1145,7 +1113,9 @@ fn etw_effective_roots(
         {
             roots.push(root.clone());
         } else if let Some(inferred) =
-            infer_scan_root_for_etw_file(Path::new(etw_file), managed_path)
+            infer_scan_root_for_etw_file(
+                Path::new(etw_file), managed_path, documents.as_deref(), public_documents.as_deref(),
+            )
         {
             roots.push(inferred);
         }
@@ -2083,7 +2053,7 @@ mod tests {
     use std::{fs, path::Path};
 
     use super::{
-        arm_capture_watchdog, calculate_learning_confidence, classify_scope_evidence,
+        arm_capture_watchdog, calculate_learning_confidence, classify_scope_evidence, ActiveLearningSession,
         collect_snapshot, collect_targeted_snapshot, discover_save_container_files,
         discovered_only_the_install_dir, etw_effective_roots, find_candidate_directories,
         infer_scope_drafts, is_etw_candidate, is_transaction_evidence_path, path_is_within_root,
@@ -2096,7 +2066,7 @@ mod tests {
         is_noise_path, is_save_candidate, is_save_container_directory,
     };
     use crate::domain::{
-        ActiveLearningSession, EtwCaptureHandle, FileFingerprint, LearningSessionView,
+        EtwCaptureHandle, FileFingerprint, LearningSessionView,
         LearningStatus, SaveCandidateEvidenceLevel, SaveRootType, SaveScope, SaveScopeDraft,
         SaveTransactionSummary, ScanRoot, UnknownFilePolicy, DEFAULT_MAX_FILE_BYTES,
     };
@@ -2125,6 +2095,32 @@ mod tests {
             pid: 42,
             file_object_id: None,
         }
+    }
+
+    #[test]
+    fn process_tracker_keeps_scanning_after_the_launcher_exits() {
+        use super::{should_refresh_tracked_processes, PROCESS_HANDOFF_GRACE};
+        use std::time::Instant;
+
+        let start = Instant::now();
+        let mut idle_since = None;
+        assert!(should_refresh_tracked_processes(&mut idle_since, start, true, false));
+
+        let launcher_exit = start + Duration::from_millis(500);
+        assert!(should_refresh_tracked_processes(&mut idle_since, launcher_exit, false, false));
+        let successor = launcher_exit + Duration::from_secs(2);
+        assert!(should_refresh_tracked_processes(&mut idle_since, successor, false, false));
+        assert!(should_refresh_tracked_processes(&mut idle_since, successor, true, false));
+        assert_eq!(idle_since, None);
+
+        let successor_exit = successor + Duration::from_secs(15);
+        assert!(should_refresh_tracked_processes(&mut idle_since, successor_exit, false, false));
+        assert!(!should_refresh_tracked_processes(
+            &mut idle_since,
+            successor_exit + PROCESS_HANDOFF_GRACE,
+            false,
+            false,
+        ));
     }
 
     #[test]
@@ -2962,7 +2958,7 @@ mod tests {
                 physical_path: root.to_path_buf(),
             }],
             baseline: None,
-            tracked_pids: Arc::new(Mutex::new(vec![100])),
+            tracked_processes: Arc::new(Mutex::new(Default::default())),
             process_tracker_stop: Arc::new(AtomicBool::new(false)),
             process_tracker_done: Arc::new(AtomicBool::new(false)),
             etw_capture: None,
@@ -3150,7 +3146,7 @@ mod tests {
                 physical_path: PathBuf::from(r"c:\users\player\saved games\mygame"),
             }],
             baseline: None,
-            tracked_pids: Arc::new(Mutex::new(vec![100])),
+            tracked_processes: Arc::new(Mutex::new(Default::default())),
             process_tracker_stop: Arc::new(AtomicBool::new(false)),
             process_tracker_done: Arc::new(AtomicBool::new(false)),
             etw_capture: None,
@@ -3233,7 +3229,7 @@ mod tests {
                 physical_path: PathBuf::from(r"c:\users\player\saved games\mygame"),
             }],
             baseline: None,
-            tracked_pids: Arc::new(Mutex::new(vec![100])),
+            tracked_processes: Arc::new(Mutex::new(Default::default())),
             process_tracker_stop: Arc::new(AtomicBool::new(false)),
             process_tracker_done: Arc::new(AtomicBool::new(false)),
             etw_capture: None,
@@ -3306,7 +3302,7 @@ mod tests {
                 physical_path: PathBuf::from(r"c:\users\player\saved games\mygame"),
             }],
             baseline: None,
-            tracked_pids: Arc::new(Mutex::new(vec![100])),
+            tracked_processes: Arc::new(Mutex::new(Default::default())),
             process_tracker_stop: Arc::new(AtomicBool::new(false)),
             process_tracker_done: Arc::new(AtomicBool::new(false)),
             etw_capture: None,
@@ -3387,7 +3383,7 @@ mod tests {
                 physical_path: PathBuf::from(r"C:\Users\Player\AppData\LocalLow\Company\MyGame"),
             }],
             baseline: None,
-            tracked_pids: Arc::new(Mutex::new(vec![100])),
+            tracked_processes: Arc::new(Mutex::new(Default::default())),
             process_tracker_stop: Arc::new(AtomicBool::new(false)),
             process_tracker_done: Arc::new(AtomicBool::new(false)),
             etw_capture: None,
@@ -3487,6 +3483,15 @@ mod tests {
     }
 
     #[test]
+    fn infer_scan_root_recognizes_redirected_documents() {
+        let documents = PathBuf::from(r"F:\Sync\文档");
+        let save = documents.join("my games").join("example").join("slot.sav");
+        let root = super::infer_scan_root_for_etw_file(&save, None, Some(&documents), None).unwrap();
+        assert_eq!(root.root_type, SaveRootType::Documents);
+        assert_eq!(root.physical_path, documents.join("my games").join("example"));
+    }
+
+    #[test]
     fn infer_scan_root_for_etw_file_resolves_standard_locations() {
         let profile =
             std::env::var("USERPROFILE").unwrap_or_else(|_| r"C:\Users\Player".to_string());
@@ -3499,7 +3504,7 @@ mod tests {
             .join("miHoYo")
             .join("Genshin")
             .join("save.dat");
-        let root = super::infer_scan_root_for_etw_file(&local_low_file, Some(managed));
+        let root = super::infer_scan_root_for_etw_file(&local_low_file, Some(managed), None, None);
         assert!(root.is_some());
         let root = root.unwrap();
         assert_eq!(root.root_type, SaveRootType::LocalLow);
@@ -3510,7 +3515,7 @@ mod tests {
             .join("Saved Games")
             .join("Hades")
             .join("Profile1.sav");
-        let root = super::infer_scan_root_for_etw_file(&saved_games_file, Some(managed));
+        let root = super::infer_scan_root_for_etw_file(&saved_games_file, Some(managed), None, None);
         assert!(root.is_some());
         let root = root.unwrap();
         assert_eq!(root.root_type, SaveRootType::SavedGames);
@@ -3518,7 +3523,7 @@ mod tests {
 
         // 3. Managed Game
         let managed_file = managed.join("Game_Data").join("slot.bin");
-        let root = super::infer_scan_root_for_etw_file(&managed_file, Some(managed));
+        let root = super::infer_scan_root_for_etw_file(&managed_file, Some(managed), None, None);
         assert!(root.is_some());
         let root = root.unwrap();
         assert_eq!(root.root_type, SaveRootType::ManagedGame);
@@ -3538,7 +3543,7 @@ mod tests {
             .join("2456740")
             .join("remote")
             .join("slot0.json");
-        let root = super::infer_scan_root_for_etw_file(&steam_file, Some(managed));
+        let root = super::infer_scan_root_for_etw_file(&steam_file, Some(managed), None, Some(&public_doc));
         assert!(root.is_some());
         let root = root.unwrap();
         assert_eq!(root.root_type, SaveRootType::Documents);
@@ -3565,7 +3570,7 @@ mod tests {
             .join("ClassicGame")
             .join("save")
             .join("slot0.dat");
-        let root = super::infer_scan_root_for_etw_file(&nested, None).expect("应回推出范围");
+        let root = super::infer_scan_root_for_etw_file(&nested, None, None, None).expect("应回推出范围");
         assert_eq!(root.root_type, SaveRootType::ProgramData);
         assert_eq!(
             normalize_path(&root.physical_path),
@@ -3575,7 +3580,7 @@ mod tests {
 
         // 少一段时只能取一级：把第二段（其实是文件名）也拼进去，范围根就成了文件路径。
         let shallow = program_data.join("ClassicGame").join("save.dat");
-        let root = super::infer_scan_root_for_etw_file(&shallow, None).expect("应回推出范围");
+        let root = super::infer_scan_root_for_etw_file(&shallow, None, None, None).expect("应回推出范围");
         assert_eq!(root.root_type, SaveRootType::ProgramData);
         assert_eq!(
             normalize_path(&root.physical_path),
@@ -3763,7 +3768,7 @@ mod tests {
     fn infer_scan_root_for_etw_file_resolves_steam_userdata() {
         let steam_file =
             Path::new(r"C:\Program Files (x86)\Steam\userdata\123456\2456740\remote\slot0.json");
-        let root = super::infer_scan_root_for_etw_file(steam_file, None);
+        let root = super::infer_scan_root_for_etw_file(steam_file, None, None, None);
         assert!(root.is_some());
         let root = root.unwrap();
         assert_eq!(root.root_type, SaveRootType::Custom);

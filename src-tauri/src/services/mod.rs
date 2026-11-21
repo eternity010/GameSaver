@@ -1,4 +1,5 @@
 pub mod add_game_service;
+pub(crate) mod baidu_auth_service;
 pub mod baidu_netdisk_service;
 pub mod cloud_account_service;
 pub mod cloud_manifest_service;
@@ -8,7 +9,9 @@ pub mod disk_space;
 pub mod game_body_install_service;
 pub mod game_body_package_service;
 pub mod game_body_update_service;
+pub(crate) mod game_cover_service;
 pub mod game_library_service;
+pub mod game_removal_service;
 pub mod instance_service;
 pub mod launch_service;
 pub(crate) mod learning;
@@ -18,9 +21,10 @@ pub mod save_learning_service;
 pub mod task_service;
 
 pub use add_game_service::AddGameService;
+#[cfg(test)]
+pub use baidu_netdisk_service::BaiduToken;
 pub use baidu_netdisk_service::{
-    safe_network_error, BaiduConnectionStatus, BaiduNetdiskClient, BaiduQuota, BaiduToken,
-    RemoteFile,
+    BaiduConnectionStatus, BaiduNetdiskClient, BaiduQuota, RemoteFile,
 };
 pub use cloud_account_service::{CloudAccountProfile, CloudAccountService};
 pub use cloud_manifest_service::{
@@ -35,6 +39,7 @@ pub use game_body_install_service::GameBodyInstallService;
 pub use game_body_package_service::BodyPackageService;
 pub use game_body_update_service::GameBodyUpdateService;
 pub use game_library_service::GameLibraryService;
+pub use game_removal_service::{GameRemovalService, RemovalKind, RemovalOutcome, RemovalRecovery};
 pub use instance_service::InstanceService;
 pub use launch_service::LaunchPrecheck;
 pub use launch_service::LaunchService;

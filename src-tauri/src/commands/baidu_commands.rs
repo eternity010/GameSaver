@@ -5,7 +5,7 @@ use crate::{
         compare_optional_created_at, is_safe_path_segment, Game, GameBodyVersion, GameLifecycle,
         TaskCategory, TaskRetry, TaskStatus,
     },
-    repositories::{BaiduConfigRepository, GameRepository},
+    repositories::GameRepository,
     services::{
         BaiduConnectionStatus, BaiduNetdiskClient, BaiduQuota, BodyPackageService, CachedEntry,
         CloudGameCatalog, CloudGamePage, CloudGameSummary, CloudManifestService,
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
-const REMOTE_ROOT: &str = "/apps/GameSaver/games";
+const REMOTE_ROOT: &str = crate::services::baidu_netdisk_service::REMOTE_GAMES_ROOT;
 const BODY_MANIFEST_PENDING_PREFIX: &str = "本体包已上传，但云端版本清单更新失败：";
 
 /// 查询百度网盘连接状态。
@@ -30,12 +30,7 @@ pub async fn get_baidu_status(app: AppHandle) -> Result<BaiduConnectionStatus, S
 
 fn get_baidu_status_blocking(app: AppHandle) -> Result<BaiduConnectionStatus, String> {
     let app_data_dir = app_data_dir(&app)?;
-    let config = BaiduConfigRepository::load(&app_data_dir)?;
-    Ok(BaiduNetdiskClient::connection_status_with_credentials(
-        &app_data_dir,
-        config.as_ref().map(|value| value.app_key.as_str()),
-        config.as_ref().map(|value| value.secret_key.as_str()),
-    ))
+    Ok(BaiduNetdiskClient::connection_status(&app_data_dir))
 }
 
 /// 查询网盘容量：`load_baidu_client` 可能触发 token 刷新，`quota()` 是一次网络往返。
@@ -1731,26 +1726,15 @@ fn install_cloud_game_task(
             Some(&manifest_cache_root),
         ) {
             if let Ok(library_root) = state.library_root_path() {
-                let cover_id = Uuid::new_v4().simple().to_string();
-                let cover_dir = library_root.join("covers").join(&local_uid).join(&cover_id);
-                if std::fs::create_dir_all(&cover_dir).is_ok() {
-                    let _ = std::fs::write(cover_dir.join("display.jpg"), &cover_bytes);
-                    let _ = std::fs::write(cover_dir.join("original.jpg"), &cover_bytes);
-                    game.cover = Some(crate::domain::game::GameCover {
-                        original_path: format!("covers/{local_uid}/{cover_id}/original.jpg"),
-                        display_path: format!("covers/{local_uid}/{cover_id}/display.jpg"),
-                        crop: crate::domain::game::CoverCrop {
-                            aspect_width: 16,
-                            aspect_height: 9,
-                            output_width: 1280,
-                            output_height: 720,
-                        },
-                        position: crate::domain::game::CoverPosition {
-                            zoom_milli: 1000,
-                            offset_x_milli: 0,
-                            offset_y_milli: 0,
-                        },
-                    });
+                match crate::services::game_cover_service::install_cloud_cover(
+                    &library_root,
+                    &local_uid,
+                    &cover_bytes,
+                ) {
+                    Ok(cover) => game.cover = Some(cover),
+                    Err(error) => {
+                        crate::logging::error(format!("游戏安装继续，但云端封面未保存：{error}"))
+                    }
                 }
             }
         }
@@ -2052,16 +2036,7 @@ fn release_transfer(state: &AppState, game_uid: &str) {
 }
 
 pub(crate) fn load_baidu_client(app: &AppHandle) -> Result<BaiduNetdiskClient, String> {
-    let app_data_dir = app_data_dir(app)?;
-    let config = BaiduConfigRepository::load(&app_data_dir)?;
-    match config {
-        Some(config) => BaiduNetdiskClient::load_from_app_data_with_credentials(
-            &app_data_dir,
-            Some(&config.app_key),
-            Some(&config.secret_key),
-        ),
-        None => BaiduNetdiskClient::load_from_app_data(&app_data_dir),
-    }
+    BaiduNetdiskClient::load_configured(&app_data_dir(app)?)
 }
 
 pub(crate) fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -2077,10 +2052,7 @@ fn body_package_cache_root(app: &AppHandle) -> Result<PathBuf, String> {
 pub(crate) fn remote_body_dir(game_key: &str) -> Result<String, String> {
     // 判定收敛到领域层的 `is_safe_path_segment`：这里原先是一段内联的等价检查，
     // 与云账号清单校验里那份 `is_valid_game_key` 重复。
-    if !is_safe_path_segment(game_key) {
-        return Err("gameKey 包含不支持的远程路径字符".to_string());
-    }
-    Ok(format!("{REMOTE_ROOT}/{}/body", game_key.trim()))
+    BaiduNetdiskClient::remote_body_dir(game_key)
 }
 
 pub(crate) fn validate_remote_package_path(directory: &str, path: &str) -> Result<(), String> {

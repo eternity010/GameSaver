@@ -1,11 +1,12 @@
 {
   "name": "gamesaver-next",
   "private": true,
-  "version": "1.0.31",
+  "version": "1.0.34",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
+    "build:installer:test": "node scripts/build-test-installer.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

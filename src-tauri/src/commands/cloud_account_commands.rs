@@ -1,16 +1,13 @@
+use crate::services::cloud_account_service::merge_profile;
 use crate::{
     app_state::AppState,
     commands::run_blocking,
-    domain::{
-        game::CloudStatus, Game, GameHealth, GameLifecycle, SaveProfile, SaveScope, TaskCategory,
-        TaskStatus,
-    },
+    domain::{TaskCategory, TaskStatus},
     repositories::{BaiduConfigRepository, GameRepository},
     services::{BaiduNetdiskClient, CloudAccountProfile, CloudAccountService, TaskService},
 };
-use std::{collections::HashMap, path::PathBuf};
+use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
-use uuid::Uuid;
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,7 +48,7 @@ pub fn start_upload_cloud_account_task(
         .clone();
     let auto_upload_body = load_auto_upload_setting(&app);
     let profile = CloudAccountService::build(&store, auto_upload_body);
-    let task_id = begin_sync(&state, "上传 GameSaver 云端档案")?;
+    let task_id = begin_sync(&state, "上传 GameSaver 云端档案", false)?;
     let task_id_for_thread = task_id.clone();
     std::thread::spawn(move || {
         let result = upload_account(&app, &task_id_for_thread, &profile);
@@ -71,10 +68,15 @@ pub fn start_download_cloud_account_task(
     app: AppHandle,
     state: State<AppState>,
 ) -> Result<String, String> {
-    let task_id = begin_sync(&state, "准备恢复云端 GameSaver 档案")?;
+    let task_id = begin_sync(&state, "准备恢复云端 GameSaver 档案", true)?;
     let task_id_for_thread = task_id.clone();
     std::thread::spawn(move || {
-        let result = download_account(&app, &task_id_for_thread);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            download_account(&app, &task_id_for_thread)
+        }))
+        .unwrap_or_else(|_| Err("恢复云端档案时发生内部错误，详情见日志".to_string()));
+        app.state::<AppState>()
+            .release_operation(AppState::ACCOUNT_RESTORE_KEY);
         finish_sync(
             &app,
             &task_id_for_thread,
@@ -141,19 +143,16 @@ fn download_account(app: &AppHandle, task_id: &str) -> Result<(), String> {
     let cloud_auto_upload = profile.settings.auto_upload_body;
     // games_root 需要锁 library_root，先取出来，避免在 store 锁内嵌套加锁。
     let games_root = state.games_root()?;
-    let old_config = BaiduConfigRepository::load(&data_dir)?;
     let imported_games = state.with_store_mut(|store| {
         let imported_games = merge_profile(store, &games_root, profile)?;
-        if let Some(mut config) = old_config.clone() {
-            config.auto_upload_body = cloud_auto_upload;
-            BaiduConfigRepository::save(&data_dir, config)?;
-        }
-        if let Err(error) = GameRepository::persist(app, store) {
-            if let Some(config) = old_config.clone() {
-                let _ = BaiduConfigRepository::save(&data_dir, config);
-            }
-            return Err(format!("保存云端游戏库失败：{error}"));
-        }
+        BaiduConfigRepository::update_with_commit(
+            &data_dir,
+            |config| config.auto_upload_body = cloud_auto_upload,
+            || {
+                GameRepository::persist(app, store)
+                    .map_err(|error| format!("保存云端游戏库失败：{error}"))
+            },
+        )?;
         Ok(imported_games)
     })?;
     TaskService::update(
@@ -167,196 +166,7 @@ fn download_account(app: &AppHandle, task_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 把云端档案合并进 `store`。调用方需在持有 store 锁的情况下调用
-/// （见 `AppState::with_store_mut`），合并失败时不做任何提交。
-fn merge_profile(
-    store: &mut crate::domain::AppStore,
-    games_root: &std::path::Path,
-    profile: CloudAccountProfile,
-) -> Result<usize, String> {
-    let candidate = store;
-    let mut imported_games = 0;
-    let mut cloud_uid_to_local_uid = HashMap::new();
-    let mut cloud_uid_to_game_key = HashMap::new();
-    for cloud_game in &profile.games {
-        let game_key = if cloud_game.game_key.trim().is_empty() {
-            Game::derive_game_key(&cloud_game.display_name)
-        } else {
-            Game::derive_game_key(&cloud_game.game_key)
-        };
-        let local_index = candidate
-            .games
-            .iter()
-            .position(|game| game.game_key == game_key || game.game_uid == cloud_game.game_uid);
-        let local_uid = if let Some(index) = local_index {
-            let local = &mut candidate.games[index];
-            local.game_key = game_key.clone();
-            local.display_name = cloud_game.display_name.clone();
-            local.launch = cloud_game.launch.clone();
-            local.last_played_at = cloud_game.last_played_at.clone();
-            if cloud_game.added_at.is_some() && local.added_at.is_none() {
-                local.added_at = cloud_game.added_at.clone();
-            }
-            local.cloud_status = CloudStatus::Synced;
-            local.game_uid.clone()
-        } else {
-            let local_uid = Uuid::new_v4().to_string();
-            let mut game = Game::new_pending(
-                &cloud_game.display_name,
-                games_root.join(&local_uid).to_string_lossy(),
-                &cloud_game.launch.executable_relative_path,
-            );
-            game.game_uid = local_uid.clone();
-            game.game_key = game_key.clone();
-            game.launch = cloud_game.launch.clone();
-            game.save_profile_id = cloud_game.save_profile_id.clone();
-            game.last_played_at = cloud_game.last_played_at.clone();
-            if cloud_game.added_at.is_some() {
-                game.added_at = cloud_game.added_at.clone();
-            }
-            game.lifecycle = GameLifecycle::NeedsRepair;
-            game.health = GameHealth::Broken;
-            game.cloud_status = CloudStatus::Synced;
-            candidate.games.push(game);
-            imported_games += 1;
-            local_uid
-        };
-        cloud_uid_to_local_uid.insert(cloud_game.game_uid.clone(), local_uid);
-        cloud_uid_to_game_key.insert(cloud_game.game_uid.clone(), game_key);
-    }
-    for cloud_profile in &profile.save_profiles {
-        let local_uid = cloud_uid_to_local_uid
-            .get(&cloud_profile.game_uid)
-            .cloned()
-            .or_else(|| {
-                let game_key = if cloud_profile.game_key.trim().is_empty() {
-                    cloud_uid_to_game_key.get(&cloud_profile.game_uid).cloned()
-                } else {
-                    Some(Game::derive_game_key(&cloud_profile.game_key))
-                }?;
-                candidate
-                    .games
-                    .iter()
-                    .find(|game| game.game_key == game_key)
-                    .map(|game| game.game_uid.clone())
-            });
-        let Some(local_uid) = local_uid else {
-            continue;
-        };
-        let game = candidate
-            .games
-            .iter()
-            .find(|game| game.game_uid == local_uid)
-            .cloned()
-            .ok_or_else(|| "云端存档配置对应的本地游戏不存在".to_string())?;
-        let existing = candidate
-            .save_profiles
-            .iter()
-            .find(|item| item.profile_id == cloud_profile.profile_id || item.game_uid == local_uid)
-            .cloned();
-        let scopes = cloud_profile
-            .scopes
-            .iter()
-            .enumerate()
-            .map(|(index, scope)| {
-                let fallback = existing
-                    .as_ref()
-                    .and_then(|item| item.scopes.get(index))
-                    .map(|item| item.root_path.as_str());
-                resolve_scope(&game, scope, fallback)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let save_profile = SaveProfile {
-            profile_id: cloud_profile.profile_id.clone(),
-            game_uid: local_uid.clone(),
-            executable_hash: cloud_profile.executable_hash.clone(),
-            scopes,
-            detection_evidence: cloud_profile.detection_evidence.clone(),
-            confidence: cloud_profile.confidence,
-            enabled: true,
-            keep_versions: existing
-                .as_ref()
-                .map(|item| item.keep_versions)
-                .unwrap_or(5),
-            created_at: existing
-                .as_ref()
-                .map(|item| item.created_at.clone())
-                .unwrap_or_else(|| cloud_profile.updated_at.clone()),
-            updated_at: cloud_profile.updated_at.clone(),
-        };
-        candidate.save_profiles.retain(|item| {
-            item.profile_id != save_profile.profile_id && item.game_uid != save_profile.game_uid
-        });
-        candidate.save_profiles.push(save_profile);
-        if let Some(local) = candidate
-            .games
-            .iter_mut()
-            .find(|item| item.game_uid == local_uid)
-        {
-            local.save_profile_id = Some(cloud_profile.profile_id.clone());
-        }
-    }
-    candidate.normalize();
-    Ok(imported_games)
-}
-
-pub(crate) fn resolve_scope(
-    game: &Game,
-    scope: &crate::services::cloud_account_service::CloudSaveScope,
-    fallback: Option<&str>,
-) -> Result<SaveScope, String> {
-    let base_path = match scope.root_type {
-        crate::domain::SaveRootType::ManagedGame => Some(PathBuf::from(&game.managed_path)),
-        crate::domain::SaveRootType::AppData => std::env::var_os("APPDATA").map(PathBuf::from),
-        crate::domain::SaveRootType::LocalAppData => {
-            std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
-        }
-        crate::domain::SaveRootType::LocalLow => std::env::var_os("USERPROFILE")
-            .map(|path| PathBuf::from(path).join("AppData").join("LocalLow")),
-        crate::domain::SaveRootType::Documents => {
-            std::env::var_os("USERPROFILE").map(|path| PathBuf::from(path).join("Documents"))
-        }
-        crate::domain::SaveRootType::SavedGames => {
-            std::env::var_os("USERPROFILE").map(|path| PathBuf::from(path).join("Saved Games"))
-        }
-        crate::domain::SaveRootType::UserProfile => {
-            std::env::var_os("USERPROFILE").map(PathBuf::from)
-        }
-        crate::domain::SaveRootType::ProgramData => {
-            std::env::var_os("PROGRAMDATA").map(PathBuf::from)
-        }
-        crate::domain::SaveRootType::Custom => scope.custom_root_path.as_ref().map(PathBuf::from),
-    };
-
-    let root_path = if let Some(base) = base_path {
-        if let Some(sub) = scope.sub_path.as_deref().filter(|s| !s.trim().is_empty()) {
-            let normalized_sub = sub.replace('/', "\\");
-            base.join(normalized_sub).to_string_lossy().to_string()
-        } else {
-            // Standard roots must resolve on the current machine. Falling back to
-            // an exported absolute path would target the source machine's profile.
-            base.to_string_lossy().to_string()
-        }
-    } else if let Some(fallback_path) = fallback {
-        fallback_path.to_string()
-    } else {
-        return Err(format!("无法解析云端存档范围：{:?}", scope.root_type));
-    };
-
-    Ok(SaveScope {
-        root_type: scope.root_type,
-        root_path,
-        confirmed_files: scope.confirmed_files.clone(),
-        include_directories: scope.include_directories.clone(),
-        exclude_exact: scope.exclude_exact.clone(),
-        exclude_patterns: scope.exclude_patterns.clone(),
-        exclude_directories: scope.exclude_directories.clone(),
-        unknown_file_policy: scope.unknown_file_policy,
-        max_file_bytes: scope.max_file_bytes,
-    })
-}
-
-fn begin_sync(state: &AppState, message: &str) -> Result<String, String> {
+fn begin_sync(state: &AppState, message: &str, restoring: bool) -> Result<String, String> {
     let mut syncing = state
         .cloud_account_sync
         .lock()
@@ -364,10 +174,17 @@ fn begin_sync(state: &AppState, message: &str) -> Result<String, String> {
     if *syncing {
         return Err("已有云端账号同步任务正在进行".to_string());
     }
+    if restoring {
+        state.claim_account_restore()?;
+    }
     *syncing = true;
     match TaskService::create(
         state,
-        "cloud_account_sync",
+        if restoring {
+            "restore_cloud_account"
+        } else {
+            "cloud_account_sync"
+        },
         TaskCategory::Maintenance,
         None,
         message,
@@ -375,6 +192,9 @@ fn begin_sync(state: &AppState, message: &str) -> Result<String, String> {
         Ok(task_id) => Ok(task_id),
         Err(error) => {
             *syncing = false;
+            if restoring {
+                state.release_operation(AppState::ACCOUNT_RESTORE_KEY);
+            }
             Err(error)
         }
     }
@@ -433,15 +253,7 @@ fn list_account_files(
 
 fn load_baidu_client(app: &AppHandle) -> Result<BaiduNetdiskClient, String> {
     let data_dir = app_data_dir(app)?;
-    let config = BaiduConfigRepository::load(&data_dir)?;
-    match config {
-        Some(config) => BaiduNetdiskClient::load_from_app_data_with_credentials(
-            &data_dir,
-            Some(&config.app_key),
-            Some(&config.secret_key),
-        ),
-        None => BaiduNetdiskClient::load_from_app_data(&data_dir),
-    }
+    BaiduNetdiskClient::load_configured(&data_dir)
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -460,70 +272,21 @@ fn load_auto_upload_setting(app: &AppHandle) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Game, SaveRootType, UnknownFilePolicy};
-    use crate::services::cloud_account_service::CloudSaveScope;
 
     #[test]
-    fn resolve_scope_joins_sub_path_for_locallow() {
-        let game = Game::new_pending("Game1", r"E:\Games\Game1", "game.exe");
-        let cloud_scope = CloudSaveScope {
-            root_type: SaveRootType::LocalLow,
-            custom_root_path: None,
-            sub_path: Some("miHoYo/GenshinImpact".to_string()),
-            confirmed_files: vec!["save.dat".to_string()],
-            include_directories: Vec::new(),
-            exclude_exact: Vec::new(),
-            exclude_patterns: Vec::new(),
-            exclude_directories: Vec::new(),
-            unknown_file_policy: UnknownFilePolicy::Protect,
-            max_file_bytes: None,
-        };
-        let resolved = resolve_scope(&game, &cloud_scope, None).expect("should resolve");
-        assert!(resolved
-            .root_path
-            .ends_with(r"AppData\LocalLow\miHoYo\GenshinImpact"));
-    }
-
-    #[test]
-    fn resolve_scope_joins_sub_path_for_managed_game() {
-        let game = Game::new_pending("Game1", r"E:\Games\Game1", "game.exe");
-        let cloud_scope = CloudSaveScope {
-            root_type: SaveRootType::ManagedGame,
-            custom_root_path: None,
-            sub_path: Some("SaveData/Slot1".to_string()),
-            confirmed_files: vec!["save.dat".to_string()],
-            include_directories: Vec::new(),
-            exclude_exact: Vec::new(),
-            exclude_patterns: Vec::new(),
-            exclude_directories: Vec::new(),
-            unknown_file_policy: UnknownFilePolicy::Protect,
-            max_file_bytes: None,
-        };
-        let resolved = resolve_scope(&game, &cloud_scope, None).expect("should resolve");
-        assert_eq!(resolved.root_path, r"E:\Games\Game1\SaveData\Slot1");
-    }
-
-    #[test]
-    fn resolve_scope_uses_current_standard_root_when_sub_path_is_none() {
-        let game = Game::new_pending("Game1", r"E:\Games\Game1", "game.exe");
-        let cloud_scope = CloudSaveScope {
-            root_type: SaveRootType::LocalLow,
-            custom_root_path: None,
-            sub_path: None,
-            confirmed_files: vec!["save.dat".to_string()],
-            include_directories: Vec::new(),
-            exclude_exact: Vec::new(),
-            exclude_patterns: Vec::new(),
-            exclude_directories: Vec::new(),
-            unknown_file_policy: UnknownFilePolicy::Protect,
-            max_file_bytes: None,
-        };
-        let fallback = r"C:\Users\Bob\AppData\LocalLow\CustomFolder";
-        let resolved = resolve_scope(&game, &cloud_scope, Some(fallback)).expect("should resolve");
-        let expected = std::env::var_os("USERPROFILE")
-            .map(|path| PathBuf::from(path).join("AppData").join("LocalLow"))
-            .expect("USERPROFILE should be available during test");
-        assert_eq!(PathBuf::from(&resolved.root_path), expected);
-        assert_ne!(resolved.root_path, fallback);
+    fn failed_restore_task_creation_releases_both_claims() {
+        let dir = crate::test_support::TempWorkspace::new("account-start-failure");
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let state = AppState::new(
+            crate::domain::AppStore::default(),
+            dir.to_path_buf(),
+            std::collections::HashMap::new(),
+            blocker.join("tasks.json"),
+        );
+        assert!(begin_sync(&state, "restore", true).is_err());
+        assert!(!*state.cloud_account_sync.lock().unwrap());
+        assert!(state.save_operations.lock().unwrap().is_empty());
+        assert!(state.claim_operation("game", "busy").is_ok());
     }
 }

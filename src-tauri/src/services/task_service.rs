@@ -20,6 +20,20 @@ impl TaskService {
         game_uid: Option<String>,
         message: &str,
     ) -> Result<String, String> {
+        let operations = state
+            .save_operations
+            .lock()
+            .map_err(|_| "锁定游戏操作状态失败".to_string())?;
+        if AppState::account_restore_in_progress(&operations)
+            && task_type != "restore_cloud_account"
+        {
+            return Err("正在恢复云端档案，请等待完成后再操作".to_string());
+        }
+        if AppState::library_migration_in_progress(&operations)
+            && !["set_library_root", "resume_library_migration"].contains(&task_type)
+        {
+            return Err("游戏库迁移尚未完成，请先在平台设置中完成迁移".to_string());
+        }
         let task_id = Uuid::new_v4().to_string();
         let task = AppTask {
             task_id: task_id.clone(),
@@ -34,6 +48,7 @@ impl TaskService {
             retry: None,
             created_at: now_millis(),
             cancel_requested: false,
+            cancellable: None,
         };
         let mut tasks = state
             .tasks
@@ -45,6 +60,7 @@ impl TaskService {
             return Err(error);
         }
         drop(tasks);
+        drop(operations);
         notify_changed(state, &task_id, "created");
         Ok(task_id)
     }
@@ -166,6 +182,11 @@ impl TaskService {
                 .get_mut(task_id)
                 .ok_or_else(|| "task not found".to_string())?;
             if matches!(task.status, TaskStatus::Pending | TaskStatus::Running) {
+                if task.cancellable == Some(false)
+                    || task.category == Some(TaskCategory::SaveRestore)
+                {
+                    return Err("任务正在提交，无法安全取消，请等待完成".to_string());
+                }
                 task.cancel_requested = true;
                 persist_locked(state, &tasks);
                 true
@@ -177,6 +198,28 @@ impl TaskService {
         if requested {
             notify_changed(state, task_id, "updated");
         }
+        Ok(())
+    }
+
+    pub fn begin_commit(state: &AppState, task_id: &str) -> Result<(), String> {
+        {
+            let mut tasks = state
+                .tasks
+                .lock()
+                .map_err(|_| "锁定任务状态失败".to_string())?;
+            let task = tasks
+                .get_mut(task_id)
+                .ok_or_else(|| "任务不存在".to_string())?;
+            if task.cancel_requested {
+                return Err("任务已取消".to_string());
+            }
+            if !matches!(task.status, TaskStatus::Pending | TaskStatus::Running) {
+                return Err("任务已结束".to_string());
+            }
+            task.cancellable = Some(false);
+            persist_locked(state, &tasks);
+        }
+        notify_changed(state, task_id, "updated");
         Ok(())
     }
 
@@ -293,6 +336,237 @@ mod tests {
     /// `remove_dir_all`，`assert!` 一失败就执行不到。
     fn temp_root() -> TempWorkspace {
         TempWorkspace::new("task-service")
+    }
+
+    #[test]
+    fn account_restore_excludes_new_tasks_and_game_operations_until_released() {
+        let dir = temp_root();
+        let state = test_state(&dir);
+        state.claim_account_restore().unwrap();
+        assert!(state.claim_operation("game", "busy").is_err());
+        assert!(state.claim_cloud_operation("game").is_err());
+        let error = TaskService::create(
+            &state,
+            "set_library_root",
+            TaskCategory::Maintenance,
+            None,
+            "migrate",
+        )
+        .unwrap_err();
+        assert!(error.contains("恢复云端档案"));
+        let id = TaskService::create(
+            &state,
+            "restore_cloud_account",
+            TaskCategory::Maintenance,
+            None,
+            "restore",
+        )
+        .unwrap();
+        state.release_operation(AppState::ACCOUNT_RESTORE_KEY);
+        TaskService::finish(&state, &id, TaskStatus::Success, 100, "done", None, None);
+        assert!(state.claim_operation("game", "busy").is_ok());
+    }
+
+    #[test]
+    fn account_restore_rejects_existing_tasks_operations_and_migration() {
+        let dir = temp_root();
+        let state = test_state(&dir);
+        let id = TaskService::create(
+            &state,
+            "learn_saves",
+            TaskCategory::Maintenance,
+            None,
+            "learn",
+        )
+        .unwrap();
+        assert!(state.claim_account_restore().is_err());
+        TaskService::finish(&state, &id, TaskStatus::Success, 100, "done", None, None);
+        state.claim_operation("game", "busy").unwrap();
+        assert!(state.claim_account_restore().is_err());
+        state.release_operation("game");
+        *state.library_migration.lock().unwrap() = true;
+        assert!(state.claim_account_restore().is_err());
+        *state.library_migration.lock().unwrap() = false;
+        assert!(state.claim_account_restore().is_ok());
+        state.release_operation(AppState::ACCOUNT_RESTORE_KEY);
+    }
+
+    #[test]
+    fn account_restore_and_task_creation_cannot_both_win_the_race() {
+        let dir = temp_root();
+        let state = test_state(&dir);
+        let start = std::sync::Barrier::new(3);
+        let (restored, created) = std::thread::scope(|scope| {
+            let restore = scope.spawn(|| {
+                start.wait();
+                state.claim_account_restore().is_ok()
+            });
+            let create = scope.spawn(|| {
+                start.wait();
+                TaskService::create(
+                    &state,
+                    "set_library_root",
+                    TaskCategory::Maintenance,
+                    None,
+                    "migrate",
+                )
+                .is_ok()
+            });
+            start.wait();
+            (restore.join().unwrap(), create.join().unwrap())
+        });
+        assert_ne!(restored, created);
+        state.release_operation(AppState::ACCOUNT_RESTORE_KEY);
+    }
+
+    #[test]
+    fn library_migration_excludes_tasks_launch_checks_and_game_operations() {
+        let dir = temp_root();
+        let state = test_state(&dir);
+        state.claim_library_migration(false).unwrap();
+        assert!(state.claim_operation("game", "busy").is_err());
+        assert!(state.claim_cloud_operation("game").is_err());
+        assert!(state.claim_account_restore().is_err());
+        assert!(state.has_exclusive_operation(&state.save_operations.lock().unwrap(), "game"));
+        assert!(
+            TaskService::create(&state, "add_game", TaskCategory::Maintenance, None, "add")
+                .is_err()
+        );
+        let id = TaskService::create(
+            &state,
+            "set_library_root",
+            TaskCategory::Maintenance,
+            None,
+            "migrate",
+        )
+        .unwrap();
+        assert!(state.claim_library_migration(true).is_err());
+        TaskService::finish(&state, &id, TaskStatus::Failed, 10, "retry", None, None);
+        state.finish_library_migration(true);
+        assert!(state.claim_library_migration(true).is_ok());
+        state.finish_library_migration(false);
+        assert!(state.claim_operation("game", "busy").is_ok());
+    }
+
+    #[test]
+    fn library_migration_rejects_existing_tasks_operations_and_running_games() {
+        let dir = temp_root();
+        let state = test_state(&dir);
+        let id = TaskService::create(
+            &state,
+            "learn_saves",
+            TaskCategory::Maintenance,
+            None,
+            "learn",
+        )
+        .unwrap();
+        assert!(state.claim_library_migration(false).is_err());
+        TaskService::finish(&state, &id, TaskStatus::Success, 100, "done", None, None);
+        state.claim_operation("game", "busy").unwrap();
+        assert!(state.claim_library_migration(false).is_err());
+        state.release_operation("game");
+        state
+            .begin_runtime(crate::domain::GameRuntime {
+                game_uid: "game".into(),
+                status: crate::domain::GameRuntimeStatus::Running,
+                pid: Some(1),
+                started_at: None,
+                task_id: None,
+            })
+            .unwrap();
+        assert!(state.claim_library_migration(false).is_err());
+        state.remove_runtime("game");
+        assert!(state.claim_library_migration(false).is_ok());
+        state.finish_library_migration(false);
+    }
+
+    #[test]
+    fn library_migration_and_new_task_cannot_both_win_admission() {
+        let dir = temp_root();
+        let state = test_state(&dir);
+        let start = std::sync::Barrier::new(3);
+        let (migrated, created) = std::thread::scope(|scope| {
+            let migrate = scope.spawn(|| {
+                start.wait();
+                state.claim_library_migration(false).is_ok()
+            });
+            let create = scope.spawn(|| {
+                start.wait();
+                TaskService::create(&state, "add_game", TaskCategory::Maintenance, None, "add")
+                    .is_ok()
+            });
+            start.wait();
+            (migrate.join().unwrap(), create.join().unwrap())
+        });
+        assert_ne!(migrated, created);
+        state.finish_library_migration(false);
+    }
+
+    #[test]
+    fn library_resume_requests_cannot_both_claim_before_task_creation() {
+        let dir = temp_root();
+        let state = test_state(&dir);
+        state.claim_library_migration(false).unwrap();
+        state.finish_library_migration(true);
+        let start = std::sync::Barrier::new(3);
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                start.wait();
+                state.claim_library_migration(true).is_ok()
+            });
+            let second = scope.spawn(|| {
+                start.wait();
+                state.claim_library_migration(true).is_ok()
+            });
+            start.wait();
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_ne!(first, second);
+        state.finish_library_migration(false);
+    }
+
+    #[test]
+    fn cloud_save_cancel_before_commit_prevents_commit() {
+        let dir = temp_root();
+        let state = test_state(&dir);
+        let id = TaskService::create(
+            &state,
+            "sync_cloud_save",
+            TaskCategory::CloudSaveSync,
+            None,
+            "sync",
+        )
+        .unwrap();
+        TaskService::cancel(&state, &id).unwrap();
+        assert_eq!(
+            TaskService::begin_commit(&state, &id).unwrap_err(),
+            "任务已取消"
+        );
+        assert_ne!(
+            TaskService::get(&state, &id).unwrap().cancellable,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn cloud_save_commit_disables_cancel_in_backend_and_summary() {
+        let dir = temp_root();
+        let state = test_state(&dir);
+        let id = TaskService::create(
+            &state,
+            "sync_cloud_save",
+            TaskCategory::CloudSaveSync,
+            None,
+            "sync",
+        )
+        .unwrap();
+        TaskService::begin_commit(&state, &id).unwrap();
+        assert!(TaskService::cancel(&state, &id).is_err());
+        assert!(!TaskService::is_cancelled(&state, &id));
+        assert_eq!(
+            TaskService::list(&state).unwrap()[0].cancellable,
+            Some(false)
+        );
     }
 
     /// 云存档同步的"失败要响"就建立在这条契约上：终态、错误原因、重试参数都必须落盘。

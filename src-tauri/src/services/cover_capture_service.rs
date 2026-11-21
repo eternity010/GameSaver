@@ -5,7 +5,7 @@ use std::{
     fs,
     io::Cursor,
     path::{Path, PathBuf},
-    sync::{mpsc, Mutex, OnceLock},
+    sync::{Condvar, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -19,7 +19,9 @@ use windows_sys::Win32::{
         DIB_RGB_COLORS, SRCCOPY,
     },
     UI::{
-        Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT},
+        Input::KeyboardAndMouse::{
+            RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
+        },
         WindowsAndMessaging::{
             GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, PeekMessageW, MSG,
             PM_REMOVE, WM_HOTKEY,
@@ -67,32 +69,143 @@ struct PendingCapture {
 }
 
 static ACTIVE_CAPTURE: OnceLock<Mutex<Option<PendingCapture>>> = OnceLock::new();
-static HOTKEY_LISTENER_STATUS: OnceLock<Result<(), String>> = OnceLock::new();
+#[derive(Default)]
+struct ListenerState {
+    registered: bool,
+    error: Option<String>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+static HOTKEY_LISTENER: OnceLock<(Mutex<ListenerState>, Condvar)> = OnceLock::new();
+
+fn listener_state() -> &'static (Mutex<ListenerState>, Condvar) {
+    HOTKEY_LISTENER.get_or_init(Default::default)
+}
+
+fn record_listener_status(registered: bool, error: Option<String>) {
+    let (lock, ready) = listener_state();
+    let mut state = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+    if state.error != error {
+        if let Some(error) = error.as_ref() {
+            crate::logging::error(error);
+        }
+    }
+    state.registered = registered;
+    state.error = error;
+    ready.notify_all();
+}
+
+struct RegisteredHotkey(bool);
+
+impl Drop for RegisteredHotkey {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe {
+                UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID);
+            }
+        }
+    }
+}
+
+fn retry_registration(
+    registered: &mut bool,
+    last_attempt: &mut Option<Instant>,
+    register: impl FnOnce() -> Result<(), String>,
+) -> Option<Result<(), String>> {
+    if *registered || last_attempt.is_some_and(|attempt| attempt.elapsed() < Duration::from_secs(1))
+    {
+        return None;
+    }
+    *last_attempt = Some(Instant::now());
+    let result = register();
+    *registered = result.is_ok();
+    Some(result)
+}
 
 pub struct CoverCaptureService;
 
 impl CoverCaptureService {
-    pub fn start_global_listener(app: AppHandle) -> Result<(), String> {
-        HOTKEY_LISTENER_STATUS
-            .get_or_init(|| {
-                if let Err(error) = cleanup_old_captures() {
-                    crate::logging::error(format!("启动时清理封面截图临时文件失败：{error}"));
-                }
-                let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
-                thread::spawn(move || run_hotkey_loop(app, ready_sender));
-                ready_receiver
-                    .recv_timeout(Duration::from_secs(2))
-                    .unwrap_or_else(|_| Err("注册全局截图快捷键超时".to_string()))
-            })
-            .clone()
+    pub(crate) fn arm_for_game(app: &AppHandle, game_uid: &str) -> Result<CaptureArmView, String> {
+        let game_uid = game_uid.trim();
+        crate::services::game_cover_service::validate_component(game_uid, "游戏标识")?;
+        let state = app.state::<crate::app_state::AppState>();
+        let managed_path = {
+            let store = state.store.lock().map_err(|_| "读取游戏记录失败")?;
+            crate::services::GameLibraryService::find(&store, game_uid)
+                .ok_or("游戏不存在")?
+                .managed_path
+        };
+        if !Path::new(&managed_path).is_dir() {
+            return Err("受管游戏目录不存在，无法截取封面".into());
+        }
+        if !state
+            .running_games
+            .lock()
+            .map_err(|_| "读取游戏运行状态失败")?
+            .contains_key(game_uid)
+        {
+            return Err("请先启动游戏后再截取封面".into());
+        }
+        Self::arm(app, game_uid, PathBuf::from(managed_path))
     }
 
-    pub fn arm(game_uid: &str, managed_path: PathBuf) -> Result<CaptureArmView, String> {
-        match HOTKEY_LISTENER_STATUS.get() {
-            Some(Ok(())) => {}
-            Some(Err(error)) => return Err(format!("全局截图快捷键不可用：{error}")),
-            None => return Err("全局截图快捷键尚未初始化，请重启 GameSaver".to_string()),
+    pub fn start_global_listener(app: AppHandle) -> Result<(), String> {
+        let (lock, ready) = listener_state();
+        let mut state = lock.lock().map_err(|_| "读取快捷键监听状态失败")?;
+        if state
+            .thread
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            state.thread.take();
+            state.registered = false;
         }
+        if state.thread.is_none() {
+            state.error = None;
+            let handle = thread::Builder::new()
+                .name("cover-hotkey".into())
+                .spawn(move || {
+                    if let Err(error) = cleanup_old_captures() {
+                        crate::logging::error(format!("清理封面截图临时文件失败：{error}"));
+                    }
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_hotkey_loop(app)
+                    }));
+                    let error = if result.is_err() {
+                        "截图快捷键监听异常退出，请重新点击截取游戏画面"
+                    } else {
+                        "截图快捷键监听已退出，请重新点击截取游戏画面"
+                    };
+                    record_listener_status(false, Some(error.into()));
+                })
+                .map_err(|error| format!("启动截图快捷键监听失败：{error}"))?;
+            state.thread = Some(handle);
+        }
+        if !state.registered && state.error.is_none() {
+            state = ready
+                .wait_timeout_while(state, Duration::from_secs(2), |state| {
+                    !state.registered && state.error.is_none()
+                })
+                .map_err(|_| "等待截图快捷键监听失败")?
+                .0;
+        }
+        if state.registered {
+            Ok(())
+        } else {
+            Err(state
+                .error
+                .clone()
+                .unwrap_or_else(|| "快捷键正在初始化，请稍后重试".into()))
+        }
+    }
+
+    pub fn arm(
+        app: &AppHandle,
+        game_uid: &str,
+        managed_path: PathBuf,
+    ) -> Result<CaptureArmView, String> {
+        Self::start_global_listener(app.clone())
+            .map_err(|error| format!("全局截图快捷键不可用：{error}；冲突解除后会自动重试"))?;
         crate::logging::info(format!(
             "开始封面截图：game_uid={game_uid} managed_path={}",
             managed_path.display()
@@ -139,29 +252,37 @@ impl CoverCaptureService {
     }
 }
 
-fn run_hotkey_loop(app: AppHandle, ready_sender: mpsc::SyncSender<Result<(), String>>) {
+fn run_hotkey_loop(app: AppHandle) {
     unsafe {
         let mut message = std::mem::zeroed::<MSG>();
         let _ = PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE);
-        if RegisterHotKey(
-            std::ptr::null_mut(),
-            HOTKEY_ID,
-            MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
-            b'S' as u32,
-        ) == 0
-        {
-            let error = format!(
-                "Ctrl + Alt + S 注册失败，可能与其他程序冲突（Windows 错误码：{}）",
-                GetLastError()
-            );
-            crate::logging::error(&error);
-            let _ = ready_sender.send(Err(error));
-            return;
-        }
-        crate::logging::info("封面截图全局热键已注册：Ctrl + Alt + S");
-        let _ = ready_sender.send(Ok(()));
-
+        let mut registration = RegisteredHotkey(false);
+        let mut last_attempt = None::<Instant>;
         loop {
+            if let Some(result) = retry_registration(&mut registration.0, &mut last_attempt, || {
+                if RegisterHotKey(
+                    std::ptr::null_mut(),
+                    HOTKEY_ID,
+                    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+                    b'S' as u32,
+                ) != 0
+                {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "Ctrl + Alt + S 注册失败，可能与其他程序冲突（Windows 错误码：{}）",
+                        GetLastError()
+                    ))
+                }
+            }) {
+                match result {
+                    Ok(()) => {
+                        record_listener_status(true, None);
+                        crate::logging::info("封面截图全局热键已注册：Ctrl + Alt + S");
+                    }
+                    Err(error) => record_listener_status(false, Some(error)),
+                }
+            }
             let mut hotkey_triggered = false;
             while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
                 if message.message == WM_HOTKEY && message.wParam == HOTKEY_ID as usize {
@@ -169,7 +290,7 @@ fn run_hotkey_loop(app: AppHandle, ready_sender: mpsc::SyncSender<Result<(), Str
                     break;
                 }
             }
-            if hotkey_triggered {
+            if registration.0 && hotkey_triggered {
                 handle_hotkey(&app);
             }
             expire_capture_if_needed(&app);
@@ -422,6 +543,7 @@ unsafe fn capture_screen_region(
     width: u32,
     height: u32,
 ) -> Result<Vec<u8>, String> {
+    let mut pixels = vec![0u8; capture_buffer_len(width, height)?];
     let screen = GetDC(std::ptr::null_mut());
     if screen.is_null() {
         return Err("无法访问屏幕截图设备".to_string());
@@ -438,18 +560,24 @@ unsafe fn capture_screen_region(
         return Err("无法创建截图位图".to_string());
     }
     let previous = SelectObject(memory, bitmap);
-    let copied = BitBlt(
-        memory,
-        0,
-        0,
-        width as i32,
-        height as i32,
-        screen,
-        left,
-        top,
-        SRCCOPY | CAPTUREBLT,
-    ) != 0;
-    let mut pixels = vec![0u8; capture_buffer_len(width, height)?];
+    let selected = !previous.is_null() && previous as isize != -1;
+    let copied = selected
+        && BitBlt(
+            memory,
+            0,
+            0,
+            width as i32,
+            height as i32,
+            screen,
+            left,
+            top,
+            SRCCOPY | CAPTUREBLT,
+        ) != 0;
+    let restored = if selected {
+        SelectObject(memory, previous)
+    } else {
+        std::ptr::null_mut()
+    };
     let mut bitmap_info = std::mem::zeroed::<BITMAPINFO>();
     bitmap_info.bmiHeader = BITMAPINFOHEADER {
         biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -460,7 +588,7 @@ unsafe fn capture_screen_region(
         biCompression: BI_RGB,
         ..std::mem::zeroed()
     };
-    let copied_pixels = if copied {
+    let copied_pixels = if copied && !restored.is_null() && restored as isize != -1 {
         GetDIBits(
             memory,
             bitmap,
@@ -473,9 +601,8 @@ unsafe fn capture_screen_region(
     } else {
         false
     };
-    let _ = SelectObject(memory, previous);
-    let _ = DeleteObject(bitmap);
     let _ = DeleteDC(memory);
+    let _ = DeleteObject(bitmap);
     let _ = ReleaseDC(std::ptr::null_mut(), screen);
     if !copied_pixels {
         return Err("无法读取游戏画面，可能受到独占全屏或保护内容限制".to_string());
@@ -558,7 +685,39 @@ fn cleanup_old_captures() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_buffer_len, MAX_CAPTURE_PIXELS};
+    use super::{capture_buffer_len, retry_registration, MAX_CAPTURE_PIXELS};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn cover_hotkey_retries_after_conflict_without_duplicate_registration() {
+        let mut registered = false;
+        let mut last_attempt = None;
+        assert!(
+            retry_registration(&mut registered, &mut last_attempt, || Err("1409".into()))
+                .unwrap()
+                .is_err()
+        );
+        assert!(!registered);
+        assert!(
+            retry_registration(&mut registered, &mut last_attempt, || panic!(
+                "retry is throttled"
+            ))
+            .is_none()
+        );
+        last_attempt = Some(Instant::now() - Duration::from_secs(2));
+        assert!(
+            retry_registration(&mut registered, &mut last_attempt, || Ok(()))
+                .unwrap()
+                .is_ok()
+        );
+        assert!(registered);
+        assert!(
+            retry_registration(&mut registered, &mut last_attempt, || panic!(
+                "already registered"
+            ))
+            .is_none()
+        );
+    }
 
     #[test]
     fn capture_buffer_rejects_unreasonably_large_windows() {

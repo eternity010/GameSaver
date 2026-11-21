@@ -1,4 +1,7 @@
-use crate::domain::{ActiveLearningSession, AppStore, AppTask, GameRuntime};
+use crate::{
+    domain::{AppStore, AppTask, GameRuntime},
+    services::save_learning_service::ActiveLearningSession,
+};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -22,7 +25,7 @@ pub struct AppState {
     pub library_root: Mutex<PathBuf>,
     pub tasks: Mutex<HashMap<String, AppTask>>,
     pub tasks_path: PathBuf,
-    pub learning_sessions: Mutex<HashMap<String, ActiveLearningSession>>,
+    pub(crate) learning_sessions: Mutex<HashMap<String, ActiveLearningSession>>,
     pub running_games: Mutex<HashMap<String, GameRuntime>>,
     pub save_operations: Mutex<HashSet<String>>,
     pub library_migration: Mutex<bool>,
@@ -41,6 +44,9 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) const ACCOUNT_RESTORE_KEY: &'static str = "account:restore";
+    pub(crate) const LIBRARY_MIGRATION_KEY: &'static str = "library:migration";
+
     pub fn new(
         store: AppStore,
         library_root: PathBuf,
@@ -114,8 +120,273 @@ impl AppState {
     /// 「集合里存在该游戏的任何操作」就等于「占用中」。
     fn any_operation_for(&self, operations: &HashSet<String>, game_uid: &str) -> bool {
         let game_uid = game_uid.trim();
-        operations.contains(&Self::game_operation_key(game_uid))
+        Self::account_restore_in_progress(operations)
+            || Self::library_migration_in_progress(operations)
+            || operations.contains(&Self::game_operation_key(game_uid))
             || operations.contains(&Self::cloud_operation_key(game_uid))
+            || operations.contains(&Self::removal_operation_key(game_uid))
+            || operations.contains(&Self::update_operation_key(game_uid))
+    }
+
+    fn removal_operation_key(game_uid: &str) -> String {
+        format!("removal:{}", game_uid.trim())
+    }
+
+    fn update_operation_key(game_uid: &str) -> String {
+        format!("update:{}", game_uid.trim())
+    }
+
+    pub(crate) fn claim_game_add(&self, game_key: &str) -> Result<String, String> {
+        let key = format!("add:{game_key}");
+        let mut operations = self
+            .save_operations
+            .lock()
+            .map_err(|_| "锁定游戏操作状态失败")?;
+        if Self::account_restore_in_progress(&operations)
+            || Self::library_migration_in_progress(&operations)
+            || operations.contains(&key)
+        {
+            return Err("该游戏正在添加，或游戏库正在维护，请等待完成后再操作".into());
+        }
+        operations.insert(key.clone());
+        Ok(key)
+    }
+
+    pub(crate) fn claim_learning_start(&self, game_uid: &str) -> Result<(), String> {
+        let mut operations = self
+            .save_operations
+            .lock()
+            .map_err(|_| "锁定游戏操作状态失败")?;
+        if self.any_operation_for(&operations, game_uid) {
+            return Err("该游戏已有操作正在进行，请勿重复启动识别".into());
+        }
+        if self
+            .running_games
+            .lock()
+            .map_err(|_| "读取游戏运行状态失败")?
+            .contains_key(game_uid)
+            || self
+                .learning_sessions
+                .lock()
+                .map_err(|_| "读取存档识别状态失败")?
+                .values()
+                .any(|session| session.view.game_uid == game_uid)
+        {
+            return Err("请先关闭游戏并结束当前存档识别".into());
+        }
+        operations.insert(Self::game_operation_key(game_uid));
+        Ok(())
+    }
+
+    pub(crate) fn claim_game_update(&self, game_uid: &str, resume: bool) -> Result<(), String> {
+        let mut operations = self
+            .save_operations
+            .lock()
+            .map_err(|_| "锁定游戏操作状态失败")?;
+        if Self::account_restore_in_progress(&operations)
+            || Self::library_migration_in_progress(&operations)
+            || operations.contains(&Self::game_operation_key(game_uid))
+            || operations.contains(&Self::cloud_operation_key(game_uid))
+            || operations.contains(&Self::removal_operation_key(game_uid))
+            || (!resume && operations.contains(&Self::update_operation_key(game_uid)))
+        {
+            return Err("该游戏已有操作或更新事务待恢复，请先完成后再操作".into());
+        }
+        if self
+            .running_games
+            .lock()
+            .map_err(|_| "读取游戏运行状态失败")?
+            .contains_key(game_uid)
+            || self
+                .learning_sessions
+                .lock()
+                .map_err(|_| "读取存档识别状态失败")?
+                .values()
+                .any(|session| session.view.game_uid == game_uid)
+        {
+            return Err("请先关闭游戏并结束存档识别，再操作游戏本体".into());
+        }
+        operations.insert(Self::game_operation_key(game_uid));
+        Ok(())
+    }
+
+    pub(crate) fn finish_game_update(&self, game_uid: &str, pending: bool) {
+        if let Ok(mut operations) = self.save_operations.lock() {
+            if pending {
+                operations.insert(Self::update_operation_key(game_uid));
+            } else {
+                operations.remove(&Self::update_operation_key(game_uid));
+            }
+            operations.remove(&Self::game_operation_key(game_uid));
+        }
+    }
+
+    pub(crate) fn claim_game_removal(&self, game_uid: &str, resume: bool) -> Result<(), String> {
+        let mut operations = self
+            .save_operations
+            .lock()
+            .map_err(|_| "锁定游戏操作状态失败")?;
+        if Self::account_restore_in_progress(&operations)
+            || Self::library_migration_in_progress(&operations)
+            || operations.contains(&Self::game_operation_key(game_uid))
+            || operations.contains(&Self::cloud_operation_key(game_uid))
+            || operations.contains(&Self::update_operation_key(game_uid))
+            || (!resume && operations.contains(&Self::removal_operation_key(game_uid)))
+        {
+            return Err("该游戏有操作或待恢复的删除事务，请先完成后再操作".into());
+        }
+        if self
+            .running_games
+            .lock()
+            .map_err(|_| "读取游戏运行状态失败")?
+            .contains_key(game_uid)
+        {
+            return Err("请先关闭游戏，再卸载或删除本体".into());
+        }
+        if self
+            .learning_sessions
+            .lock()
+            .map_err(|_| "读取存档识别状态失败")?
+            .values()
+            .any(|session| session.view.game_uid == game_uid)
+        {
+            return Err("请先结束存档识别，再卸载或删除游戏".into());
+        }
+        operations.insert(Self::game_operation_key(game_uid));
+        Ok(())
+    }
+
+    pub(crate) fn finish_game_removal(&self, game_uid: &str, pending: bool) {
+        if let Ok(mut operations) = self.save_operations.lock() {
+            if pending {
+                operations.insert(Self::removal_operation_key(game_uid));
+            } else {
+                operations.remove(&Self::removal_operation_key(game_uid));
+            }
+            operations.remove(&Self::game_operation_key(game_uid));
+        }
+    }
+
+    pub(crate) fn account_restore_in_progress(operations: &HashSet<String>) -> bool {
+        operations.contains(Self::ACCOUNT_RESTORE_KEY)
+    }
+
+    pub(crate) fn library_migration_in_progress(operations: &HashSet<String>) -> bool {
+        operations.contains(Self::LIBRARY_MIGRATION_KEY)
+    }
+
+    pub(crate) fn claim_library_migration(&self, resume: bool) -> Result<(), String> {
+        let mut operations = self
+            .save_operations
+            .lock()
+            .map_err(|_| "锁定游戏操作状态失败".to_string())?;
+        let resuming =
+            resume && operations.len() == 1 && Self::library_migration_in_progress(&operations);
+        if !operations.is_empty() && !resuming {
+            return Err("游戏或存档操作进行中，暂时不能迁移游戏库".to_string());
+        }
+        if !self
+            .running_games
+            .lock()
+            .map_err(|_| "读取游戏运行状态失败")?
+            .is_empty()
+        {
+            return Err("请先关闭游戏，再迁移游戏库".to_string());
+        }
+        if !self
+            .learning_sessions
+            .lock()
+            .map_err(|_| "读取存档识别状态失败")?
+            .is_empty()
+        {
+            return Err("请先结束存档识别，再迁移游戏库".to_string());
+        }
+        if self
+            .tasks
+            .lock()
+            .map_err(|_| "读取后台任务失败")?
+            .values()
+            .any(|task| {
+                matches!(
+                    task.status,
+                    crate::domain::TaskStatus::Pending | crate::domain::TaskStatus::Running
+                )
+            })
+        {
+            return Err("请等待其他后台任务结束，再迁移游戏库".to_string());
+        }
+        let mut migrating = self
+            .library_migration
+            .lock()
+            .map_err(|_| "读取游戏库迁移状态失败")?;
+        if *migrating {
+            return Err("已有游戏库迁移任务正在进行".to_string());
+        }
+        *migrating = true;
+        operations.insert(Self::LIBRARY_MIGRATION_KEY.to_string());
+        Ok(())
+    }
+
+    pub(crate) fn finish_library_migration(&self, retain_block: bool) {
+        if let Ok(mut operations) = self.save_operations.lock() {
+            if let Ok(mut migrating) = self.library_migration.lock() {
+                *migrating = false;
+                if retain_block {
+                    operations.insert(Self::LIBRARY_MIGRATION_KEY.to_string());
+                } else {
+                    operations.remove(Self::LIBRARY_MIGRATION_KEY);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn claim_account_restore(&self) -> Result<(), String> {
+        let mut operations = self
+            .save_operations
+            .lock()
+            .map_err(|_| "锁定游戏操作状态失败".to_string())?;
+        if !operations.is_empty() {
+            return Err("游戏或存档操作进行中，暂时不能恢复云端档案".to_string());
+        }
+        if *self
+            .library_migration
+            .lock()
+            .map_err(|_| "读取游戏库迁移状态失败".to_string())?
+        {
+            return Err("游戏库迁移中，暂时不能恢复云端档案".to_string());
+        }
+        if !self
+            .running_games
+            .lock()
+            .map_err(|_| "读取游戏运行状态失败".to_string())?
+            .is_empty()
+        {
+            return Err("请先关闭游戏，再恢复云端档案".to_string());
+        }
+        if !self
+            .learning_sessions
+            .lock()
+            .map_err(|_| "读取存档识别状态失败".to_string())?
+            .is_empty()
+        {
+            return Err("存档识别进行中，暂时不能恢复云端档案".to_string());
+        }
+        if self
+            .tasks
+            .lock()
+            .map_err(|_| "读取后台任务失败".to_string())?
+            .values()
+            .any(|task| {
+                matches!(
+                    task.status,
+                    crate::domain::TaskStatus::Pending | crate::domain::TaskStatus::Running
+                )
+            })
+        {
+            return Err("请等待其他后台任务结束，再恢复云端档案".to_string());
+        }
+        operations.insert(Self::ACCOUNT_RESTORE_KEY.to_string());
+        Ok(())
     }
 
     /// 认领一次整游戏独占操作。已被占用时返回 `Err`，调用方不该继续。
@@ -162,6 +433,28 @@ impl AppState {
         if let Ok(mut operations) = self.save_operations.lock() {
             operations.remove(key);
         }
+    }
+
+    pub fn ensure_save_restore_idle(&self, game_uid: &str) -> Result<(), String> {
+        let sessions = self
+            .learning_sessions
+            .lock()
+            .map_err(|_| "锁定存档识别状态失败".to_string())?;
+        if sessions
+            .values()
+            .any(|session| session.view.game_uid == game_uid)
+        {
+            return Err("游戏正在进行存档识别，不能恢复存档".to_string());
+        }
+        drop(sessions);
+        let running = self
+            .running_games
+            .lock()
+            .map_err(|_| "锁定游戏运行状态失败".to_string())?;
+        if running.contains_key(game_uid) {
+            return Err("请先关闭游戏，再恢复云端存档".to_string());
+        }
+        Ok(())
     }
 
     /// 该游戏是否有云端同步或整游戏独占操作在进行（自行取锁）。
@@ -334,6 +627,11 @@ pub struct CloudOperationClaim<'a> {
 }
 
 impl<'a> CloudOperationClaim<'a> {
+    pub fn claim_restore(state: &'a AppState, game_uid: &str) -> Result<Self, String> {
+        let claim = Self::claim(state, game_uid)?;
+        state.ensure_save_restore_idle(game_uid)?;
+        Ok(claim)
+    }
     /// 认领该游戏的云端操作；已被占用时返回 `Err`，不产生守卫。
     pub fn claim(state: &'a AppState, game_uid: &str) -> Result<Self, String> {
         let key = state.claim_cloud_operation(game_uid)?;
@@ -373,6 +671,156 @@ mod tests {
 
     fn sample_game(name: &str) -> Game {
         Game::new_pending(name, "C:/games/sample", "game.exe")
+    }
+
+    #[test]
+    fn adding_key_is_reserved_until_worker_finishes() {
+        let state = test_state();
+        let key = state.claim_game_add("same-game").unwrap();
+        assert!(state.claim_game_add("same-game").is_err());
+        assert!(state.claim_library_migration(false).is_err());
+        assert!(state.claim_account_restore().is_err());
+        let other = state.claim_game_add("other-game").unwrap();
+        state.release_operation(&other);
+        state.release_operation(&key);
+        state.claim_game_add("same-game").unwrap();
+    }
+
+    #[test]
+    fn learning_start_reservation_blocks_reentry_removal_and_global_maintenance() {
+        let state = test_state();
+        state.claim_learning_start("game-a").unwrap();
+        assert!(state.claim_learning_start("game-a").is_err());
+        assert!(state.claim_game_removal("game-a", false).is_err());
+        assert!(state.claim_game_update("game-a", false).is_err());
+        assert!(state.claim_library_migration(false).is_err());
+        assert!(state.claim_account_restore().is_err());
+        state.release_operation("game-a");
+        state.claim_game_removal("game-a", false).unwrap();
+    }
+
+    #[test]
+    fn pending_removal_blocks_game_cloud_and_global_operations_until_retry_finishes() {
+        let state = test_state();
+        state.finish_game_removal("game-a", true);
+        assert!(state.claim_operation("game-a", "busy").is_err());
+        assert!(state.claim_cloud_operation("game-a").is_err());
+        assert!(state.claim_game_removal("game-a", false).is_err());
+        assert!(state.claim_account_restore().is_err());
+        assert!(state.claim_library_migration(false).is_err());
+        assert!(state.has_exclusive_operation(&state.save_operations.lock().unwrap(), "game-a"));
+        state.claim_game_removal("game-a", true).unwrap();
+        assert!(state.claim_game_removal("game-a", true).is_err());
+        state.finish_game_removal("game-a", true);
+        assert!(state.claim_operation("game-a", "busy").is_err());
+        state.claim_game_removal("game-a", true).unwrap();
+        state.finish_game_removal("game-a", false);
+        state.claim_operation("game-a", "busy").unwrap();
+    }
+
+    #[test]
+    fn pending_update_blocks_conflicting_operations_until_recovery_finishes() {
+        let state = test_state();
+        state.finish_game_update("game-a", true);
+        assert!(state.claim_operation("game-a", "busy").is_err());
+        assert!(state.claim_cloud_operation("game-a").is_err());
+        assert!(state.claim_game_removal("game-a", true).is_err());
+        assert!(state.claim_game_update("game-a", false).is_err());
+        assert!(state.claim_account_restore().is_err());
+        assert!(state.claim_library_migration(false).is_err());
+        assert!(state.has_exclusive_operation(&state.save_operations.lock().unwrap(), "game-a"));
+        state.claim_game_update("game-a", true).unwrap();
+        assert!(state.claim_game_update("game-a", true).is_err());
+        state.finish_game_update("game-a", true);
+        assert!(state.claim_game_update("game-a", false).is_err());
+        state.claim_game_update("game-a", true).unwrap();
+        state.finish_game_update("game-a", false);
+        state.claim_operation("game-a", "busy").unwrap();
+    }
+
+    #[test]
+    fn update_admission_rejects_running_games_and_pending_removals() {
+        let state = test_state();
+        state.begin_runtime(running_runtime("uid-1")).unwrap();
+        assert!(state.claim_game_update("uid-1", false).is_err());
+        state.remove_runtime("uid-1");
+        state.finish_game_removal("uid-1", true);
+        assert!(state.claim_game_update("uid-1", true).is_err());
+    }
+
+    #[test]
+    fn removal_admission_rejects_running_game_and_global_maintenance() {
+        let state = test_state();
+        state
+            .begin_runtime(GameRuntime {
+                game_uid: "game-a".into(),
+                status: GameRuntimeStatus::Launching,
+                pid: None,
+                started_at: None,
+                task_id: None,
+            })
+            .unwrap();
+        assert!(state.claim_game_removal("game-a", false).is_err());
+        assert!(state.save_operations.lock().unwrap().is_empty());
+        state.remove_runtime("game-a");
+        state.claim_library_migration(false).unwrap();
+        assert!(state.claim_game_removal("game-a", true).is_err());
+        state.finish_library_migration(false);
+        state.claim_account_restore().unwrap();
+        assert!(state.claim_game_removal("game-a", true).is_err());
+    }
+
+    #[test]
+    fn account_restore_rejects_running_games_and_finished_learning_tasks_with_live_sessions() {
+        let state = test_state();
+        state.running_games.lock().unwrap().insert(
+            "game".into(),
+            GameRuntime {
+                game_uid: "game".into(),
+                status: crate::domain::GameRuntimeStatus::Running,
+                pid: Some(1),
+                started_at: None,
+                task_id: None,
+            },
+        );
+        assert!(state
+            .claim_account_restore()
+            .unwrap_err()
+            .contains("关闭游戏"));
+        assert!(state
+            .claim_library_migration(false)
+            .unwrap_err()
+            .contains("关闭游戏"));
+        state.running_games.lock().unwrap().clear();
+        state.learning_sessions.lock().unwrap().insert(
+            "session".into(),
+            ActiveLearningSession {
+                view: crate::domain::LearningSessionView {
+                    session_id: "session".into(),
+                    game_uid: "game".into(),
+                    root_pid: 1,
+                    started_at: "1".into(),
+                    status: crate::domain::LearningStatus::Capturing,
+                },
+                roots: Vec::new(),
+                baseline: None,
+                tracked_processes: std::sync::Arc::new(Mutex::new(Default::default())),
+                process_tracker_stop: std::sync::Arc::new(AtomicBool::new(false)),
+                process_tracker_done: std::sync::Arc::new(AtomicBool::new(false)),
+                etw_capture: None,
+                etw_start_error: None,
+                validation_only: false,
+            },
+        );
+        assert!(state
+            .claim_account_restore()
+            .unwrap_err()
+            .contains("存档识别"));
+        assert!(state
+            .claim_library_migration(false)
+            .unwrap_err()
+            .contains("存档识别"));
+        assert!(state.save_operations.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -452,6 +900,59 @@ mod tests {
             started_at: None,
             task_id: None,
         }
+    }
+
+    #[test]
+    fn cloud_restore_rejects_running_game_and_releases_claim() {
+        let state = test_state();
+        state.set_runtime(running_runtime("game-1"));
+        assert!(CloudOperationClaim::claim_restore(&state, "game-1").is_err());
+        assert!(state.save_operations.lock().unwrap().is_empty());
+        let upload = CloudOperationClaim::claim(&state, "game-1").unwrap();
+        drop(upload);
+        state.remove_runtime("game-1");
+        let restore = CloudOperationClaim::claim_restore(&state, "game-1").unwrap();
+        assert!(occupied(&state, "game-1"));
+        assert!(CloudOperationClaim::claim(&state, "game-1").is_err());
+        drop(restore);
+        assert!(!occupied(&state, "game-1"));
+    }
+
+    #[test]
+    fn cloud_restore_checks_runtime_again_before_writing() {
+        let state = test_state();
+        let claim = CloudOperationClaim::claim_restore(&state, "game-1").unwrap();
+        state.set_runtime(running_runtime("game-1"));
+        assert!(state.ensure_save_restore_idle("game-1").is_err());
+        assert!(state.ensure_save_restore_idle("game-2").is_ok());
+        drop(claim);
+    }
+
+    #[test]
+    fn cloud_restore_rejects_active_learning_even_without_runtime_entry() {
+        let state = test_state();
+        state.learning_sessions.lock().unwrap().insert(
+            "session-1".into(),
+            ActiveLearningSession {
+                view: crate::domain::LearningSessionView {
+                    session_id: "session-1".into(),
+                    game_uid: "game-1".into(),
+                    root_pid: 1,
+                    started_at: "0".into(),
+                    status: crate::domain::LearningStatus::Capturing,
+                },
+                roots: Vec::new(),
+                baseline: None,
+                tracked_processes: std::sync::Arc::new(Mutex::new(Default::default())),
+                process_tracker_stop: std::sync::Arc::new(AtomicBool::new(false)),
+                process_tracker_done: std::sync::Arc::new(AtomicBool::new(false)),
+                etw_capture: None,
+                etw_start_error: None,
+                validation_only: false,
+            },
+        );
+        assert!(CloudOperationClaim::claim_restore(&state, "game-1").is_err());
+        assert!(state.save_operations.lock().unwrap().is_empty());
     }
 
     /// 走「持锁判定」那条路径问一次占用状态，与 `launch` 的调用形态一致。

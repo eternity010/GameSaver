@@ -10,6 +10,17 @@
 //! 所以凡是按 `created_at` 排序，一律走这里，不要直接 `String::cmp`。
 
 use std::cmp::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub(crate) const FILETIME_UNIX_EPOCH: i64 = 116_444_736_000_000_000;
+pub(crate) const FILETIME_TICKS_PER_MS: i64 = 10_000;
+
+pub(crate) fn current_filetime() -> Option<i64> {
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(elapsed.as_nanos() / 100)
+        .ok()?
+        .checked_add(FILETIME_UNIX_EPOCH)
+}
 
 /// 按时间先后比较两个 `created_at` 值。
 ///

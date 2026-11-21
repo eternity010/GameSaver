@@ -1,13 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use super::store_file::{atomic_replace, load_with_recovery};
 
 const CONFIG_FILE: &str = "baidu-netdisk-config.json";
 const CONFIG_VERSION: u32 = 1;
 const CONFIG_LABEL: &str = "百度网盘配置";
+static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BaiduConfig {
     pub app_key: String,
@@ -52,11 +54,28 @@ pub struct BaiduConfigView {
 pub struct BaiduConfigRepository;
 
 impl BaiduConfigRepository {
+    pub(crate) fn with_current<T>(
+        app_data_dir: &Path,
+        read: impl FnOnce(Option<BaiduConfig>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _guard = CONFIG_LOCK
+            .lock()
+            .map_err(|_| "锁定百度配置失败".to_string())?;
+        read(Self::load_locked(app_data_dir)?)
+    }
+
     pub fn path(app_data_dir: &Path) -> PathBuf {
         app_data_dir.join(CONFIG_FILE)
     }
 
     pub fn load(app_data_dir: &Path) -> Result<Option<BaiduConfig>, String> {
+        let _guard = CONFIG_LOCK
+            .lock()
+            .map_err(|_| "锁定百度配置失败".to_string())?;
+        Self::load_locked(app_data_dir)
+    }
+
+    fn load_locked(app_data_dir: &Path) -> Result<Option<BaiduConfig>, String> {
         let path = Self::path(app_data_dir);
         let Some(raw) =
             load_with_recovery(&path, CONFIG_LABEL, |bytes: &[u8]| decode(bytes).is_ok())?
@@ -90,7 +109,62 @@ impl BaiduConfigRepository {
         })
     }
 
+    #[cfg(test)]
     pub fn save(app_data_dir: &Path, config: BaiduConfig) -> Result<(), String> {
+        let _guard = CONFIG_LOCK
+            .lock()
+            .map_err(|_| "锁定百度配置失败".to_string())?;
+        Self::save_locked(app_data_dir, config)
+    }
+
+    pub fn update(
+        app_data_dir: &Path,
+        update: impl FnOnce(Option<BaiduConfig>) -> Result<BaiduConfig, String>,
+    ) -> Result<(), String> {
+        let _guard = CONFIG_LOCK
+            .lock()
+            .map_err(|_| "锁定百度配置失败".to_string())?;
+        let next = update(Self::load_locked(app_data_dir)?)?;
+        Self::save_locked(app_data_dir, next)
+    }
+
+    pub fn update_with_commit<T>(
+        app_data_dir: &Path,
+        update: impl FnOnce(&mut BaiduConfig),
+        commit: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _guard = CONFIG_LOCK
+            .lock()
+            .map_err(|_| "锁定百度配置失败".to_string())?;
+        let previous = Self::load_locked(app_data_dir)?;
+        let changed = if let Some(config) = previous.as_ref() {
+            let mut next = config.clone();
+            update(&mut next);
+            if &next != config {
+                Self::save_locked(app_data_dir, next)?;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        match commit() {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if changed {
+                    if let Some(config) = previous {
+                        if let Err(rollback) = Self::save_locked(app_data_dir, config) {
+                            return Err(format!("{error}；百度配置回滚失败：{rollback}"));
+                        }
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn save_locked(app_data_dir: &Path, config: BaiduConfig) -> Result<(), String> {
         validate(&config)?;
         let plain = serde_json::to_vec(&config)
             .map_err(|error| format!("序列化{CONFIG_LABEL}凭证失败：{error}"))?;
@@ -132,7 +206,7 @@ fn validate(config: &BaiduConfig) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn protect(input: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn protect(input: &[u8]) -> Result<Vec<u8>, String> {
     use windows_sys::Win32::{
         Foundation::LocalFree,
         Security::Cryptography::{CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB},
@@ -167,12 +241,12 @@ fn protect(input: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(not(windows))]
-fn protect(_: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn protect(_: &[u8]) -> Result<Vec<u8>, String> {
     Err("百度网盘应用凭证加密仅支持 Windows".to_string())
 }
 
 #[cfg(windows)]
-fn unprotect(input: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn unprotect(input: &[u8]) -> Result<Vec<u8>, String> {
     use windows_sys::Win32::{
         Foundation::LocalFree,
         Security::Cryptography::{
@@ -209,13 +283,115 @@ fn unprotect(input: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(not(windows))]
-fn unprotect(_: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn unprotect(_: &[u8]) -> Result<Vec<u8>, String> {
     Err("百度网盘应用凭证解密仅支持 Windows".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{BaiduConfig, BaiduConfigRepository};
+
+    fn fixture() -> BaiduConfig {
+        BaiduConfig {
+            app_key: "review-app".into(),
+            secret_key: "review-secret".into(),
+            auto_upload_body: false,
+            auto_sync_save: true,
+            check_cloud_save_on_launch: true,
+            cloud_save_keep_limit: 10,
+        }
+    }
+
+    #[test]
+    fn concurrent_field_updates_preserve_other_settings_and_credentials() {
+        let dir = crate::test_support::TempWorkspace::new("account-config-update");
+        BaiduConfigRepository::save(&dir, fixture()).unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|scope| {
+            let barrier = start.clone();
+            let path = &*dir;
+            scope.spawn(move || {
+                barrier.wait();
+                BaiduConfigRepository::update(path, |existing| {
+                    let mut config = existing.unwrap();
+                    config.app_key = "updated-app".into();
+                    config.secret_key = "updated-secret".into();
+                    config.auto_sync_save = false;
+                    Ok(config)
+                })
+                .unwrap();
+            });
+            let barrier = start.clone();
+            scope.spawn(move || {
+                barrier.wait();
+                BaiduConfigRepository::update_with_commit(
+                    path,
+                    |config| config.auto_upload_body = true,
+                    || Ok(()),
+                )
+                .unwrap();
+            });
+            start.wait();
+        });
+        let config = BaiduConfigRepository::load(&dir).unwrap().unwrap();
+        assert_eq!(config.app_key, "updated-app");
+        assert_eq!(config.secret_key, "updated-secret");
+        assert!(!config.auto_sync_save);
+        assert!(config.auto_upload_body);
+    }
+
+    #[test]
+    fn failed_store_commit_rolls_back_configuration() {
+        let dir = crate::test_support::TempWorkspace::new("account-config-rollback");
+        BaiduConfigRepository::save(&dir, fixture()).unwrap();
+        let result = BaiduConfigRepository::update_with_commit(
+            &dir,
+            |config| config.auto_upload_body = true,
+            || Err::<(), _>("injected store failure".into()),
+        );
+        assert_eq!(result.unwrap_err(), "injected store failure");
+        assert_eq!(BaiduConfigRepository::load(&dir).unwrap(), Some(fixture()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rollback_failure_is_included_in_the_result() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = crate::test_support::TempWorkspace::new("account-config-rollback-failure");
+        BaiduConfigRepository::save(&dir, fixture()).unwrap();
+        let mut locked = None;
+        let result = BaiduConfigRepository::update_with_commit(
+            &dir,
+            |config| config.auto_upload_body = true,
+            || {
+                locked = Some(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(0)
+                        .open(BaiduConfigRepository::path(&dir))
+                        .unwrap(),
+                );
+                Err::<(), _>("injected store failure".into())
+            },
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("injected store failure"));
+        assert!(error.contains("配置回滚失败"));
+        drop(locked);
+    }
+
+    #[test]
+    fn missing_local_credentials_are_not_created_by_account_restore() {
+        let dir = crate::test_support::TempWorkspace::new("account-no-config");
+        let value = BaiduConfigRepository::update_with_commit(
+            &dir,
+            |_| panic!("must not synthesize credentials"),
+            || Ok(7),
+        )
+        .unwrap();
+        assert_eq!(value, 7);
+        assert!(BaiduConfigRepository::load(&dir).unwrap().is_none());
+    }
 
     #[test]
     fn rejects_empty_credentials() {

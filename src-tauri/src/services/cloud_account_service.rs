@@ -1,7 +1,9 @@
 use crate::{
     domain::{
         game::{Game, LaunchConfig},
-        is_safe_path_segment, AppStore, GameLifecycle, SaveRootType, SaveScope, UnknownFilePolicy,
+        known_folders::{documents_root, public_documents_root},
+        is_safe_path_segment, AppStore, GameLifecycle, SaveProfile, SaveRootType, SaveScope,
+        UnknownFilePolicy,
     },
     services::{BaiduNetdiskClient, RemoteFile},
 };
@@ -13,6 +15,9 @@ use std::{
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
+
+mod restore;
+pub(crate) use restore::merge_profile;
 
 const FORMAT_VERSION: u32 = 1;
 const REMOTE_DIRECTORY: &str = "/apps/GameSaver/account";
@@ -64,6 +69,8 @@ pub struct CloudSaveProfile {
 #[serde(rename_all = "camelCase")]
 pub struct CloudSaveScope {
     pub root_type: SaveRootType,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub public_documents: bool,
     #[serde(default)]
     pub custom_root_path: Option<String>,
     #[serde(default)]
@@ -150,7 +157,7 @@ impl CloudAccountService {
                     scopes: profile
                         .scopes
                         .iter()
-                        .map(|scope| cloud_scope(scope, game))
+                        .map(|scope| cloud_scope(scope, game, profile))
                         .collect(),
                     detection_evidence: profile.detection_evidence.clone(),
                     confidence: profile.confidence,
@@ -266,12 +273,34 @@ impl CloudAccountService {
     }
 }
 
-fn cloud_scope(scope: &SaveScope, game: Option<&Game>) -> CloudSaveScope {
+fn cloud_scope(scope: &SaveScope, game: Option<&Game>, profile: &SaveProfile) -> CloudSaveScope {
+    let mut portable_scope = scope.clone();
+    let mut sub_path = extract_sub_path(scope, game);
+    if sub_path.is_none() && !matches!(scope.root_type, SaveRootType::ManagedGame | SaveRootType::Custom) {
+        let current = crate::domain::path_utils::normalize_path(Path::new(&scope.root_path));
+        for binding in &profile.root_bindings {
+            if binding.root_type != scope.root_type
+                || crate::domain::path_utils::normalize_path(Path::new(&binding.current_path)) != current
+            {
+                continue;
+            }
+            portable_scope.root_path.clone_from(&binding.previous_path);
+            sub_path = extract_sub_path(&portable_scope, game);
+            if sub_path.is_some() {
+                break;
+            }
+        }
+        if sub_path.is_none() {
+            portable_scope.root_path.clone_from(&scope.root_path);
+        }
+    }
     CloudSaveScope {
         root_type: scope.root_type,
+        public_documents: scope.root_type == SaveRootType::Documents
+            && is_public_documents_path(&portable_scope.root_path),
         custom_root_path: (scope.root_type == SaveRootType::Custom)
             .then(|| scope.root_path.clone()),
-        sub_path: extract_sub_path(scope, game),
+        sub_path,
         confirmed_files: scope.confirmed_files.clone(),
         include_directories: scope.include_directories.clone(),
         exclude_exact: scope.exclude_exact.clone(),
@@ -282,12 +311,44 @@ fn cloud_scope(scope: &SaveScope, game: Option<&Game>) -> CloudSaveScope {
     }
 }
 
+fn is_public_documents_path(value: &str) -> bool {
+    let normalized = crate::domain::path_utils::normalize_path(Path::new(value));
+    if public_documents_root().is_some_and(|root| {
+        let base = crate::domain::path_utils::normalize_path(&root);
+        normalized == base || normalized.starts_with(&(base + "\\"))
+    }) {
+        return true;
+    }
+    let marker = "\\users\\public\\documents";
+    normalized.find(marker).is_some_and(|index| {
+        let suffix = &normalized[index + marker.len()..];
+        suffix.is_empty() || suffix.starts_with('\\')
+    })
+}
+
 pub fn extract_sub_path(scope: &SaveScope, game: Option<&Game>) -> Option<String> {
+    extract_sub_path_with_documents(scope, game, || {
+        if is_public_documents_path(&scope.root_path) {
+            public_documents_root()
+        } else {
+            documents_root()
+        }
+    })
+}
+
+fn extract_sub_path_with_documents(
+    scope: &SaveScope,
+    game: Option<&Game>,
+    documents: impl FnOnce() -> Option<PathBuf>,
+) -> Option<String> {
     if scope.root_type == SaveRootType::Custom {
         return None;
     }
 
-    let norm_path = scope.root_path.trim().replace('/', "\\");
+    let norm_path =
+        crate::domain::path_utils::strip_verbatim_prefix(Path::new(scope.root_path.trim()))
+            .to_string_lossy()
+            .replace('/', "\\");
 
     if scope.root_type == SaveRootType::ManagedGame {
         if let Some(game) = game {
@@ -331,9 +392,7 @@ pub fn extract_sub_path(scope: &SaveScope, game: Option<&Game>) -> Option<String
         SaveRootType::LocalAppData => std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
         SaveRootType::LocalLow => std::env::var_os("USERPROFILE")
             .map(|p| PathBuf::from(p).join("AppData").join("LocalLow")),
-        SaveRootType::Documents => {
-            std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join("Documents"))
-        }
+        SaveRootType::Documents => documents(),
         SaveRootType::SavedGames => {
             std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join("Saved Games"))
         }
@@ -370,7 +429,7 @@ pub fn extract_sub_path(scope: &SaveScope, game: Option<&Game>) -> Option<String
     };
 
     if let Some(marker) = marker {
-        if let Some(pos) = norm_path.to_ascii_lowercase().rfind(marker) {
+        if let Some(pos) = norm_path.to_ascii_lowercase().find(marker) {
             let sub = &norm_path[pos + marker.len()..].trim_start_matches('\\');
             let sub_normalized = sub.replace('\\', "/");
             if is_valid_relative_path(&sub_normalized) {
@@ -446,7 +505,7 @@ fn validate(profile: &CloudAccountProfile) -> Result<(), String> {
             || game.launch.executable_relative_path.trim().is_empty()
             || !game_ids.insert(game.game_uid.as_str())
             || !is_safe_path_segment(&game.game_key)
-            || !game_keys.insert(game.game_key.as_str())
+            || !game_keys.insert(Game::derive_game_key(&game.game_key))
             || !is_valid_relative_path(&game.launch.executable_relative_path)
             || game
                 .launch
@@ -458,22 +517,30 @@ fn validate(profile: &CloudAccountProfile) -> Result<(), String> {
         }
     }
     let mut profile_ids = HashSet::new();
+    let mut profile_game_ids = HashSet::new();
     for save_profile in &profile.save_profiles {
         if save_profile.profile_id.trim().is_empty()
             || !game_ids.contains(save_profile.game_uid.as_str())
             || (!save_profile.game_key.trim().is_empty()
-                && (!game_keys.contains(save_profile.game_key.as_str())
+                && (!game_keys.contains(&Game::derive_game_key(&save_profile.game_key))
                     || profile
                         .games
                         .iter()
                         .find(|game| game.game_uid == save_profile.game_uid)
-                        .is_none_or(|game| game.game_key != save_profile.game_key)))
+                        .is_none_or(|game| {
+                            Game::derive_game_key(&game.game_key)
+                                != Game::derive_game_key(&save_profile.game_key)
+                        })))
             || !profile_ids.insert(save_profile.profile_id.as_str())
+            || !profile_game_ids.insert(save_profile.game_uid.as_str())
             || save_profile.scopes.is_empty()
         {
             return Err("云端账号清单包含无效存档配置".to_string());
         }
         for scope in &save_profile.scopes {
+            if scope.public_documents && scope.root_type != SaveRootType::Documents {
+                return Err("公共文档标识只能用于文档存档范围".to_string());
+            }
             if scope.root_type == SaveRootType::Custom
                 && scope
                     .custom_root_path
@@ -513,12 +580,15 @@ fn validate(profile: &CloudAccountProfile) -> Result<(), String> {
         if version.version_id.trim().is_empty()
             || !game_ids.contains(version.game_uid.as_str())
             || (!version.game_key.trim().is_empty()
-                && (!game_keys.contains(version.game_key.as_str())
+                && (!game_keys.contains(&Game::derive_game_key(&version.game_key))
                     || profile
                         .games
                         .iter()
                         .find(|game| game.game_uid == version.game_uid)
-                        .is_none_or(|game| game.game_key != version.game_key)))
+                        .is_none_or(|game| {
+                            Game::derive_game_key(&game.game_key)
+                                != Game::derive_game_key(&version.game_key)
+                        })))
             || version.file_count == 0
             || !version_ids.insert((version.game_uid.as_str(), version.version_id.as_str()))
             || version.remote_path.as_deref().is_none_or(|path| {
@@ -732,6 +802,16 @@ mod tests {
             super::extract_sub_path(&docs_scope, Some(&game)),
             Some("My Games/Skyrim".to_string())
         );
+        let redirected_scope = SaveScope {
+            root_path: r"D:\Sync\文档\My Games\Skyrim".to_string(),
+            ..docs_scope
+        };
+        assert_eq!(
+            super::extract_sub_path_with_documents(&redirected_scope, Some(&game), || {
+                Some(std::path::PathBuf::from(r"D:\Sync\文档"))
+            }),
+            Some("My Games/Skyrim".to_string())
+        );
 
         // 3. ManagedGame subdirectory
         let managed_sub_scope = SaveScope {
@@ -776,6 +856,7 @@ mod tests {
             executable_hash: "hash".to_string(),
             scopes: vec![super::CloudSaveScope {
                 root_type: SaveRootType::LocalLow,
+                public_documents: false,
                 custom_root_path: None,
                 sub_path: Some("../../../Windows/System32".to_string()),
                 confirmed_files: vec!["save.dat".to_string()],

@@ -5,11 +5,11 @@ pub struct GameLibraryService;
 
 impl GameLibraryService {
     pub fn register_pending(store: &mut AppStore, mut game: Game) -> Result<(), String> {
-        if store
-            .games
-            .iter()
-            .any(|item| item.game_uid == game.game_uid || item.managed_path == game.managed_path)
-        {
+        if store.games.iter().any(|item| {
+            item.game_uid == game.game_uid
+                || item.managed_path == game.managed_path
+                || item.game_key == game.game_key
+        }) {
             return Err("受管游戏已登记".to_string());
         }
         if game.added_at.is_none() {
@@ -129,6 +129,25 @@ mod tests {
     }
 
     #[test]
+    fn registration_rechecks_game_key_before_committing() {
+        let root = test_root();
+        let mut store = AppStore::default();
+        let first = Game::new_pending(
+            "Same game",
+            root.join("first").to_string_lossy(),
+            "game.exe",
+        );
+        let second = Game::new_pending(
+            "Same game",
+            root.join("second").to_string_lossy(),
+            "game.exe",
+        );
+        GameLibraryService::register_pending(&mut store, first).unwrap();
+        assert!(GameLibraryService::register_pending(&mut store, second).is_err());
+        assert_eq!(store.games.len(), 1);
+    }
+
+    #[test]
     fn library_keeps_broken_game_when_managed_body_is_missing() {
         let root = test_root();
         let mut store = AppStore::default();
@@ -209,6 +228,7 @@ mod tests {
                 unknown_file_policy: crate::domain::UnknownFilePolicy::Protect,
                 max_file_bytes: Some(10 * 1024 * 1024),
             }],
+            root_bindings: Vec::new(),
             detection_evidence: Vec::new(),
             confidence: 0,
             enabled: true,

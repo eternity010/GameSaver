@@ -2,11 +2,15 @@ use crate::{
     app_state::AppState,
     commands::save_version_commands::{release_maintenance, reserve_maintenance},
     domain::{
-        ActiveLearningSession, GameLifecycle, SaveLearningResult, SaveProfile, SaveScope,
+        path_utils::{normalize_path, strip_verbatim_prefix}, save_profile::SaveRootBinding,
+        Game, GameLifecycle, SaveLearningResult, SaveProfile, SaveRootType, SaveScope,
         TaskCategory, TaskStatus,
     },
     repositories::{GameRepository, SaveRepository},
-    services::{learning::stop_etw_capture, GameLibraryService, SaveLearningService, TaskService},
+    services::{
+        learning::stop_etw_capture, save_learning_service::ActiveLearningSession, GameLibraryService,
+        SaveLearningService, TaskService,
+    },
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -17,12 +21,78 @@ use std::{
 use tauri::{AppHandle, Manager, State};
 
 #[tauri::command]
+pub fn get_pending_game_setup(
+    state: State<AppState>,
+    game_uid: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let game_uid = game_uid.filter(|uid| !uid.trim().is_empty());
+    let game = match game_uid.as_deref() {
+        Some(uid) => {
+            let store = state.store.lock().map_err(|_| "读取游戏记录失败")?;
+            Some(GameLibraryService::find(&store, uid).ok_or("游戏记录已不存在")?)
+        }
+        None => None,
+    };
+    let session = state
+        .learning_sessions
+        .lock()
+        .map_err(|_| "读取存档识别状态失败")?
+        .values()
+        .find(|active| Some(active.view.game_uid.as_str()) == game_uid.as_deref())
+        .map(|active| (active.view.clone(), active.validation_only));
+    let task = {
+        let tasks = state.tasks.lock().map_err(|_| "读取添加任务失败")?;
+        let mut relevant = tasks
+            .values()
+            .filter(|task| {
+                let matches_game = if let Some(uid) = game_uid.as_deref() {
+                    task.game_uid.as_deref() == Some(uid)
+                } else {
+                    task.task_type == "add_game"
+                };
+                matches_game
+                    && [
+                        "add_game",
+                        "learn_saves",
+                        "verify_save_candidates",
+                        "analyze_saves",
+                    ]
+                    .contains(&task.task_type.as_str())
+            })
+            .collect::<Vec<_>>();
+        relevant.sort_by(|left, right| {
+            crate::domain::compare_created_at(&right.created_at, &left.created_at)
+        });
+        relevant
+            .first()
+            .filter(|task| {
+                matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+                    || (game_uid.is_some()
+                        && task.task_type == "analyze_saves"
+                        && task.status == TaskStatus::Success)
+            })
+            .map(|task| (task.task_id.clone(), task.task_type.clone()))
+    };
+    Ok(
+        serde_json::json!({ "game": game, "session": session.as_ref().map(|item| &item.0),
+        "validationOnly": session.as_ref().is_some_and(|item| item.1), "taskId": task.as_ref().map(|item| &item.0),
+        "taskType": task.as_ref().map(|item| &item.1) }),
+    )
+}
+
+#[tauri::command]
 pub fn start_save_learning_task(
     app: AppHandle,
     state: State<AppState>,
     game_uid: String,
 ) -> Result<String, String> {
     let game_uid = game_uid.trim().to_string();
+    state.claim_learning_start(&game_uid)?;
+    let mut reservation = SaveProfileOperationGuard {
+        state: &state,
+        key: game_uid.clone(),
+        active: true,
+    };
     let game = {
         let store = state
             .store
@@ -35,16 +105,6 @@ pub fn start_save_learning_task(
         }
         game
     };
-    if let Ok(sessions) = state.learning_sessions.lock() {
-        if sessions.values().any(|s| s.view.game_uid == game_uid) {
-            return Err("该游戏已有正在进行的存档识别会话".to_string());
-        }
-    }
-    if let Ok(running) = state.running_games.lock() {
-        if running.contains_key(&game_uid) {
-            return Err("游戏当前正在运行中，请先关闭游戏后再进行存档识别".to_string());
-        }
-    }
     let task_id = TaskService::create(
         &state,
         "learn_saves",
@@ -54,79 +114,133 @@ pub fn start_save_learning_task(
     )?;
     let app_handle = app.clone();
     let task_id_for_thread = task_id.clone();
-    std::thread::spawn(move || {
-        let result = SaveLearningService::start(
-            &app_handle,
-            &game,
-            |progress, message| {
-                TaskService::update(
-                    &app_handle.state(),
-                    &task_id_for_thread,
-                    TaskStatus::Running,
-                    progress,
-                    message,
-                    None,
+    let worker_uid = game.game_uid.clone();
+    let spawn = std::thread::Builder::new()
+        .name("learn-saves".into())
+        .spawn(move || {
+            let worker_state = app_handle.state::<AppState>();
+            let _reservation = SaveProfileOperationGuard {
+                state: &worker_state,
+                key: worker_uid,
+                active: true,
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let current = {
+                    let state = app_handle.state::<AppState>();
+                    let store = state
+                        .store
+                        .lock()
+                        .map_err(|_| "读取游戏记录失败".to_string())?;
+                    let current =
+                        GameLibraryService::find(&store, &game.game_uid).ok_or("游戏已不存在")?;
+                    if current.lifecycle != GameLifecycle::PendingSetup {
+                        return Err("游戏已完成设置".into());
+                    }
+                    current
+                };
+                SaveLearningService::start(
+                    &app_handle,
+                    &current,
+                    |progress, message| {
+                        TaskService::update(
+                            &app_handle.state(),
+                            &task_id_for_thread,
+                            TaskStatus::Running,
+                            progress,
+                            message,
+                            None,
+                        )
+                    },
+                    || TaskService::is_cancelled(&app_handle.state(), &task_id_for_thread),
                 )
-            },
-            || TaskService::is_cancelled(&app_handle.state(), &task_id_for_thread),
-        );
-        match result {
-            Ok(active) => {
-                if TaskService::is_cancelled(&app_handle.state(), &task_id_for_thread) {
-                    cleanup_active_learning(&active);
+            }))
+            .unwrap_or_else(|_| Err("存档识别启动异常，请重新开始识别".into()));
+            match result {
+                Ok(active) => {
+                    if TaskService::begin_commit(&app_handle.state(), &task_id_for_thread).is_err()
+                    {
+                        cleanup_active_learning(&active);
+                        TaskService::finish(
+                            &app_handle.state(),
+                            &task_id_for_thread,
+                            TaskStatus::Cancelled,
+                            100,
+                            "已取消存档识别",
+                            None,
+                            None,
+                        );
+                        return;
+                    }
+                    let view = active.view.clone();
+                    let state: State<AppState> = app_handle.state();
+                    match state.learning_sessions.lock() {
+                        Ok(mut sessions) => {
+                            sessions.insert(view.session_id.clone(), active);
+                        }
+                        Err(_) => {
+                            cleanup_active_learning(&active);
+                            TaskService::finish(
+                                &state,
+                                &task_id_for_thread,
+                                TaskStatus::Failed,
+                                100,
+                                "保存存档识别会话失败",
+                                None,
+                                Some("存档识别状态不可用".into()),
+                            );
+                            return;
+                        }
+                    };
+                    state.set_runtime(crate::domain::GameRuntime {
+                        game_uid: view.game_uid.clone(),
+                        pid: Some(view.root_pid),
+                        status: crate::domain::GameRuntimeStatus::Running,
+                        started_at: Some(view.started_at.clone()),
+                        task_id: None,
+                    });
                     TaskService::finish(
-                        &app_handle.state(),
+                        &state,
                         &task_id_for_thread,
-                        TaskStatus::Cancelled,
+                        TaskStatus::Success,
                         100,
-                        "已取消存档识别",
-                        None,
+                        "游戏已启动，请完成一次保存后回来分析",
+                        serde_json::to_value(view).ok(),
                         None,
                     );
-                    return;
                 }
-                let view = active.view.clone();
-                let state: State<AppState> = app_handle.state();
-                if let Ok(mut sessions) = state.learning_sessions.lock() {
-                    sessions.insert(view.session_id.clone(), active);
-                }
-                state.set_runtime(crate::domain::GameRuntime {
-                    game_uid: view.game_uid.clone(),
-                    pid: Some(view.root_pid),
-                    status: crate::domain::GameRuntimeStatus::Running,
-                    started_at: Some(view.started_at.clone()),
-                    task_id: None,
-                });
-                TaskService::finish(
-                    &state,
+                Err(error) if error == "任务已取消" => TaskService::finish(
+                    &app_handle.state(),
                     &task_id_for_thread,
-                    TaskStatus::Success,
+                    TaskStatus::Cancelled,
                     100,
-                    "游戏已启动，请完成一次保存后回来分析",
-                    serde_json::to_value(view).ok(),
+                    "已取消存档识别",
                     None,
-                );
+                    None,
+                ),
+                Err(error) => TaskService::finish(
+                    &app_handle.state(),
+                    &task_id_for_thread,
+                    TaskStatus::Failed,
+                    100,
+                    "启动存档识别失败",
+                    None,
+                    Some(error),
+                ),
             }
-            Err(error) if error == "任务已取消" => TaskService::finish(
-                &app_handle.state(),
-                &task_id_for_thread,
-                TaskStatus::Cancelled,
-                100,
-                "已取消存档识别",
-                None,
-                None,
-            ),
-            Err(error) => TaskService::finish(
-                &app_handle.state(),
-                &task_id_for_thread,
-                TaskStatus::Failed,
-                100,
-                "启动存档识别失败",
-                None,
-                Some(error),
-            ),
-        }
-    });
+        });
+    if let Err(error) = spawn {
+        TaskService::finish(
+            &state,
+            &task_id,
+            TaskStatus::Failed,
+            0,
+            "启动识别线程失败",
+            None,
+            Some(error.to_string()),
+        );
+        return Err(format!("启动识别线程失败：{error}"));
+    }
+    reservation.active = false;
     Ok(task_id)
 }
 
@@ -138,6 +252,12 @@ pub fn start_save_candidate_verification_task(
     scopes: Vec<SaveScope>,
 ) -> Result<String, String> {
     let game_uid = game_uid.trim().to_string();
+    state.claim_learning_start(&game_uid)?;
+    let mut reservation = SaveProfileOperationGuard {
+        state: &state,
+        key: game_uid.clone(),
+        active: true,
+    };
     let game = {
         let store = state
             .store
@@ -153,19 +273,6 @@ pub fn start_save_candidate_verification_task(
     if scopes.is_empty() {
         return Err("没有可再次验证的存档候选".to_string());
     }
-    if let Ok(sessions) = state.learning_sessions.lock() {
-        if sessions
-            .values()
-            .any(|session| session.view.game_uid == game_uid)
-        {
-            return Err("该游戏已有正在进行的存档识别会话".to_string());
-        }
-    }
-    if let Ok(running) = state.running_games.lock() {
-        if running.contains_key(&game_uid) {
-            return Err("游戏当前正在运行中，请先关闭游戏后再进行验证".to_string());
-        }
-    }
     let task_id = TaskService::create(
         &state,
         "verify_save_candidates",
@@ -175,80 +282,121 @@ pub fn start_save_candidate_verification_task(
     )?;
     let app_handle = app.clone();
     let task_id_for_thread = task_id.clone();
-    std::thread::spawn(move || {
-        let result = SaveLearningService::start_candidate_verification(
-            &app_handle,
-            &game,
-            &scopes,
-            |progress, message| {
-                TaskService::update(
-                    &app_handle.state(),
-                    &task_id_for_thread,
-                    TaskStatus::Running,
-                    progress,
-                    message,
-                    None,
+    let worker_uid = game.game_uid.clone();
+    let spawn = std::thread::Builder::new()
+        .name("verify-saves".into())
+        .spawn(move || {
+            let worker_state = app_handle.state::<AppState>();
+            let _reservation = SaveProfileOperationGuard {
+                state: &worker_state,
+                key: worker_uid,
+                active: true,
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                SaveLearningService::start_candidate_verification(
+                    &app_handle,
+                    &game,
+                    &scopes,
+                    |progress, message| {
+                        TaskService::update(
+                            &app_handle.state(),
+                            &task_id_for_thread,
+                            TaskStatus::Running,
+                            progress,
+                            message,
+                            None,
+                        )
+                    },
+                    || TaskService::is_cancelled(&app_handle.state(), &task_id_for_thread),
                 )
-            },
-            || TaskService::is_cancelled(&app_handle.state(), &task_id_for_thread),
-        );
-        match result {
-            Ok(active) => {
-                if TaskService::is_cancelled(&app_handle.state(), &task_id_for_thread) {
-                    cleanup_active_learning(&active);
+            }))
+            .unwrap_or_else(|_| Err("候选验证启动异常，请重新开始验证".into()));
+            match result {
+                Ok(active) => {
+                    if TaskService::begin_commit(&app_handle.state(), &task_id_for_thread).is_err()
+                    {
+                        cleanup_active_learning(&active);
+                        TaskService::finish(
+                            &app_handle.state(),
+                            &task_id_for_thread,
+                            TaskStatus::Cancelled,
+                            100,
+                            "已取消再次验证",
+                            None,
+                            None,
+                        );
+                        return;
+                    }
+                    let view = active.view.clone();
+                    let state: State<AppState> = app_handle.state();
+                    match state.learning_sessions.lock() {
+                        Ok(mut sessions) => {
+                            sessions.insert(view.session_id.clone(), active);
+                        }
+                        Err(_) => {
+                            cleanup_active_learning(&active);
+                            TaskService::finish(
+                                &state,
+                                &task_id_for_thread,
+                                TaskStatus::Failed,
+                                100,
+                                "保存验证会话失败",
+                                None,
+                                Some("存档识别状态不可用".into()),
+                            );
+                            return;
+                        }
+                    };
+                    state.set_runtime(crate::domain::GameRuntime {
+                        game_uid: view.game_uid.clone(),
+                        pid: Some(view.root_pid),
+                        status: crate::domain::GameRuntimeStatus::Running,
+                        started_at: Some(view.started_at.clone()),
+                        task_id: None,
+                    });
                     TaskService::finish(
-                        &app_handle.state(),
+                        &state,
                         &task_id_for_thread,
-                        TaskStatus::Cancelled,
+                        TaskStatus::Success,
                         100,
-                        "已取消再次验证",
-                        None,
+                        "游戏已启动，请再次完成一次保存后回来分析",
+                        serde_json::to_value(view).ok(),
                         None,
                     );
-                    return;
                 }
-                let view = active.view.clone();
-                let state: State<AppState> = app_handle.state();
-                if let Ok(mut sessions) = state.learning_sessions.lock() {
-                    sessions.insert(view.session_id.clone(), active);
-                }
-                state.set_runtime(crate::domain::GameRuntime {
-                    game_uid: view.game_uid.clone(),
-                    pid: Some(view.root_pid),
-                    status: crate::domain::GameRuntimeStatus::Running,
-                    started_at: Some(view.started_at.clone()),
-                    task_id: None,
-                });
-                TaskService::finish(
-                    &state,
+                Err(error) if error == "任务已取消" => TaskService::finish(
+                    &app_handle.state(),
                     &task_id_for_thread,
-                    TaskStatus::Success,
+                    TaskStatus::Cancelled,
                     100,
-                    "游戏已启动，请再次完成一次保存后回来分析",
-                    serde_json::to_value(view).ok(),
+                    "已取消再次验证",
                     None,
-                );
+                    None,
+                ),
+                Err(error) => TaskService::finish(
+                    &app_handle.state(),
+                    &task_id_for_thread,
+                    TaskStatus::Failed,
+                    100,
+                    "启动再次验证失败",
+                    None,
+                    Some(error),
+                ),
             }
-            Err(error) if error == "任务已取消" => TaskService::finish(
-                &app_handle.state(),
-                &task_id_for_thread,
-                TaskStatus::Cancelled,
-                100,
-                "已取消再次验证",
-                None,
-                None,
-            ),
-            Err(error) => TaskService::finish(
-                &app_handle.state(),
-                &task_id_for_thread,
-                TaskStatus::Failed,
-                100,
-                "启动再次验证失败",
-                None,
-                Some(error),
-            ),
-        }
-    });
+        });
+    if let Err(error) = spawn {
+        TaskService::finish(
+            &state,
+            &task_id,
+            TaskStatus::Failed,
+            0,
+            "启动验证线程失败",
+            None,
+            Some(error.to_string()),
+        );
+        return Err(format!("启动验证线程失败：{error}"));
+    }
+    reservation.active = false;
     Ok(task_id)
 }
 
@@ -266,6 +414,12 @@ pub fn start_finish_save_learning_task(
         .get(&session_id)
         .cloned()
         .ok_or_else(|| "存档识别会话不存在".to_string())?;
+    state.claim_operation(&active.view.game_uid, "该游戏正在分析或执行其他操作")?;
+    let mut reservation = SaveProfileOperationGuard {
+        state: &state,
+        key: active.view.game_uid.clone(),
+        active: true,
+    };
     let task_id = TaskService::create(
         &state,
         "analyze_saves",
@@ -275,81 +429,122 @@ pub fn start_finish_save_learning_task(
     )?;
     let app_handle = app.clone();
     let task_id_for_thread = task_id.clone();
-    std::thread::spawn(move || {
-        let result = SaveLearningService::finish(
-            &active,
-            |progress, message| {
-                TaskService::update(
-                    &app_handle.state(),
-                    &task_id_for_thread,
-                    TaskStatus::Running,
-                    progress,
-                    message,
-                    None,
+    let worker_uid = active.view.game_uid.clone();
+    let spawn = std::thread::Builder::new()
+        .name("analyze-saves".into())
+        .spawn(move || {
+            let worker_state = app_handle.state::<AppState>();
+            let _reservation = SaveProfileOperationGuard {
+                state: &worker_state,
+                key: worker_uid,
+                active: true,
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                SaveLearningService::finish(
+                    &active,
+                    |progress, message| {
+                        TaskService::update(
+                            &app_handle.state(),
+                            &task_id_for_thread,
+                            TaskStatus::Running,
+                            progress,
+                            message,
+                            None,
+                        )
+                    },
+                    || TaskService::is_cancelled(&app_handle.state(), &task_id_for_thread),
                 )
-            },
-            || TaskService::is_cancelled(&app_handle.state(), &task_id_for_thread),
+            }))
+            .unwrap_or_else(|_| Err("存档分析异常，已结束本次识别，请重新开始".into()));
+            match result {
+                Ok(result) => {
+                    let state: State<AppState> = app_handle.state();
+                    if let Ok(mut sessions) = state.learning_sessions.lock() {
+                        sessions.remove(&session_id);
+                    }
+                    state.remove_runtime(&active.view.game_uid);
+                    cleanup_active_learning(&active);
+                    TaskService::finish(
+                        &state,
+                        &task_id_for_thread,
+                        TaskStatus::Success,
+                        100,
+                        format!("分析完成，发现 {} 个候选文件", result.changed_files.len()),
+                        serde_json::to_value(result).ok(),
+                        None,
+                    );
+                }
+                Err(error) if error == "任务已取消" => {
+                    let state: State<AppState> = app_handle.state();
+                    if let Ok(mut sessions) = state.learning_sessions.lock() {
+                        sessions.remove(&session_id);
+                    }
+                    state.remove_runtime(&active.view.game_uid);
+                    cleanup_active_learning(&active);
+                    TaskService::finish(
+                        &app_handle.state(),
+                        &task_id_for_thread,
+                        TaskStatus::Cancelled,
+                        100,
+                        "已取消存档分析",
+                        None,
+                        None,
+                    );
+                }
+                Err(error) => {
+                    let state: State<AppState> = app_handle.state();
+                    if let Ok(mut sessions) = state.learning_sessions.lock() {
+                        sessions.remove(&session_id);
+                    }
+                    state.remove_runtime(&active.view.game_uid);
+                    cleanup_active_learning(&active);
+                    TaskService::finish(
+                        &app_handle.state(),
+                        &task_id_for_thread,
+                        TaskStatus::Failed,
+                        100,
+                        "存档分析失败",
+                        None,
+                        Some(error),
+                    );
+                }
+            }
+        });
+    if let Err(error) = spawn {
+        TaskService::finish(
+            &state,
+            &task_id,
+            TaskStatus::Failed,
+            0,
+            "启动分析线程失败",
+            None,
+            Some(error.to_string()),
         );
-        match result {
-            Ok(result) => {
-                let state: State<AppState> = app_handle.state();
-                if let Ok(mut sessions) = state.learning_sessions.lock() {
-                    sessions.remove(&session_id);
-                }
-                state.remove_runtime(&active.view.game_uid);
-                cleanup_active_learning(&active);
-                TaskService::finish(
-                    &state,
-                    &task_id_for_thread,
-                    TaskStatus::Success,
-                    100,
-                    format!("分析完成，发现 {} 个候选文件", result.changed_files.len()),
-                    serde_json::to_value(result).ok(),
-                    None,
-                );
-            }
-            Err(error) if error == "任务已取消" => {
-                let state: State<AppState> = app_handle.state();
-                if let Ok(mut sessions) = state.learning_sessions.lock() {
-                    sessions.remove(&session_id);
-                }
-                state.remove_runtime(&active.view.game_uid);
-                cleanup_active_learning(&active);
-                TaskService::finish(
-                    &app_handle.state(),
-                    &task_id_for_thread,
-                    TaskStatus::Cancelled,
-                    100,
-                    "已取消存档分析",
-                    None,
-                    None,
-                );
-            }
-            Err(error) => {
-                let state: State<AppState> = app_handle.state();
-                if let Ok(mut sessions) = state.learning_sessions.lock() {
-                    sessions.remove(&session_id);
-                }
-                state.remove_runtime(&active.view.game_uid);
-                cleanup_active_learning(&active);
-                TaskService::finish(
-                    &app_handle.state(),
-                    &task_id_for_thread,
-                    TaskStatus::Failed,
-                    100,
-                    "存档分析失败",
-                    None,
-                    Some(error),
-                );
-            }
-        }
-    });
+        return Err(format!("启动分析线程失败：{error}"));
+    }
+    reservation.active = false;
     Ok(task_id)
 }
 
 #[tauri::command]
 pub fn cancel_save_learning(state: State<AppState>, session_id: String) -> Result<(), String> {
     let session_id = session_id.trim();
+    let game_uid = state
+        .learning_sessions
+        .lock()
+        .map_err(|_| "读取存档识别状态失败")?
+        .get(session_id)
+        .map(|active| active.view.game_uid.clone());
+    let _reservation = if let Some(uid) = game_uid {
+        state.claim_operation(&uid, "当前分析尚未结束，请取消分析任务后再操作")?;
+        Some(SaveProfileOperationGuard {
+            state: &state,
+            key: uid,
+            active: true,
+        })
+    } else {
+        None
+    };
     let active = state
         .learning_sessions
         .lock()
@@ -418,21 +613,13 @@ pub fn confirm_save_profile(
     if scopes.is_empty() {
         return Err("至少需要一个存档保护范围".to_string());
     }
-    let operation_reserved = {
-        let mut operations = state
-            .save_operations
-            .lock()
-            .map_err(|_| "锁定存档确认状态失败".to_string())?;
-        if !operations.insert(format!("confirm:{game_uid}")) {
-            return Err("该游戏正在确认存档保护，请勿重复点击".to_string());
-        }
-        true
-    };
+    state.claim_operation(&game_uid, "该游戏已有操作正在进行，请稍后确认存档保护")?;
     let _operation_guard = SaveProfileOperationGuard {
         state: &state,
-        key: format!("confirm:{game_uid}"),
-        active: operation_reserved,
+        key: AppState::game_operation_key(&game_uid),
+        active: true,
     };
+    state.ensure_save_restore_idle(&game_uid)?;
     // 读 → 改 → 持久化 → 提交必须在**一次**加锁里完成。
     //
     // 旧写法先在一把锁里取 `game` 并检查 `PendingSetup`，释放锁后再在另一把锁里写入：
@@ -527,7 +714,7 @@ pub fn confirm_save_profile(
 }
 
 struct SaveProfileOperationGuard<'a> {
-    state: &'a State<'a, AppState>,
+    state: &'a AppState,
     key: String,
     active: bool,
 }
@@ -547,65 +734,8 @@ pub fn discard_pending_game(
     app: AppHandle,
     state: State<AppState>,
     game_uid: String,
-) -> Result<(), String> {
-    let game_uid = game_uid.trim().to_string();
-    let game = {
-        let store = state
-            .store
-            .lock()
-            .map_err(|_| "lock GameSaver store failed".to_string())?;
-        let game =
-            GameLibraryService::find(&store, &game_uid).ok_or_else(|| "游戏不存在".to_string())?;
-        if !matches!(game.lifecycle, GameLifecycle::PendingSetup) {
-            return Err("只能放弃等待设置的游戏".to_string());
-        }
-        game
-    };
-    let managed_path = PathBuf::from(&game.managed_path);
-    let quarantine = managed_path.with_file_name(format!(".{}.discarding", game_uid));
-    if managed_path.exists() {
-        fs::rename(&managed_path, &quarantine)
-            .map_err(|err| format!("准备清理游戏本体失败：{err}"))?;
-    }
-    let result = (|| -> Result<(), String> {
-        let mut store = state
-            .store
-            .lock()
-            .map_err(|_| "lock GameSaver store failed".to_string())?;
-        let mut candidate = store.clone();
-        candidate.games.retain(|item| item.game_uid != game_uid);
-        candidate
-            .save_profiles
-            .retain(|item| item.game_uid != game_uid);
-        GameRepository::persist(&app, &candidate)?;
-        *store = candidate;
-        Ok(())
-    })();
-    if result.is_err() && quarantine.exists() {
-        let _ = fs::rename(&quarantine, &managed_path);
-    }
-    if result.is_ok() {
-        // 隔离目录此时已经和游戏库解耦（上面的 rename 是元数据操作，很快），真正的删除放到
-        // 后台线程：它可能是刚复制进来的整份游戏本体（GB 级 / 上万个文件），留在命令体里
-        // 会让 Tauri 主线程连同窗口消息循环与后续所有 IPC 一起停摆。
-        // 审计依据：docs/command-blocking-audit-2026-09-14.md 的 F2。
-        //
-        // 删除失败只记日志、不建任务：用户可见的结果（游戏已从待设置列表消失）在命令返回时
-        // 就已经完成，这里只是收拾一个已被摘除引用的目录；建任务要同步落盘 tasks.json
-        // （实测 2.8 MB）还会多出一张「未知游戏」的卡片，不划算。兜底交给启动清扫 ——
-        // GameBodyUpdateService 的 `cleanup_stale_update_artifacts` 会回收残留的
-        // `.<uid>.discarding`（与 `.updating` 同一套机制）。
-        let quarantine_for_thread = quarantine.clone();
-        std::thread::spawn(move || match fs::remove_dir_all(&quarantine_for_thread) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => crate::logging::error(format!(
-                "放弃待设置游戏后清理隔离目录失败（{}）：{error}",
-                quarantine_for_thread.display()
-            )),
-        });
-    }
-    result
+) -> Result<String, String> {
+    crate::commands::game_commands::start_pending_game_removal(app, &state, game_uid)
 }
 
 fn validate_scope(scope: &SaveScope) -> Result<(), String> {
@@ -781,20 +911,20 @@ pub fn update_save_profile_keep_versions(
 }
 
 #[tauri::command]
-pub fn update_save_profile_scopes(
+pub fn rebind_save_scope(
     app: AppHandle,
     state: State<AppState>,
     game_uid: String,
-    mut scopes: Vec<SaveScope>,
+    scope_index: usize,
+    expected_root_path: String,
+    directory: String,
 ) -> Result<SaveProfile, String> {
     let game_uid = game_uid.trim().to_string();
-    if scopes.is_empty() {
-        return Err("存档保护范围不能为空".to_string());
-    }
-    for scope in &mut scopes {
-        scope.ensure_default_exclusions_if_empty();
-        validate_scope(scope)?;
-    }
+    let directory = strip_verbatim_prefix(
+        &Path::new(&directory)
+            .canonicalize()
+            .map_err(|err| format!("无法解析新的存档目录：{err}"))?,
+    );
 
     reserve_maintenance(&state, &game_uid)?;
     let result = (|| {
@@ -815,7 +945,7 @@ pub fn update_save_profile_scopes(
             })
             .ok_or_else(|| "未找到存档保护配置".to_string())?;
 
-        profile.scopes = scopes;
+        rebind_scope(profile, &game, scope_index, &expected_root_path, &directory)?;
         profile.updated_at = now_iso();
         let updated_profile = profile.clone();
 
@@ -829,6 +959,60 @@ pub fn update_save_profile_scopes(
     })();
     release_maintenance(&state, &game_uid);
     result
+}
+
+fn rebind_scope(
+    profile: &mut SaveProfile,
+    game: &Game,
+    scope_index: usize,
+    expected_root_path: &str,
+    directory: &Path,
+) -> Result<(), String> {
+    let scope = profile.scopes.get(scope_index).ok_or("存档范围已变化，请刷新后重试")?;
+    if scope.root_path != expected_root_path {
+        return Err("存档范围已变化，请刷新后重试".to_string());
+    }
+    let target_key = normalize_path(directory);
+    if profile.scopes.iter().enumerate().any(|(index, candidate)| {
+        index != scope_index && normalize_path(Path::new(&candidate.root_path)) == target_key
+    }) || profile.root_bindings.iter().any(|binding| {
+        binding.root_type == scope.root_type
+            && normalize_path(Path::new(&binding.previous_path)) == target_key
+            && normalize_path(Path::new(&binding.current_path)) != normalize_path(Path::new(&scope.root_path))
+    }) {
+        return Err("这个目录已经关联到另一个存档范围".to_string());
+    }
+    if scope.root_type == SaveRootType::ManagedGame {
+        let managed = Path::new(&game.managed_path).canonicalize()
+            .map_err(|err| format!("无法解析受管游戏目录：{err}"))?;
+        if !directory.starts_with(strip_verbatim_prefix(&managed)) {
+            return Err("游戏目录内的存档范围只能改到当前游戏目录内".to_string());
+        }
+    }
+    let mut updated = scope.clone();
+    updated.root_path = directory.to_string_lossy().into_owned();
+    validate_scope(&updated)?;
+    let previous_path = scope.root_path.clone();
+    let previous_key = normalize_path(Path::new(&previous_path));
+    if previous_key != target_key {
+        for binding in &mut profile.root_bindings {
+            if binding.root_type == scope.root_type
+                && normalize_path(Path::new(&binding.current_path)) == previous_key
+            {
+                binding.current_path = updated.root_path.clone();
+            }
+        }
+        profile.root_bindings.retain(|binding| {
+            normalize_path(Path::new(&binding.previous_path)) != normalize_path(Path::new(&binding.current_path))
+        });
+        profile.root_bindings.push(SaveRootBinding {
+            root_type: scope.root_type,
+            previous_path,
+            current_path: updated.root_path.clone(),
+        });
+    }
+    profile.scopes[scope_index] = updated;
+    Ok(())
 }
 
 #[tauri::command]
@@ -925,6 +1109,39 @@ mod tests {
             sha256_file(&path).expect("hash test file"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn rebind_changes_only_the_selected_root_and_keeps_historical_paths() {
+        use crate::domain::{Game, SaveProfile, SaveRootType, SaveScope, UnknownFilePolicy};
+
+        let workspace = crate::test_support::TempWorkspace::new("save-rebind");
+        let first = workspace.join("moved");
+        let second = workspace.join("moved-again");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let old = r"C:\Users\Old\AppData\LocalLow\Studio\Game";
+        let mut original = SaveScope::new_manual(old.to_string());
+        original.root_type = SaveRootType::LocalLow;
+        original.confirmed_files = vec!["slot1.sav".to_string()];
+        original.unknown_file_policy = UnknownFilePolicy::Ignore;
+        let unrelated = SaveScope::new_manual(r"E:\Unavailable".to_string());
+        let game = Game::new_pending("Example", r"D:\Games\Example", "game.exe");
+        let mut profile = SaveProfile::new(
+            game.game_uid.clone(), "hash".to_string(), vec![original, unrelated], 100, "0".to_string(),
+        );
+
+        super::rebind_scope(&mut profile, &game, 0, old, &first).unwrap();
+        let first_path = profile.scopes[0].root_path.clone();
+        super::rebind_scope(&mut profile, &game, 0, &first_path, &second).unwrap();
+        assert_eq!(profile.scopes[0].root_type, SaveRootType::LocalLow);
+        assert_eq!(profile.scopes[0].confirmed_files, ["slot1.sav"]);
+        assert_eq!(profile.scopes[0].unknown_file_policy, UnknownFilePolicy::Ignore);
+        assert_eq!(profile.scopes[1].root_path, r"E:\Unavailable");
+        assert_eq!(profile.root_bindings.len(), 2);
+        assert!(profile.root_bindings.iter().any(|binding| binding.previous_path == old));
+        assert!(profile.root_bindings.iter().all(|binding| binding.current_path == profile.scopes[0].root_path));
+        assert!(super::rebind_scope(&mut profile, &game, 0, old, &first).is_err());
     }
 
     #[test]

@@ -128,11 +128,21 @@ fn default_keep_versions() -> usize {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct SaveRootBinding {
+    pub root_type: SaveRootType,
+    pub previous_path: String,
+    pub current_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SaveProfile {
     pub profile_id: String,
     pub game_uid: String,
     pub executable_hash: String,
     pub scopes: Vec<SaveScope>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) root_bindings: Vec<SaveRootBinding>,
     pub detection_evidence: Vec<String>,
     pub confidence: u8,
     pub enabled: bool,
@@ -155,6 +165,7 @@ impl SaveProfile {
             game_uid,
             executable_hash,
             scopes,
+            root_bindings: Vec::new(),
             // 溯源信息由调用方按实际采集方式补上（`with_detection_evidence`）。
             // 手动创建的 profile 没有识别过程，留空才是真话。
             detection_evidence: Vec::new(),

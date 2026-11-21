@@ -1,4 +1,5 @@
 pub mod baidu_config_repository;
+pub(crate) mod baidu_token_repository;
 pub mod game_repository;
 pub mod library_config_repository;
 pub mod save_repository;

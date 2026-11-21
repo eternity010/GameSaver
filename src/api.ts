@@ -89,6 +89,7 @@ export interface AppTask {
   taskType: string;
   /** 旧数据可能缺这个字段，`taskCategoryOf()` 会兜底。 */
   category?: TaskCategory;
+  cancellable?: boolean;
   status: "pending" | "running" | "success" | "failed" | "cancelled" | "interrupted";
   progress: number;
   message: string;
@@ -118,6 +119,7 @@ export interface BaiduStatus {
   expiresAt?: number;
   expired: boolean;
   refreshError?: string;
+  reauthorizationRequired?: boolean;
 }
 
 export interface ElevationStatus {
@@ -321,9 +323,12 @@ export interface LibrarySettings {
   gamesBytes: number;
   bodyPackagesBytes: number;
   savesBytes: number;
+  coversBytes: number;
   totalBytes: number;
   fileCount: number;
   freeBytes: number;
+  pendingMigrationSource: string | null;
+  migrationWarning: string | null;
 }
 
 export function getLibrarySettings(): Promise<LibrarySettings> {
@@ -334,8 +339,22 @@ export function startSetLibraryRootTask(targetRoot: string): Promise<string> {
   return invokeCommand<string>("start_set_library_root_task", { targetRoot });
 }
 
+export function resumeLibraryMigrationTask(): Promise<string> {
+  return invokeCommand<string>("resume_library_migration_task");
+}
+
 export function startSaveLearningTask(gameUid: string): Promise<string> {
   return invokeCommand<string>("start_save_learning_task", { gameUid });
+}
+
+export function getPendingGameSetup(gameUid?: string): Promise<{
+  game: Game | null;
+  session: SaveLearningSession | null;
+  validationOnly: boolean;
+  taskId: string | null;
+  taskType: string | null;
+}> {
+  return invokeCommand("get_pending_game_setup", { gameUid: gameUid ?? null });
 }
 
 export function startSaveCandidateVerificationTask(gameUid: string, scopes: SaveScope[]): Promise<string> {
@@ -372,16 +391,24 @@ export function updateSaveProfileKeepVersions(gameUid: string, keepVersions: num
   return invokeCommand<SaveProfile>("update_save_profile_keep_versions", { gameUid, keepVersions });
 }
 
-export function updateSaveProfileScopes(gameUid: string, scopes: SaveScope[]): Promise<SaveProfile> {
-  return invokeCommand<SaveProfile>("update_save_profile_scopes", { gameUid, scopes });
+export function rebindSaveScope(gameUid: string, scopeIndex: number, expectedRootPath: string, directory: string): Promise<SaveProfile> {
+  return invokeCommand<SaveProfile>("rebind_save_scope", { gameUid, scopeIndex, expectedRootPath, directory });
 }
 
-export function discardPendingGame(gameUid: string): Promise<void> {
-  return invokeCommand<void>("discard_pending_game", { gameUid });
+export function discardPendingGame(gameUid: string): Promise<string> {
+  return invokeCommand<string>("discard_pending_game", { gameUid });
 }
 
 export function removeGameFromLibrary(gameUid: string): Promise<void> {
   return invokeCommand<void>("remove_game_from_library", { gameUid });
+}
+
+export function retryGameRemoval(gameUid: string): Promise<string> {
+  return invokeCommand<string>("retry_game_removal", { gameUid });
+}
+
+export function retryGameBodyUpdate(gameUid: string): Promise<string> {
+  return invokeCommand<string>("retry_game_body_update", { gameUid });
 }
 
 export function openPathInExplorer(path: string): Promise<void> {
@@ -477,6 +504,10 @@ export function setBaiduAutoUpload(enabled: boolean): Promise<BaiduConfigView> {
 
 export function buildBaiduAuthorizeUrl(): Promise<string> {
   return invokeCommand<string>("build_baidu_authorize_url");
+}
+
+export function openBaiduAuthorizePage(): Promise<string> {
+  return invokeCommand<string>("open_baidu_authorize_page");
 }
 
 export function exchangeBaiduCode(code: string): Promise<void> {

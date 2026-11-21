@@ -68,8 +68,11 @@ impl TaskCategory {
             | "delete_remote_body_package"
             | "repair_cloud_body_manifest"
             | "update_game_body"
+            | "retry_game_body_update"
             | "package_game_body"
             | "uninstall_game_body"
+            | "remove_game_from_library"
+            | "retry_game_removal"
             | "delete_game_body_package" => Self::BodyTransfer,
             "sync_cloud_save" => Self::CloudSaveSync,
             "restore_save_version" => Self::SaveRestore,
@@ -103,6 +106,8 @@ pub struct AppTask {
     pub created_at: String,
     #[serde(skip)]
     pub cancel_requested: bool,
+    #[serde(default)]
+    pub cancellable: Option<bool>,
 }
 
 /// `list_tasks` 的列表视图：**刻意不含 `result`**。
@@ -122,6 +127,7 @@ pub struct AppTask {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskSummary {
+    pub cancellable: Option<bool>,
     pub task_id: String,
     pub task_type: String,
     /// 旧数据可能缺这个字段，`TaskCategory::infer` 会补齐（见 [`AppTask::category`]）。
@@ -145,6 +151,7 @@ impl From<&AppTask> for TaskSummary {
     /// JSON 深拷贝一遍再丢掉，白白付出一次分配。这里 `result` 完全不碰。
     fn from(task: &AppTask) -> Self {
         Self {
+            cancellable: task.cancellable,
             task_id: task.task_id.clone(),
             task_type: task.task_type.clone(),
             category: task.category,
@@ -180,6 +187,7 @@ mod tests {
             retry: None,
             created_at: "1789050204989".to_string(),
             cancel_requested: false,
+            cancellable: None,
         }
     }
 

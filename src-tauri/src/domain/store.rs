@@ -1,5 +1,6 @@
 use super::{compare_created_at, Game, GameBodyVersion, SaveProfile, SaveVersion};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
@@ -15,6 +16,8 @@ pub struct AppStore {
     pub save_versions: Vec<SaveVersion>,
     #[serde(default)]
     pub body_versions: Vec<GameBodyVersion>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) committed_save_restores: BTreeSet<String>,
 }
 
 impl Default for AppStore {
@@ -25,6 +28,7 @@ impl Default for AppStore {
             save_profiles: Vec::new(),
             save_versions: Vec::new(),
             body_versions: Vec::new(),
+            committed_save_restores: BTreeSet::new(),
         }
     }
 }

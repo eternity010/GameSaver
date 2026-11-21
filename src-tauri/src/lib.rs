@@ -13,7 +13,8 @@ use app_state::AppState;
 use repositories::{GameRepository, LibraryConfigRepository, SaveRepository, TaskRepository};
 use services::{
     learning::cleanup_stale_captures, BodyPackageService, CoverCaptureService,
-    GameBodyInstallService, GameBodyUpdateService, InstanceService, LaunchService,
+    GameBodyInstallService, GameBodyUpdateService, GameRemovalService, InstanceService,
+    LaunchService,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -69,6 +70,20 @@ pub fn run() {
             logging::install_panic_hook();
             logging::info(format!("应用启动，数据目录：{}", data_dir.display()));
             cleanup_stale_captures(app.handle());
+            if let Some(outcome) =
+                services::library_service::LibraryMigration::recover(&data_dir, |source, target| {
+                    let mut store = GameRepository::load(app.handle())?;
+                    services::LibraryService::rewrite_paths_in_place(&mut store, source, target)?;
+                    GameRepository::persist(app.handle(), &store)
+                })
+                .map_err(|error| format!("游戏库迁移恢复失败，已保留原库与新库：{error}"))?
+            {
+                if let Some(warning) = outcome.warning {
+                    logging::warn(warning);
+                } else {
+                    logging::info("未完成的游戏库迁移已恢复并收尾");
+                }
+            }
             let library_root = LibraryConfigRepository::resolve_root(&data_dir)
                 .map_err(|error| format!("解析游戏库根目录失败：{error}"))?;
             let games_root = library_root.join("games");
@@ -77,7 +92,11 @@ pub fn run() {
                 logging::error(format!("本体包临时文件清理失败：{error}"));
                 eprintln!("GameSaver 本体包临时文件清理失败：{error}");
             }
-            let store = GameRepository::load(app.handle())?;
+            let mut store = GameRepository::load(app.handle())?;
+            if let Err(error) = SaveRepository::recover_restore_journals(&data_dir, &mut store) {
+                logging::error(format!("存档恢复事务未收尾，现场已保留：{error}"));
+                return Err(format!("存档恢复事务未收尾，现场已保留：{error}").into());
+            }
             let cloud_installs_recovered = match GameBodyInstallService::recover_pending_installs(
                 &games_root,
                 &body_package_root,
@@ -99,7 +118,12 @@ pub fn run() {
                         Vec::new()
                     }
                 };
-            let mut store = store;
+            let removal_notices = GameRemovalService::recover_pending(
+                &library_root,
+                &mut store,
+                |candidate| GameRepository::persist(app.handle(), candidate),
+                |versions| SaveRepository::collect_garbage_in_library(&library_root, versions),
+            )?;
             if !removed_restore_archives.is_empty() {
                 let removed = removed_restore_archives
                     .iter()
@@ -159,6 +183,20 @@ pub fn run() {
                 logging::error(format!("任务恢复状态写入失败：{error}"));
                 eprintln!("GameSaver 任务恢复状态写入失败：{error}");
             }
+            let interrupted_adds = tasks
+                .values()
+                .filter(|task| {
+                    task.task_type == "add_game" && task.status != domain::TaskStatus::Success
+                })
+                .filter_map(|task| task.game_uid.clone())
+                .collect::<Vec<_>>();
+            if let Err(error) = services::AddGameService::recover_interrupted(
+                &games_root,
+                &store,
+                &interrupted_adds,
+            ) {
+                logging::error(format!("中断的添加游戏任务恢复未完成，现场已保留：{error}"));
+            }
             let committed_archives = store
                 .body_versions
                 .iter()
@@ -170,18 +208,35 @@ pub fn run() {
                         .to_ascii_lowercase()
                 })
                 .collect::<HashSet<_>>();
-            if let Err(error) =
-                GameBodyUpdateService::recover_pending_updates(&games_root, &committed_archives)
-            {
-                logging::error(format!("游戏更新恢复失败：{error}"));
-                eprintln!("GameSaver 游戏更新恢复失败：{error}");
-            }
-            if let Err(error) = GameBodyUpdateService::cleanup_archived_body_versions(
+            let updates_recovered = match GameBodyUpdateService::recover_pending_updates_with(
                 &games_root,
-                &mut store.body_versions,
+                &committed_archives,
+                |uid, _| {
+                    let mut candidate = store.clone();
+                    GameBodyUpdateService::clear_missing_archives(
+                        &games_root,
+                        uid,
+                        &mut candidate.body_versions,
+                    )?;
+                    GameRepository::persist(app.handle(), &candidate)?;
+                    store = candidate;
+                    Ok(())
+                },
             ) {
-                logging::error(format!("清理历史游戏本体失败：{error}"));
-                eprintln!("GameSaver 清理历史游戏本体失败：{error}");
+                Ok(()) => true,
+                Err(error) => {
+                    logging::error(format!("游戏更新恢复失败，已暂停历史本体清理：{error}"));
+                    false
+                }
+            };
+            if updates_recovered {
+                if let Err(error) = GameBodyUpdateService::cleanup_archived_body_versions(
+                    &games_root,
+                    &mut store.body_versions,
+                ) {
+                    logging::error(format!("清理历史游戏本体失败：{error}"));
+                    eprintln!("GameSaver 清理历史游戏本体失败：{error}");
+                }
             }
             // 存档恢复被强杀会在用户的存档目录里留下工作目录（`.gamesaver-restore-*` /
             // `.gamesaver-rollback-*`）。这里清的是上一次进程留下的，此刻还没进入运行期、
@@ -206,10 +261,22 @@ pub fn run() {
                 eprintln!("GameSaver 清理历史游戏本体记录失败：{error}");
             }
             let state = AppState::new(store, library_root, tasks, PathBuf::from(tasks_path));
+            let pending_updates = GameBodyUpdateService::pending_game_uids(&games_root)?;
+            for uid in &pending_updates {
+                state.finish_game_update(uid, true);
+            }
+            for uid in GameRemovalService::pending_game_uids(&state.library_root_path()?)? {
+                state.finish_game_removal(&uid, true);
+            }
             for uid in pending_install_games {
                 state.claim_operation(&uid, "游戏安装事务待恢复")?;
             }
             app.manage(state);
+            commands::game_commands::record_recovered_game_removals(app.handle(), removal_notices);
+            services::game_body_update_service::record_pending_updates(
+                app.handle(),
+                pending_updates,
+            );
             // 注入事件推送器：此后任务与游戏运行时状态的变化会主动推给前端，
             // 各组件的高频轮询因此得以降级为低频兜底。
             //
@@ -249,6 +316,7 @@ pub fn run() {
             commands::game_commands::get_game_cover_path,
             commands::game_commands::get_game_cover_paths,
             commands::game_commands::remove_game_from_library,
+            commands::game_commands::retry_game_removal,
             commands::game_commands::get_game_detail_view,
             commands::add_game_commands::start_add_game_task,
             commands::task_commands::get_task,
@@ -256,6 +324,7 @@ pub fn run() {
             commands::task_commands::cancel_task,
             commands::task_commands::delete_tasks,
             commands::save_commands::start_save_learning_task,
+            commands::save_commands::get_pending_game_setup,
             commands::save_commands::start_save_candidate_verification_task,
             commands::save_commands::start_finish_save_learning_task,
             commands::save_commands::cancel_save_learning,
@@ -263,7 +332,7 @@ pub fn run() {
             commands::save_commands::get_save_profile,
             commands::save_commands::preview_save_scopes,
             commands::save_commands::update_save_profile_keep_versions,
-            commands::save_commands::update_save_profile_scopes,
+            commands::save_commands::rebind_save_scope,
             commands::save_commands::discard_pending_game,
             commands::save_commands::open_path_in_explorer,
             commands::save_commands::get_default_save_exclusions,
@@ -276,6 +345,7 @@ pub fn run() {
             commands::save_version_commands::prune_save_versions,
             commands::game_body_commands::list_game_body_versions,
             commands::game_body_commands::update_game_body,
+            commands::game_body_commands::retry_game_body_update,
             commands::game_body_commands::package_game_body,
             commands::game_body_commands::delete_game_body_package,
             commands::game_body_commands::uninstall_game_body,
@@ -292,6 +362,7 @@ pub fn run() {
             commands::baidu_config_commands::get_baidu_config,
             commands::baidu_config_commands::save_baidu_config,
             commands::baidu_config_commands::build_baidu_authorize_url,
+            commands::baidu_config_commands::open_baidu_authorize_page,
             commands::baidu_config_commands::exchange_baidu_code,
             commands::baidu_config_commands::set_baidu_auto_upload,
             commands::baidu_commands::get_baidu_quota,
@@ -302,6 +373,7 @@ pub fn run() {
             commands::admin_commands::restart_as_admin,
             commands::library_commands::get_library_settings,
             commands::library_commands::start_set_library_root_task,
+            commands::library_commands::resume_library_migration_task,
             commands::cloud_account_commands::get_cloud_account_status,
             commands::cloud_account_commands::start_upload_cloud_account_task,
             commands::cloud_account_commands::start_download_cloud_account_task,
@@ -443,7 +515,8 @@ mod tests {
     ];
 
     /// 体内直接命中这些名字时网络在下一层（服务层），逐个人工确认过，标记在这里。
-    const SERVICE_NETWORK_MARKERS: [&str; 7] = [
+    const SERVICE_NETWORK_MARKERS: [&str; 8] = [
+        "BaiduAuthService::exchange_code(",
         "CloudSaveService::get_overview(",
         "CloudSaveService::fetch_manifest(",
         "CloudSaveService::delete_cloud_version(",

@@ -1,10 +1,6 @@
 use super::save_profile::SaveScope;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{atomic::AtomicBool, Arc, Mutex},
-};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -100,14 +96,14 @@ pub struct ScanRoot {
 }
 
 #[derive(Debug, Clone)]
-pub struct ActiveLearningSession {
-    pub view: LearningSessionView,
-    pub roots: Vec<ScanRoot>,
-    pub baseline: Option<HashMap<String, FileFingerprint>>,
-    pub tracked_pids: Arc<Mutex<Vec<u32>>>,
-    pub process_tracker_stop: Arc<AtomicBool>,
-    pub process_tracker_done: Arc<AtomicBool>,
-    pub etw_capture: Option<EtwCaptureHandle>,
-    pub etw_start_error: Option<String>,
-    pub validation_only: bool,
+pub(crate) struct ProcessLifetime {
+    pub pid: u32,
+    pub started_at: i64,
+    pub ended_at: i64,
+}
+
+impl ProcessLifetime {
+    pub(crate) fn contains(&self, event_time: i64) -> bool {
+        self.started_at <= event_time && event_time < self.ended_at
+    }
 }

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, type Component } from "vue";
 import { CheckCircle2, CloudDownload, CloudUpload, History, LoaderCircle, Play, RefreshCw, Trash2, XCircle } from "@lucide/vue";
-import { cancelTask, confirmAction, deleteRemoteBodyPackage, deleteTasks, downloadGameBodyPackage, installCloudGame, repairCloudBodyManifest, startRestoreCloudSaveTask, startUploadSaveVersionTask, type AppTask, type CloudGameSummary, type TaskCategory, uploadGameBodyPackage } from "../api";
+import { cancelTask, confirmAction, deleteRemoteBodyPackage, deleteTasks, downloadGameBodyPackage, installCloudGame, repairCloudBodyManifest, retryGameBodyUpdate, retryGameRemoval, startRestoreCloudSaveTask, startUploadSaveVersionTask, type AppTask, type CloudGameSummary, type TaskCategory, uploadGameBodyPackage } from "../api";
 import type { Game } from "../domain/game";
 import { taskCancelHint, taskCategoryOf, taskPolicyOf, useTaskFeed } from "../taskFeed";
 
@@ -86,6 +86,10 @@ async function retry(task: AppTask) {
       newTaskId = await deleteRemoteBodyPackage(retryInfo.gameUid, retryInfo.gameKey, retryInfo.remotePath, retryInfo.remoteFsId);
     } else if (retryInfo.operation === "repair_cloud_body_manifest") {
       newTaskId = await repairCloudBodyManifest(retryInfo.gameUid);
+    } else if (retryInfo.operation === "retry_game_removal") {
+      newTaskId = await retryGameRemoval(retryInfo.gameUid);
+    } else if (retryInfo.operation === "retry_game_body_update") {
+      newTaskId = await retryGameBodyUpdate(retryInfo.gameUid);
     } else if (retryInfo.operation === "sync_cloud_save" && retryInfo.versionId) {
       newTaskId = await startUploadSaveVersionTask(retryInfo.gameUid, retryInfo.versionId);
     } else if (retryInfo.operation === "restore_cloud_save" && retryInfo.versionId) {
@@ -163,10 +167,12 @@ const TASK_TITLES: Record<string, string> = {
   delete_remote_body_package: "删除云端本体",
   repair_cloud_body_manifest: "修复云端清单",
   update_game_body: "更新游戏本体",
+  retry_game_body_update: "恢复游戏更新与清理",
   package_game_body: "打包游戏本体",
   uninstall_game_body: "卸载游戏本体",
   delete_game_body_package: "删除本地本体包",
   remove_game_from_library: "从库中移除游戏",
+  retry_game_removal: "继续卸载或删除清理",
   sync_cloud_save: "云存档同步",
   restore_save_version: "恢复存档版本",
   launch_game: "启动游戏",
@@ -181,8 +187,10 @@ const TASK_ICONS: Record<string, Component> = {
   delete_game_body_package: Trash2,
   uninstall_game_body: Trash2,
   remove_game_from_library: Trash2,
+  retry_game_removal: Trash2,
   repair_cloud_body_manifest: RefreshCw,
   update_game_body: RefreshCw,
+  retry_game_body_update: RefreshCw,
   package_game_body: CloudUpload,
 };
 
@@ -210,6 +218,7 @@ function gameName(gameUid?: string): string {
 
 function retryIcon(task: AppTask) {
   const operation = task.retry?.operation;
+  if (operation === "retry_game_body_update") return RefreshCw;
   return operation === "upload_game_body_package" || operation === "sync_cloud_save" ? CloudUpload : CloudDownload;
 }
 

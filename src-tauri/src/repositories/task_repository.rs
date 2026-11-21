@@ -116,6 +116,7 @@ mod tests {
             }),
             created_at: "1".to_string(),
             cancel_requested: false,
+            cancellable: None,
         }
     }
 

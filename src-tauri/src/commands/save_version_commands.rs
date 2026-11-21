@@ -3,10 +3,11 @@ use crate::{
     domain::{
         compare_created_at, GameLifecycle, SaveProfile, SaveVersion, TaskCategory, TaskStatus,
     },
-    repositories::{GameRepository, SaveRepository},
+    repositories::{save_repository::RestorePlan, GameRepository, SaveRepository},
     services::{GameLibraryService, TaskService},
 };
 use tauri::{AppHandle, Manager, State};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 #[tauri::command]
 pub fn restore_save_version(
@@ -17,8 +18,15 @@ pub fn restore_save_version(
 ) -> Result<String, String> {
     let game_uid = game_uid.trim().to_string();
     let version_id = version_id.trim().to_string();
-    let (game, profile, version, latest) = load_version_context(&state, &game_uid, &version_id)?;
     reserve_maintenance(&state, &game_uid)?;
+    let (game, profile, version, latest) =
+        match load_version_context(&state, &game_uid, &version_id) {
+            Ok(value) => value,
+            Err(error) => {
+                release_maintenance(&state, &game_uid);
+                return Err(error);
+            }
+        };
     let task_id = match TaskService::create(
         &state,
         "restore_save_version",
@@ -71,11 +79,11 @@ pub fn restore_save_version(
             Err(error) => TaskService::finish(
                 &state,
                 &task_id_for_thread,
-                TaskStatus::Failed,
+                if error == "任务已取消" { TaskStatus::Cancelled } else { TaskStatus::Failed },
                 100,
-                "保存版本恢复失败",
+                if error == "任务已取消" { "已取消恢复存档" } else { "保存版本恢复失败" },
                 None,
-                Some(error),
+                (error != "任务已取消").then_some(error),
             ),
         }
     });
@@ -225,6 +233,18 @@ fn restore_version_task(
 ) -> Result<serde_json::Value, String> {
     let state = app.state::<AppState>();
     ensure_maintenance_allowed(&state, &game.game_uid)?;
+    SaveRepository::ensure_no_pending_restore(app, &game.game_uid)?;
+    TaskService::update(
+        &state,
+        task_id,
+        TaskStatus::Running,
+        2,
+        "正在确认存档恢复范围",
+        None,
+    );
+    let plan = SaveRepository::plan_restore(game, profile, version)?;
+    confirm_restore_targets(app, game, &plan)?;
+    ensure_maintenance_allowed(&state, &game.game_uid)?;
     TaskService::update(
         &state,
         task_id,
@@ -296,12 +316,12 @@ fn restore_version_task(
         "当前存档已保护，正在校验目标版本",
         None,
     );
-    let receipt = SaveRepository::restore(app, game, profile, version, |progress, message| {
+    let receipt = SaveRepository::restore_confirmed(app, plan, |progress, message| {
         TaskService::update(
             &state,
             task_id,
             TaskStatus::Running,
-            35 + progress * 3 / 5,
+            35 + (u16::from(progress) * 3 / 5) as u8,
             message,
             None,
         );
@@ -322,6 +342,7 @@ fn restore_version_task(
             });
         };
         game_record.latest_save_version_id = Some(version.version_id.clone());
+        receipt.record_commit(candidate);
         if let Err(error) = GameRepository::persist(app, candidate) {
             return Err(match SaveRepository::rollback_restore(receipt) {
                 Ok(()) => format!("保存恢复结果失败，已回滚存档：{error}"),
@@ -330,7 +351,7 @@ fn restore_version_task(
                 }
             });
         }
-        SaveRepository::finalize_restore(receipt);
+        SaveRepository::finalize_restore(receipt, candidate);
         Ok(())
     })?;
     Ok(serde_json::json!({
@@ -338,6 +359,36 @@ fn restore_version_task(
         "createdAt": version.created_at,
         "removedFileCount": removed_file_count,
     }))
+}
+
+pub(crate) fn confirm_restore_targets(
+    app: &AppHandle,
+    game: &crate::domain::Game,
+    plan: &RestorePlan,
+) -> Result<(), String> {
+    let targets = plan.targets()
+        .map(|path| format!("• {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (written, removed) = plan.file_counts();
+    let warning = if plan.unmatched_deletions == 0 {
+        String::new()
+    } else {
+        format!("\n另有 {} 条删除记录无法匹配当前范围，将跳过。", plan.unmatched_deletions)
+    };
+    let dialog = app.dialog()
+        .message(format!(
+            "将恢复「{}」的存档。\n\n目标目录：\n{targets}\n\n写入 {written} 个文件，移除 {removed} 个目标版本不包含的受保护文件。{warning}\n确认后会先保护当前存档，再开始恢复。",
+            game.display_name
+        ))
+        .title("确认存档恢复目标")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancel);
+    let dialog = match app.get_webview_window("main") {
+        Some(window) => dialog.parent(&window),
+        None => dialog,
+    };
+    if dialog.blocking_show() { Ok(()) } else { Err("任务已取消".to_string()) }
 }
 
 fn delete_versions_task(

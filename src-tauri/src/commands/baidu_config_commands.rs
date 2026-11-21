@@ -1,22 +1,10 @@
 use crate::{
     commands::run_blocking,
-    repositories::{BaiduConfig, BaiduConfigRepository, BaiduConfigView},
-    services::{safe_network_error, BaiduNetdiskClient, BaiduToken},
+    repositories::{BaiduConfigRepository, BaiduConfigView},
+    services::baidu_auth_service::BaiduAuthService,
 };
-use reqwest::blocking::Client;
-use serde::Deserialize;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
-
-const OAUTH_BASE: &str = "https://openapi.baidu.com/oauth/2.0";
-const REDIRECT_URI: &str = "oob";
-
-#[derive(Debug, Deserialize)]
-struct TokenResponse {
-    access_token: Option<String>,
-    refresh_token: Option<String>,
-    expires_in: Option<u64>,
-}
 
 #[tauri::command]
 pub fn get_baidu_config(app: AppHandle) -> Result<BaiduConfigView, String> {
@@ -30,41 +18,19 @@ pub fn save_baidu_config(
     secret_key: String,
 ) -> Result<BaiduConfigView, String> {
     let app_data_dir = app_data_dir(&app)?;
-    let existing = BaiduConfigRepository::load(&app_data_dir)?;
-    let auto_upload_body = existing
-        .as_ref()
-        .is_some_and(|config| config.auto_upload_body);
-    let auto_sync_save = existing
-        .as_ref()
-        .map(|config| config.auto_sync_save)
-        .unwrap_or(true);
-    let check_cloud_save_on_launch = existing
-        .as_ref()
-        .map(|config| config.check_cloud_save_on_launch)
-        .unwrap_or(true);
-    let cloud_save_keep_limit = existing
-        .as_ref()
-        .map(|config| config.cloud_save_keep_limit)
-        .unwrap_or(10);
-    let config = BaiduConfig {
-        app_key: app_key.trim().to_string(),
-        secret_key: secret_key.trim().to_string(),
-        auto_upload_body,
-        auto_sync_save,
-        check_cloud_save_on_launch,
-        cloud_save_keep_limit,
-    };
-    BaiduConfigRepository::save(&app_data_dir, config)?;
+    BaiduAuthService::save_config(&app_data_dir, &app_key, &secret_key)?;
     BaiduConfigRepository::view(&app_data_dir)
 }
 
 #[tauri::command]
 pub fn set_baidu_auto_upload(app: AppHandle, enabled: bool) -> Result<BaiduConfigView, String> {
     let app_data_dir = app_data_dir(&app)?;
-    let mut config = BaiduConfigRepository::load(&app_data_dir)?
-        .ok_or_else(|| "请先在平台设置中保存百度 AppKey 和 SecretKey".to_string())?;
-    config.auto_upload_body = enabled;
-    BaiduConfigRepository::save(&app_data_dir, config)?;
+    BaiduConfigRepository::update(&app_data_dir, |existing| {
+        let mut config =
+            existing.ok_or_else(|| "请先在平台设置中保存百度 AppKey 和 SecretKey".to_string())?;
+        config.auto_upload_body = enabled;
+        Ok(config)
+    })?;
     BaiduConfigRepository::view(&app_data_dir)
 }
 
@@ -76,27 +42,25 @@ pub fn update_baidu_save_sync_settings(
     cloud_save_keep_limit: usize,
 ) -> Result<BaiduConfigView, String> {
     let app_data_dir = app_data_dir(&app)?;
-    let mut config = BaiduConfigRepository::load(&app_data_dir)?
-        .ok_or_else(|| "请先在平台设置中保存百度 AppKey 和 SecretKey".to_string())?;
-    config.auto_sync_save = auto_sync_save;
-    config.check_cloud_save_on_launch = check_cloud_save_on_launch;
-    config.cloud_save_keep_limit = cloud_save_keep_limit.clamp(1, 100);
-    BaiduConfigRepository::save(&app_data_dir, config)?;
+    BaiduConfigRepository::update(&app_data_dir, |existing| {
+        let mut config =
+            existing.ok_or_else(|| "请先在平台设置中保存百度 AppKey 和 SecretKey".to_string())?;
+        config.auto_sync_save = auto_sync_save;
+        config.check_cloud_save_on_launch = check_cloud_save_on_launch;
+        config.cloud_save_keep_limit = cloud_save_keep_limit.clamp(1, 100);
+        Ok(config)
+    })?;
     BaiduConfigRepository::view(&app_data_dir)
 }
 
 #[tauri::command]
 pub fn build_baidu_authorize_url(app: AppHandle) -> Result<String, String> {
-    let config = BaiduConfigRepository::load(&app_data_dir(&app)?)?
-        .ok_or_else(|| "请先在平台设置中保存百度 AppKey 和 SecretKey".to_string())?;
-    let mut url = reqwest::Url::parse(&format!("{OAUTH_BASE}/authorize"))
-        .map_err(|error| format!("生成百度授权地址失败：{error}"))?;
-    url.query_pairs_mut()
-        .append_pair("response_type", "code")
-        .append_pair("client_id", &config.app_key)
-        .append_pair("redirect_uri", REDIRECT_URI)
-        .append_pair("scope", "basic,netdisk");
-    Ok(url.to_string())
+    BaiduAuthService::authorize_url(&app_data_dir(&app)?)
+}
+
+#[tauri::command]
+pub async fn open_baidu_authorize_page(app: AppHandle) -> Result<String, String> {
+    run_blocking(move || BaiduAuthService::open_authorization_page(&app_data_dir(&app)?)).await
 }
 
 /// 用授权码换取 token。
@@ -104,75 +68,11 @@ pub fn build_baidu_authorize_url(app: AppHandle) -> Result<String, String> {
 /// 体内 `Client::builder() … .send()` 是一次 OAuth 往返，必须在阻塞线程池上执行。
 #[tauri::command]
 pub async fn exchange_baidu_code(app: AppHandle, code: String) -> Result<(), String> {
-    run_blocking(move || exchange_baidu_code_blocking(app, code)).await
-}
-
-fn exchange_baidu_code_blocking(app: AppHandle, code: String) -> Result<(), String> {
-    let code = code.trim();
-    if code.is_empty() {
-        return Err("授权 Code 不能为空".to_string());
-    }
-    let config = BaiduConfigRepository::load(&app_data_dir(&app)?)?
-        .ok_or_else(|| "请先在平台设置中保存百度 AppKey 和 SecretKey".to_string())?;
-    let client = Client::builder()
-        .no_proxy()
-        .connect_timeout(std::time::Duration::from_secs(20))
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent("pan.baidu.com")
-        .build()
-        .map_err(|error| format!("创建百度授权客户端失败：{error}"))?;
-    let response = client
-        .get(format!("{OAUTH_BASE}/token"))
-        .query(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("client_id", config.app_key.as_str()),
-            ("client_secret", config.secret_key.as_str()),
-            ("redirect_uri", REDIRECT_URI),
-        ])
-        .send()
-        .map_err(|error| format!("请求百度授权 Token 失败：{}", safe_network_error(error)))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .map_err(|error| format!("读取百度授权响应失败：{}", safe_network_error(error)))?;
-    let value = serde_json::from_str::<serde_json::Value>(&body)
-        .map_err(|error| format!("百度授权返回非 JSON：HTTP {status}，{error}"))?;
-    if let Some(error_code) = value.get("error").and_then(serde_json::Value::as_str) {
-        let description = value
-            .get("error_description")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("未知授权错误");
-        return Err(format!("百度授权失败：{description} ({error_code})"));
-    }
-    let token: TokenResponse =
-        serde_json::from_value(value).map_err(|error| format!("百度授权响应格式无效：{error}"))?;
-    let access_token = token
-        .access_token
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "百度授权响应缺少 access_token".to_string())?;
-    let expires_at = token
-        .expires_in
-        .map(|seconds| now_millis().saturating_add(seconds.saturating_mul(1000)));
-    BaiduNetdiskClient::save_token(
-        &app_data_dir(&app)?,
-        BaiduToken {
-            access_token,
-            expires_at,
-            refresh_token: token.refresh_token,
-        },
-    )
+    run_blocking(move || BaiduAuthService::exchange_code(&app_data_dir(&app)?, &code)).await
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
         .map_err(|error| format!("解析 GameSaver 数据目录失败：{error}"))
-}
-
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
 }

@@ -88,6 +88,7 @@ impl LaunchService {
         if state.has_exclusive_operation(&operation_lock, &game_uid) {
             return Err("游戏正在进行存档版本操作".to_string());
         }
+        SaveRepository::ensure_no_pending_restore(app, &game_uid)?;
         if let Ok(sessions) = state.learning_sessions.lock() {
             if sessions.values().any(|s| s.view.game_uid == game_uid) {
                 return Err("游戏正在进行存档识别学习，无法直接启动".to_string());

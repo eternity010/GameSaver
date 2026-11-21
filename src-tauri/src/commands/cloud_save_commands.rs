@@ -1,6 +1,6 @@
 use crate::{
     app_state::{AppState, CloudOperationClaim},
-    commands::run_blocking,
+    commands::{run_blocking, save_version_commands::confirm_restore_targets},
     domain::{Game, SaveProfile, SaveVersion, TaskCategory, TaskRetry, TaskStatus},
     repositories::BaiduConfigRepository,
     services::{
@@ -100,6 +100,7 @@ pub fn start_upload_save_version_task(
     game_uid: String,
     version_id: String,
 ) -> Result<String, String> {
+    let claim = CloudOperationClaim::claim(&state, &game_uid)?;
     let store = state
         .store
         .lock()
@@ -136,13 +137,6 @@ pub fn start_upload_save_version_task(
     // 两次并发的云端操作会各自读到同一份旧清单，后写的那次把先写的条目**整条丢掉**，
     // 而丢掉的那份包已经上传到网盘、又不在清单里，于是永远无法在界面上删除。
     // 退出游戏时的自动同步与用户手动同步正是可以并发的两条路径，所以这里必须互斥。
-    // 认领在 `drop(store)` 之后、发起任务之前：既避开持着 store 锁去抢操作锁，也让
-    // 「已被占用」能在真正干活之前就返回。
-    //
-    // 认领走 `CloudOperationClaim` 守卫而不是裸 key：下面任何一步失败都会自动释放。
-    // 收窄前这里是手写配对，`?` 早退会漏掉释放，而泄漏的 key 是纯内存、只有重启才清。
-    let claim = CloudOperationClaim::claim(&state, &game_uid)?;
-
     let task_id = begin_sync(
         &state,
         &format!("上传【{}】游戏存档至百度网盘", game.display_name),
@@ -207,6 +201,7 @@ fn start_restore_cloud_save_task_blocking(
 ) -> Result<String, String> {
     let state = app.state::<AppState>();
     let game_uid = game_uid.trim().to_string();
+    let claim = CloudOperationClaim::claim_restore(&state, &game_uid)?;
     let store = state
         .store
         .lock()
@@ -232,8 +227,6 @@ fn start_restore_cloud_save_task_blocking(
     // 认领走 `CloudOperationClaim` 守卫：下面三次 `?` 早退（凭据读取失败、清单取不到、
     // 指定版本不存在）都会经 `Drop` 释放。收窄前这里是手写配对，这三处**全都会漏**，
     // 而泄漏的 key 是纯内存、只有重启才清 —— 用户重试永远撞「已有同步任务正在进行」。
-    let claim = CloudOperationClaim::claim(&state, &game_uid)?;
-
     let client = load_baidu_client(&app)?;
     let manifest = CloudSaveService::fetch_manifest(&client, &game.game_key, &game.game_uid)?
         .ok_or_else(|| "未找到云端存档清单".to_string())?;
@@ -304,6 +297,7 @@ fn delete_cloud_save_version_blocking(
     version_id: String,
 ) -> Result<Vec<CloudSaveManifestVersion>, String> {
     let state = app.state::<AppState>();
+    let _claim = CloudOperationClaim::claim(&state, &game_uid)?;
     let store = state
         .store
         .lock()
@@ -322,8 +316,6 @@ fn delete_cloud_save_version_blocking(
     // 认领走 `CloudOperationClaim` 守卫，整个函数不再有手写释放：这里没有工作线程，
     // 守卫在函数返回时 `Drop` 即释放 —— 包括 `load_baidu_client` 与 `delete_cloud_version`
     // 两处 `?` 早退。收窄前作者只想到了后者，漏了前者。
-    let _claim = CloudOperationClaim::claim(&state, &game_uid)?;
-
     let client = load_baidu_client(&app)?;
     let deleted = CloudSaveService::delete_cloud_version(
         &client,
@@ -361,8 +353,9 @@ fn upload_save_worker(
         keep_limit,
         |pct, msg| {
             TaskService::update(&state, task_id, TaskStatus::Running, pct, msg, None);
-            true
+            !TaskService::is_cancelled(&state, task_id)
         },
+        || TaskService::begin_commit(&state, task_id),
     )?;
     Ok(())
 }
@@ -375,6 +368,7 @@ fn restore_save_worker(
     remote_version: &CloudSaveManifestVersion,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
+    state.ensure_save_restore_idle(&game.game_uid)?;
     TaskService::update(
         &state,
         task_id,
@@ -392,7 +386,12 @@ fn restore_save_worker(
         remote_version,
         |pct, msg| {
             TaskService::update(&state, task_id, TaskStatus::Running, pct, msg, None);
-            true
+            !TaskService::is_cancelled(&state, task_id)
+        },
+        |plan| confirm_restore_targets(app, game, plan),
+        || {
+            state.ensure_save_restore_idle(&game.game_uid)?;
+            TaskService::begin_commit(&state, task_id)
         },
     )?;
     Ok(())
@@ -441,14 +440,23 @@ fn finish_sync(
         Err(error) => {
             // 只在失败时补重试参数，让传输中心的「重试」按钮有东西可点。
             let _ = TaskService::set_retry(state, task_id, retry);
+            let cancelled = error == "任务已取消";
             TaskService::finish(
                 state,
                 task_id,
-                TaskStatus::Failed,
+                if cancelled {
+                    TaskStatus::Cancelled
+                } else {
+                    TaskStatus::Failed
+                },
                 100,
-                format!("{failed_prefix}：{error}"),
+                if cancelled {
+                    "云端存档任务已取消".to_string()
+                } else {
+                    format!("{failed_prefix}：{error}")
+                },
                 None,
-                Some(error),
+                if cancelled { None } else { Some(error) },
             );
         }
     }
@@ -459,7 +467,7 @@ fn load_baidu_client(app: &AppHandle) -> Result<BaiduNetdiskClient, String> {
         .path()
         .app_data_dir()
         .map_err(|err| format!("解析应用数据目录失败：{err}"))?;
-    BaiduNetdiskClient::load_from_app_data(&app_data_dir)
+    BaiduNetdiskClient::load_configured(&app_data_dir)
 }
 
 /// 编排层的测试。
@@ -590,5 +598,27 @@ mod tests {
         assert_eq!(retry.operation, "sync_cloud_save");
         assert_eq!(retry.game_uid, "game-1");
         assert_eq!(retry.version_id.as_deref(), Some("version-1"));
+    }
+
+    #[test]
+    fn finish_cloud_save_cancel_persists_cancelled_and_retry_without_error() {
+        let dir = TempWorkspace::new("cloud-save-cancel");
+        let state = test_state(&dir);
+        let task_id = begin_sync(&state, "sync", "game-1").unwrap();
+        TaskService::update(&state, &task_id, TaskStatus::Running, 42, "uploading", None);
+        finish_sync(
+            &state,
+            &task_id,
+            Err("任务已取消".into()),
+            "done",
+            "failed",
+            retry(),
+        );
+        let tasks = TaskRepository::load(&state.tasks_path).unwrap();
+        let task = &tasks[&task_id];
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(task.progress, 42);
+        assert!(task.error.is_none());
+        assert!(task.retry.is_some());
     }
 }

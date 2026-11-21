@@ -1,15 +1,20 @@
+#[cfg(target_os = "windows")]
+use crate::domain::timestamp::current_filetime;
+use crate::domain::learning::ProcessLifetime;
+#[cfg(target_os = "windows")]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
+    Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE},
     System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     },
     System::Threading::{
-        GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
-        WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
+        TerminateProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     },
 };
 
@@ -20,6 +25,7 @@ const SYNCHRONIZE: u32 = 0x00100000;
 pub struct ProcessService;
 
 #[cfg(target_os = "windows")]
+#[derive(Debug)]
 pub struct TrackedProcessHandle {
     #[allow(dead_code)]
     pub pid: u32,
@@ -55,6 +61,35 @@ impl TrackedProcessHandle {
             ok != 0 && exit_code == STILL_ACTIVE
         }
     }
+
+    fn lifetime(&self) -> Option<(i64, Option<i64>)> {
+        process_times(self.handle)
+    }
+
+    fn open_snapshot_member(pid: u32, snapshot_started_at: i64) -> Option<(Self, i64)> {
+        let handle = Self::open(pid)?;
+        let (started_at, _) = handle.lifetime()?;
+        (started_at <= snapshot_started_at).then_some((handle, started_at))
+    }
+
+    fn image_path(&self) -> Option<PathBuf> {
+        process_image_path(self.handle)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn process_times(handle: HANDLE) -> Option<(i64, Option<i64>)> {
+    let mut started = FILETIME::default();
+    let mut ended = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    if unsafe { GetProcessTimes(handle, &mut started, &mut ended, &mut kernel, &mut user) } == 0 {
+        return None;
+    }
+    let ticks =
+        |value: FILETIME| (i64::from(value.dwHighDateTime) << 32) | i64::from(value.dwLowDateTime);
+    let ended = ticks(ended);
+    Some((ticks(started), (ended > 0).then_some(ended)))
 }
 
 #[cfg(target_os = "windows")]
@@ -79,6 +114,128 @@ unsafe impl Send for TrackedProcessHandle {}
 #[cfg(not(target_os = "windows"))]
 pub struct TrackedProcessHandle {
     pub pid: u32,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct LearningProcessTracker {
+    #[cfg(target_os = "windows")]
+    members: HashMap<u32, TrackedProcessHandle>,
+}
+
+impl LearningProcessTracker {
+    pub(crate) fn from_child(child: &std::process::Child) -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            Self {
+                members: TrackedProcessHandle::open(child.id())
+                    .map(|handle| (child.id(), handle))
+                    .into_iter()
+                    .collect(),
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = child;
+            Self::default()
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            self.members.is_empty()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            true
+        }
+    }
+
+    pub(crate) fn any_alive(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            self.members.values().any(TrackedProcessHandle::is_alive)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn lifetimes(&self, capture_end: i64) -> Vec<ProcessLifetime> {
+        #[cfg(target_os = "windows")]
+        {
+            let mut lifetimes = self.members.values().filter_map(|handle| {
+                let alive = handle.is_alive();
+                let (started_at, ended_at) = handle.lifetime()?;
+                let ended_at = ended_at.or_else(|| alive.then_some(capture_end))?.min(capture_end);
+                (started_at < ended_at).then_some(ProcessLifetime {
+                    pid: handle.pid,
+                    started_at,
+                    ended_at,
+                })
+            }).collect::<Vec<_>>();
+            lifetimes.sort_unstable_by_key(|lifetime| lifetime.pid);
+            lifetimes
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = capture_end;
+            Vec::new()
+        }
+    }
+
+    pub(crate) fn refresh(&mut self, managed_path: Option<&Path>) -> Result<(), String> {
+        #[cfg(target_os = "windows")]
+        {
+            let snapshot_started_at = current_filetime().ok_or("无法确定进程快照时间")?;
+            let processes = process_parent_snapshot()?;
+            if let Some(directory) = managed_path {
+                for &pid in processes.keys() {
+                    if pid <= 4 || self.members.contains_key(&pid) {
+                        continue;
+                    }
+                    if let Some((handle, _)) =
+                        TrackedProcessHandle::open_snapshot_member(pid, snapshot_started_at)
+                    {
+                        if handle.image_path().is_some_and(|image| {
+                            is_process_in_directory(&image, directory)
+                                && !is_ignored_process_name(&image.to_string_lossy())
+                        }) {
+                            self.members.insert(pid, handle);
+                        }
+                    }
+                }
+            }
+            loop {
+                let previous_len = self.members.len();
+                for (&pid, &parent_pid) in &processes {
+                    if self.members.contains_key(&pid) {
+                        continue;
+                    }
+                    let Some(parent) = self.members.get(&parent_pid) else {
+                        continue;
+                    };
+                    let Some((child, child_start)) =
+                        TrackedProcessHandle::open_snapshot_member(pid, snapshot_started_at)
+                    else {
+                        continue;
+                    };
+                    if parent.lifetime().is_some_and(|(start, end)| {
+                        start <= child_start && end.is_none_or(|end| child_start <= end)
+                    }) {
+                        self.members.insert(pid, child);
+                    }
+                }
+                if self.members.len() == previous_len {
+                    break;
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = managed_path;
+        Ok(())
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -186,17 +343,38 @@ pub fn get_process_image_path(pid: u32) -> Option<PathBuf> {
         if handle.is_null() {
             return None;
         }
-        let mut buffer = [0u16; 1024];
-        let mut size = buffer.len() as u32;
-        let success = QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size);
+        let path = process_image_path(handle);
         CloseHandle(handle);
-        if success != 0 && size > 0 {
-            let path_str = String::from_utf16_lossy(&buffer[..size as usize]);
-            Some(PathBuf::from(path_str))
-        } else {
-            None
-        }
+        path
     }
+}
+
+#[cfg(target_os = "windows")]
+fn process_image_path(handle: HANDLE) -> Option<PathBuf> {
+    let mut buffer = [0u16; 1024];
+    let mut size = buffer.len() as u32;
+    let success = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) };
+    (success != 0 && size > 0).then(|| PathBuf::from(String::from_utf16_lossy(&buffer[..size as usize])))
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn process_parent_snapshot() -> Result<HashMap<u32, u32>, String> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(format!("无法读取进程快照：{}", std::io::Error::last_os_error()));
+    }
+    let mut parents = HashMap::new();
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while has_entry {
+        parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    Ok(parents)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -295,6 +473,34 @@ mod tests {
         let path = path.unwrap();
         assert!(path.exists());
         assert!(path.to_string_lossy().ends_with(".exe"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn learning_tracker_preserves_the_exited_process_window() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start test helper");
+        let pid = child.id();
+        let tracker = LearningProcessTracker::from_child(&child);
+        let was_alive = tracker.any_alive();
+        child.kill().expect("stop test helper");
+        child.wait().expect("wait for test helper");
+        drop(child);
+
+        assert!(was_alive);
+        assert!(!tracker.any_alive());
+        let lifetimes = tracker.lifetimes(i64::MAX);
+        let [lifetime] = lifetimes.as_slice() else { panic!("expected one lifetime") };
+        assert_eq!(lifetime.pid, pid);
+        assert!(TrackedProcessHandle::open_snapshot_member(pid, lifetime.started_at - 1).is_none());
+        assert!(TrackedProcessHandle::open_snapshot_member(pid, lifetime.started_at).is_some());
+        assert!(lifetime.contains(lifetime.started_at));
+        assert!(lifetime.contains(lifetime.ended_at - 1));
+        assert!(!lifetime.contains(lifetime.ended_at));
     }
 
     /// 取消游戏会话的收尾全靠这条能力：`TrackedProcessHandle` 只有查询权限，

@@ -24,6 +24,7 @@ const games = ref<Game[]>([]);
 const cloudGames = ref<CloudGameSummary[]>([]);
 const coverUrls = ref<Record<string, string>>({});
 const activePage = ref<AppPage>("library");
+const pendingSetupUid = ref<string>();
 const activeView = ref<LibraryView>("all");
 const activeSort = ref<LibrarySort>(validSorts.includes(savedSort) ? savedSort : "activity");
 const search = ref("");
@@ -80,6 +81,7 @@ const elevationError = ref("");
 const taskFeed = useTaskFeed();
 const tasks = taskFeed.tasks;
 const observedTaskStatuses = new Map<string, AppTask["status"]>();
+const observedRemovalCommits = new Set<string>();
 
 const isActiveTask = (task: AppTask) => task.status === "pending" || task.status === "running";
 
@@ -371,17 +373,36 @@ watch(activePage, (page, previousPage) => {
 watch(tasks, (nextTasks) => {
   let sessionFinished = false;
   let installationFinished = false;
+  let accountRestored = false;
+  let libraryMigrated = false;
+  let localRemovalChanged = false;
   for (const task of nextTasks) {
     const previousStatus = observedTaskStatuses.get(task.taskId);
+    if (["uninstall_game_body", "remove_game_from_library", "retry_game_removal", "update_game_body", "retry_game_body_update"].includes(task.taskType)) {
+      if ((task.progress >= 30 && !observedRemovalCommits.has(task.taskId))
+          || (!isActiveTask(task) && previousStatus !== task.status)) {
+        observedRemovalCommits.add(task.taskId);
+        localRemovalChanged = true;
+      }
+    }
     if (task.category === "session" && previousStatus && isActiveTask({ ...task, status: previousStatus }) && !isActiveTask(task)) {
       sessionFinished = true;
     }
     if (task.taskType === "install_cloud_game" && task.status === "success" && previousStatus !== "success") {
       installationFinished = true;
     }
+    if (task.taskType === "restore_cloud_account" && task.status === "success" && previousStatus !== "success") {
+      accountRestored = true;
+    }
+    if (["set_library_root", "resume_library_migration"].includes(task.taskType) && task.status === "success" && previousStatus !== "success") {
+      libraryMigrated = true;
+    }
     observedTaskStatuses.set(task.taskId, task.status);
   }
-  if (sessionFinished || installationFinished) scheduleLibraryRefresh();
+  if (sessionFinished || installationFinished || accountRestored || libraryMigrated || localRemovalChanged) {
+    if (accountRestored || libraryMigrated || localRemovalChanged) gamesLoadedAt = 0;
+    scheduleLibraryRefresh();
+  }
   if (installationFinished) {
     storeLoaded.value = false;
     if (activePage.value === "store" && !cloudInstallUid.value) void loadStore(true, storePage.value);
@@ -541,6 +562,17 @@ function openAddGame() {
   activePage.value = "add";
 }
 
+function resumeGameSetup(gameUid: string) {
+  pendingSetupUid.value = gameUid;
+  activePage.value = "add";
+}
+
+function leaveAddGame() {
+  pendingSetupUid.value = undefined;
+  activePage.value = "library";
+  void loadGames(true);
+}
+
 function openStore() {
   activePage.value = "store";
   void loadStore();
@@ -696,6 +728,7 @@ async function watchCloudInstall(taskId: string, cloudGame: CloudGameSummary) {
 }
 
 async function finishAddGame(completedGame?: Game) {
+  pendingSetupUid.value = undefined;
   activePage.value = "library";
   activeView.value = "all";
   search.value = "";
@@ -759,8 +792,8 @@ async function finishAddGame(completedGame?: Game) {
         </label>
       </header>
 
-      <AddGameWizard v-if="activePage === 'add'" @back="activePage = 'library'" @completed="finishAddGame" />
-      <GameDetailPage v-else-if="activePage === 'detail' && selectedGame" :key="selectedGame.gameUid" :game="selectedGame" :cover-url="selectedGame ? coverUrls[selectedGame.gameUid] : ''" :initial-error="selectedGameError" :pending-cover-capture="pendingCoverCapture" @back="activePage = 'library'" @settings="activePage = 'settings'" @refresh="loadGames(true)" @capture-handled="finishPendingCoverCapture" />
+      <AddGameWizard v-if="activePage === 'add'" :game-uid="pendingSetupUid" @pending="pendingSetupUid = $event" @back="leaveAddGame" @completed="finishAddGame" />
+      <GameDetailPage v-else-if="activePage === 'detail' && selectedGame" :key="selectedGame.gameUid" :game="selectedGame" :cover-url="selectedGame ? coverUrls[selectedGame.gameUid] : ''" :initial-error="selectedGameError" :pending-cover-capture="pendingCoverCapture" @back="activePage = 'library'" @settings="activePage = 'settings'" @resume-setup="resumeGameSetup(selectedGame.gameUid)" @refresh="loadGames(true)" @capture-handled="finishPendingCoverCapture" />
       <GameStorePage v-else-if="activePage === 'store'" :games="cloudGames" :search="search" :loading="storeLoading" :load-error="storeError" :install-uid="cloudInstallUid" :install-progress="cloudInstallProgress" :install-message="cloudInstallMessage" :install-error="cloudInstallError" :install-notice="cloudInstallNotice" :page="storePage" :page-size="STORE_PAGE_SIZE" :total-count="storeTotalCount" :total-pages="storeTotalPages" :has-more="storeHasMore" @install="installAndLaunch" @delete-version="deleteCloudVersion" @retry="refreshStore" @refresh="refreshStore" @page-change="changeStorePage" />
       <TransferCenter v-else-if="activePage === 'transfers'" :games="games" :cloud-games="cloudGames" />
       <PlatformSettings v-else-if="activePage === 'settings'" />

@@ -13,31 +13,23 @@ use std::{
     time::Duration,
 };
 
+use super::baidu_auth_service::configuration_id;
+#[cfg(test)]
+use crate::repositories::baidu_token_repository::BaiduAuthorization;
+pub use crate::repositories::baidu_token_repository::BaiduToken;
+use crate::repositories::baidu_token_repository::{BaiduTokenRepository, AUTHORIZATION_CHANGED};
 use uuid::Uuid;
 
 const API_BASE: &str = "https://pan.baidu.com";
+pub(crate) const REMOTE_GAMES_ROOT: &str = "/apps/GameSaver/games";
 const UPLOAD_API_BASE: &str = "https://d.pcs.baidu.com";
 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const UPLOAD_CONCURRENCY: usize = 3;
 const MAX_REQUEST_ATTEMPTS: usize = 3;
 const TOKEN_REFRESH_LEEWAY_MS: u64 = 5 * 60 * 1000;
-const TOKEN_FILE_NAME: &str = "baidu-netdisk-token.json";
 const OAUTH_TOKEN_URL: &str = "https://openapi.baidu.com/oauth/2.0/token";
 
 static TOKEN_REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BaiduToken {
-    #[serde(alias = "accessToken", alias = "access_token")]
-    pub access_token: String,
-    #[serde(alias = "expiresAt", alias = "expires_at")]
-    #[serde(default)]
-    pub expires_at: Option<u64>,
-    #[serde(alias = "refresh_token")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refresh_token: Option<String>,
-}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +40,7 @@ pub struct BaiduConnectionStatus {
     pub expired: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_error: Option<String>,
+    pub reauthorization_required: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -161,7 +154,6 @@ struct OAuthTokenResponse {
 /// 故意不实现 `Debug`，避免 AppKey/SecretKey 被格式化进日志或错误信息。
 #[derive(Clone)]
 struct RefreshContext {
-    token_path: PathBuf,
     app_key: String,
     secret_key: String,
 }
@@ -172,33 +164,65 @@ pub struct BaiduNetdiskClient {
     token: Mutex<BaiduToken>,
     app_data_dir: PathBuf,
     refresh_context: Option<RefreshContext>,
+    authorization_revision: Option<String>,
+    configuration_id: Option<String>,
 }
 
 impl BaiduNetdiskClient {
-    pub fn load_from_app_data(app_data_dir: &Path) -> Result<Self, String> {
+    pub(crate) fn load_configured(app_data_dir: &Path) -> Result<Self, String> {
+        match crate::repositories::BaiduConfigRepository::load(app_data_dir)? {
+            Some(config) => Self::load_from_app_data_with_credentials(
+                app_data_dir,
+                Some(&config.app_key),
+                Some(&config.secret_key),
+            ),
+            None => Err("请先在平台设置中配置百度 AppKey 和 SecretKey".into()),
+        }
+    }
+
+    pub(crate) fn remote_body_dir(game_key: &str) -> Result<String, String> {
+        if !crate::domain::is_safe_path_segment(game_key) {
+            return Err("gameKey 包含不支持的远程路径字符".into());
+        }
+        Ok(format!("{REMOTE_GAMES_ROOT}/{}/body", game_key.trim()))
+    }
+
+    #[cfg(test)]
+    fn load_from_app_data(app_data_dir: &Path) -> Result<Self, String> {
         Self::load_from_app_data_with_credentials(app_data_dir, None, None)
     }
 
-    pub fn load_from_app_data_with_credentials(
+    fn load_from_app_data_with_credentials(
         app_data_dir: &Path,
         app_key: Option<&str>,
         secret_key: Option<&str>,
     ) -> Result<Self, String> {
-        let (token_path, token) = read_token(app_data_dir)?;
         let refresh_context = match (app_key, secret_key) {
             (Some(app_key), Some(secret_key))
                 if !app_key.trim().is_empty() && !secret_key.trim().is_empty() =>
             {
                 Some(RefreshContext {
-                    token_path,
                     app_key: app_key.to_string(),
                     secret_key: secret_key.to_string(),
                 })
             }
             _ => None,
         };
-        let client = Self::from_parts(token, app_data_dir.to_path_buf(), refresh_context)?;
-        if !client.token_is_stale() || client.refresh_token(false)? {
+        let config_id = refresh_context
+            .as_ref()
+            .map(|context| configuration_id(&context.app_key, &context.secret_key));
+        let authorization = BaiduTokenRepository::load(app_data_dir, config_id.as_deref())?
+            .ok_or_else(|| "未找到百度网盘授权信息，请先完成百度网盘授权".to_string())?;
+        if authorization.configuration_id != config_id && authorization.token.is_some() {
+            return Err("百度应用凭证已变更，请重新授权".into());
+        }
+        let token = authorization
+            .token
+            .ok_or_else(|| "百度网盘尚未授权或授权已失效，请重新授权".to_string())?;
+        let mut client = Self::from_parts(token, app_data_dir.to_path_buf(), refresh_context)?;
+        client.authorization_revision = Some(authorization.revision);
+        client.configuration_id = config_id;
+        if !client.token_is_stale() || client.refresh_token(None)? {
             return Ok(client);
         }
         // 没有刷新凭据，且磁盘上也没有更新的授权：只有在已完全过期时才报错，
@@ -210,49 +234,60 @@ impl BaiduNetdiskClient {
     }
 
     pub fn connection_status(app_data_dir: &Path) -> BaiduConnectionStatus {
-        let path = token_paths(app_data_dir)
-            .into_iter()
-            .find(|path| path.is_file());
-        let token = path
-            .as_ref()
-            .and_then(|path| fs::read(path).ok())
-            .and_then(|raw| serde_json::from_slice::<BaiduToken>(&raw).ok());
-        let expires_at = token.as_ref().and_then(|token| token.expires_at);
-        BaiduConnectionStatus {
-            authorized: token
-                .as_ref()
-                .is_some_and(|token| !token.access_token.trim().is_empty()),
-            token_path: path.map(|path| path.to_string_lossy().to_string()),
-            expires_at,
-            expired: expires_at.is_some_and(|value| value <= now_millis()),
+        let mut status = BaiduConnectionStatus {
+            authorized: false,
+            token_path: None,
+            expires_at: None,
+            expired: false,
             refresh_error: None,
-        }
-    }
-
-    pub fn connection_status_with_credentials(
-        app_data_dir: &Path,
-        app_key: Option<&str>,
-        secret_key: Option<&str>,
-    ) -> BaiduConnectionStatus {
-        let mut status = Self::connection_status(app_data_dir);
-        if !status.authorized || app_key.is_none() || secret_key.is_none() {
-            return status;
-        }
-        match Self::load_from_app_data_with_credentials(app_data_dir, app_key, secret_key) {
-            Ok(_) => Self::connection_status(app_data_dir),
-            Err(error) => {
-                status.refresh_error = Some(error);
-                status
+            reauthorization_required: false,
+        };
+        let result = (|| -> Result<(), String> {
+            let config = crate::repositories::BaiduConfigRepository::load(app_data_dir)?;
+            let config_id = config
+                .as_ref()
+                .map(|value| configuration_id(&value.app_key, &value.secret_key));
+            let Some(authorization) =
+                BaiduTokenRepository::load(app_data_dir, config_id.as_deref())?
+            else {
+                return Ok(());
+            };
+            status.token_path = Some(
+                BaiduTokenRepository::path(app_data_dir)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            let Some(token) = authorization.token else {
+                return Ok(());
+            };
+            if authorization.configuration_id != config_id || config.is_none() {
+                return Err("百度应用凭证已变更或缺失，请配置后重新授权".into());
             }
+            status.authorized = true;
+            status.expires_at = token.expires_at;
+            status.expired = token.expires_at.is_some_and(|value| value <= now_millis());
+            let client = Self::load_configured(app_data_dir)?;
+            let token = client
+                .token
+                .lock()
+                .map_err(|_| "读取百度授权状态失败".to_string())?;
+            status.expires_at = token.expires_at;
+            status.expired = token.expires_at.is_some_and(|value| value <= now_millis());
+            Ok(())
+        })();
+        if let Err(error) = result {
+            status.reauthorization_required = authorization_required(&error);
+            status.refresh_error = Some(error);
         }
+        status
     }
 
-    pub fn save_token(app_data_dir: &Path, token: BaiduToken) -> Result<(), String> {
-        let lock = TOKEN_REFRESH_LOCK.get_or_init(|| Mutex::new(()));
-        let _guard = lock
-            .lock()
-            .map_err(|_| "百度网盘 Token 刷新锁不可用".to_string())?;
-        save_token_at(&app_data_dir.join(TOKEN_FILE_NAME), token)
+    #[cfg(test)]
+    fn save_token(app_data_dir: &Path, token: BaiduToken) -> Result<(), String> {
+        BaiduTokenRepository::update(app_data_dir, |_| {
+            Ok(BaiduAuthorization::new(Some(token), None))
+        })
+        .map(|_| ())
     }
 
     /// 仅用于单元测试：构造一个不具备刷新能力、不落盘的客户端。
@@ -281,10 +316,13 @@ impl BaiduNetdiskClient {
             token: Mutex::new(token),
             app_data_dir,
             refresh_context,
+            authorization_revision: None,
+            configuration_id: None,
         })
     }
 
     fn access_token(&self) -> Result<String, String> {
+        self.synchronize_authorization()?;
         Ok(self
             .token
             .lock()
@@ -320,39 +358,89 @@ impl BaiduNetdiskClient {
         Ok(())
     }
 
-    /// 刷新 access token，返回 `true` 表示授权已可用。
-    ///
-    /// - 未进入刷新窗口且 `force` 为假时直接返回 `true`（无需刷新）。
-    /// - 持锁后会重读磁盘，别的进程已刷新并落盘时直接沿用，避免重复刷新。
-    /// - 没有刷新凭据且磁盘上也没有更新时返回 `false`。
-    /// - `force` 用于服务端明确回报鉴权失败的场景，此时跳过「即将过期」的判断。
-    fn refresh_token(&self, force: bool) -> Result<bool, String> {
-        if !force && !self.token_is_stale() {
-            return Ok(true);
+    fn synchronize_authorization(&self) -> Result<(), String> {
+        let Some(revision) = self.authorization_revision.as_deref() else {
+            return Ok(());
+        };
+        let authorization =
+            BaiduTokenRepository::load(&self.app_data_dir, self.configuration_id.as_deref())?
+                .ok_or_else(|| AUTHORIZATION_CHANGED.to_string())?;
+        if authorization.revision != revision
+            || authorization.configuration_id != self.configuration_id
+        {
+            return Err(AUTHORIZATION_CHANGED.into());
         }
+        let token = authorization
+            .token
+            .ok_or_else(|| AUTHORIZATION_CHANGED.to_string())?;
+        self.store_token(token)
+    }
+
+    fn refresh_token(&self, rejected_token: Option<&str>) -> Result<bool, String> {
+        self.refresh_token_with(rejected_token, |context| {
+            self.fetch_refreshed_token(context)
+        })
+    }
+
+    fn refresh_token_with(
+        &self,
+        rejected_token: Option<&str>,
+        fetch: impl FnOnce(&RefreshContext) -> Result<BaiduToken, String>,
+    ) -> Result<bool, String> {
         let lock = TOKEN_REFRESH_LOCK.get_or_init(|| Mutex::new(()));
         let _guard = lock
             .lock()
             .map_err(|_| "百度网盘 Token 刷新锁不可用".to_string())?;
 
         let current = self.access_token()?;
-        if let Ok((_, disk_token)) = read_token(&self.app_data_dir) {
-            if !disk_token.access_token.trim().is_empty() && disk_token.access_token != current {
-                self.store_token(disk_token)?;
-                return Ok(true);
-            }
+        if rejected_token.is_some_and(|rejected| rejected != current)
+            && !self.access_token_expired()
+        {
+            return Ok(true);
         }
-        if !force && !self.token_is_stale() {
+        if rejected_token.is_none() && !self.token_is_stale() {
             return Ok(true);
         }
         let Some(context) = self.refresh_context.clone() else {
             return Ok(false);
         };
-        self.refresh_access_token(&context)?;
+        let token = fetch(&context)?;
+        if token.access_token.trim().is_empty()
+            || token
+                .expires_at
+                .is_some_and(|expires| expires <= now_millis())
+        {
+            return Err("百度 Token 刷新结果无效，请重新授权".into());
+        }
+        self.commit_refreshed_token(&current, token)?;
         Ok(true)
     }
 
-    fn refresh_access_token(&self, context: &RefreshContext) -> Result<(), String> {
+    fn commit_refreshed_token(
+        &self,
+        previous_access_token: &str,
+        token: BaiduToken,
+    ) -> Result<(), String> {
+        if let Some(revision) = self.authorization_revision.as_deref() {
+            BaiduTokenRepository::update(&self.app_data_dir, |current| {
+                let mut current = current.ok_or_else(|| AUTHORIZATION_CHANGED.to_string())?;
+                if current.revision != revision
+                    || current.configuration_id != self.configuration_id
+                    || current
+                        .token
+                        .as_ref()
+                        .is_none_or(|old| old.access_token != previous_access_token)
+                {
+                    return Err(AUTHORIZATION_CHANGED.into());
+                }
+                current.token = Some(token.clone());
+                Ok(current)
+            })?;
+        }
+        self.store_token(token)
+    }
+
+    fn fetch_refreshed_token(&self, context: &RefreshContext) -> Result<BaiduToken, String> {
         let (refresh_token, fallback_expires_at, fallback_refresh_token) = {
             let token = self
                 .token
@@ -371,6 +459,7 @@ impl BaiduNetdiskClient {
         let response = self
             .client
             .get(OAUTH_TOKEN_URL)
+            .timeout(Duration::from_secs(30))
             .query(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", refresh_token.as_str()),
@@ -403,7 +492,7 @@ impl BaiduNetdiskClient {
             .access_token
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| "百度 Token 刷新响应缺少 access_token".to_string())?;
-        let next_token = BaiduToken {
+        Ok(BaiduToken {
             access_token,
             expires_at: parsed
                 .expires_in
@@ -413,9 +502,7 @@ impl BaiduNetdiskClient {
                 .refresh_token
                 .filter(|value| !value.trim().is_empty())
                 .or(fallback_refresh_token),
-        };
-        save_token_at(&context.token_path, next_token.clone())?;
-        self.store_token(next_token)
+        })
     }
 
     pub fn list(&self, remote_dir: &str) -> Result<Vec<RemoteFile>, String> {
@@ -439,9 +526,25 @@ impl BaiduNetdiskClient {
         start: usize,
         limit: usize,
     ) -> Result<RemoteFilePage, String> {
+        self.list_page_if_exists(remote_dir, start, limit)?
+            .ok_or_else(|| "读取百度网盘文件列表失败：目录不存在 (-9)".to_string())
+    }
+
+    pub fn list_if_exists(&self, remote_dir: &str) -> Result<Option<Vec<RemoteFile>>, String> {
+        list_directory_if_exists(remote_dir, |directory, start| {
+            self.list_page_if_exists(directory, start, 1000)
+        })
+    }
+
+    fn list_page_if_exists(
+        &self,
+        remote_dir: &str,
+        start: usize,
+        limit: usize,
+    ) -> Result<Option<RemoteFilePage>, String> {
         let url = format!("{API_BASE}/rest/2.0/xpan/file");
         let limit = limit.clamp(1, 1000);
-        let body: FileListResponse = self.request_json(
+        let value = self.request_json_value(
             |client, token| {
                 client
                     .get(&url)
@@ -459,22 +562,7 @@ impl BaiduNetdiskClient {
             },
             "读取百度网盘文件列表",
         )?;
-        Ok(RemoteFilePage {
-            files: body
-                .list
-                .unwrap_or_default()
-                .into_iter()
-                .map(|item| RemoteFile {
-                    path: item.path,
-                    fs_id: item.fs_id,
-                    size: item.size,
-                    md5: item.md5,
-                    is_dir: item.isdir != 0,
-                    server_mtime: item.server_mtime,
-                })
-                .collect(),
-            has_more: body.has_more == Some(1),
-        })
+        parse_file_list(value, limit)
     }
 
     pub fn quota(&self) -> Result<BaiduQuota, String> {
@@ -897,7 +985,10 @@ impl BaiduNetdiskClient {
     {
         let mut last_error = None;
         for attempt in 0..MAX_REQUEST_ATTEMPTS {
-            match request(&self.client, token) {
+            self.synchronize_authorization()?;
+            let response = request(&self.client, token);
+            self.synchronize_authorization()?;
+            match response {
                 Ok(response)
                     if response.status().is_success()
                         || !is_retryable_status(response.status()) =>
@@ -946,13 +1037,23 @@ impl BaiduNetdiskClient {
             let body = response.text().map_err(|error| {
                 format!("{operation}读取响应失败：{}", safe_network_error(error))
             })?;
-            let value = serde_json::from_str::<serde_json::Value>(&body)
-                .map_err(|_| format!("{operation}返回非 JSON：HTTP {status}"))?;
-            if !refreshed && is_auth_failure(status, &value) {
-                refreshed = true;
-                if matches!(self.refresh_token(true), Ok(true)) {
-                    continue;
+            self.synchronize_authorization()?;
+            let value = serde_json::from_str::<serde_json::Value>(&body);
+            let auth_failure = status.as_u16() == 401
+                || value
+                    .as_ref()
+                    .is_ok_and(|value| is_auth_failure(status, value));
+            if auth_failure {
+                if refreshed {
+                    return Err(format!("{operation}授权仍然无效，请重新授权"));
                 }
+                refreshed = true;
+                self.refresh_for_request(&token, operation)?;
+                continue;
+            }
+            let value = value.map_err(|_| format!("{operation}返回非 JSON：HTTP {status}"))?;
+            if !status.is_success() {
+                return Err(format!("{operation}失败：HTTP {status}"));
             }
             return Ok(value);
         }
@@ -976,13 +1077,25 @@ impl BaiduNetdiskClient {
         loop {
             let token = self.access_token()?;
             let response = self.send_with_retry(&mut build, &token, operation)?;
-            if response.status().as_u16() == 401 && !refreshed {
-                refreshed = true;
-                if matches!(self.refresh_token(true), Ok(true)) {
-                    continue;
+            if response.status().as_u16() == 401 {
+                if refreshed {
+                    return Err(format!("{operation}授权仍然无效，请重新授权"));
                 }
+                refreshed = true;
+                self.refresh_for_request(&token, operation)?;
+                continue;
             }
             return Ok(response);
+        }
+    }
+
+    fn refresh_for_request(&self, rejected_token: &str, operation: &str) -> Result<(), String> {
+        match self.refresh_token(Some(rejected_token)) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!(
+                "{operation}授权已失效，缺少自动刷新凭据，请重新授权"
+            )),
+            Err(error) => Err(format!("{operation}鉴权失败；自动刷新未完成：{error}")),
         }
     }
 }
@@ -1067,74 +1180,32 @@ fn is_auth_failure(status: reqwest::StatusCode, value: &serde_json::Value) -> bo
     ) {
         return true;
     }
+    if matches!(
+        value.get("error_code").and_then(serde_json::Value::as_i64),
+        Some(-6) | Some(110) | Some(111)
+    ) {
+        return true;
+    }
     matches!(
         value.get("error").and_then(serde_json::Value::as_str),
         Some("invalid_token") | Some("expired_token")
     )
 }
 
-fn token_paths(app_data_dir: &Path) -> Vec<std::path::PathBuf> {
-    let mut paths = vec![app_data_dir.join(TOKEN_FILE_NAME)];
-    if let Some(parent) = app_data_dir.parent() {
-        let legacy = parent.join("com.gamesaver.desktop").join(TOKEN_FILE_NAME);
-        if !paths.iter().any(|path| path == &legacy) {
-            paths.push(legacy);
-        }
-    }
-    paths
-}
-
-fn read_token(app_data_dir: &Path) -> Result<(PathBuf, BaiduToken), String> {
-    let Some(path) = token_paths(app_data_dir)
-        .into_iter()
-        .find(|path| path.is_file())
-    else {
-        return Err("未找到百度网盘授权信息，请先完成百度网盘授权".to_string());
-    };
-    let raw = fs::read(&path).map_err(|err| format!("读取百度网盘授权信息失败：{err}"))?;
-    let token = serde_json::from_slice::<BaiduToken>(&raw)
-        .map_err(|err| format!("解析百度网盘授权信息失败：{err}"))?;
-    Ok((path, token))
+fn authorization_required(error: &str) -> bool {
+    [
+        "重新授权",
+        "invalid_grant",
+        "invalid_client",
+        "invalid_token",
+        "expired_token",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
 }
 
 fn token_needs_refresh(expires_at: Option<u64>) -> bool {
     expires_at.is_some_and(|value| value <= now_millis().saturating_add(TOKEN_REFRESH_LEEWAY_MS))
-}
-
-fn save_token_at(path: &Path, token: BaiduToken) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "百度 Token 路径无父目录".to_string())?;
-    fs::create_dir_all(parent).map_err(|error| format!("创建百度 Token 目录失败：{error}"))?;
-    let bytes = serde_json::to_vec_pretty(&token)
-        .map_err(|error| format!("序列化百度 Token 失败：{error}"))?;
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let temporary = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4().simple()));
-    let backup = parent.join(format!(".{name}.bak-{}", uuid::Uuid::new_v4().simple()));
-    let result = (|| -> Result<(), String> {
-        let mut file = fs::File::create(&temporary)
-            .map_err(|error| format!("创建百度 Token 临时文件失败：{error}"))?;
-        file.write_all(&bytes)
-            .map_err(|error| format!("写入百度 Token 临时文件失败：{error}"))?;
-        file.sync_all()
-            .map_err(|error| format!("刷新百度 Token 临时文件失败：{error}"))?;
-        let had_token = path.exists();
-        if had_token {
-            fs::rename(path, &backup).map_err(|error| format!("暂存百度 Token 失败：{error}"))?;
-        }
-        if let Err(error) = fs::rename(&temporary, path) {
-            if had_token {
-                let _ = fs::rename(&backup, path);
-            }
-            return Err(format!("提交百度 Token 失败：{error}"));
-        }
-        if had_token {
-            let _ = fs::remove_file(&backup);
-        }
-        Ok(())
-    })();
-    let _ = fs::remove_file(&temporary);
-    result
 }
 
 fn now_millis() -> u64 {
@@ -1168,6 +1239,86 @@ fn block_md5_list(
         }
     }
     Ok((result, hex::encode(hasher.finalize())))
+}
+
+fn collect_directory_pages(
+    directory: &str,
+    read_page: &impl Fn(&str, usize) -> Result<Option<RemoteFilePage>, String>,
+) -> Result<Option<Vec<RemoteFile>>, String> {
+    let mut files = Vec::new();
+    loop {
+        let Some(page) = read_page(directory, files.len())? else {
+            return if files.is_empty() {
+                Ok(None)
+            } else {
+                Err("读取云端目录期间目录状态发生变化，请重试".into())
+            };
+        };
+        if page.files.is_empty() && page.has_more {
+            return Err("云端目录分页响应不完整".into());
+        }
+        let finished = !page.has_more;
+        files.extend(page.files);
+        if finished {
+            return Ok(Some(files));
+        }
+    }
+}
+
+fn list_directory_if_exists(
+    directory: &str,
+    read_page: impl Fn(&str, usize) -> Result<Option<RemoteFilePage>, String>,
+) -> Result<Option<Vec<RemoteFile>>, String> {
+    if let Some(files) = collect_directory_pages(directory, &read_page)? {
+        return Ok(Some(files));
+    }
+    let mut missing = directory.trim_end_matches('/');
+    while let Some((parent, _)) = missing.rsplit_once('/') {
+        let parent = if parent.is_empty() { "/" } else { parent };
+        if let Some(files) = collect_directory_pages(parent, &read_page)? {
+            return if files.iter().any(|file| file.path == missing) {
+                Err("云端目录存在但无法读取，已停止操作以保护历史清单".into())
+            } else {
+                Ok(None)
+            };
+        }
+        if parent == "/" {
+            break;
+        }
+        missing = parent;
+    }
+    Err("无法确认云端目录是否存在，请检查授权或网络连接".into())
+}
+
+fn parse_file_list(
+    value: serde_json::Value,
+    limit: usize,
+) -> Result<Option<RemoteFilePage>, String> {
+    if value.get("errno").and_then(serde_json::Value::as_i64) == Some(-9) {
+        return Ok(None);
+    }
+    let body: FileListResponse = parse_value(value, "读取百度网盘文件列表")?;
+    let files = body
+        .list
+        .ok_or_else(|| "云端目录响应缺少文件列表".to_string())?;
+    if files.iter().any(|file| file.path.is_empty()) {
+        return Err("云端目录响应包含无效文件路径".into());
+    }
+    let has_more = body.has_more == Some(1) || (body.has_more.is_none() && files.len() == limit);
+    Ok(Some(RemoteFilePage {
+        files: files
+            .into_iter()
+            .map(|item| RemoteFile {
+                path: item.path,
+                fs_id: item.fs_id,
+                size: item.size,
+                md5: item.md5,
+                is_dir: item.isdir != 0,
+                server_mtime: item.server_mtime,
+            })
+            .collect(),
+        has_more,
+    }))
 }
 
 fn parse_value<T: for<'de> Deserialize<'de>>(
@@ -1288,10 +1439,109 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::fs;
 
+    #[test]
+    fn cloud_save_directory_errors_are_never_an_empty_list() {
+        for value in [
+            serde_json::json!({"errno": -6}),
+            serde_json::json!({"errno": 111}),
+            serde_json::json!({"errno": 0}),
+            serde_json::json!({"errno": 0, "list": [{}]}),
+        ] {
+            assert!(super::parse_file_list(value, 1000).is_err());
+        }
+        assert!(
+            super::parse_file_list(serde_json::json!({"errno": -9}), 1000)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            super::parse_file_list(serde_json::json!({"errno": 0, "list": []}), 1000)
+                .unwrap()
+                .unwrap()
+                .files
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cloud_save_absence_is_confirmed_by_a_readable_parent() {
+        let absent =
+            super::list_directory_if_exists("/apps/GameSaver/saves/game", |directory, _| {
+                Ok(if directory == "/apps/GameSaver" {
+                    Some(super::RemoteFilePage {
+                        files: Vec::new(),
+                        has_more: false,
+                    })
+                } else {
+                    None
+                })
+            });
+        assert!(absent.unwrap().is_none());
+        let inaccessible =
+            super::list_directory_if_exists("/apps/GameSaver/saves/game", |directory, _| {
+                Ok(if directory == "/apps/GameSaver/saves" {
+                    Some(super::RemoteFilePage {
+                        files: vec![super::RemoteFile {
+                            path: "/apps/GameSaver/saves/game".into(),
+                            fs_id: 1,
+                            size: 0,
+                            is_dir: true,
+                            md5: None,
+                            server_mtime: None,
+                        }],
+                        has_more: false,
+                    })
+                } else {
+                    None
+                })
+            });
+        assert!(inaccessible.is_err());
+        assert!(
+            super::list_directory_if_exists("/apps/GameSaver/saves/game", |_, _| Ok(None)).is_err()
+        );
+        assert!(
+            super::list_directory_if_exists("/apps/GameSaver/saves/game", |_, _| Err(
+                "network error".into()
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cloud_save_directory_reads_all_pages_even_without_has_more_flag() {
+        let page = super::parse_file_list(
+            serde_json::json!({"errno": 0, "list": [{"path": "/test/file"}]}),
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(page.has_more);
+        let calls = std::cell::Cell::new(0);
+        let files = super::list_directory_if_exists("/test", |_, start| {
+            calls.set(calls.get() + 1);
+            Ok(Some(super::RemoteFilePage {
+                files: if start == 0 {
+                    page.files.clone()
+                } else {
+                    Vec::new()
+                },
+                has_more: start == 0,
+            }))
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(calls.get(), 2);
+        assert!(
+            super::collect_directory_pages("/test", &|_, _| Ok(Some(super::RemoteFilePage {
+                files: Vec::new(),
+                has_more: true
+            })))
+            .is_err()
+        );
+    }
+
     /// token 夹具：一个临时「AppData」目录，随作用域自动清理。
-    ///
-    /// 为什么要建**双层**：`token_paths` 会看 `app_data.parent()`（legacy 路径回退），
-    /// 单层目录会把父目录当成 legacy 位置，可能读到真实存在的 token。
     ///
     /// 清理挂在 `Drop` 上（同 `crate::test_support::TempWorkspace`）：此前靠测试末尾
     /// `remove_dir_all`，`assert!` 一失败就执行不到，`%TEMP%` 下会攒下 `gamesaver-token-test-*`。
@@ -1309,10 +1559,6 @@ mod tests {
         /// 交给 `BaiduNetdiskClient::from_parts` 的 AppData 目录（它收 `PathBuf`）。
         fn app_data(&self) -> std::path::PathBuf {
             self.workspace.join("app-data")
-        }
-
-        fn join(&self, relative: &str) -> std::path::PathBuf {
-            self.app_data().join(relative)
         }
     }
 
@@ -1400,6 +1646,10 @@ mod tests {
                 is_auth_failure(ok, &serde_json::json!({ "errno": errno })),
                 "errno {errno} 应判为鉴权失败"
             );
+            assert!(is_auth_failure(
+                ok,
+                &serde_json::json!({ "error_code": errno })
+            ));
         }
         for error in ["invalid_token", "expired_token"] {
             assert!(
@@ -1427,35 +1677,356 @@ mod tests {
         )
         .expect("client");
         assert!(
-            !client.refresh_token(true).expect("refresh call"),
+            !client.refresh_token(Some("stale")).expect("refresh call"),
             "没有凭据且磁盘无更新时应报告无法刷新"
         );
     }
 
     #[test]
-    fn refresh_picks_up_token_written_by_another_process() {
+    fn refresh_picks_up_token_from_the_same_authorization() {
         let workspace = TokenWorkspace::new();
-        let path = workspace.join(super::TOKEN_FILE_NAME);
         let stale = token(
             "stale-token",
-            Some(super::now_millis().saturating_sub(1000)),
+            Some(super::now_millis().saturating_add(3_600_000)),
         );
-        super::save_token_at(&path, stale.clone()).expect("seed token");
-        let client =
-            BaiduNetdiskClient::from_parts(stale, workspace.app_data(), None).expect("client");
-
-        // 模拟另一个进程刷新后落盘。
-        super::save_token_at(
-            &path,
-            token(
+        BaiduNetdiskClient::save_token(&workspace.app_data(), stale).expect("seed token");
+        let client = BaiduNetdiskClient::load_from_app_data(&workspace.app_data()).expect("client");
+        super::BaiduTokenRepository::update(&workspace.app_data(), |current| {
+            let mut current = current.unwrap();
+            current.token = Some(token(
                 "fresh-token",
                 Some(super::now_millis().saturating_add(3_600_000)),
-            ),
-        )
+            ));
+            Ok(current)
+        })
         .expect("write refreshed token");
 
-        assert!(client.refresh_token(true).expect("refresh call"));
+        assert!(client
+            .refresh_token(Some("stale-token"))
+            .expect("refresh call"));
         assert_eq!(client.access_token().expect("access token"), "fresh-token");
+    }
+
+    fn configured_client(workspace: &TokenWorkspace, refresh: bool) -> BaiduNetdiskClient {
+        use crate::services::baidu_auth_service::BaiduAuthService;
+        let app = workspace.app_data();
+        BaiduAuthService::save_config(&app, "fake-app", "fake-secret").unwrap();
+        let request = BaiduAuthService::begin_authorization(&app).unwrap();
+        let mut initial = token("initial-token", Some(super::now_millis() + 3_600_000));
+        if !refresh {
+            initial.refresh_token = None;
+        }
+        BaiduAuthService::commit_authorization(&app, &request, initial).unwrap();
+        BaiduNetdiskClient::load_configured(&app).unwrap()
+    }
+
+    fn replace_authorization(workspace: &TokenWorkspace) {
+        use crate::services::baidu_auth_service::BaiduAuthService;
+        let app = workspace.app_data();
+        let request = BaiduAuthService::begin_authorization(&app).unwrap();
+        BaiduAuthService::commit_authorization(
+            &app,
+            &request,
+            token("other-account", Some(super::now_millis() + 3_600_000)),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn configured_loader_supplies_refresh_credentials() {
+        let workspace = TokenWorkspace::new();
+        let client = configured_client(&workspace, true);
+        assert!(client.refresh_context.is_some());
+        assert!(client.authorization_revision.is_some());
+        assert!(client.configuration_id.is_some());
+    }
+
+    #[test]
+    fn reauthorization_stops_existing_clients_without_adopting_another_account() {
+        let workspace = TokenWorkspace::new();
+        let client = configured_client(&workspace, true);
+        replace_authorization(&workspace);
+        assert_eq!(
+            client.access_token().unwrap_err(),
+            super::AUTHORIZATION_CHANGED
+        );
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = client.refresh_token_with(Some("initial-token"), |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(token("must-not-be-used", None))
+        });
+        assert!(result.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn credentials_change_invalidates_the_client_and_reports_unauthorized() {
+        let workspace = TokenWorkspace::new();
+        let client = configured_client(&workspace, true);
+        crate::services::baidu_auth_service::BaiduAuthService::save_config(
+            &workspace.app_data(),
+            "different-app",
+            "different-secret",
+        )
+        .unwrap();
+        assert!(client.access_token().is_err());
+        assert!(!BaiduNetdiskClient::connection_status(&workspace.app_data()).authorized);
+        assert!(BaiduNetdiskClient::load_configured(&workspace.app_data()).is_err());
+    }
+
+    #[test]
+    fn concurrent_failures_for_one_token_refresh_exactly_once() {
+        let workspace = TokenWorkspace::new();
+        let client = configured_client(&workspace, true);
+        let before = client.authorization_revision.clone();
+        let barrier = std::sync::Barrier::new(2);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _index in 0..2 {
+                let client = &client;
+                let barrier = &barrier;
+                let calls = &calls;
+                scope.spawn(move || {
+                    let rejected = client.access_token().unwrap();
+                    barrier.wait();
+                    assert!(client
+                        .refresh_token_with(Some(&rejected), |_| {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Ok(token(
+                                "refreshed-token",
+                                Some(super::now_millis() + 3_600_000),
+                            ))
+                        })
+                        .unwrap());
+                });
+            }
+        });
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(client.access_token().unwrap(), "refreshed-token");
+        assert_eq!(client.authorization_revision, before);
+    }
+
+    #[test]
+    fn late_refresh_cannot_overwrite_a_new_authorization() {
+        let workspace = TokenWorkspace::new();
+        let client = configured_client(&workspace, true);
+        let result = client.refresh_token_with(Some("initial-token"), |_| {
+            replace_authorization(&workspace);
+            Ok(token("late-refresh", Some(super::now_millis() + 3_600_000)))
+        });
+        assert_eq!(result.unwrap_err(), super::AUTHORIZATION_CHANGED);
+        assert_eq!(
+            BaiduNetdiskClient::load_configured(&workspace.app_data())
+                .unwrap()
+                .access_token()
+                .unwrap(),
+            "other-account"
+        );
+    }
+
+    #[test]
+    fn expired_disk_replacement_is_not_reported_as_successfully_refreshed() {
+        let workspace = TokenWorkspace::new();
+        let client = configured_client(&workspace, true);
+        super::BaiduTokenRepository::update(&workspace.app_data(), |current| {
+            let mut current = current.unwrap();
+            current.token = Some(token("expired-replacement", Some(1)));
+            Ok(current)
+        })
+        .unwrap();
+        let mut called = false;
+        assert!(client
+            .refresh_token_with(Some("initial-token"), |_| {
+                called = true;
+                Ok(token(
+                    "valid-replacement",
+                    Some(super::now_millis() + 3_600_000),
+                ))
+            })
+            .unwrap());
+        assert!(called);
+        assert!(!client.access_token_expired());
+    }
+
+    #[test]
+    fn failed_or_invalid_refresh_preserves_existing_authorization() {
+        let workspace = TokenWorkspace::new();
+        let client = configured_client(&workspace, true);
+        let error = client
+            .refresh_token_with(Some("initial-token"), |_| {
+                Err("网络连接超时，请稍后重试".into())
+            })
+            .unwrap_err();
+        assert!(!super::authorization_required(&error));
+        assert!(client
+            .refresh_token_with(Some("initial-token"), |_| Ok(token("invalid", Some(1))))
+            .is_err());
+        assert_eq!(client.access_token().unwrap(), "initial-token");
+    }
+
+    fn response_server(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = format!("http://{}/probe", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for (status, body) in responses {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(5))
+                        }
+                        Err(error) => panic!("loopback server accept failed: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = [0u8; 4096];
+                socket.read(&mut request).unwrap();
+                write!(socket, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        (address, server)
+    }
+
+    #[test]
+    fn a_replaced_authorization_stops_json_and_raw_requests_before_sending() {
+        let workspace = TokenWorkspace::new();
+        let client = configured_client(&workspace, true);
+        replace_authorization(&workspace);
+        let mut calls = 0;
+        let json_error = client
+            .request_json_value(
+                |http, _| {
+                    calls += 1;
+                    http.get("http://127.0.0.1:9/must-not-send").send()
+                },
+                "probe",
+            )
+            .unwrap_err();
+        let raw_error = client
+            .send_raw(
+                |http, _| {
+                    calls += 1;
+                    http.get("http://127.0.0.1:9/must-not-send").send()
+                },
+                "probe",
+            )
+            .unwrap_err();
+        assert_eq!(calls, 0);
+        assert_eq!(json_error, super::AUTHORIZATION_CHANGED);
+        assert_eq!(raw_error, super::AUTHORIZATION_CHANGED);
+    }
+
+    #[test]
+    fn an_in_flight_response_is_rejected_after_reauthorization() {
+        let workspace = TokenWorkspace::new();
+        let client = configured_client(&workspace, true);
+        let (url, server) = response_server(vec![(200, r#"{"errno":0}"#)]);
+        let result = client.request_json_value(
+            |http, _| {
+                let response = http.get(&url).send();
+                replace_authorization(&workspace);
+                response
+            },
+            "probe",
+        );
+        server.join().unwrap();
+        assert_eq!(result.unwrap_err(), super::AUTHORIZATION_CHANGED);
+    }
+
+    #[test]
+    fn numeric_auth_error_preserves_the_missing_refresh_token_diagnostic() {
+        let workspace = TokenWorkspace::new();
+        let client = configured_client(&workspace, false);
+        let (url, server) =
+            response_server(vec![(200, r#"{"error_code":111,"error_msg":"expired"}"#)]);
+        let error = client
+            .request_json_value(|http, _| http.get(&url).send(), "probe")
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(error.contains("没有 refresh token"));
+        assert!(error.contains("重新授权"));
+    }
+
+    #[test]
+    fn non_json_unauthorized_response_replays_once_using_the_refreshed_session() {
+        let workspace = TokenWorkspace::new();
+        let client = configured_client(&workspace, true);
+        let (url, server) = response_server(vec![(401, "not-json"), (200, r#"{"errno":0}"#)]);
+        let mut calls = 0;
+        let result = client
+            .request_json_value(
+                |http, access| {
+                    calls += 1;
+                    let response = http.get(&url).send();
+                    if calls == 1 {
+                        assert_eq!(access, "initial-token");
+                        client
+                            .commit_refreshed_token(
+                                access,
+                                token("refreshed-token", Some(super::now_millis() + 3_600_000)),
+                            )
+                            .unwrap();
+                    } else {
+                        assert_eq!(access, "refreshed-token");
+                    }
+                    response
+                },
+                "probe",
+            )
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(result["errno"], 0);
+    }
+
+    #[test]
+    fn raw_download_keeps_the_actionable_refresh_error() {
+        let workspace = TokenWorkspace::new();
+        let client = configured_client(&workspace, false);
+        let (url, server) = response_server(vec![(401, "not-json")]);
+        let error = client
+            .send_raw(|http, _| http.get(&url).send(), "download")
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(error.contains("没有 refresh token"));
+    }
+
+    #[test]
+    fn second_unauthorized_response_does_not_start_a_third_request() {
+        let workspace = TokenWorkspace::new();
+        let client = configured_client(&workspace, true);
+        let (url, server) = response_server(vec![(401, "not-json"), (401, "still-not-json")]);
+        let mut calls = 0;
+        let result = client.request_json_value(
+            |http, access| {
+                calls += 1;
+                let response = http.get(&url).send();
+                if calls == 1 {
+                    client
+                        .commit_refreshed_token(
+                            access,
+                            token("refreshed", Some(super::now_millis() + 3_600_000)),
+                        )
+                        .unwrap();
+                }
+                response
+            },
+            "probe",
+        );
+        server.join().unwrap();
+        assert_eq!(calls, 2);
+        assert!(result.unwrap_err().contains("仍然无效"));
     }
 
     #[test]

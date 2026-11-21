@@ -8,6 +8,10 @@ use super::etw_capture::{
 };
 use super::transactions::{FileOperation, FileOperationKind};
 use crate::domain::save_candidate::should_ignore_event_path;
+use crate::domain::{
+    learning::ProcessLifetime,
+    timestamp::{FILETIME_TICKS_PER_MS, FILETIME_UNIX_EPOCH},
+};
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::{
@@ -25,8 +29,8 @@ const FILE_OBJECT_PROPERTY_NAMES: &[&str] = &["FileObject", "FileKey"];
 const PATH_PROPERTY_NAMES: &[&str] = &["FileName", "FilePath", "OpenPath", "Path"];
 
 #[cfg(target_os = "windows")]
-struct NativeCollector {
-    tracked_pids: HashSet<u32>,
+struct NativeCollector<'a> {
+    tracked: &'a HashMap<u32, &'a ProcessLifetime>,
     device_paths: Vec<(String, String)>,
     files: HashSet<String>,
     operations: Vec<FileOperation>,
@@ -34,6 +38,7 @@ struct NativeCollector {
     written_file_objects: HashSet<String>,
     total_events: usize,
     matched_pid_events: usize,
+    outside_lifetime_events: usize,
     task_prefiltered_events: usize,
     extracted_paths: usize,
     ignored_paths: usize,
@@ -45,10 +50,10 @@ struct NativeCollector {
 }
 
 #[cfg(target_os = "windows")]
-impl NativeCollector {
-    fn new(tracked_pids: &[u32]) -> Self {
+impl<'a> NativeCollector<'a> {
+    fn new(tracked: &'a HashMap<u32, &'a ProcessLifetime>) -> Self {
         Self {
-            tracked_pids: tracked_pids.iter().copied().collect(),
+            tracked,
             device_paths: build_device_path_map(),
             files: HashSet::new(),
             operations: Vec::new(),
@@ -56,6 +61,7 @@ impl NativeCollector {
             written_file_objects: HashSet::new(),
             total_events: 0,
             matched_pid_events: 0,
+            outside_lifetime_events: 0,
             task_prefiltered_events: 0,
             extracted_paths: 0,
             ignored_paths: 0,
@@ -73,7 +79,11 @@ impl NativeCollector {
             return;
         }
         let pid = event.EventHeader.ProcessId;
-        if !self.tracked_pids.is_empty() && !self.tracked_pids.contains(&pid) {
+        let Some(lifetime) = self.tracked.get(&pid) else {
+            return;
+        };
+        if !lifetime.contains(event.EventHeader.TimeStamp) {
+            self.outside_lifetime_events += 1;
             return;
         }
         self.matched_pid_events += 1;
@@ -183,10 +193,10 @@ unsafe extern "system" fn event_record_callback(event: *mut EVENT_RECORD) {
 #[cfg(target_os = "windows")]
 pub(crate) fn collect_related_files_from_etl(
     etl_path: &str,
-    tracked_pids: &[u32],
+    tracked: &HashMap<u32, &ProcessLifetime>,
 ) -> Result<TraceCollectionResult, String> {
     let started = Instant::now();
-    let mut collector = NativeCollector::new(tracked_pids);
+    let mut collector = NativeCollector::new(tracked);
     let mut etl_path_wide = etl_path.encode_utf16().collect::<Vec<_>>();
     etl_path_wide.push(0);
     let mut logfile = EVENT_TRACE_LOGFILEW::default();
@@ -216,7 +226,7 @@ pub(crate) fn collect_related_files_from_etl(
     if collector.total_events == 0 {
         return Err("native ETL contained no events".to_string());
     }
-    if !collector.tracked_pids.is_empty() && collector.matched_pid_events == 0 {
+    if collector.matched_pid_events == 0 {
         return Err("native ETL contained no target process events".to_string());
     }
     if collector.matched_pid_events > 0 && collector.extracted_paths == 0 {
@@ -238,10 +248,13 @@ pub(crate) fn collect_related_files_from_etl(
             collector.files.insert(path.clone());
         }
     }
+    let mut tracked_pids: Vec<_> = tracked.keys().copied().collect();
+    tracked_pids.sort_unstable();
     let mut logs = vec![
         "原生 ETL 解析完成（OpenTraceW + ProcessTrace + TDH）".to_string(),
         format!("设备路径映射：{} 个卷", collector.device_paths.len()),
         format!("目标 PID：{tracked_pids:?}"),
+        format!("进程生命周期过滤：{} 条事件时间不匹配", collector.outside_lifetime_events),
         format!(
             "事件描述符样本：{}",
             collector.descriptor_samples.join("；")
@@ -313,7 +326,7 @@ pub(crate) fn collect_related_files_from_etl(
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn collect_related_files_from_etl(
     _etl_path: &str,
-    _tracked_pids: &[u32],
+    _tracked: &HashMap<u32, &ProcessLifetime>,
 ) -> Result<TraceCollectionResult, String> {
     Err("native ETL parsing is only available on Windows".to_string())
 }
@@ -417,8 +430,7 @@ fn format_file_object_id(bytes: &[u8]) -> String {
 }
 
 fn filetime_to_unix_ms(value: i64) -> Option<i64> {
-    const WINDOWS_TO_UNIX_EPOCH_MS: i64 = 11_644_473_600_000;
-    (value > 100_000_000_000_000).then(|| value / 10_000 - WINDOWS_TO_UNIX_EPOCH_MS)
+    (value > 100_000_000_000_000).then(|| (value - FILETIME_UNIX_EPOCH) / FILETIME_TICKS_PER_MS)
 }
 
 fn is_mutation_related_task(task: u32) -> bool {
@@ -481,6 +493,32 @@ mod tests {
         needs_direct_path,
     };
     use crate::services::learning::transactions::FileOperationKind;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn native_etl_filters_reused_pids_before_decoding_properties() {
+        use super::{NativeCollector, ProcessLifetime, KERNEL_FILE_PROVIDER};
+        use std::collections::HashMap;
+        use windows_sys::Win32::System::Diagnostics::Etw::EVENT_RECORD;
+
+        let started_at = 134_313_202_837_027_063;
+        let ended_at = started_at + 2;
+        let lifetime = ProcessLifetime { pid: 42, started_at, ended_at };
+        let tracked = HashMap::from([(lifetime.pid, &lifetime)]);
+        let mut collector = NativeCollector::new(&tracked);
+        let mut event = EVENT_RECORD::default();
+        event.EventHeader.ProviderId = KERNEL_FILE_PROVIDER;
+        event.EventHeader.ProcessId = lifetime.pid;
+        event.EventHeader.EventDescriptor.Task = 15;
+        for time in [started_at - 1, started_at, ended_at - 1, ended_at, ended_at + 1] {
+            event.EventHeader.TimeStamp = time;
+            unsafe { collector.consume(&event) };
+        }
+        assert_eq!(collector.matched_pid_events, 2);
+        assert_eq!(collector.outside_lifetime_events, 3);
+        assert_eq!(collector.task_prefiltered_events, 2);
+        assert!(collector.operations.is_empty());
+    }
 
     #[test]
     fn decodes_unicode_path_properties() {

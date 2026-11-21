@@ -1,4 +1,5 @@
 pub mod game;
+pub(crate) mod known_folders;
 pub mod learning;
 pub mod path_safety;
 pub mod path_utils;
@@ -14,7 +15,7 @@ pub use game::{
     GameRuntime, GameRuntimeStatus,
 };
 pub use learning::{
-    ActiveLearningSession, EtwCaptureHandle, FileFingerprint, LearningSessionView, LearningStatus,
+    EtwCaptureHandle, FileFingerprint, LearningSessionView, LearningStatus,
     SaveCandidateEvidenceLevel, SaveLearningResult, SaveScopeDraft, SaveTransactionSummary,
     ScanRoot,
 };

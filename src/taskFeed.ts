@@ -73,6 +73,14 @@ const TASK_CATEGORY_POLICY = {
  * 其余同类任务用分类级兜底即可。
  */
 const CANCEL_HINT_OVERRIDES: Partial<Record<string, string>> = {
+  update_game_body:
+    "检查和复制阶段可以取消；开始交换游戏本体后将关闭取消入口，并完成存档保护和记录提交。确定取消吗？",
+  retry_game_body_update:
+    "开始恢复更新事务后将关闭取消入口，系统会保留可恢复现场。确定取消吗？",
+  uninstall_game_body:
+    "仅提交前可以取消；开始移出本体后将关闭取消入口，操作进度可在传输中心查看。确定取消吗？",
+  remove_game_from_library:
+    "仅提交前可以取消；开始移除游戏记录后将关闭取消入口，云端文件不会受影响。确定取消吗？",
   upload_game_body_package:
     "取消后会停止后续分片处理，已上传的临时分片可能由百度网盘自动清理。确定取消吗？",
 };
@@ -88,7 +96,8 @@ export function taskCategoryOf(task: AppTask): TaskCategory {
 
 /** 取任务的分类策略。 */
 export function taskPolicyOf(task: AppTask): TaskCategoryPolicy {
-  return TASK_CATEGORY_POLICY[taskCategoryOf(task)];
+  const policy = TASK_CATEGORY_POLICY[taskCategoryOf(task)];
+  return task.cancellable === false ? { ...policy, cancellable: false } : policy;
 }
 
 /** 取消确认文案：优先按任务类型取精确文案，否则用分类级兜底。 */

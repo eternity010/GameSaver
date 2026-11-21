@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { AlertTriangle, ArrowLeft, Check, CheckCircle2, FolderOpen, FolderSearch, Gamepad2, LoaderCircle, Plus, Trash2, X } from "@lucide/vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -8,6 +8,7 @@ import {
   confirmSaveProfile,
   discardPendingGame,
   getGame,
+  getPendingGameSetup,
   getTask,
   startAddGameTask,
   startSaveCandidateVerificationTask,
@@ -19,9 +20,12 @@ import {
 } from "../api";
 import { createDefaultSaveScope, type Game, type SaveCandidateEvidenceLevel, type SaveLearningResult, type SaveLearningSession, type SaveRootType, type SaveScope } from "../domain/game";
 
-type WizardPhase = "form" | "copying" | "ready" | "capturing" | "analyzing" | "review" | "done";
+type WizardPhase = "form" | "copying" | "ready" | "capturing" | "analyzing" | "review" | "done" | "discarding";
 
-const emit = defineEmits<{ (event: "back"): void; (event: "completed", game: Game): void }>();
+const props = defineProps<{ gameUid?: string }>();
+const emit = defineEmits<{ (event: "back"): void; (event: "completed", game: Game): void; (event: "pending", gameUid: string): void }>();
+const resuming = ref(true);
+const resumeFailed = ref(false);
 
 const phase = ref<WizardPhase>("form");
 const displayName = ref("");
@@ -62,9 +66,10 @@ const newPatternByScope = ref<Record<number, string>>({});
 // 它们不会被自动纳入保护范围——毕竟只是启发式判断，误收别人的存档比漏收更难收拾。
 const proposedByScope = ref<Record<string, string[]>>({});
 let pollTimer: ReturnType<typeof setTimeout> | undefined;
+let disposed = false;
 
-const isBusy = computed(() => phase.value === "copying" || phase.value === "analyzing");
-const canStart = computed(() => Boolean(displayName.value.trim() && sourcePath.value.trim() && executablePath.value.trim()) && phase.value === "form");
+const isBusy = computed(() => resuming.value || !!taskId.value || phase.value === "copying" || phase.value === "analyzing" || phase.value === "discarding");
+const canStart = computed(() => !resuming.value && !taskId.value && Boolean(displayName.value.trim() && sourcePath.value.trim() && executablePath.value.trim()) && phase.value === "form");
 const stepNumber = computed(() => phase.value === "form" || phase.value === "copying" ? 1 : phase.value === "ready" || phase.value === "capturing" ? 2 : phase.value === "analyzing" || phase.value === "review" ? 3 : 4);
 const stepTitle = computed(() => phase.value === "form" || phase.value === "copying" ? "选择并复制游戏本体" : phase.value === "ready" || phase.value === "capturing" ? "完成一次游戏内保存" : phase.value === "analyzing" ? "分析存档变化" : phase.value === "review" ? "确认存档保护范围" : "添加完成");
 const canConfirm = computed(() => reviewScopes.value.length > 0 && reviewScopes.value.every((scope) => scope.confirmedFiles.length > 0 || scope.includeDirectories.length > 0));
@@ -194,16 +199,19 @@ function handleTaskFailure(task: AppTask, cancelledMessage: string, failedMessag
 
 async function watchTask(onSuccess: (task: AppTask) => Promise<void>, cancelledMessage: string, failedMessage: string, onFailure?: (task: AppTask) => Promise<void>) {
   const watchedTaskId = taskId.value;
-  if (!watchedTaskId) return;
+  if (!watchedTaskId || disposed) return;
   try {
     const task = await getTask(watchedTaskId);
+    if (disposed || taskId.value !== watchedTaskId) return;
     progress.value = task.progress;
     message.value = task.message;
     if (task.status === "success") {
       stopPolling();
+      await onSuccess(task);
+      if (disposed || taskId.value !== watchedTaskId) return;
       taskId.value = "";
       cancelling.value = false;
-      await onSuccess(task);
+      error.value = "";
       return;
     }
     if (task.status === "failed" || task.status === "cancelled" || task.status === "interrupted") {
@@ -213,11 +221,57 @@ async function watchTask(onSuccess: (task: AppTask) => Promise<void>, cancelledM
     }
     pollTimer = setTimeout(() => void watchTask(onSuccess, cancelledMessage, failedMessage, onFailure), 350);
   } catch (reason) {
+    if (disposed || taskId.value !== watchedTaskId) return;
     stopPolling();
-    taskId.value = "";
-    cancelling.value = false;
-    error.value = String(reason);
-    phase.value = completedGame.value ? "ready" : "form";
+    error.value = `读取任务状态暂时失败，正在重新连接：${String(reason)}`;
+    pollTimer = setTimeout(() => void watchTask(onSuccess, cancelledMessage, failedMessage, onFailure), 1200);
+  }
+}
+
+async function resumeSetup() {
+  resuming.value = true;
+  resumeFailed.value = false;
+  try {
+    const context = await getPendingGameSetup(props.gameUid);
+    if (disposed) return;
+    completedGame.value = context.game;
+    session.value = context.session;
+    validatingCandidates.value = context.validationOnly;
+    if (context.game) {
+      emit("pending", context.game.gameUid);
+      phase.value = context.game.lifecycle === "pending_setup" ? (context.session ? "capturing" : "ready") : "done";
+    }
+    if (context.taskId && phase.value !== "done") {
+      taskId.value = context.taskId;
+      phase.value = context.taskType === "add_game" ? "copying" : context.taskType === "analyze_saves" ? "analyzing" : "capturing";
+      resuming.value = false;
+      await watchTask(async (finished) => {
+        if (finished.taskType === "add_game") {
+          completedGame.value = finished.result as Game | undefined ?? (finished.gameUid ? await getGame(finished.gameUid) : null);
+          if (disposed) return;
+          if (!completedGame.value) throw new Error("等待游戏记录写入");
+          emit("pending", completedGame.value.gameUid);
+          phase.value = "ready";
+        } else if (finished.taskType === "analyze_saves") {
+          if (!finished.result) throw new Error("未找到分析结果");
+          applyInitialLearningResult(finished.result as SaveLearningResult);
+          session.value = null;
+          phase.value = "review";
+        } else {
+          const active = finished.result as SaveLearningSession | undefined;
+          if (!active?.sessionId) throw new Error("未找到存档识别会话");
+          session.value = active;
+          phase.value = "capturing";
+        }
+      }, "任务已取消，可重新设置", "添加流程未完成，可重试");
+    }
+  } catch (reason) {
+    if (!disposed) {
+      resumeFailed.value = true;
+      error.value = `接续添加流程失败：${String(reason)}`;
+    }
+  } finally {
+    resuming.value = false;
   }
 }
 
@@ -230,8 +284,10 @@ async function submitAdd(allowLargeSource: boolean) {
   try {
     taskId.value = await startAddGameTask({ displayName: displayName.value, gameKey: normalizeGameKey(gameKey.value || displayName.value), sourcePath: sourcePath.value, executablePath: executablePath.value, allowLargeSource });
     await watchTask(async (task) => {
-      completedGame.value = task.gameUid ? await getGame(task.gameUid) : null;
+      completedGame.value = task.result as Game | undefined ?? (task.gameUid ? await getGame(task.gameUid) : null);
+      if (disposed) return;
       if (!completedGame.value) throw new Error("游戏已复制，但没有找到待设置的游戏记录");
+      emit("pending", completedGame.value.gameUid);
       phase.value = "ready";
       message.value = "游戏本体已准备好";
     }, "已取消复制", "添加游戏失败", async (task) => {
@@ -285,7 +341,7 @@ async function beginLearning() {
 }
 
 async function analyze() {
-  if (!session.value || phase.value !== "capturing") return;
+  if (!session.value || phase.value !== "capturing" || taskId.value) return;
   error.value = "";
   message.value = "正在分析保存前后的变化";
   progress.value = 0;
@@ -511,10 +567,14 @@ async function confirm() {
   error.value = "";
   confirming.value = true;
   try {
-    await confirmSaveProfile(completedGame.value.gameUid, reviewScopes.value, confidence.value, learningResult.value?.eventCaptureMode ?? null);
-    completedGame.value = await getGame(completedGame.value.gameUid);
-    if (!completedGame.value) throw new Error("存档保护已保存，但游戏记录读取失败");
+    const profile = await confirmSaveProfile(completedGame.value.gameUid, reviewScopes.value, confidence.value, learningResult.value?.eventCaptureMode ?? null);
+    completedGame.value = { ...completedGame.value, lifecycle: "active", health: "ready", saveProfileId: profile.profileId };
     phase.value = "done";
+    try {
+      completedGame.value = await getGame(completedGame.value.gameUid);
+    } catch {
+      message.value = "存档保护已保存，返回游戏库后会自动刷新。";
+    }
   } catch (reason) {
     error.value = String(reason);
   } finally {
@@ -558,6 +618,14 @@ async function cancelTaskOrLearning() {
 }
 
 async function abandonPendingGame() {
+  if (phase.value === "done") {
+    if (completedGame.value) emit("completed", completedGame.value);
+    return;
+  }
+  if (isBusy.value) {
+    error.value = "请先等待或取消当前任务，再放弃添加";
+    return;
+  }
   if (!completedGame.value) {
     emit("back");
     return;
@@ -571,14 +639,16 @@ async function abandonPendingGame() {
       await cancelSaveLearning(session.value.sessionId);
       session.value = null;
     }
-    await discardPendingGame(completedGame.value.gameUid);
-    emit("back");
+    taskId.value = await discardPendingGame(completedGame.value.gameUid);
+    phase.value = "discarding";
+    await watchTask(async () => { emit("back"); }, "已取消放弃添加", "清理未完成，可在传输中心重试");
   } catch (reason) {
     error.value = String(reason);
   }
 }
 
-onUnmounted(stopPolling);
+onMounted(resumeSetup);
+onUnmounted(() => { disposed = true; stopPolling(); });
 </script>
 
 <template>
@@ -593,7 +663,9 @@ onUnmounted(stopPolling);
       <div><strong>{{ stepTitle }}</strong><small>第 {{ stepNumber }} 步，共 4 步</small></div>
     </div>
 
-    <form v-if="phase === 'form' || phase === 'copying'" class="wizard-form" @submit.prevent="start">
+    <section v-if="resuming || resumeFailed" class="wizard-form"><span v-if="resuming" class="loader"></span><p>正在接续添加流程…</p><p v-if="error" class="error-message">{{ error }}</p><button v-if="resumeFailed" class="primary-button" type="button" @click="resumeSetup">重试接续</button></section>
+    <section v-else-if="phase === 'discarding'" class="wizard-form"><span class="loader"></span><h2>正在放弃添加</h2><p>{{ message }}</p><p v-if="error" class="error-message">{{ error }}</p></section>
+    <form v-else-if="phase === 'form' || phase === 'copying'" class="wizard-form" @submit.prevent="start">
       <section class="wizard-section"><h2>游戏信息</h2><label class="field"><span>游戏名称</span><input v-model="displayName" :disabled="phase === 'copying'" type="text" placeholder="例如：Black Market" @input="!gameKey && (gameKey = normalizeGameKey(displayName))" /></label><label class="field"><span>游戏标识</span><input v-model="gameKey" :disabled="phase === 'copying'" type="text" placeholder="用于关联云端游戏" /><small class="field-note">默认由游戏名称生成，确认后不随显示名称变化。</small></label></section>
       <section class="wizard-section"><h2>游戏本体目录</h2><p class="field-note">GameSaver 会复制一份本体到自己的游戏库，原始目录不会被修改。</p><div class="path-row"><input v-model="sourcePath" :disabled="phase === 'copying'" type="text" placeholder="选择游戏所在文件夹" /><button type="button" :disabled="phase === 'copying'" title="选择游戏目录" @click="chooseSource"><FolderOpen :size="17" />选择</button></div></section>
       <section class="wizard-section"><h2>启动程序</h2><p class="field-note">启动程序必须位于游戏本体目录内。</p><div class="path-row"><input v-model="executablePath" :disabled="phase === 'copying'" type="text" placeholder="选择游戏 EXE" /><button type="button" :disabled="phase === 'copying'" title="选择启动程序" @click="chooseExecutable"><Gamepad2 :size="17" />选择</button></div></section>

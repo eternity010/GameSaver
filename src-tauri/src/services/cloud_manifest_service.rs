@@ -370,6 +370,26 @@ impl CloudManifestService {
         temporary_root: &Path,
         cache_root: Option<&Path>,
     ) -> Result<(), String> {
+        Self::write_cover_with_upload(
+            remote_dir,
+            cover_bytes,
+            temporary_root,
+            cache_root,
+            |temporary, remote| {
+                client
+                    .upload_file(temporary, remote, None, |_, _| true)
+                    .map(|_| ())
+            },
+        )
+    }
+
+    fn write_cover_with_upload(
+        remote_dir: &str,
+        cover_bytes: &[u8],
+        temporary_root: &Path,
+        cache_root: Option<&Path>,
+        upload: impl FnOnce(&Path, &str) -> Result<(), String>,
+    ) -> Result<(), String> {
         fs::create_dir_all(temporary_root)
             .map_err(|error| format!("创建云端封面临时目录失败：{error}"))?;
         let temporary =
@@ -381,14 +401,28 @@ impl CloudManifestService {
                 .map_err(|error| format!("写入云端封面临时文件失败：{error}"))?;
             file.sync_all()
                 .map_err(|error| format!("刷新云端封面临时文件失败：{error}"))?;
-            client.upload_file(&temporary, &Self::cover_path(remote_dir), None, |_, _| true)?;
+            upload(&temporary, &Self::cover_path(remote_dir))?;
             Ok(())
         })();
         let _ = fs::remove_file(&temporary);
-        if let Some(cache_root) = cache_root {
+        if let Some(cache_root) = cache_root.filter(|_| result.is_ok()) {
             let dir = cache_root.join(Self::cache_folder_name(remote_dir));
-            let _ = fs::create_dir_all(&dir);
-            let _ = fs::write(dir.join("cover.jpg"), cover_bytes);
+            let cache_result = (|| -> Result<(), String> {
+                fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+                match fs::remove_file(dir.join("cover.cache.json")) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+                crate::repositories::store_file::atomic_replace(
+                    &dir.join("cover.jpg"),
+                    cover_bytes,
+                    "云端封面缓存",
+                )
+            })();
+            if let Err(error) = cache_result {
+                crate::logging::error(format!("封面上传成功，但刷新本地云封面缓存失败：{error}"));
+            }
         }
         result
     }
@@ -944,6 +978,67 @@ fn now_iso() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_cover_upload_preserves_existing_cache_and_metadata() {
+        let workspace = crate::test_support::TempWorkspace::new("cover-upload-failure");
+        let cache = workspace.join("cache");
+        let directory = cache.join(super::CloudManifestService::cache_folder_name(
+            "/cloud/game-a",
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("cover.jpg"), b"cloud-old").unwrap();
+        std::fs::write(directory.join("cover.cache.json"), b"old-metadata").unwrap();
+        let temporary = workspace.join("temp");
+        let result = super::CloudManifestService::write_cover_with_upload(
+            "/cloud/game-a",
+            b"new",
+            &temporary,
+            Some(&cache),
+            |path, _| {
+                assert_eq!(std::fs::read(path).unwrap(), b"new");
+                Err("injected upload failure".into())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(directory.join("cover.jpg")).unwrap(),
+            b"cloud-old"
+        );
+        assert_eq!(
+            std::fs::read(directory.join("cover.cache.json")).unwrap(),
+            b"old-metadata"
+        );
+        assert_eq!(std::fs::read_dir(temporary).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn successful_cover_upload_updates_image_and_invalidates_old_metadata() {
+        let workspace = crate::test_support::TempWorkspace::new("cover-upload-success");
+        let cache = workspace.join("cache");
+        let directory = cache.join(super::CloudManifestService::cache_folder_name(
+            "/cloud/game-a",
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("cover.jpg"), b"cloud-old").unwrap();
+        std::fs::write(directory.join("cover.cache.json"), b"old-metadata").unwrap();
+        let temporary = workspace.join("temp");
+        super::CloudManifestService::write_cover_with_upload(
+            "/cloud/game-a",
+            b"new",
+            &temporary,
+            Some(&cache),
+            |path, remote| {
+                assert_eq!(remote, "/cloud/game-a/cover.jpg");
+                assert_eq!(std::fs::read(path).unwrap(), b"new");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(directory.join("cover.jpg")).unwrap(), b"new");
+        assert!(!directory.join("cover.cache.json").exists());
+        assert_eq!(std::fs::read_dir(temporary).unwrap().count(), 0);
+    }
+
     use super::{
         existing_manifest_for_rebuild, game_key_from_body_dir, parse_manifest, rebuilt_version_id,
         validate, CloudBodyManifest, CloudBodyManifestVersion, CloudGameCatalog,

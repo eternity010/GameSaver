@@ -1,5 +1,9 @@
 use crate::domain::save_candidate::should_ignore_event_path;
-use crate::domain::EtwCaptureHandle;
+use crate::domain::{
+    learning::ProcessLifetime,
+    timestamp::{current_filetime, FILETIME_TICKS_PER_MS, FILETIME_UNIX_EPOCH},
+    EtwCaptureHandle,
+};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -33,9 +37,7 @@ const ETW_TRACE_MAX_LOG_MB: u32 = 256;
 ///     见 `save_learning_service` 里的采集看门狗。
 ///
 /// 同理**不加 `-ct`**：它只影响时间戳时钟（省一点 CPU），却会改变 CSV 里 ClockTime 的
-/// 量纲，而 `parse_trace_timestamp_ms` 是靠数值大小猜格式的（>1e14 当 FILETIME、
-/// <1e10 当秒）。换了时钟类型有可能把时间戳静默解析错，进而打散 2 秒窗口的事务聚合，
-/// 而它对「资源上界」这个目标毫无贡献。
+/// 量纲。生命周期过滤只接受 CSV 中可确认的 Windows FILETIME，不切换时钟类型。
 fn etw_trace_args(trace_name: &str, etl_path: &str) -> Vec<String> {
     vec![
         "create".to_string(),
@@ -66,32 +68,7 @@ pub(crate) struct TraceCollectionResult {
 
 #[cfg(target_os = "windows")]
 pub(crate) fn extend_tracked_process_tree(tracked: &mut HashSet<u32>) -> Result<(), String> {
-    use std::collections::HashMap;
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
-        System::Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-            TH32CS_SNAPPROCESS,
-        },
-    };
-
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err("create process snapshot failed".to_string());
-    }
-    let mut parents = HashMap::new();
-    let mut entry = PROCESSENTRY32W {
-        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-        ..unsafe { std::mem::zeroed() }
-    };
-    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
-    while has_entry {
-        parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
-        has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
-    }
-    unsafe {
-        CloseHandle(snapshot);
-    }
+    let parents = crate::services::process_service::process_parent_snapshot()?;
 
     loop {
         let descendants = parents
@@ -268,7 +245,7 @@ pub(crate) fn is_running_as_admin() -> bool {
 pub(crate) fn collect_related_files_by_trace(
     trace_name: Option<&str>,
     trace_path: Option<&str>,
-    tracked_pids: &[u32],
+    process_lifetimes: impl FnOnce(i64) -> Vec<ProcessLifetime>,
 ) -> Result<TraceCollectionResult, String> {
     let collection_started = Instant::now();
     let mut files = HashSet::new();
@@ -300,8 +277,15 @@ pub(crate) fn collect_related_files_by_trace(
         stop_started.elapsed().as_millis()
     ));
     logs.push(format!("ETL 文件：{etl_path}"));
+    let capture_end = current_filetime().ok_or("无法确定 ETW 采集结束时间")?;
+    let lifetimes = process_lifetimes(capture_end);
+    if lifetimes.is_empty() {
+        return Err("无法确认游戏进程生命周期，未使用未验证的 ETW 事件".to_string());
+    }
+    let tracked: HashMap<_, _> = lifetimes.iter().map(|lifetime| (lifetime.pid, lifetime)).collect();
+    let tracked_pids: Vec<_> = lifetimes.iter().map(|lifetime| lifetime.pid).collect();
 
-    match super::native_etw::collect_related_files_from_etl(etl_path, tracked_pids) {
+    match super::native_etw::collect_related_files_from_etl(etl_path, &tracked) {
         Ok(mut native) => {
             logs.append(&mut native.logs);
             logs.push(format!(
@@ -373,8 +357,7 @@ pub(crate) fn collect_related_files_by_trace(
     let opcode_idx = find_header_index(&headers, &["opcode"]);
     let task_idx = find_header_index(&headers, &["task"]);
     let keyword_idx = find_header_index(&headers, &["keyword"]);
-    let clock_time_idx =
-        find_header_index(&headers, &["clock-time", "clock time", "timestamp", "time"]);
+    let clock_time_idx = find_header_index(&headers, &["clock-time", "clock time", "timestamp"]);
     let user_data_idx = find_header_index(&headers, &["user data", "userdata"]);
     let path_idx = find_header_index(
         &headers,
@@ -396,13 +379,13 @@ pub(crate) fn collect_related_files_by_trace(
         user_data_idx.map_or_else(|| "未找到".to_string(), |idx| idx.to_string()),
         path_idx.map_or_else(|| "回退扫描整行".to_string(), |idx| idx.to_string())
     ));
-    let pid_set = tracked_pids.iter().copied().collect::<HashSet<u32>>();
     let device_paths = build_device_path_map();
     logs.push(format!("设备路径映射：{} 个卷", device_paths.len()));
     logs.push(format!("目标 PID：{:?}", tracked_pids));
     let mut total_rows = 0usize;
     let mut parsed_pid_rows = 0usize;
     let mut matched_pid_rows = 0usize;
+    let mut outside_lifetime_rows = 0usize;
     let mut task_prefiltered_rows = 0usize;
     let mut write_like_rows = 0usize;
     let mut extracted_path_rows = 0usize;
@@ -453,10 +436,9 @@ pub(crate) fn collect_related_files_by_trace(
         if observed_pids.len() < 12 {
             observed_pids.insert(pid);
         }
-        if !pid_set.is_empty() && !pid_set.contains(&pid) {
+        let Some(lifetime) = tracked.get(&pid) else {
             continue;
-        }
-        matched_pid_rows += 1;
+        };
         if is_kernel_file {
             let actual_task_index = task_idx.map(|index| index.saturating_sub(1));
             let task = actual_task_index
@@ -467,6 +449,11 @@ pub(crate) fn collect_related_files_by_trace(
                 continue;
             }
         }
+        let Some(event_time) = csv_event_time(trimmed, clock_time_idx, is_kernel_file, lifetime) else {
+            outside_lifetime_rows += 1;
+            continue;
+        };
+        matched_pid_rows += 1;
         let row = parse_csv_line(trimmed);
 
         let extracted = path_idx
@@ -508,9 +495,7 @@ pub(crate) fn collect_related_files_by_trace(
             operations.push(FileOperation {
                 path: path.clone(),
                 operation,
-                timestamp_ms: clock_time_idx
-                    .and_then(|idx| event_field_value(&row, idx))
-                    .and_then(|value| parse_trace_timestamp_ms(value)),
+                timestamp_ms: Some((event_time - FILETIME_UNIX_EPOCH) / FILETIME_TICKS_PER_MS),
                 pid,
                 file_object_id: file_object_id.clone(),
             });
@@ -553,6 +538,7 @@ pub(crate) fn collect_related_files_by_trace(
     logs.push(format!(
         "事件统计：总行 {total_rows}，PID 可解析 {parsed_pid_rows}，PID 命中 {matched_pid_rows}，Task 前置过滤 {task_prefiltered_rows}，写相关 {write_like_rows}，路径提取 {extracted_path_rows}，路径忽略 {ignored_path_rows}"
     ));
+    logs.push(format!("进程生命周期过滤：{outside_lifetime_rows} 条事件时间不匹配或不可用"));
     logs.push(format!(
         "文件对象关联：路径对象 {}，写入对象 {}",
         file_object_paths.len(),
@@ -658,53 +644,15 @@ pub(super) fn classify_file_operation(
     }
 }
 
-fn parse_trace_timestamp_ms(value: &str) -> Option<i64> {
-    let trimmed = value.trim().trim_matches('"');
-    if let Ok(number) = trimmed.parse::<i64>() {
-        const WINDOWS_TO_UNIX_EPOCH_MS: i64 = 11_644_473_600_000;
-        return Some(if number > 100_000_000_000_000 {
-            number / 10_000 - WINDOWS_TO_UNIX_EPOCH_MS
-        } else if number.abs() < 10_000_000_000 {
-            number * 1_000
-        } else {
-            number
-        });
-    }
-    let (date, time) = trimmed.split_once(char::is_whitespace)?;
-    let mut date_parts = date
-        .split(['/', '-'])
-        .filter_map(|part| part.parse::<i32>().ok());
-    let first = date_parts.next()?;
-    let second = date_parts.next()?;
-    let third = date_parts.next()?;
-    let (year, month, day) = if first > 31 {
-        (first, second, third)
-    } else {
-        (third, first, second)
-    };
-    let mut time_parts = time.split(':');
-    let hour = time_parts.next()?.parse::<i64>().ok()?;
-    let minute = time_parts.next()?.parse::<i64>().ok()?;
-    let seconds = time_parts.next()?.replace(',', ".");
-    let seconds_value = seconds.parse::<f64>().ok()?;
-    let days = days_from_civil(year, month, day)?;
-    Some(
-        (days * 86_400_000 + hour * 3_600_000 + minute * 60_000 + (seconds_value * 1_000.0) as i64)
-            as i64,
-    )
-}
-
-fn days_from_civil(year: i32, month: i32, day: i32) -> Option<i64> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || year < 1970 {
-        return None;
-    }
-    let year = year - i32::from(month <= 2);
-    let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let month_adjusted = month + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * month_adjusted + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    Some((era * 146097 + day_of_era - 719468) as i64)
+fn csv_event_time(
+    row: &str,
+    clock_index: Option<usize>,
+    is_kernel_file: bool,
+    lifetime: &ProcessLifetime,
+) -> Option<i64> {
+    let index = clock_index?.checked_sub(usize::from(is_kernel_file))?;
+    let ticks = fast_csv_field(row, index)?.parse::<i64>().ok()?;
+    (ticks >= FILETIME_UNIX_EPOCH && lifetime.contains(ticks)).then_some(ticks)
 }
 
 #[cfg(test)]
@@ -943,7 +891,7 @@ mod tests {
     use super::{
         classify_file_operation, etw_trace_args, event_field_value, event_file_object_id,
         event_pid_value, fast_csv_field, is_trace_artifact, parse_csv_line,
-        parse_trace_timestamp_ms, parse_u32, resolve_device_path, should_skip_kernel_task,
+        csv_event_time, parse_u32, resolve_device_path, should_skip_kernel_task, ProcessLifetime,
         KERNEL_FILE_CAPTURE_KEYWORDS,
     };
     use crate::services::learning::transactions::FileOperationKind;
@@ -1065,10 +1013,27 @@ mod tests {
     }
 
     #[test]
-    fn converts_windows_filetime_to_unix_milliseconds() {
+    fn csv_filters_reused_pids_and_unverifiable_timestamps() {
+        let started_at = 134_313_202_837_027_063;
+        let ended_at = started_at + 2;
+        let lifetime = ProcessLifetime { pid: 42, started_at, ended_at };
+        for (time, accepted) in [
+            (started_at - 1, false),
+            (started_at, true),
+            (ended_at - 1, true),
+            (ended_at, false),
+            (ended_at + 1, false),
+            (1_786_846_683_702, false),
+        ] {
+            let row = format!("Microsoft-Windows-Kernel-File,{time}");
+            assert_eq!(
+                csv_event_time(&row, Some(2), true, &lifetime),
+                accepted.then_some(time)
+            );
+        }
         assert_eq!(
-            parse_trace_timestamp_ms("134313202837027064"),
-            Some(1_786_846_683_702)
+            csv_event_time("Microsoft-Windows-Kernel-File,", Some(2), true, &lifetime),
+            None
         );
     }
 
