@@ -1,4 +1,5 @@
 use super::etw_capture::normalize_windows_path;
+use crate::domain::path_utils::normalize_path;
 use crate::domain::SaveTransactionSummary;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -26,33 +27,124 @@ pub(crate) struct FileOperation {
 
 struct TransactionGroup {
     operations: Vec<FileOperation>,
+    completed: bool,
 }
 
-/// 把一次采集到的文件操作按「2 秒静默窗口 + 同进程 + 同目录」聚成事务并打分。
-///
-/// **前置条件**：`operations` 必须已经是候选口径（见
-/// `save_learning_service::transaction_evidence`）。本函数不认识「什么算存档」，
-/// 喂多宽的口径就按多宽打分——噪音目录里的写入进来就会凭空多出几个「已完成」事务，
-/// 并顺着 `calculate_learning_confidence` 抬高识别置信度。口径刻意留在学习服务里：
-/// 候选判定是上层启发式（`is_etw_candidate`），不该为唯一一个调用点下沉到采集层。
-pub(crate) fn analyze_save_transactions(
-    mut operations: Vec<FileOperation>,
-) -> SaveTransactionSummary {
-    operations.sort_by_key(|operation| operation.timestamp_ms);
+pub(crate) struct TransactionAnalysis {
+    pub summary: SaveTransactionSummary,
+    pub completed_paths: HashMap<String, FileOperationKind>,
+}
+
+#[cfg(test)]
+pub(crate) fn analyze_save_transactions(operations: Vec<FileOperation>) -> SaveTransactionSummary {
+    analyze_save_transactions_for(operations, |path| {
+        !matches!(
+            Path::new(path).extension().and_then(|value| value.to_str()),
+            Some("tmp" | "temp" | "bak")
+        )
+    })
+    .summary
+}
+
+#[cfg(test)]
+pub(crate) fn analyze_save_transactions_for(
+    operations: Vec<FileOperation>,
+    is_target: impl Fn(&str) -> bool,
+) -> TransactionAnalysis {
+    FileOperationTrace::new(operations).analyze(|_| true, |_| true, is_target)
+}
+
+pub(crate) struct FileOperationTrace {
+    operations: Vec<FileOperation>,
+    write_sources: Vec<Option<usize>>,
+}
+
+impl FileOperationTrace {
+    pub(crate) fn new(mut operations: Vec<FileOperation>) -> Self {
+        operations.sort_by_key(|operation| operation.timestamp_ms);
+        let mut writes = PendingWrites::default();
+        let write_sources = operations
+            .iter()
+            .enumerate()
+            .map(|(index, operation)| {
+                let path = normalize_path(Path::new(&operation.path));
+                writes.record(operation, &path, index)
+            })
+            .collect();
+        Self {
+            operations,
+            write_sources,
+        }
+    }
+
+    pub(crate) fn completed_writes(&self) -> impl Iterator<Item = (&FileOperation, &FileOperation)> {
+        self.operations
+            .iter()
+            .zip(&self.write_sources)
+            .filter_map(|(target, source)| source.map(|index| (&self.operations[index], target)))
+    }
+
+    pub(crate) fn analyze(
+        self,
+        is_evidence: impl Fn(&str) -> bool,
+        is_write_source: impl Fn(&str) -> bool,
+        is_target: impl Fn(&str) -> bool,
+    ) -> TransactionAnalysis {
+        let mut linked_writes = HashSet::new();
+        let completed = self.operations
+            .iter()
+            .zip(self.write_sources)
+            .map(|(operation, source)| {
+                source.is_some_and(|index| {
+                    let path = normalize_path(Path::new(&operation.path));
+                    if !is_target(&path) || !is_write_source(&self.operations[index].path) {
+                        return false;
+                    }
+                    linked_writes.insert(index);
+                    true
+                })
+            })
+            .collect::<Vec<_>>();
+        let operations = self.operations
+            .into_iter()
+            .zip(completed)
+            .enumerate()
+            .filter_map(|(index, (operation, completed))| {
+                (completed || linked_writes.contains(&index) || is_evidence(&operation.path))
+                    .then_some((operation, completed))
+            });
+        summarize_transactions(operations, is_target)
+    }
+}
+
+fn summarize_transactions(
+    operations: impl Iterator<Item = (FileOperation, bool)>,
+    is_target: impl Fn(&str) -> bool,
+) -> TransactionAnalysis {
     let mut groups = Vec::<TransactionGroup>::new();
-    for operation in operations {
+    let mut completed_paths = HashMap::new();
+    for (operation, completed) in operations {
+        if completed {
+            completed_paths
+                .entry(normalize_path(Path::new(&operation.path)))
+                .and_modify(|kind| {
+                    if operation.operation == FileOperationKind::Rename {
+                        *kind = FileOperationKind::Rename;
+                    }
+                })
+                .or_insert(operation.operation);
+        }
         let belongs = groups.last().is_some_and(|group| {
             same_transaction_window(group.operations.last(), Some(&operation))
         });
         if belongs {
-            groups
-                .last_mut()
-                .expect("transaction group exists")
-                .operations
-                .push(operation);
+            let group = groups.last_mut().expect("transaction group exists");
+            group.operations.push(operation);
+            group.completed |= completed;
         } else {
             groups.push(TransactionGroup {
                 operations: vec![operation],
+                completed,
             });
         }
     }
@@ -73,12 +165,14 @@ pub(crate) fn analyze_save_transactions(
         raw_operation_count += group.operations.len();
         let compacted_group = TransactionGroup {
             operations: compact_group_operations(&group.operations),
+            completed: group.completed,
         };
         operation_count += compacted_group.operations.len();
         let group_confidence = score_group(
             &compacted_group,
             &mut affected_files,
             &mut affected_directories,
+            &is_target,
         );
         confidence = confidence.max(group_confidence);
         if group
@@ -100,7 +194,7 @@ pub(crate) fn analyze_save_transactions(
             .max();
         started_at = min_optional(started_at, group_start);
         ended_at = max_optional(ended_at, group_end);
-        if group_confidence >= 80 {
+        if group.completed {
             completed_count += 1;
         } else if group_confidence >= 45 {
             candidate_count += 1;
@@ -138,7 +232,7 @@ pub(crate) fn analyze_save_transactions(
     affected_files.sort();
     let mut affected_directories = affected_directories.into_iter().collect::<Vec<_>>();
     affected_directories.sort();
-    SaveTransactionSummary {
+    let summary = SaveTransactionSummary {
         status: status.to_string(),
         confidence,
         transaction_count: groups.len(),
@@ -148,6 +242,70 @@ pub(crate) fn analyze_save_transactions(
         ended_at: ended_at.map(|value| value.to_string()),
         operation_count,
         notes,
+    };
+    TransactionAnalysis {
+        summary,
+        completed_paths,
+    }
+}
+
+#[derive(Default)]
+struct PendingWrites {
+    by_object: HashMap<(u32, String), (String, i64, usize)>,
+    by_path: HashMap<(u32, String), (i64, usize)>,
+}
+
+impl PendingWrites {
+    fn record(&mut self, operation: &FileOperation, path: &str, index: usize) -> Option<usize> {
+        let now = operation.timestamp_ms?;
+        if path.is_empty() {
+            return None;
+        }
+        let path_key = (operation.pid, path.to_owned());
+        let object_key = operation
+            .file_object_id
+            .as_ref()
+            .map(|object| (operation.pid, object.clone()));
+        let within_window =
+            |written: i64| now >= written && now.saturating_sub(written) <= TRANSACTION_GAP_MS;
+        match operation.operation {
+            FileOperationKind::Write => {
+                if let Some(key) = object_key {
+                    self.by_object.insert(key, (path.to_owned(), now, index));
+                } else {
+                    self.by_path.insert(path_key, (now, index));
+                }
+            }
+            FileOperationKind::Close => {
+                return if let Some(key) = object_key {
+                    self.by_object
+                        .remove(&key)
+                        .and_then(|(written_path, time, source)| {
+                            (written_path == path && within_window(time)).then_some(source)
+                        })
+                } else {
+                    self.by_path.remove(&path_key).and_then(|(time, source)| {
+                        within_window(time).then_some(source)
+                    })
+                };
+            }
+            FileOperationKind::Rename => {
+                self.by_path.remove(&path_key);
+                return object_key
+                    .and_then(|key| self.by_object.remove(&key))
+                    .and_then(|(written_path, time, source)| {
+                        (written_path != path && within_window(time)).then_some(source)
+                    });
+            }
+            FileOperationKind::Create | FileOperationKind::Delete => {
+                self.by_path.remove(&path_key);
+                if let Some(key) = object_key {
+                    self.by_object.remove(&key);
+                }
+            }
+            FileOperationKind::Unknown => {}
+        }
+        None
     }
 }
 
@@ -204,6 +362,7 @@ fn score_group(
     group: &TransactionGroup,
     affected_files: &mut HashSet<String>,
     affected_directories: &mut HashSet<String>,
+    is_target: &impl Fn(&str) -> bool,
 ) -> u8 {
     let mut score = 0i16;
     let mut has_write = false;
@@ -212,19 +371,17 @@ fn score_group(
     let mut has_delete = false;
     let mut has_unknown = false;
     let mut pids = HashSet::new();
-    let mut object_paths = HashMap::new();
+    let mut has_target = false;
 
     for operation in &group.operations {
         let path = normalize_windows_path(&operation.path);
         if path.is_empty() {
             continue;
         }
+        has_target |= is_target(&normalize_path(Path::new(&operation.path)));
         affected_files.insert(path.clone());
         if let Some(parent) = Path::new(&path).parent() {
             affected_directories.insert(normalize_windows_path(&parent.to_string_lossy()));
-        }
-        if let Some(object_id) = operation.file_object_id.as_ref() {
-            object_paths.insert(object_id.clone(), path);
         }
         pids.insert(operation.pid);
         match operation.operation {
@@ -265,8 +422,13 @@ fn score_group(
     {
         score -= 20;
     }
-    let _ = object_paths;
-    score.clamp(0, 100) as u8
+    if group.completed {
+        score.clamp(80, 100) as u8
+    } else if has_target {
+        score.clamp(0, 79) as u8
+    } else {
+        0
+    }
 }
 
 fn min_optional(current: Option<i64>, candidate: Option<i64>) -> Option<i64> {
@@ -329,15 +491,56 @@ mod tests {
 
     #[test]
     fn temp_write_and_rename_is_completed() {
-        let result = analyze_save_transactions(vec![
+        let mut operations = vec![
             operation("C:/save/slot.tmp", FileOperationKind::Write, Some(1_000)),
             operation("C:/save/slot.sav", FileOperationKind::Rename, Some(1_200)),
-        ]);
+        ];
+        assert_ne!(
+            analyze_save_transactions(operations.clone()).status,
+            "completed"
+        );
+        for event in &mut operations {
+            event.file_object_id = Some("0x1234".to_owned());
+        }
+        let result = analyze_save_transactions(operations);
         assert_eq!(result.status, "completed");
         assert!(result
             .affected_files
             .iter()
             .any(|path| path.ends_with("slot.sav")));
+    }
+
+    #[test]
+    fn unrelated_closes_and_temporary_files_do_not_complete_a_save() {
+        for (written, closed) in [
+            ("C:/save/a.sav", "C:/save/b.sav"),
+            ("C:/save/slot.tmp", "C:/save/slot.tmp"),
+        ] {
+            let result = analyze_save_transactions(vec![
+                operation(written, FileOperationKind::Write, Some(1_000)),
+                operation(closed, FileOperationKind::Close, Some(1_100)),
+            ]);
+            assert_ne!(result.status, "completed");
+            assert!(result.confidence < 80);
+        }
+    }
+
+    #[test]
+    fn writes_survive_unrelated_events_but_not_a_different_file_object() {
+        let mut write = operation("C:/save/slot.sav", FileOperationKind::Write, Some(1_000));
+        write.file_object_id = Some("object-1".into());
+        let mut close = operation("C:/save/slot.sav", FileOperationKind::Close, Some(1_200));
+        close.file_object_id = Some("object-2".into());
+        let other = operation("C:/other/slot.sav", FileOperationKind::Write, Some(1_100));
+        assert_ne!(
+            analyze_save_transactions(vec![write.clone(), other.clone(), close.clone()]).status,
+            "completed"
+        );
+        close.file_object_id = write.file_object_id.clone();
+        assert_eq!(
+            analyze_save_transactions(vec![write, other, close]).status,
+            "completed"
+        );
     }
 
     #[test]

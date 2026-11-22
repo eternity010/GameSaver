@@ -129,6 +129,7 @@ const IDLE_FALLBACK_MS = 10000;
 let subscribers = 0;
 let loadGeneration = 0;
 let inflight: Promise<void> | undefined;
+let refreshRequested = false;
 let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
 let stopListening: UnlistenFn | undefined;
@@ -157,25 +158,32 @@ function scheduleFallback() {
 
 /** 重新拉取任务列表；并发调用合并为同一次请求。 */
 export function refresh(): Promise<void> {
+  refreshRequested = true;
   if (inflight) return inflight;
   const generation = ++loadGeneration;
-  inflight = listTasks()
-    .then((loaded) => {
-      if (generation !== loadGeneration) return;
-      tasks.value = loaded;
-      error.value = "";
-    })
-    .catch((reason) => {
-      if (generation !== loadGeneration) return;
-      error.value = String(reason);
-    })
-    .finally(() => {
-      inflight = undefined;
-      if (generation === loadGeneration) {
-        loading.value = false;
-        scheduleFallback();
+  const request = (async () => {
+    do {
+      refreshRequested = false;
+      try {
+        const loaded = await listTasks();
+        if (generation !== loadGeneration) return;
+        if (refreshRequested) continue;
+        tasks.value = loaded;
+        error.value = "";
+      } catch (reason) {
+        if (generation !== loadGeneration) return;
+        if (refreshRequested) continue;
+        error.value = String(reason);
       }
-    });
+    } while (refreshRequested && generation === loadGeneration);
+  })().finally(() => {
+    if (inflight !== request) return;
+    inflight = undefined;
+    if (refreshRequested) return refresh();
+    loading.value = false;
+    scheduleFallback();
+  });
+  inflight = request;
   return inflight;
 }
 
@@ -202,6 +210,9 @@ async function startListening() {
 function release() {
   subscribers = Math.max(0, subscribers - 1);
   if (subscribers > 0) return;
+  loadGeneration++;
+  refreshRequested = false;
+  inflight = undefined;
   stopListening?.();
   stopListening = undefined;
   if (debounceTimer) clearTimeout(debounceTimer);
@@ -212,10 +223,18 @@ function release() {
 
 /** 订阅共享任务流。 */
 export function useTaskFeed(): TaskFeed {
-  if (subscribers === 0) {
+  subscribers += 1;
+  if (subscribers === 1) {
     void startListening();
     void refresh();
   }
-  subscribers += 1;
-  return { tasks, loading, error, refresh, release };
+  let released = false;
+  return {
+    tasks, loading, error, refresh,
+    release: () => {
+      if (released) return;
+      released = true;
+      release();
+    },
+  };
 }

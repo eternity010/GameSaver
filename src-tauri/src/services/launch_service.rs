@@ -6,7 +6,7 @@ use crate::{
         TaskCategory, TaskStatus, TaskSummary,
     },
     repositories::{GameRepository, SaveRepository},
-    services::{GameLibraryService, TaskService},
+    services::{GameBodyUpdateService, GameLibraryService, TaskService},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -22,6 +22,7 @@ use tauri::{AppHandle, Manager};
 pub struct LaunchPrecheck {
     pub game_uid: String,
     pub can_launch: bool,
+    pub body_directory_exists: bool,
     pub executable_exists: bool,
     pub save_profile_ready: bool,
     pub valid_scope_count: usize,
@@ -41,7 +42,8 @@ impl LaunchService {
         if !matches!(game.lifecycle, GameLifecycle::Active) {
             issues.push("游戏尚未完成设置".to_string());
         }
-        if !Path::new(&game.managed_path).is_dir() {
+        let body_directory_exists = Path::new(&game.managed_path).is_dir();
+        if !body_directory_exists {
             issues.push("游戏本体目录不存在".to_string());
         }
         let executable = match managed_executable_path(&game) {
@@ -67,6 +69,7 @@ impl LaunchService {
         Ok(LaunchPrecheck {
             game_uid: game.game_uid,
             can_launch: issues.is_empty(),
+            body_directory_exists,
             executable_exists,
             save_profile_ready,
             valid_scope_count,
@@ -88,7 +91,7 @@ impl LaunchService {
         if state.has_exclusive_operation(&operation_lock, &game_uid) {
             return Err("游戏正在进行存档版本操作".to_string());
         }
-        SaveRepository::ensure_no_pending_restore(app, &game_uid)?;
+        ensure_game_transactions_idle(app, state, &game_uid)?;
         if let Ok(sessions) = state.learning_sessions.lock() {
             if sessions.values().any(|s| s.view.game_uid == game_uid) {
                 return Err("游戏正在进行存档识别学习，无法直接启动".to_string());
@@ -171,7 +174,9 @@ impl LaunchService {
     pub fn restore_running_sessions(app: &AppHandle, state: &AppState) -> Vec<String> {
         let mut restored = Vec::new();
         for (game, root) in adoptable_sessions(state) {
-            match resume_session(app, state, game, root) {
+            match ensure_game_transactions_idle(app, state, &game.game_uid)
+                .and_then(|()| resume_session(app, state, game, root))
+            {
                 Ok(game_uid) => restored.push(game_uid),
                 Err(error) => crate::logging::error(format!("重建游戏会话失败：{error}")),
             }
@@ -181,6 +186,15 @@ impl LaunchService {
         }
         restored
     }
+}
+
+fn ensure_game_transactions_idle(
+    app: &AppHandle,
+    state: &AppState,
+    game_uid: &str,
+) -> Result<(), String> {
+    GameBodyUpdateService::ensure_no_pending_update(&state.games_root()?, game_uid)?;
+    SaveRepository::ensure_no_pending_restore(app, game_uid)
 }
 
 /// 会话的「根进程」：决定如何等待它退出、以及取消时如何终止它。

@@ -37,6 +37,7 @@ const session = ref<SaveLearningSession | null>(null);
 const learningResult = ref<SaveLearningResult | null>(null);
 const reviewScopes = ref<SaveScope[]>([]);
 const scopeEvidence = ref<Record<string, { level: SaveCandidateEvidenceLevel; reason: string }>>({});
+const observedFilesByScope = new Map<string, Map<string, string>>();
 const validatingCandidates = ref(false);
 const confidence = ref(0);
 // `confidence` 是 30–95 之间的**评分**，不是概率（后端 calculate_learning_confidence
@@ -54,9 +55,11 @@ const previewing = ref(false);
 // 与 `previewing` 分开：前者是「后台预取」，不该禁用主动作按钮。
 const inferringDrafts = ref(false);
 const inferredDrafts = ref<SaveLearningResult | null>(null);
+const inferenceError = ref("");
 // 同一次添加里只自动推一次：`phase` 在「学习失败/取消」后会退回 `ready`，不该重新遍历一遍目录。
 // 换游戏（gameUid 变化）时重置。
 let inferredForGameUid = "";
+let inferenceGeneration = 0;
 const cancelling = ref(false);
 const showLargeConfirmModal = ref(false);
 const largeConfirmMessage = ref("");
@@ -72,11 +75,24 @@ const isBusy = computed(() => resuming.value || !!taskId.value || phase.value ==
 const canStart = computed(() => !resuming.value && !taskId.value && Boolean(displayName.value.trim() && sourcePath.value.trim() && executablePath.value.trim()) && phase.value === "form");
 const stepNumber = computed(() => phase.value === "form" || phase.value === "copying" ? 1 : phase.value === "ready" || phase.value === "capturing" ? 2 : phase.value === "analyzing" || phase.value === "review" ? 3 : 4);
 const stepTitle = computed(() => phase.value === "form" || phase.value === "copying" ? "选择并复制游戏本体" : phase.value === "ready" || phase.value === "capturing" ? "完成一次游戏内保存" : phase.value === "analyzing" ? "分析存档变化" : phase.value === "review" ? "确认存档保护范围" : "添加完成");
-const canConfirm = computed(() => reviewScopes.value.length > 0 && reviewScopes.value.every((scope) => scope.confirmedFiles.length > 0 || scope.includeDirectories.length > 0));
+const canConfirm = computed(() => reviewScopes.value.length > 0 && reviewScopes.value.every((scope) =>
+  scope.confirmedFiles.length > 0 || (scope.unknownFilePolicy === "protect" && scope.includeDirectories.length > 0),
+));
 const hasReviewCandidates = computed(() => reviewScopes.value.some((scope) => scopeEvidence.value[scopeEvidenceKey(scope)]?.level === "review"));
 // 只读初稿（评审 A1）：没有启动游戏、没有任何写入证据。文案必须与「真的跑过一次识别」
 // 明确区分 —— 否则用户会把一份猜出来的范围当成已经被证据确认过的。
 const isPreviewDraft = computed(() => learningResult.value?.eventCaptureMode === "preview");
+const captureInsufficient = computed(() => learningResult.value?.eventCaptureMode === "insufficient");
+const capturePartial = computed(() => learningResult.value?.eventCaptureMode === "etw_partial");
+const captureEvidenceLabel = computed(() => {
+  switch (learningResult.value?.eventCaptureMode) {
+    case "etw": return "ETW 写入证据";
+    case "etw_partial": return "ETW 采集不完整";
+    case "snapshot": return "快照差异证据";
+    case "preview": return "只读推断 · 无写入证据";
+    default: return "没有可验证的采集证据";
+  }
+});
 
 const rootTypeLabel: Record<SaveRootType, string> = {
   managed_game: "游戏目录",
@@ -130,37 +146,69 @@ function applyInitialLearningResult(result: SaveLearningResult) {
   reviewScopes.value = result.scopeDrafts.map((draft) => ({ ...draft.scope, confirmedFiles: [...draft.scope.confirmedFiles], includeDirectories: [...draft.scope.includeDirectories], excludeExact: [...draft.scope.excludeExact], excludePatterns: [...draft.scope.excludePatterns], excludeDirectories: [...draft.scope.excludeDirectories] }));
   scopeEvidence.value = Object.fromEntries(result.scopeDrafts.map((draft) => [scopeEvidenceKey(draft.scope), { level: draft.evidenceLevel, reason: draft.evidenceReason }]));
   proposedByScope.value = Object.fromEntries(result.scopeDrafts.map((draft) => [scopeEvidenceKey(draft.scope), [...(draft.proposedFiles ?? [])]]));
+  observedFilesByScope.clear();
+  if (isCompleteLearningRound(result)) {
+    for (const draft of result.scopeDrafts) {
+      observedFilesByScope.set(scopeEvidenceKey(draft.scope), new Map(observedSaveFiles(draft).map((file) => [scopeFileKey(file), result.sessionId])));
+    }
+  }
   confidence.value = result.confidence;
+}
+
+function isCompleteLearningRound(result: SaveLearningResult): boolean {
+  return Boolean(result.sessionId) && (result.eventCaptureMode === "etw" || result.eventCaptureMode === "snapshot");
+}
+
+function observedSaveFiles(draft: SaveLearningResult["scopeDrafts"][number]): string[] {
+  const changes = new Set(draft.changedFiles.map(scopeFileKey));
+  return draft.scope.confirmedFiles.filter((file) => changes.has(scopeFileKey(file)));
 }
 
 function mergeCandidateVerification(result: SaveLearningResult) {
   const verified = new Map(result.scopeDrafts.map((draft) => [scopeEvidenceKey(draft.scope), draft]));
   let promoted = 0;
+  const verifiedCapture = isCompleteLearningRound(result);
   for (const scope of reviewScopes.value) {
     const key = scopeEvidenceKey(scope);
     const prior = scopeEvidence.value[key];
     const matched = verified.get(key);
     if (!matched) continue;
-    for (const file of matched.scope.confirmedFiles) {
-      if (!scope.confirmedFiles.includes(file)) scope.confirmedFiles.push(file);
+    const retained = new Set(scope.confirmedFiles.map(scopeFileKey));
+    const previous = observedFilesByScope.get(key) ?? new Map<string, string>();
+    let repeated = false;
+    for (const file of observedSaveFiles(matched)) {
+      if (isExactlyExcluded(scope, file)) continue;
+      const fileKey = scopeFileKey(file);
+      if (verifiedCapture) {
+        const observedIn = previous.get(fileKey);
+        repeated ||= retained.has(fileKey) && observedIn !== undefined && observedIn !== result.sessionId;
+        previous.set(fileKey, result.sessionId);
+        if (!retained.has(fileKey)) {
+          scope.confirmedFiles.push(file);
+          retained.add(fileKey);
+        }
+      }
     }
-    const extraProposals = matched.proposedFiles ?? [];
+    if (verifiedCapture) observedFilesByScope.set(key, previous);
+    const extraProposals = (matched.proposedFiles ?? []).filter((file) => !isExactlyExcluded(scope, file));
     if (extraProposals.length) {
       proposedByScope.value[key] = [...new Set([...(proposedByScope.value[key] ?? []), ...extraProposals])];
     }
-    if (prior?.level === "review") {
-      scopeEvidence.value[key] = { level: "strong", reason: "两次独立保存均命中此范围，已提升为高可信。" };
+    if (prior?.level === "review" && repeated) {
+      scopeEvidence.value[key] = { level: "strong", reason: "两轮独立采集均观察到同一候选存档变化，已提升为高可信。" };
       promoted += 1;
     }
   }
   const summary = promoted > 0
     ? `再次保存验证完成：${promoted} 个候选范围已提升为高可信。`
-    : "再次保存验证未命中待确认范围；现有范围仍保留，可继续手动调整。";
+    : verifiedCapture
+      ? "尚未在两轮独立采集中观察到同一候选文件变化；现有范围仍保留。"
+      : "这次验证的采集证据不完整，现有范围保留，不提升可信度。";
   learningResult.value = {
     ...result,
     notes: [...(learningResult.value?.notes || []), summary, ...result.notes],
   };
-  confidence.value = Math.max(confidence.value, result.confidence, promoted > 0 ? 90 : 0);
+  if (promoted > 0) confidence.value = Math.max(confidence.value, 90);
 }
 
 async function chooseSource() {
@@ -368,9 +416,7 @@ async function analyze() {
       }
     });
   } catch (reason) {
-    const wasValidating = validatingCandidates.value;
-    validatingCandidates.value = false;
-    phase.value = wasValidating ? "review" : "capturing";
+    phase.value = "capturing";
     error.value = String(reason);
   }
 }
@@ -382,15 +428,17 @@ async function analyze() {
  * 证据等级一律是「待确认」，界面上也会换成只读初稿的文案。
  */
 async function previewDraft() {
-  if (!completedGame.value || phase.value !== "ready" || previewing.value) return;
+  const gameUid = completedGame.value?.gameUid;
+  if (!gameUid || phase.value !== "ready" || previewing.value || inferringDrafts.value) return;
+  if (inferredForGameUid === gameUid && inferredDrafts.value) {
+    openInferredDraft();
+    return;
+  }
   error.value = "";
   previewing.value = true;
-  message.value = "正在按目录推断候选范围";
   try {
-    applyInitialLearningResult(await previewSaveScopes(completedGame.value.gameUid));
-    phase.value = "review";
-  } catch (reason) {
-    error.value = String(reason);
+    await inferDraftsAhead(gameUid, true);
+    if (!disposed && completedGame.value?.gameUid === gameUid) openInferredDraft();
   } finally {
     previewing.value = false;
   }
@@ -403,21 +451,23 @@ async function previewDraft() {
  * 用户不知道点了会发生什么，多数人不会点 —— 于是就变成「跑完一整套学习 + 手动保存一次，
  * 才发现目录根本不对」。自动跑一次把这份信息提前。
  *
- * **不阻塞主动作**：用独立的 `inferringDrafts`，不并入 `previewing` —— 推断期间「启动并开始识别」
- * 必须仍然可点。推断失败也只是少一块提示（`inferredDrafts` 保持 `null`），不写 `error`、
- * 不影响继续走完整识别。
+ * 推断期间仍可启动完整识别；失败显示在初稿卡片中，不影响正式识别。
  */
-async function inferDraftsAhead(gameUid: string) {
-  if (!gameUid || inferringDrafts.value || inferredForGameUid === gameUid) return;
+async function inferDraftsAhead(gameUid: string, force = false) {
+  if (!gameUid || (!force && inferredForGameUid === gameUid)) return;
+  const generation = ++inferenceGeneration;
   inferredForGameUid = gameUid;
   inferringDrafts.value = true;
+  inferredDrafts.value = null;
+  inferenceError.value = "";
+  const isCurrent = () => !disposed && generation === inferenceGeneration && completedGame.value?.gameUid === gameUid;
   try {
-    inferredDrafts.value = await previewSaveScopes(gameUid);
-  } catch {
-    // 刻意吞掉：这是一次「锦上添花」的后台预取，失败不该在用户还没提要求时就报错。
-    inferredDrafts.value = null;
+    const result = await previewSaveScopes(gameUid);
+    if (isCurrent()) inferredDrafts.value = result;
+  } catch (reason) {
+    if (isCurrent()) inferenceError.value = String(reason);
   } finally {
-    inferringDrafts.value = false;
+    if (!disposed && generation === inferenceGeneration) inferringDrafts.value = false;
   }
 }
 
@@ -439,7 +489,7 @@ watch(
  * 还可能拿到与刚才展示不一致的清单，属于无谓的不确定。想拿新快照就重新走完整识别。
  */
 function openInferredDraft() {
-  if (phase.value !== "ready" || !inferredDrafts.value) return;
+  if (phase.value !== "ready" || inferredForGameUid !== completedGame.value?.gameUid || !inferredDrafts.value) return;
   error.value = "";
   applyInitialLearningResult(inferredDrafts.value);
   phase.value = "review";
@@ -493,7 +543,11 @@ function addFile(scopeIndex: number) {
   const value = (newFileByScope.value[scopeIndex] || "").trim().replace(/\\/g, "/");
   if (!value) return;
   const scope = reviewScopes.value[scopeIndex];
-  if (scope && !scope.confirmedFiles.includes(value)) scope.confirmedFiles.push(value);
+  if (scope) {
+    const key = scopeFileKey(value);
+    scope.excludeExact = scope.excludeExact.filter((file) => scopeFileKey(file) !== key);
+    if (!scope.confirmedFiles.some((file) => scopeFileKey(file) === key)) scope.confirmedFiles.push(value);
+  }
   newFileByScope.value[scopeIndex] = "";
 }
 
@@ -510,7 +564,7 @@ function adoptProposedFiles(scopeIndex: number) {
   if (!scope) return;
   const key = scopeEvidenceKey(scope);
   for (const file of proposedByScope.value[key] ?? []) {
-    if (!scope.confirmedFiles.includes(file)) scope.confirmedFiles.push(file);
+    if (!scope.confirmedFiles.includes(file) && !isExactlyExcluded(scope, file)) scope.confirmedFiles.push(file);
   }
   proposedByScope.value[key] = [];
 }
@@ -521,8 +575,20 @@ function toggleScopePolicy(scopeIndex: number) {
   scope.unknownFilePolicy = scope.unknownFilePolicy === "protect" ? "ignore" : "protect";
 }
 
+function scopeFileKey(file: string): string {
+  return file.replace(/\\/g, "/").replace(/^(\.\/)+/, "").toLowerCase();
+}
+
+function isExactlyExcluded(scope: SaveScope, file: string): boolean {
+  const key = scopeFileKey(file);
+  return scope.excludeExact.some((excluded) => scopeFileKey(excluded) === key);
+}
+
 function removeFile(scopeIndex: number, fileIndex: number) {
-  reviewScopes.value[scopeIndex]?.confirmedFiles.splice(fileIndex, 1);
+  const scope = reviewScopes.value[scopeIndex];
+  if (!scope) return;
+  const [file] = scope.confirmedFiles.splice(fileIndex, 1);
+  if (file && !isExactlyExcluded(scope, file)) scope.excludeExact.push(file);
 }
 
 function removePattern(scopeIndex: number, patternIndex: number) {
@@ -541,6 +607,7 @@ function removeScope(scopeIndex: number) {
   const [removed] = reviewScopes.value.splice(scopeIndex, 1);
   if (removed) {
     const key = scopeEvidenceKey(removed);
+    observedFilesByScope.delete(key);
     delete scopeEvidence.value[key];
     delete proposedByScope.value[key];
   }
@@ -676,7 +743,7 @@ onUnmounted(() => { disposed = true; stopPolling(); });
 
     <section v-else-if="phase === 'ready' || phase === 'capturing'" class="wizard-form">
       <section class="wizard-section learning-intro"><div class="section-icon"><Gamepad2 :size="22" /></div><div><h2>{{ completedGame?.displayName }} 的存档保护</h2><p>{{ validatingCandidates ? "只验证待确认的候选目录。请在游戏内再次完成一次保存。" : "启动受管游戏，在游戏内完成一次保存。建议保存后退出游戏再点击分析，确保数据完整落盘。" }}</p></div></section>
-      <section class="wizard-section"><div class="task-progress-heading"><span>{{ validatingCandidates ? "再次验证会话" : "学习会话" }}</span><strong v-if="session">PID {{ session.rootPid }}</strong><strong v-else>尚未启动</strong></div><p v-if="phase === 'ready'" class="field-note">只会记录本次学习期间的文件变化，不会立即创建正式存档版本。</p><p v-else class="field-note">在游戏内完成一次保存后，建议先退出游戏，再点击分析；也可以直接点击分析。</p><div v-if="phase === 'capturing'" class="capture-state"><span class="loader"></span><strong>{{ validatingCandidates ? "正在验证候选范围" : "正在记录文件变化" }}</strong><span>{{ message }}</span></div></section>
+      <section class="wizard-section"><div class="task-progress-heading"><span>{{ validatingCandidates ? "再次验证会话" : "学习会话" }}</span><strong v-if="session">PID {{ session.rootPid }}</strong><strong v-else>尚未启动</strong></div><p v-if="phase === 'ready'" class="field-note">只会记录本次学习期间的文件变化，不会立即创建正式存档版本。</p><p v-else class="field-note">在游戏内完成一次保存后，请完全退出游戏，再点击分析。</p><div v-if="phase === 'capturing'" class="capture-state"><span class="loader"></span><strong>{{ validatingCandidates ? "正在验证候选范围" : "正在记录文件变化" }}</strong><span>{{ message }}</span></div></section>
       <section v-if="phase === 'ready'" class="wizard-section inferred-scopes">
         <div class="editor-label">
           <strong><FolderSearch :size="15" /> 已推断的候选目录</strong>
@@ -684,18 +751,25 @@ onUnmounted(() => { disposed = true; stopPolling(); });
           <span v-else-if="inferredDrafts">{{ inferredDrafts.scopeDrafts.length }} 个</span>
         </div>
         <p v-if="inferringDrafts" class="scope-note">正在按目录名与文件特征推断，不影响你继续启动识别。</p>
-        <template v-else-if="inferredDrafts && inferredDrafts.scopeDrafts.length">
-          <ul class="inferred-scope-list">
+        <template v-else-if="inferredDrafts">
+          <p class="scope-note">{{ inferredDrafts.notes[0] }}</p>
+          <ul v-if="inferredDrafts.scopeDrafts.length" class="inferred-scope-list">
             <li v-for="(draft, index) in inferredDrafts.scopeDrafts.slice(0, 5)" :key="`${draft.scope.rootPath}-${index}`">
               <span class="inferred-root-label">{{ rootTypeLabel[draft.scope.rootType] ?? draft.scope.rootType }}</span>
               <code :title="draft.scope.rootPath">{{ draft.scope.rootPath }}</code>
             </li>
           </ul>
           <p v-if="inferredDrafts.scopeDrafts.length > 5" class="scope-note">另有 {{ inferredDrafts.scopeDrafts.length - 5 }} 个候选目录，可在初稿审阅里逐个查看。</p>
-          <p class="scope-note">这是<strong>只读推断</strong>：没有启动游戏、没有任何写入证据，仅按目录名与文件特征判断。可以先看一眼，再启动识别做正式确认。</p>
-          <div class="inline-editor"><button class="secondary-button" type="button" :disabled="previewing" @click="openInferredDraft"><ArrowLeft :size="15" />查看并编辑这份初稿</button></div>
+          <p v-if="inferredDrafts.scopeDrafts.length" class="scope-note">没有记录游戏写入。初稿默认只保护列出的文件，请逐项确认。</p>
+          <div class="inline-editor">
+            <button v-if="inferredDrafts.scopeDrafts.length" class="secondary-button" type="button" :disabled="previewing" @click="openInferredDraft"><ArrowLeft :size="15" />查看并编辑这份初稿</button>
+            <button class="secondary-button" type="button" :disabled="previewing" @click="inferDraftsAhead(completedGame?.gameUid || '', true)">重新推断</button>
+          </div>
         </template>
-        <p v-else-if="inferredDrafts" class="scope-note">没有按目录名推断出存档目录：候选目录名里没有出现游戏名时，普通权限发现不了它。启动识别后可以手动添加存档目录。</p>
+        <template v-else-if="inferenceError">
+          <p class="scope-note">只读初稿扫描失败：{{ inferenceError }}。仍可启动正式识别。</p>
+          <button class="secondary-button" type="button" :disabled="previewing" @click="inferDraftsAhead(completedGame?.gameUid || '', true)">重试推断</button>
+        </template>
       </section>
       <p v-if="error" class="error-message" role="alert">{{ error }}</p>
       <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="cancelling" @click="abandonPendingGame">放弃添加</button><button v-if="phase === 'capturing'" class="secondary-button" type="button" :disabled="cancelling" @click="cancelTaskOrLearning"><LoaderCircle v-if="cancelling" :size="16" class="spin" /><X v-else :size="16" />{{ cancelling ? "正在停止" : `停止${validatingCandidates ? "验证" : "识别"}` }}</button><button v-if="phase === 'ready'" class="secondary-button" type="button" :disabled="previewing || inferringDrafts" title="不启动游戏，直接按存档目录名与文件特征推断一份待确认的初稿" @click="previewDraft"><LoaderCircle v-if="previewing" :size="16" class="spin" /><FolderOpen v-else :size="16" />{{ previewing ? "正在推断" : "跳过识别，先看初稿" }}</button><button v-if="phase === 'ready'" class="primary-button" type="button" :disabled="previewing" @click="beginLearning"><Gamepad2 :size="17" />启动并开始识别</button><button v-else class="primary-button" type="button" @click="analyze"><Check :size="17" />完成保存，开始{{ validatingCandidates ? "验证" : "分析" }}</button></footer>
@@ -707,7 +781,7 @@ onUnmounted(() => { disposed = true; stopPolling(); });
     </section>
 
     <section v-else-if="phase === 'review'" class="wizard-form">
-      <section class="wizard-section result-summary"><div><p class="eyebrow">{{ isPreviewDraft ? "只读初稿" : "识别结果" }}</p><h2>确认存档保护范围</h2><p v-if="isPreviewDraft">没有启动游戏，也没有记录任何写入证据；以下 {{ reviewScopes.length }} 个候选范围只按目录名与文件特征推断，请逐项确认，或改回完整识别。</p><p v-else>{{ learningResult?.changedFiles.length || 0 }} 个文件发生变化，已按目录整理为 {{ reviewScopes.length }} 个候选范围。</p><div class="evidence-summary"><span>{{ isPreviewDraft ? "只读推断 · 无写入证据" : learningResult?.eventCaptureMode === "etw" ? "ETW + 快照证据" : "快照差异证据" }}</span><span v-if="learningResult?.transactionSummary">事务 {{ learningResult.transactionSummary.transactionCount }} 个 · {{ learningResult.transactionSummary.operationCount }} 条操作 · {{ learningResult.transactionSummary.status === "completed" ? "已确认" : learningResult.transactionSummary.status === "candidate" ? "候选" : "证据不足" }}</span></div></div><div v-if="isPreviewDraft" class="confidence-score"><strong>初稿</strong><span>只读推断 · 未经写入证据校验</span></div><div v-else class="confidence-score"><strong>{{ confidenceBand }}</strong><span>识别置信度 · 评分 {{ confidence }}/100</span></div></section>
+      <section class="wizard-section result-summary"><div><p class="eyebrow">{{ isPreviewDraft ? "只读初稿" : "识别结果" }}</p><h2>确认存档保护范围</h2><p v-if="isPreviewDraft">没有启动游戏，也没有记录任何写入证据；以下 {{ reviewScopes.length }} 个候选范围只按目录名与文件特征推断，请逐项确认，或改回完整识别。</p><p v-else-if="captureInsufficient">本次没有可验证的写入或快照差异。可以重新识别，或手动添加存档目录。</p><p v-else>{{ learningResult?.changedFiles.length || 0 }} 个候选文件，已按目录整理为 {{ reviewScopes.length }} 个候选范围。</p><div class="evidence-summary"><span>{{ captureEvidenceLabel }}</span><span v-if="learningResult?.transactionSummary">事务 {{ learningResult.transactionSummary.transactionCount }} 个 · {{ learningResult.transactionSummary.operationCount }} 条操作 · {{ learningResult.transactionSummary.status === "completed" ? "已确认" : learningResult.transactionSummary.status === "candidate" ? "候选" : "证据不足" }}</span></div></div><div v-if="isPreviewDraft" class="confidence-score"><strong>初稿</strong><span>只读推断 · 未经写入证据校验</span></div><div v-else-if="capturePartial || captureInsufficient" class="confidence-score"><strong>{{ capturePartial ? "待核对" : "证据不足" }}</strong><span>未完成可靠验证</span></div><div v-else class="confidence-score"><strong>{{ confidenceBand }}</strong><span>识别置信度 · 评分 {{ confidence }}/100</span></div></section>
       <section v-for="(scope, scopeIndex) in reviewScopes" :key="`${scope.rootPath}-${scopeIndex}`" class="wizard-section scope-editor">
         <header class="scope-heading">
           <div>
@@ -726,8 +800,9 @@ onUnmounted(() => { disposed = true; stopPolling(); });
             </button>
           </div>
         </header>
-        <div class="editor-block"><div class="editor-label"><strong>保护文件</strong><span>{{ scope.confirmedFiles.length }} 项</span></div><div class="chip-list"><span v-for="(file, fileIndex) in scope.confirmedFiles" :key="file" class="file-chip">{{ file }}<button type="button" :aria-label="`删除 ${file}`" title="删除文件" @click="removeFile(scopeIndex, fileIndex)"><X :size="13" /></button></span><span v-if="!scope.confirmedFiles.length && !scope.includeDirectories.length" class="muted-text">暂无确认文件</span></div><div class="inline-editor"><input v-model="newFileByScope[scopeIndex]" type="text" placeholder="输入相对文件名，例如 save.dat" @keyup.enter="addFile(scopeIndex)" /><button class="secondary-button" type="button" @click="addFile(scopeIndex)"><Plus :size="15" />添加文件</button></div></div>
+        <div class="editor-block"><div class="editor-label"><strong>保护文件</strong><span>{{ scope.confirmedFiles.length }} 项</span></div><div class="chip-list"><span v-for="(file, fileIndex) in scope.confirmedFiles" :key="file" class="file-chip">{{ file }}<button type="button" :aria-label="`停止保护 ${file}`" title="从存档保护中排除此文件（不会删除磁盘文件）" @click="removeFile(scopeIndex, fileIndex)"><X :size="13" /></button></span><span v-if="!scope.confirmedFiles.length && !scope.includeDirectories.length" class="muted-text">暂无确认文件</span></div><div class="inline-editor"><input v-model="newFileByScope[scopeIndex]" type="text" placeholder="输入相对文件名，例如 save.dat" @keyup.enter="addFile(scopeIndex)" /><button class="secondary-button" type="button" @click="addFile(scopeIndex)"><Plus :size="15" />添加文件</button></div></div>
         <div v-if="scope.unknownFilePolicy !== 'protect' && proposedByScope[scopeEvidenceKey(scope)]?.length" class="editor-block proposed-block"><div class="editor-label"><strong>疑似存档（本次未变化）</strong><span>{{ proposedByScope[scopeEvidenceKey(scope)].length }} 项</span></div><div class="chip-list"><span v-for="file in proposedByScope[scopeEvidenceKey(scope)].slice(0, 12)" :key="file" class="file-chip proposed-chip">{{ file }}</span><span v-if="proposedByScope[scopeEvidenceKey(scope)].length > 12" class="muted-text">另有 {{ proposedByScope[scopeEvidenceKey(scope)].length - 12 }} 项</span></div><p class="scope-note">这些文件看起来也是存档，但本次学习没有发生变化。纳入后会一起备份并受保护；如果不属于这个游戏，忽略即可。把上方徽章切回「自动保护新存档」就不必逐个确认。</p><div class="inline-editor"><button class="secondary-button" type="button" @click="adoptProposedFiles(scopeIndex)"><Plus :size="15" />全部纳入保护</button></div></div>
+        <p v-if="scope.unknownFilePolicy === 'ignore' && !scope.confirmedFiles.length" class="scope-note">此范围只保护已确认文件。请添加文件，或切换为「自动保护新存档」。</p>
         <div v-if="scope.includeDirectories.length" class="editor-block"><div class="editor-label"><strong>保护目录</strong><span>{{ scope.includeDirectories.length }} 项</span></div><div class="chip-list"><span v-for="directory in scope.includeDirectories" :key="directory" class="file-chip directory-chip">{{ directory }}</span></div></div>
         <div v-if="scope.excludeDirectories.length" class="editor-block"><div class="editor-label"><strong>排除目录</strong><span>{{ scope.excludeDirectories.length }} 项</span></div><div class="chip-list"><span v-for="(dir, dirIndex) in scope.excludeDirectories" :key="dir" class="file-chip exclude-dir-chip">{{ dir }}<button type="button" :aria-label="`删除排除目录 ${dir}`" title="删除排除目录" @click="removeExcludeDirectory(scopeIndex, dirIndex)"><X :size="13" /></button></span></div></div>
         <div v-if="scope.excludeExact.length" class="editor-block"><div class="editor-label"><strong>排除特定文件</strong><span>{{ scope.excludeExact.length }} 项</span></div><div class="chip-list"><span v-for="(exact, exactIndex) in scope.excludeExact" :key="exact" class="file-chip exclude-chip">{{ exact }}<button type="button" :aria-label="`删除排除文件 ${exact}`" title="删除排除文件" @click="removeExcludeExact(scopeIndex, exactIndex)"><X :size="13" /></button></span></div></div>
@@ -738,7 +813,7 @@ onUnmounted(() => { disposed = true; stopPolling(); });
       <button class="secondary-button add-scope-button" type="button" @click="addDirectoryScope"><Plus :size="16" />手动添加存档目录</button>
       <div v-if="learningResult?.notes.length" class="notes-panel"><strong>识别说明</strong><p v-for="note in learningResult.notes" :key="note">{{ note }}</p></div>
       <p v-if="error" class="error-message" role="alert">{{ error }}</p>
-      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="confirming" @click="abandonPendingGame">放弃添加</button><button v-if="isPreviewDraft" class="secondary-button" type="button" :disabled="confirming" title="放弃这份只读初稿，回到上一步启动游戏做完整识别" @click="backToFullLearning"><ArrowLeft :size="16" />改回完整识别</button><button v-if="hasReviewCandidates" class="secondary-button" type="button" :disabled="confirming" @click="beginCandidateVerification"><Gamepad2 :size="17" />再次保存验证</button><button class="primary-button" type="button" :disabled="!canConfirm || confirming" @click="confirm"><LoaderCircle v-if="confirming" :size="17" class="spin" /><Check v-else :size="17" />{{ confirming ? "正在保存" : "确认并加入游戏库" }}</button></footer>
+      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="confirming" @click="abandonPendingGame">放弃添加</button><button v-if="isPreviewDraft || captureInsufficient" class="secondary-button" type="button" :disabled="confirming" title="返回上一步重新开始识别" @click="backToFullLearning"><ArrowLeft :size="16" />{{ isPreviewDraft ? "改回完整识别" : "重新识别" }}</button><button v-if="hasReviewCandidates" class="secondary-button" type="button" :disabled="confirming" @click="beginCandidateVerification"><Gamepad2 :size="17" />再次保存验证</button><button class="primary-button" type="button" :disabled="!canConfirm || confirming" @click="confirm"><LoaderCircle v-if="confirming" :size="17" class="spin" /><Check v-else :size="17" />{{ confirming ? "正在保存" : "确认并加入游戏库" }}</button></footer>
     </section>
 
     <div v-else class="wizard-success"><CheckCircle2 :size="34" /><div><h2>{{ completedGame?.displayName }} 已加入游戏库</h2><p>存档保护范围已确认，现在可以从游戏库启动它。</p></div><button class="primary-button" type="button" @click="emit('completed', completedGame!)">返回游戏库</button></div>

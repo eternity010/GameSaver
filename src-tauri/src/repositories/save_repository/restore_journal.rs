@@ -74,6 +74,22 @@ impl Journal {
     pub(super) fn settle(&self, directory: &Path, committed: bool) -> Result<(), String> {
         for group in &self.groups {
             validate_restore_root(&group.root)?;
+            let volume_root = group
+                .root
+                .ancestors()
+                .find(|path| path.has_root() && path.parent().is_none())
+                .ok_or("无法确认存档恢复所在卷")?;
+            let required_root = if committed {
+                group.root.as_path()
+            } else {
+                volume_root
+            };
+            if !work_directory_exists(required_root)? {
+                return Err(format!(
+                    "存档恢复位置暂不可用，事务已保留：{}",
+                    required_root.display()
+                ));
+            }
         }
         if !committed {
             for group in self.groups.iter().rev() {
@@ -145,15 +161,32 @@ pub(super) fn mark_ready(staging: &Path, id: &str) -> Result<(), String> {
 }
 
 pub(super) fn recover(data_dir: &Path, store: &mut AppStore) -> Result<(), String> {
+    recover_matching(data_dir, store, |_| true)?;
+    store.committed_save_restores.clear();
+    Ok(())
+}
+
+pub(super) fn recover_game(
+    data_dir: &Path,
+    store: &mut AppStore,
+    game_uid: &str,
+) -> Result<(), String> {
+    recover_matching(data_dir, store, |journal| journal.game_uid == game_uid)
+}
+
+fn recover_matching(
+    data_dir: &Path,
+    store: &mut AppStore,
+    matches: impl Fn(&Journal) -> bool,
+) -> Result<(), String> {
     let directory = directory(data_dir);
-    for journal in list(&directory)? {
+    for journal in list(&directory)?.into_iter().filter(matches) {
         journal.settle(
             &directory,
             store.committed_save_restores.contains(journal.id()),
         )?;
         store.committed_save_restores.remove(journal.id());
     }
-    store.committed_save_restores.clear();
     Ok(())
 }
 

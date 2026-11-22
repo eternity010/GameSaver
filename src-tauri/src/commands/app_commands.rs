@@ -16,6 +16,8 @@ pub fn confirm_app_exit(app: AppHandle, state: State<AppState>) -> Result<(), St
         "用户确认在 {} 个游戏运行时退出应用，本次会话的存档不会自动提交",
         state.running_game_count()
     ));
+    #[cfg(target_os = "windows")]
+    crate::services::window_placement::save_main_window(&app);
     app.exit(0);
     Ok(())
 }

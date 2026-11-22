@@ -42,6 +42,10 @@ pub fn run() {
                 return;
             };
             let app = window.app_handle();
+            #[cfg(target_os = "windows")]
+            if window.label() == "main" {
+                services::window_placement::save_main_window(app);
+            }
             let Some(state) = app.try_state::<AppState>() else {
                 // setup 尚未注册状态时无从判断，保守放行。
                 return;
@@ -69,6 +73,12 @@ pub fn run() {
             }
             logging::install_panic_hook();
             logging::info(format!("应用启动，数据目录：{}", data_dir.display()));
+            #[cfg(target_os = "windows")]
+            services::window_placement::show_main_window(app.handle(), &data_dir)?;
+            #[cfg(not(target_os = "windows"))]
+            if let Some(window) = app.get_webview_window("main") {
+                window.show()?;
+            }
             cleanup_stale_captures(app.handle());
             if let Some(outcome) =
                 services::library_service::LibraryMigration::recover(&data_dir, |source, target| {
@@ -93,10 +103,14 @@ pub fn run() {
                 eprintln!("GameSaver 本体包临时文件清理失败：{error}");
             }
             let mut store = GameRepository::load(app.handle())?;
-            if let Err(error) = SaveRepository::recover_restore_journals(&data_dir, &mut store) {
-                logging::error(format!("存档恢复事务未收尾，现场已保留：{error}"));
-                return Err(format!("存档恢复事务未收尾，现场已保留：{error}").into());
-            }
+            let save_restores_recovered =
+                match SaveRepository::recover_restore_journals(&data_dir, &mut store) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        logging::error(format!("存档恢复事务未收尾，现场已保留：{error}"));
+                        false
+                    }
+                };
             let cloud_installs_recovered = match GameBodyInstallService::recover_pending_installs(
                 &games_root,
                 &body_package_root,
@@ -208,7 +222,7 @@ pub fn run() {
                         .to_ascii_lowercase()
                 })
                 .collect::<HashSet<_>>();
-            let updates_recovered = match GameBodyUpdateService::recover_pending_updates_with(
+            let updates_recovered = save_restores_recovered && match GameBodyUpdateService::recover_pending_updates_with(
                 &games_root,
                 &committed_archives,
                 |uid, _| {
@@ -241,9 +255,11 @@ pub fn run() {
             // 存档恢复被强杀会在用户的存档目录里留下工作目录（`.gamesaver-restore-*` /
             // `.gamesaver-rollback-*`）。这里清的是上一次进程留下的，此刻还没进入运行期、
             // 没有恢复任务在跑，不存在与进行中的恢复抢文件。
-            if let Err(error) = SaveRepository::recover_interrupted_restores(&store.save_profiles) {
-                logging::error(format!("存档恢复残留清理失败：{error}"));
-                eprintln!("GameSaver 存档恢复残留清理失败：{error}");
+            if save_restores_recovered {
+                if let Err(error) = SaveRepository::recover_interrupted_restores(&store.save_profiles) {
+                    logging::error(format!("存档恢复残留清理失败：{error}"));
+                    eprintln!("GameSaver 存档恢复残留清理失败：{error}");
+                }
             }
             // 同理：云端安装游戏被强杀会留下 `.{game_uid}.cloud-installing` 暂存目录，而重装
             // 时「暂存目录已存在就拒绝」的判据会让那个游戏永久装不上。这里同样只可能清到上
@@ -260,8 +276,9 @@ pub fn run() {
                 logging::error(format!("清理历史游戏本体记录失败：{error}"));
                 eprintln!("GameSaver 清理历史游戏本体记录失败：{error}");
             }
+            let pending_updates =
+                services::game_body_update_service::pending_updates_at_startup(&games_root, &tasks);
             let state = AppState::new(store, library_root, tasks, PathBuf::from(tasks_path));
-            let pending_updates = GameBodyUpdateService::pending_game_uids(&games_root)?;
             for uid in &pending_updates {
                 state.finish_game_update(uid, true);
             }
@@ -372,6 +389,7 @@ pub fn run() {
             commands::admin_commands::get_elevation_status,
             commands::admin_commands::restart_as_admin,
             commands::library_commands::get_library_settings,
+            commands::library_commands::get_library_storage_overview,
             commands::library_commands::start_set_library_root_task,
             commands::library_commands::resume_library_migration_task,
             commands::cloud_account_commands::get_cloud_account_status,

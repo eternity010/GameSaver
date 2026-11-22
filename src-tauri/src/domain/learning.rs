@@ -81,6 +81,7 @@ pub struct SaveTransactionSummary {
 pub struct EtwCaptureHandle {
     pub trace_name: String,
     pub etl_path: PathBuf,
+    pub(crate) timed_out: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

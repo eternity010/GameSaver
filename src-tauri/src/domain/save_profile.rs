@@ -91,21 +91,6 @@ impl SaveScope {
             max_file_bytes: default_max_file_bytes(),
         }
     }
-
-    pub fn ensure_default_exclusions_if_empty(&mut self) {
-        if self.exclude_patterns.is_empty() {
-            self.exclude_patterns = DEFAULT_EXCLUDE_PATTERNS
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-        }
-        if self.exclude_directories.is_empty() {
-            self.exclude_directories = DEFAULT_EXCLUDE_DIRECTORIES
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-        }
-    }
 }
 
 /// 单个存档文件的管理上限，单位字节。
@@ -192,11 +177,13 @@ impl SaveProfile {
 /// 刻意收敛在 Rust 单点：前端只负责说清「这次是 ETW 还是快照差异」，具体措辞由这里
 /// 决定，免得同一份溯源信息在前后端各写一套字面量、日后各改各的。
 pub fn detection_evidence_for(capture_mode: Option<&str>) -> Vec<String> {
-    let mut evidence = vec![match capture_mode {
-        Some("etw") => "etw_write",
-        _ => "snapshot_diff",
-    }
-    .to_string()];
+    let source = match capture_mode {
+        Some("etw") => Some("etw_write"),
+        Some("etw_partial") => Some("etw_partial"),
+        Some("snapshot") => Some("snapshot_diff"),
+        _ => None,
+    };
+    let mut evidence = source.into_iter().map(str::to_owned).collect::<Vec<_>>();
     evidence.push("folder_grouping".to_string());
     evidence
 }
@@ -223,39 +210,14 @@ mod tests {
     }
 
     #[test]
-    fn ensure_default_exclusions_if_empty_preserves_custom_rules_or_fills_defaults() {
-        let mut empty_scope = SaveScope {
-            root_type: SaveRootType::Custom,
-            root_path: "D:\\GameSaves".to_string(),
-            confirmed_files: vec![],
-            include_directories: vec![".".to_string()],
-            exclude_exact: vec![],
-            exclude_patterns: vec![],
-            exclude_directories: vec![],
-            unknown_file_policy: UnknownFilePolicy::Protect,
-            max_file_bytes: Some(10 * 1024 * 1024),
-        };
-        empty_scope.ensure_default_exclusions_if_empty();
-        assert!(!empty_scope.exclude_patterns.is_empty());
-        assert!(!empty_scope.exclude_directories.is_empty());
-
-        let mut custom_scope = SaveScope {
-            root_type: SaveRootType::Custom,
-            root_path: "D:\\GameSaves".to_string(),
-            confirmed_files: vec![],
-            include_directories: vec![".".to_string()],
-            exclude_exact: vec![],
-            exclude_patterns: vec!["*.custom".to_string()],
-            exclude_directories: vec!["custom_dir".to_string()],
-            unknown_file_policy: UnknownFilePolicy::Protect,
-            max_file_bytes: Some(10 * 1024 * 1024),
-        };
-        custom_scope.ensure_default_exclusions_if_empty();
-        assert_eq!(custom_scope.exclude_patterns, vec!["*.custom".to_string()]);
-        assert_eq!(
-            custom_scope.exclude_directories,
-            vec!["custom_dir".to_string()]
-        );
+    fn explicitly_cleared_exclusions_stay_empty_after_round_trip() {
+        let mut scope = SaveScope::new_manual("D:\\GameSaves".into());
+        scope.exclude_patterns.clear();
+        scope.exclude_directories.clear();
+        let persisted = serde_json::to_value(scope).unwrap();
+        let restored: SaveScope = serde_json::from_value(persisted).unwrap();
+        assert!(restored.exclude_patterns.is_empty());
+        assert!(restored.exclude_directories.is_empty());
     }
 
     #[test]
@@ -268,10 +230,13 @@ mod tests {
             detection_evidence_for(Some("snapshot")),
             vec!["snapshot_diff".to_string(), "folder_grouping".to_string()]
         );
-        // 采集方式缺失或无法识别时按快照差异处理，绝不谎报 ETW。
         assert_eq!(
             detection_evidence_for(None),
-            vec!["snapshot_diff".to_string(), "folder_grouping".to_string()]
+            vec!["folder_grouping".to_string()]
+        );
+        assert_eq!(
+            detection_evidence_for(Some("insufficient")),
+            vec!["folder_grouping".to_string()]
         );
     }
 

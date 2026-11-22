@@ -6,7 +6,10 @@ use crate::{
         Game, GameLifecycle, SaveLearningResult, SaveProfile, SaveRootType, SaveScope,
         TaskCategory, TaskStatus,
     },
-    repositories::{GameRepository, SaveRepository},
+    repositories::{
+        save_repository::{matching_directory_exclusion, matching_exclusion},
+        GameRepository, SaveRepository,
+    },
     services::{
         learning::stop_etw_capture, save_learning_service::ActiveLearningSession, GameLibraryService,
         SaveLearningService, TaskService,
@@ -401,25 +404,53 @@ pub fn start_save_candidate_verification_task(
 }
 
 #[tauri::command]
-pub fn start_finish_save_learning_task(
+pub async fn start_finish_save_learning_task(
     app: AppHandle,
-    state: State<AppState>,
     session_id: String,
 ) -> Result<String, String> {
+    super::run_blocking(move || start_finish_save_learning(app, session_id)).await
+}
+
+fn start_finish_save_learning(app: AppHandle, session_id: String) -> Result<String, String> {
+    let state = app.state::<AppState>();
     let session_id = session_id.trim().to_string();
-    let active = state
+    let game_uid = state
         .learning_sessions
         .lock()
         .map_err(|_| "lock learning session state failed".to_string())?
         .get(&session_id)
-        .cloned()
+        .map(|active| active.view.game_uid.clone())
         .ok_or_else(|| "存档识别会话不存在".to_string())?;
-    state.claim_operation(&active.view.game_uid, "该游戏正在分析或执行其他操作")?;
+    state.claim_operation(&game_uid, "该游戏正在分析或执行其他操作")?;
     let mut reservation = SaveProfileOperationGuard {
         state: &state,
-        key: active.view.game_uid.clone(),
+        key: AppState::game_operation_key(&game_uid),
         active: true,
     };
+    let managed_path = {
+        let store = state.store.lock().map_err(|_| "读取游戏记录失败")?;
+        store
+            .games
+            .iter()
+            .find(|game| game.game_uid == game_uid)
+            .map(|game| PathBuf::from(&game.managed_path))
+            .ok_or("游戏记录已不存在")?
+    };
+    let tracked_processes = state
+        .learning_sessions
+        .lock()
+        .map_err(|_| "读取存档识别会话失败")?
+        .get(&session_id)
+        .map(|active| active.tracked_processes.clone())
+        .ok_or("存档识别会话不存在")?;
+    SaveLearningService::ensure_game_exited(&managed_path, Some(&tracked_processes))?;
+    let active = state
+        .learning_sessions
+        .lock()
+        .map_err(|_| "读取存档识别会话失败")?
+        .get(&session_id)
+        .cloned()
+        .ok_or("存档识别会话不存在")?;
     let task_id = TaskService::create(
         &state,
         "analyze_saves",
@@ -596,14 +627,27 @@ pub fn get_default_save_exclusions() -> DefaultSaveExclusions {
 }
 
 #[tauri::command]
-pub fn confirm_save_profile(
+pub async fn confirm_save_profile(
     app: AppHandle,
-    state: State<AppState>,
     game_uid: String,
-    mut scopes: Vec<SaveScope>,
+    scopes: Vec<SaveScope>,
     confidence: u8,
     capture_mode: Option<String>,
 ) -> Result<SaveProfile, String> {
+    super::run_blocking(move || {
+        confirm_save_profile_blocking(app, game_uid, scopes, confidence, capture_mode)
+    })
+    .await
+}
+
+fn confirm_save_profile_blocking(
+    app: AppHandle,
+    game_uid: String,
+    scopes: Vec<SaveScope>,
+    confidence: u8,
+    capture_mode: Option<String>,
+) -> Result<SaveProfile, String> {
+    let state = app.state::<AppState>();
     let game_uid = game_uid.trim().to_string();
     crate::logging::info(format!(
         "开始确认存档保护：game_uid={game_uid} scopes={} capture_mode={:?}",
@@ -634,9 +678,9 @@ pub fn confirm_save_profile(
         if !matches!(game.lifecycle, GameLifecycle::PendingSetup) {
             return Err("该游戏已经完成设置".to_string());
         }
-        for scope in &mut scopes {
-            scope.ensure_default_exclusions_if_empty();
-            validate_scope(scope)?;
+        SaveLearningService::ensure_game_exited(Path::new(&game.managed_path), None)?;
+        for scope in &scopes {
+            validate_scope_for_confirmation(scope)?;
         }
         crate::logging::info(format!(
             "存档保护范围校验完成：game_uid={game_uid} scopes={}",
@@ -738,6 +782,51 @@ pub fn discard_pending_game(
     crate::commands::game_commands::start_pending_game_removal(app, &state, game_uid)
 }
 
+fn validate_scope_for_confirmation(scope: &SaveScope) -> Result<(), String> {
+    validate_scope(scope)?;
+    let root = Path::new(&scope.root_path);
+    for file in &scope.confirmed_files {
+        if let Some(rule) = matching_exclusion(file, scope) {
+            return Err(format!(
+                "存档目录「{}」中的保护文件「{file}」命中排除规则「{rule}」。请移除该排除规则，或取消保护此文件。",
+                scope.root_path
+            ));
+        }
+        let metadata = std::fs::metadata(root.join(file)).map_err(|error| {
+            format!("无法确认保护文件「{file}」（{}）：{error}", scope.root_path)
+        })?;
+        if !metadata.is_file() {
+            return Err(format!("「{file}」不是文件，请从保护文件中移除它。"));
+        }
+        if let Some(limit) = scope.max_file_bytes.filter(|limit| metadata.len() > *limit) {
+            return Err(format!(
+                "保护文件「{file}」大小为 {} 字节，超过保护上限 {limit} 字节，不能纳入保护。",
+                metadata.len()
+            ));
+        }
+    }
+    if scope.confirmed_files.is_empty() {
+        if scope.unknown_file_policy == crate::domain::UnknownFilePolicy::Ignore {
+            return Err(format!(
+                "存档范围「{}」选择了仅保护已确认文件，请至少添加一个保护文件，或开启自动保护新存档。",
+                scope.root_path
+            ));
+        }
+        let admits_future_files = !scope.exclude_patterns.iter().any(|rule| {
+            !rule.is_empty() && rule.bytes().all(|byte| byte == b'*')
+        }) && scope.include_directories.iter().any(|directory| {
+            matching_directory_exclusion(directory, scope).is_none() && root.join(directory).is_dir()
+        });
+        if !admits_future_files {
+            return Err(format!(
+                "存档范围「{}」没有可保护的文件或目录，请检查排除规则和保护目录。",
+                scope.root_path
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_scope(scope: &SaveScope) -> Result<(), String> {
     if scope.root_path.trim().is_empty() || !Path::new(&scope.root_path).is_dir() {
         return Err(format!("存档目录不存在：{}", scope.root_path));
@@ -756,7 +845,14 @@ fn validate_scope(scope: &SaveScope) -> Result<(), String> {
         if path.is_absolute()
             || path
                 .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
+                .any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::Prefix(_)
+                            | std::path::Component::RootDir
+                            | std::path::Component::ParentDir
+                    )
+                })
         {
             return Err(format!("存档范围包含无效相对路径：{value}"));
         }
@@ -813,10 +909,18 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 /// 返回结构与 `finish_save_learning` 一致（`eventCaptureMode = "preview"`），前端复用同一套
 /// 审阅界面；证据等级一律是「待确认」，不会有任何范围被当成已确认。
 #[tauri::command]
-pub fn preview_save_scopes(
-    state: State<AppState>,
+pub async fn preview_save_scopes(
+    app: AppHandle,
     game_uid: String,
 ) -> Result<SaveLearningResult, String> {
+    super::run_blocking(move || preview_save_scopes_blocking(app, game_uid)).await
+}
+
+fn preview_save_scopes_blocking(
+    app: AppHandle,
+    game_uid: String,
+) -> Result<SaveLearningResult, String> {
+    let state = app.state::<AppState>();
     let game_uid = game_uid.trim();
     let game = {
         let store = state
@@ -1094,8 +1198,55 @@ fn now_iso() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sha256_file;
+    use super::{sha256_file, validate_scope_for_confirmation, SaveScope};
     use std::fs;
+
+    #[test]
+    fn scope_confirmation_rejects_empty_explicit_protection_and_invalid_files() {
+        let workspace = crate::test_support::TempWorkspace::new("save-effective-scope");
+        let root = workspace.join("saves");
+        fs::create_dir_all(root.join("directory")).unwrap();
+        fs::write(root.join("slot.sav"), b"save").unwrap();
+        let mut scope = SaveScope::new_manual(root.to_string_lossy().into_owned());
+        scope.unknown_file_policy = crate::domain::UnknownFilePolicy::Ignore;
+        assert!(validate_scope_for_confirmation(&scope).unwrap_err().contains("至少添加"));
+
+        scope.confirmed_files.push("slot.sav".into());
+        scope.max_file_bytes = Some(1);
+        assert!(validate_scope_for_confirmation(&scope).unwrap_err().contains("超过保护上限"));
+        scope.max_file_bytes = Some(4);
+        validate_scope_for_confirmation(&scope).unwrap();
+
+        scope.confirmed_files[0] = "directory".into();
+        assert!(validate_scope_for_confirmation(&scope).unwrap_err().contains("不是文件"));
+        scope.confirmed_files[0] = "missing.sav".into();
+        assert!(validate_scope_for_confirmation(&scope).unwrap_err().contains("无法确认保护文件"));
+
+        scope.confirmed_files.clear();
+        scope.unknown_file_policy = crate::domain::UnknownFilePolicy::Protect;
+        scope.root_path = root.join("directory").to_string_lossy().into_owned();
+        validate_scope_for_confirmation(&scope).unwrap();
+        scope.exclude_patterns.push("*".into());
+        assert!(validate_scope_for_confirmation(&scope).is_err());
+    }
+
+    #[test]
+    fn saving_a_scope_reports_a_confirmed_file_that_matches_an_exclusion() {
+        let workspace = crate::test_support::TempWorkspace::new("save-conflicting-exclusion");
+        let file = workspace.join("Slot.CSV");
+        fs::write(&file, b"actual save").unwrap();
+        let mut scope = SaveScope::new_manual(file.parent().unwrap().to_string_lossy().into_owned());
+        scope.confirmed_files.push("Slot.CSV".into());
+        let error = validate_scope_for_confirmation(&scope).unwrap_err();
+        assert!(error.contains("Slot.CSV"));
+        assert!(error.contains("*.csv"));
+
+        scope.exclude_patterns.clear();
+        scope.exclude_directories.clear();
+        validate_scope_for_confirmation(&scope).unwrap();
+        assert!(scope.exclude_patterns.is_empty());
+        assert!(scope.exclude_directories.is_empty());
+    }
 
     #[test]
     fn hashes_executable_without_using_large_stack_buffer() {

@@ -1,21 +1,22 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { AlertTriangle, ChevronLeft, ChevronRight, CloudDownload, CloudUpload, Gamepad2, Library, Plus, Settings, Search, ShieldCheck } from "@lucide/vue";
+import { AlertTriangle, ChevronLeft, ChevronRight, CloudDownload, CloudUpload, Gamepad2, HardDrive, Library, Plus, Settings, Search, ShieldCheck } from "@lucide/vue";
 import { confirmAction, confirmAppExit, deleteRemoteBodyPackage, discardGameCoverCapture, getElevationStatus, getGameCoverUrl, getGameRuntime, getTask, installCloudGame, launchGame, listCloudGames, listGames, restartAsAdmin } from "./api";
 import type { AppTask, ElevationStatus } from "./api";
-import type { CloudGameSummary, CloudGameVersion } from "./api";
+import type { CloudGamePage, CloudGameSummary, CloudGameVersion } from "./api";
 import { gameStatusLabel, type Game } from "./domain/game";
 import { taskPolicyOf, useTaskFeed } from "./taskFeed";
 import AddGameWizard from "./components/AddGameWizard.vue";
 import GameDetailPage from "./components/GameDetailPage.vue";
 import GameStorePage from "./components/GameStorePage.vue";
+import LibraryStoragePage from "./components/LibraryStoragePage.vue";
 import TransferCenter from "./components/TransferCenter.vue";
 import PlatformSettings from "./components/PlatformSettings.vue";
 
 type LibraryView = "all" | "attention";
 type LibrarySort = "activity" | "last_played" | "newest_added" | "name_asc" | "oldest_added";
-type AppPage = "library" | "store" | "add" | "detail" | "transfers" | "settings";
+type AppPage = "library" | "store" | "add" | "detail" | "transfers" | "settings" | "storage";
 
 const validSorts: LibrarySort[] = ["activity", "last_played", "newest_added", "name_asc", "oldest_added"];
 const savedSort = localStorage.getItem("gamesaver_library_sort") as LibrarySort;
@@ -24,10 +25,13 @@ const games = ref<Game[]>([]);
 const cloudGames = ref<CloudGameSummary[]>([]);
 const coverUrls = ref<Record<string, string>>({});
 const activePage = ref<AppPage>("library");
+const storageBackPage = ref<"library" | "settings">("library");
+const detailBackPage = ref<"library" | "storage">("library");
 const pendingSetupUid = ref<string>();
 const activeView = ref<LibraryView>("all");
 const activeSort = ref<LibrarySort>(validSorts.includes(savedSort) ? savedSort : "activity");
-const search = ref("");
+const librarySearch = ref("");
+const storeSearch = ref("");
 const loading = ref(true);
 const error = ref("");
 /** 列表是否已有一次成功结果；只有它为真时刷新才保留旧列表而不是显示全屏加载。 */
@@ -38,20 +42,24 @@ const selectedGame = ref<Game | null>(null);
 const selectedGameError = ref("");
 const pendingCoverCapture = ref<{ captureId: string; gameUid: string } | null>(null);
 const cloudInstallUid = ref("");
+const cloudOperationTaskId = ref("");
 const cloudInstallProgress = ref(0);
 const cloudInstallMessage = ref("");
 const cloudInstallError = ref("");
 const cloudInstallNotice = ref("");
+const cloudFeedbackGameKey = ref("");
 const storeLoading = ref(false);
 const storeError = ref("");
-const storeLoaded = ref(false);
 const storePage = ref(1);
 const storeTotalCount = ref(0);
 const storeTotalPages = ref(1);
 const storeHasMore = ref(false);
 const STORE_PAGE_SIZE = 9;
 const LIBRARY_PAGE_SIZE = 9;
-let storeLoadedKeyword = "";
+const storePageCache = new Map<string, { loadedAt: number; page: CloudGamePage }>();
+const storePageRequests = new Map<string, { epoch: number; promise: Promise<CloudGamePage> }>();
+const STORE_CACHE_TTL_MS = 30_000;
+let storeCacheEpoch = 0;
 /**
  * 游戏库列表的缓存有效期。
  *
@@ -121,12 +129,16 @@ const unsyncedGameUids = computed(
 );
 const syncAttentionCount = computed(() => unsyncedSyncTasks.value.length);
 let cloudInstallTimer: ReturnType<typeof setTimeout> | undefined;
+let cloudFeedbackTimer: ReturnType<typeof setTimeout> | undefined;
 let stopCoverCaptureRoute: UnlistenFn | undefined;
 let stopExitGuard: UnlistenFn | undefined;
 let appDisposed = false;
 let exitPromptOpen = false;
 let gamesLoadGeneration = 0;
 let storeLoadGeneration = 0;
+let cloudOperationGeneration = 0;
+let quickLaunchGeneration = 0;
+const quickLaunchPending = new Set<string>();
 let libraryRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 let libraryRefreshCheckTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -141,7 +153,7 @@ function parseTimestamp(raw?: string): number {
 }
 
 const filteredGames = computed(() => {
-  const keyword = search.value.trim().toLocaleLowerCase();
+  const keyword = librarySearch.value.trim().toLocaleLowerCase();
   const result = games.value.filter((game) => {
     if (keyword && !game.displayName.toLocaleLowerCase().includes(keyword)) return false;
     const needsAttention = gameStatusLabel(game) !== "可启动";
@@ -206,6 +218,9 @@ const filteredGames = computed(() => {
 });
 
 const libraryPageCount = computed(() => Math.max(1, Math.ceil(filteredGames.value.length / LIBRARY_PAGE_SIZE)));
+watch(libraryPageCount, (count) => {
+  libraryPage.value = Math.min(Math.max(1, libraryPage.value), count);
+}, { flush: "sync" });
 const pagedGames = computed(() => {
   const page = Math.min(libraryPage.value, libraryPageCount.value);
   const start = (page - 1) * LIBRARY_PAGE_SIZE;
@@ -239,13 +254,13 @@ const pageTitle = computed(() => activeView.value === "all" ? "游戏库" : "需
 const readyGameCount = computed(() => games.value.filter((game) => gameStatusLabel(game) === "可启动").length);
 const libraryEmptyTitle = computed(() => {
   if (!games.value.length) return "还没有加入游戏";
-  if (search.value.trim()) return "没有匹配的游戏";
+  if (librarySearch.value.trim()) return "没有匹配的游戏";
   if (activeView.value === "attention") return "没有需要处理的游戏";
   return readyGameCount.value ? "没有匹配的游戏" : "当前没有可启动的游戏";
 });
 const libraryEmptyDescription = computed(() => {
   if (!games.value.length) return "添加游戏本体后，它会出现在这里。";
-  if (search.value.trim()) return "调整搜索关键词，或切换到另一个视图。";
+  if (librarySearch.value.trim()) return "调整搜索关键词，或切换到另一个视图。";
   if (activeView.value === "attention") return "所有游戏当前都可以启动。";
   return readyGameCount.value
     ? "调整搜索关键词，或切换到另一个视图。"
@@ -254,21 +269,24 @@ const libraryEmptyDescription = computed(() => {
 
 let storeSearchTimer: ReturnType<typeof setTimeout> | undefined;
 
-watch([search, activeView, activeSort], () => {
+watch([librarySearch, activeView, activeSort], () => {
   if (activeSort.value) {
     localStorage.setItem("gamesaver_library_sort", activeSort.value);
   }
   libraryPage.value = 1;
 });
 
-watch(search, (val) => {
-  if (activePage.value === "store") {
-    if (storeSearchTimer) clearTimeout(storeSearchTimer);
-    storeSearchTimer = setTimeout(() => {
-      storePage.value = 1;
-      void loadStore(true, 1, val);
-    }, 280);
-  }
+watch(storeSearch, () => {
+  if (storeSearchTimer) clearTimeout(storeSearchTimer);
+  storeSearchTimer = undefined;
+  storePage.value = 1;
+  storeLoadGeneration++;
+  if (activePage.value !== "store" || appDisposed) return;
+  storeLoading.value = true;
+  storeSearchTimer = setTimeout(() => {
+    storeSearchTimer = undefined;
+    if (activePage.value === "store" && !appDisposed) void loadStore(false, 1);
+  }, 280);
 });
 
 function loadGameCovers(list: Game[]) {
@@ -325,7 +343,6 @@ async function loadGames(force = false) {
     games.value = loaded;
     gamesLoaded.value = true;
     gamesLoadedAt = Date.now();
-    libraryPage.value = Math.min(libraryPage.value, Math.max(1, Math.ceil(loaded.length / LIBRARY_PAGE_SIZE)));
     syncSelectedGame(loaded);
     void loadGameCovers(loaded);
   } catch (reason) {
@@ -363,12 +380,20 @@ function scheduleLibraryRefreshCheck() {
 }
 
 watch(activePage, (page, previousPage) => {
+  quickLaunchGeneration++;
+  if (previousPage === "store" && page !== "store") {
+    clearCloudInstallFeedback();
+    if (storeSearchTimer) clearTimeout(storeSearchTimer);
+    storeSearchTimer = undefined;
+    storeLoadGeneration++;
+    storeLoading.value = false;
+  }
   if (page === "library" && previousPage !== "library") {
     void loadGames().finally(scheduleLibraryRefreshCheck);
   } else if (page !== "library") {
     scheduleLibraryRefreshCheck();
   }
-});
+}, { flush: "sync" });
 
 watch(tasks, (nextTasks) => {
   let sessionFinished = false;
@@ -376,8 +401,13 @@ watch(tasks, (nextTasks) => {
   let accountRestored = false;
   let libraryMigrated = false;
   let localRemovalChanged = false;
+  let cloudStoreChanged = false;
   for (const task of nextTasks) {
     const previousStatus = observedTaskStatuses.get(task.taskId);
+    if (["upload_game_body_package", "delete_remote_body_package", "repair_cloud_body_manifest"].includes(task.taskType)
+        && !isActiveTask(task) && previousStatus !== task.status) {
+      cloudStoreChanged = true;
+    }
     if (["uninstall_game_body", "remove_game_from_library", "retry_game_removal", "update_game_body", "retry_game_body_update"].includes(task.taskType)) {
       if ((task.progress >= 30 && !observedRemovalCommits.has(task.taskId))
           || (!isActiveTask(task) && previousStatus !== task.status)) {
@@ -403,9 +433,9 @@ watch(tasks, (nextTasks) => {
     if (accountRestored || libraryMigrated || localRemovalChanged) gamesLoadedAt = 0;
     scheduleLibraryRefresh();
   }
-  if (installationFinished) {
-    storeLoaded.value = false;
-    if (activePage.value === "store" && !cloudInstallUid.value) void loadStore(true, storePage.value);
+  if (installationFinished || cloudStoreChanged || accountRestored || localRemovalChanged) {
+    invalidateStoreCache();
+    if (activePage.value === "store" && !cloudInstallUid.value) void loadStore(false, storePage.value);
   }
 });
 
@@ -416,25 +446,52 @@ function scrollToContentTop() {
   }
 }
 
-async function loadStore(force = false, page = storePage.value, keyword = search.value) {
+function invalidateStoreCache() {
+  storePageCache.clear();
+  storePageRequests.clear();
+  storeCacheEpoch++;
+  storeLoadGeneration++;
+  storeLoading.value = false;
+}
+
+function applyStorePage(result: CloudGamePage) {
+  cloudGames.value = result.games;
+  storePage.value = result.page;
+  storeTotalCount.value = result.totalCount;
+  storeTotalPages.value = result.totalPages;
+  storeHasMore.value = result.hasMore;
+}
+
+async function loadStore(force = false, page = storePage.value, keyword = storeSearch.value) {
+  if (appDisposed) return;
   const normalizedKeyword = keyword.trim();
-  if (
-    (!force && storeLoading.value)
-    || (!force && storeLoaded.value && page === storePage.value && storeLoadedKeyword === normalizedKeyword)
-  ) return;
+  if (force) invalidateStoreCache();
+  const key = JSON.stringify([page, normalizedKeyword]);
+  const epoch = storeCacheEpoch;
   const generation = ++storeLoadGeneration;
-  storeLoading.value = true;
   storeError.value = "";
+  const cached = storePageCache.get(key);
+  if (cached && Date.now() - cached.loadedAt < STORE_CACHE_TTL_MS) {
+    applyStorePage(cached.page);
+    storeLoading.value = false;
+    return;
+  }
+  storeLoading.value = true;
+  const pending = storePageRequests.get(key);
+  const request = pending?.epoch === epoch
+    ? pending.promise
+    : listCloudGames(page, STORE_PAGE_SIZE, normalizedKeyword);
+  storePageRequests.set(key, { epoch, promise: request });
   try {
-    const result = await listCloudGames(page, STORE_PAGE_SIZE, normalizedKeyword);
+    const result = await request;
+    if (epoch !== storeCacheEpoch || appDisposed) return;
+    storePageCache.set(key, { loadedAt: Date.now(), page: result });
+    if (storePageCache.size > 12) {
+      const oldestKey = storePageCache.keys().next().value;
+      if (oldestKey !== undefined) storePageCache.delete(oldestKey);
+    }
     if (generation !== storeLoadGeneration) return;
-    cloudGames.value = result.games;
-    storePage.value = result.page;
-    storeTotalCount.value = result.totalCount;
-    storeTotalPages.value = result.totalPages;
-    storeHasMore.value = result.hasMore;
-    storeLoadedKeyword = normalizedKeyword;
-    storeLoaded.value = true;
+    applyStorePage(result);
   } catch (reason) {
     if (generation !== storeLoadGeneration) return;
     if (page === 1) {
@@ -445,6 +502,7 @@ async function loadStore(force = false, page = storePage.value, keyword = search
     }
     storeError.value = String(reason);
   } finally {
+    if (storePageRequests.get(key)?.promise === request) storePageRequests.delete(key);
     if (generation === storeLoadGeneration) {
       storeLoading.value = false;
     }
@@ -452,12 +510,12 @@ async function loadStore(force = false, page = storePage.value, keyword = search
 }
 
 function refreshStore() {
-  void loadStore(true, storePage.value, search.value);
+  void loadStore(true, storePage.value, storeSearch.value);
 }
 
 function changeStorePage(page: number) {
   if (page < 1 || page > storeTotalPages.value || page === storePage.value) return;
-  void loadStore(true, page, search.value).then(() => {
+  void loadStore(false, page, storeSearch.value).then(() => {
     scrollToContentTop();
   });
 }
@@ -531,6 +589,7 @@ onMounted(() => {
     selectedGame.value = game;
     selectedGameError.value = "";
     pendingCoverCapture.value = event.payload;
+    detailBackPage.value = activePage.value === "storage" ? "storage" : "library";
     activePage.value = "detail";
   }).then((unlisten) => {
     if (appDisposed) unlisten();
@@ -549,10 +608,12 @@ onMounted(() => {
 });
 onUnmounted(() => {
   appDisposed = true;
+  clearCloudInstallFeedback();
   stopCoverCaptureRoute?.();
   stopExitGuard?.();
   taskFeed.release();
-  if (cloudInstallTimer) clearTimeout(cloudInstallTimer);
+  endCloudOperation();
+  if (storeSearchTimer) clearTimeout(storeSearchTimer);
   if (libraryRefreshTimer) clearTimeout(libraryRefreshTimer);
   if (libraryRefreshCheckTimer) clearTimeout(libraryRefreshCheckTimer);
   coverUrls.value = {};
@@ -574,15 +635,31 @@ function leaveAddGame() {
 }
 
 function openStore() {
+  const fromSettings = activePage.value === "settings";
   activePage.value = "store";
-  void loadStore();
+  void loadStore(fromSettings);
 }
 
 function openGame(game: Game, detailError = "") {
+  detailBackPage.value = activePage.value === "storage" ? "storage" : "library";
   pendingCoverCapture.value = null;
   selectedGame.value = game;
   selectedGameError.value = detailError;
   activePage.value = "detail";
+}
+
+function openStorage(from: "library" | "settings") {
+  storageBackPage.value = from;
+  activePage.value = "storage";
+}
+
+async function openStorageGame(gameUid: string) {
+  let game = games.value.find((item) => item.gameUid === gameUid);
+  if (!game) {
+    await loadGames(true);
+    game = games.value.find((item) => item.gameUid === gameUid);
+  }
+  if (game && activePage.value === "storage") openGame(game);
 }
 
 function finishPendingCoverCapture(captureId: string) {
@@ -590,39 +667,107 @@ function finishPendingCoverCapture(captureId: string) {
 }
 
 async function quickLaunch(game: Game) {
+  if (appDisposed || quickLaunchPending.has(game.gameUid)) return;
   if (game.lifecycle !== "active") {
     openGame(game);
     return;
   }
   // 已在运行的游戏绝不再拉起第二个实例：后端最终也会拒绝，但先跳到详情页更符合
   // 预期 —— 那里能看到「运行中」和本次会话的提交进度。
-  try {
-    if (await getGameRuntime(game.gameUid)) {
-      openGame(game);
-      return;
+  quickLaunchPending.add(game.gameUid);
+  const generation = ++quickLaunchGeneration;
+  const sourcePage = activePage.value;
+  const showResult = (failure = "") => {
+    if (!appDisposed && generation === quickLaunchGeneration && activePage.value === sourcePage) {
+      openGame(game, failure);
     }
-  } catch {
-    // runtime 查询失败不阻断启动，交给后端做最终判定
-  }
+  };
   try {
-    await launchGame(game.gameUid);
-    openGame(game);
-  } catch (reason) {
-    openGame(game, String(reason));
+    try {
+      if (await getGameRuntime(game.gameUid)) {
+        showResult();
+        return;
+      }
+    } catch {
+    }
+    if (appDisposed) return;
+    try {
+      await launchGame(game.gameUid);
+      showResult();
+    } catch (reason) {
+      showResult(String(reason));
+    }
+  } finally {
+    quickLaunchPending.delete(game.gameUid);
+  }
+}
+
+function beginCloudOperation(cloudGame: CloudGameSummary, message: string): number {
+  const generation = ++cloudOperationGeneration;
+  if (cloudInstallTimer) clearTimeout(cloudInstallTimer);
+  cloudInstallTimer = undefined;
+  cloudOperationTaskId.value = "";
+  cloudInstallUid.value = cloudGame.gameUid;
+  cloudInstallProgress.value = 0;
+  cloudInstallMessage.value = message;
+  clearCloudInstallFeedback();
+  return generation;
+}
+
+function endCloudOperation(generation = cloudOperationGeneration) {
+  if (generation !== cloudOperationGeneration) return;
+  cloudOperationGeneration++;
+  if (cloudInstallTimer) clearTimeout(cloudInstallTimer);
+  cloudInstallTimer = undefined;
+  cloudOperationTaskId.value = "";
+  cloudInstallUid.value = "";
+  cloudInstallProgress.value = 0;
+  cloudInstallMessage.value = "";
+}
+
+function cloudOperationIsCurrent(generation: number, taskId?: string): boolean {
+  return !appDisposed && generation === cloudOperationGeneration && Boolean(cloudInstallUid.value)
+    && (taskId === undefined || taskId === cloudOperationTaskId.value);
+}
+
+function handleMissingCloudTask(cloudGame: CloudGameSummary, generation: number, reason: unknown): boolean {
+  if (!String(reason).includes("task not found")) return false;
+  endCloudOperation(generation);
+  showCloudInstallFeedback(cloudGame, "error", "任务记录已不存在，正在重新读取游戏状态，请确认操作结果。");
+  invalidateStoreCache();
+  void loadGames(true);
+  if (activePage.value === "store") void loadStore(false, storePage.value);
+  return true;
+}
+
+function clearCloudInstallFeedback() {
+  if (cloudFeedbackTimer) clearTimeout(cloudFeedbackTimer);
+  cloudFeedbackTimer = undefined;
+  cloudInstallError.value = "";
+  cloudInstallNotice.value = "";
+  cloudFeedbackGameKey.value = "";
+}
+
+function showCloudInstallFeedback(cloudGame: CloudGameSummary, kind: "error" | "notice", message: string) {
+  clearCloudInstallFeedback();
+  if (appDisposed || activePage.value !== "store") return;
+  cloudFeedbackGameKey.value = cloudGame.gameKey || cloudGame.gameUid;
+  const text = `${cloudGame.displayName}：${message}`;
+  if (kind === "error") {
+    cloudInstallError.value = text;
+  } else {
+    cloudInstallNotice.value = text;
+    cloudFeedbackTimer = setTimeout(clearCloudInstallFeedback, 5000);
   }
 }
 
 async function installAndLaunch(cloudGame: CloudGameSummary, version: CloudGameVersion) {
-  if (cloudInstallUid.value) return;
+  if (appDisposed || cloudInstallUid.value) return;
   if (!cloudGame.executableRelativePath) {
-    cloudInstallError.value = "这个云端游戏缺少启动信息，请重新上传游戏本体包。";
+    showCloudInstallFeedback(cloudGame, "error", "这个云端游戏缺少启动信息，请重新上传游戏本体包。");
     return;
   }
-  cloudInstallUid.value = cloudGame.gameUid;
-  cloudInstallProgress.value = 0;
-  cloudInstallMessage.value = "准备下载游戏本体";
-  cloudInstallError.value = "";
-  cloudInstallNotice.value = "";
+  const generation = beginCloudOperation(cloudGame, "准备下载游戏本体");
   try {
     const localGame = games.value.find((game) => game.gameKey === cloudGame.gameKey);
     const replaceExisting = cloudGame.installed || Boolean(localGame);
@@ -630,62 +775,80 @@ async function installAndLaunch(cloudGame: CloudGameSummary, version: CloudGameV
       `将下载“${cloudGame.displayName}”版本 ${version.versionId} 并替换本地游戏本体。\n\n` +
       "本地只保留一个版本；已配置的受保护存档会保留，其他游戏文件会被替换。安装完成后不会自动启动。\n\n确定继续吗？",
     ))) {
-      cloudInstallUid.value = "";
+      endCloudOperation(generation);
       return;
     }
+    if (!cloudOperationIsCurrent(generation)) return;
     const taskId = await installCloudGame(cloudGame.gameUid, cloudGame.gameKey, version.path, version.fsId, replaceExisting);
-    await watchCloudInstall(taskId, cloudGame);
+    if (!cloudOperationIsCurrent(generation)) return;
+    cloudOperationTaskId.value = taskId;
+    await watchCloudInstall(taskId, cloudGame, generation);
   } catch (reason) {
-    cloudInstallUid.value = "";
-    cloudInstallError.value = String(reason);
+    if (!cloudOperationIsCurrent(generation)) return;
+    endCloudOperation(generation);
+    showCloudInstallFeedback(cloudGame, "error", String(reason));
   }
 }
 
 async function deleteCloudVersion(cloudGame: CloudGameSummary, version: CloudGameVersion) {
-  if (cloudInstallUid.value) return;
+  if (appDisposed || cloudInstallUid.value) return;
+  const generation = beginCloudOperation(cloudGame, "等待确认删除云端版本");
   const warning = `将永久删除百度网盘中的“${cloudGame.displayName}”版本 ${version.versionId}（${formatBytes(version.size)}）。此操作无法撤销，确定继续吗？`;
-  // 两道确认都必须 await：漏掉 await 时 `!Promise` 恒为 false，两道闸门会一起静默失效。
-  if (!(await confirmAction(warning)) || !(await confirmAction("请再次确认：仅云端版本会被删除，本地游戏本体不会受影响。"))) return;
-  cloudInstallUid.value = cloudGame.gameUid;
-  cloudInstallProgress.value = 0;
-  cloudInstallMessage.value = "准备删除云端版本";
-  cloudInstallError.value = "";
-  cloudInstallNotice.value = "";
   try {
+    if (!(await confirmAction(warning))) {
+      endCloudOperation(generation);
+      return;
+    }
+    if (!cloudOperationIsCurrent(generation)) return;
+    if (!(await confirmAction("请再次确认：仅云端版本会被删除，本地游戏本体不会受影响。"))) {
+      endCloudOperation(generation);
+      return;
+    }
+    if (!cloudOperationIsCurrent(generation)) return;
+    cloudInstallMessage.value = "准备删除云端版本";
     const taskId = await deleteRemoteBodyPackage(cloudGame.gameUid, cloudGame.gameKey, version.path, version.fsId);
-    await watchCloudDeletion(taskId);
+    if (!cloudOperationIsCurrent(generation)) return;
+    cloudOperationTaskId.value = taskId;
+    await watchCloudDeletion(taskId, cloudGame, generation);
   } catch (reason) {
-    cloudInstallUid.value = "";
-    cloudInstallError.value = String(reason);
+    if (!cloudOperationIsCurrent(generation)) return;
+    endCloudOperation(generation);
+    showCloudInstallFeedback(cloudGame, "error", String(reason));
   }
 }
 
-async function watchCloudDeletion(taskId: string) {
+async function watchCloudDeletion(taskId: string, cloudGame: CloudGameSummary, generation = cloudOperationGeneration) {
+  if (!cloudOperationIsCurrent(generation, taskId)) return;
   let task: AppTask;
   try {
     task = await getTask(taskId);
   } catch (reason) {
-    cloudInstallUid.value = "";
-    cloudInstallError.value = `读取删除进度失败：${String(reason)}。请在传输中心确认任务状态。`;
-    storeLoaded.value = false;
+    if (!cloudOperationIsCurrent(generation, taskId)) return;
+    if (handleMissingCloudTask(cloudGame, generation, reason)) return;
+    cloudInstallMessage.value = `读取删除进度暂时失败，正在自动重试：${String(reason)}`;
+    if (cloudInstallTimer) clearTimeout(cloudInstallTimer);
+    cloudInstallTimer = setTimeout(() => void watchCloudDeletion(taskId, cloudGame, generation), 2000);
     return;
   }
-  if (appDisposed) return;
+  if (!cloudOperationIsCurrent(generation, taskId)) return;
   cloudInstallProgress.value = task.progress;
   cloudInstallMessage.value = task.message;
   if (task.status === "success") {
-    cloudInstallUid.value = "";
-    cloudInstallNotice.value = "云端版本已删除。";
-    await loadStore(true, storePage.value);
+    endCloudOperation(generation);
+    showCloudInstallFeedback(cloudGame, "notice", "云端版本已删除。");
+    invalidateStoreCache();
+    if (activePage.value === "store") await loadStore(false, storePage.value);
     return;
   }
   if (task.status === "failed" || task.status === "cancelled" || task.status === "interrupted") {
-    cloudInstallUid.value = "";
-    cloudInstallError.value = task.error || task.message;
+    endCloudOperation(generation);
+    showCloudInstallFeedback(cloudGame, "error", task.error || task.message);
+    invalidateStoreCache();
+    if (activePage.value === "store") await loadStore(false, storePage.value);
     return;
   }
   if (cloudInstallTimer) clearTimeout(cloudInstallTimer);
-  cloudInstallTimer = setTimeout(() => void watchCloudDeletion(taskId), 700);
+  cloudInstallTimer = setTimeout(() => void watchCloudDeletion(taskId, cloudGame, generation), 700);
 }
 
 function formatBytes(bytes: number): string {
@@ -694,44 +857,50 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-async function watchCloudInstall(taskId: string, cloudGame: CloudGameSummary) {
+async function watchCloudInstall(taskId: string, cloudGame: CloudGameSummary, generation = cloudOperationGeneration) {
+  if (!cloudOperationIsCurrent(generation, taskId)) return;
   let task: AppTask;
   try {
     task = await getTask(taskId);
   } catch (reason) {
-    cloudInstallUid.value = "";
-    cloudInstallError.value = `读取安装进度失败：${String(reason)}。后台任务可能仍在进行，请在传输中心查看。`;
-    storeLoaded.value = false;
-    void loadGames(true);
+    if (!cloudOperationIsCurrent(generation, taskId)) return;
+    if (handleMissingCloudTask(cloudGame, generation, reason)) return;
+    cloudInstallMessage.value = `读取安装进度暂时失败，正在自动重试：${String(reason)}`;
+    if (cloudInstallTimer) clearTimeout(cloudInstallTimer);
+    cloudInstallTimer = setTimeout(() => void watchCloudInstall(taskId, cloudGame, generation), 2000);
     return;
   }
-  if (appDisposed) return;
+  if (!cloudOperationIsCurrent(generation, taskId)) return;
   cloudInstallProgress.value = task.progress;
   cloudInstallMessage.value = task.message;
   if (task.status === "success") {
-    cloudInstallUid.value = "";
+    endCloudOperation(generation);
     const cleanupPending = (task.result as { cleanupPending?: boolean } | undefined)?.cleanupPending === true;
-    cloudInstallNotice.value = cleanupPending
+    showCloudInstallFeedback(cloudGame, "notice", cleanupPending
       ? "安装已提交，但旧文件清理尚未完成。请重启 GameSaver 完成恢复后再操作该游戏。"
-      : "安装完成，游戏已加入游戏库。可以从游戏库手动启动。";
+      : "安装完成，游戏已加入游戏库。可以从游戏库手动启动。");
+    invalidateStoreCache();
     await loadGames(true);
-    await loadStore(true, storePage.value);
+    if (activePage.value === "store") await loadStore(false, storePage.value);
     return;
   }
   if (task.status === "failed" || task.status === "cancelled" || task.status === "interrupted") {
-    cloudInstallUid.value = "";
-    cloudInstallError.value = task.error || task.message;
+    endCloudOperation(generation);
+    showCloudInstallFeedback(cloudGame, "error", task.error || task.message);
+    await loadGames(true);
+    invalidateStoreCache();
+    if (activePage.value === "store") await loadStore(false, storePage.value);
     return;
   }
   if (cloudInstallTimer) clearTimeout(cloudInstallTimer);
-  cloudInstallTimer = setTimeout(() => void watchCloudInstall(taskId, cloudGame), 700);
+  cloudInstallTimer = setTimeout(() => void watchCloudInstall(taskId, cloudGame, generation), 700);
 }
 
 async function finishAddGame(completedGame?: Game) {
   pendingSetupUid.value = undefined;
   activePage.value = "library";
   activeView.value = "all";
-  search.value = "";
+  librarySearch.value = "";
   // 必须 force：添加流程刚改过列表，缓存守卫会把新游戏挡住。
   await loadGames(true);
   if (completedGame && !games.value.some((game) => game.gameUid === completedGame.gameUid)) {
@@ -748,7 +917,7 @@ async function finishAddGame(completedGame?: Game) {
         <span>GameSaver</span>
       </div>
       <nav class="primary-nav" aria-label="主导航">
-        <button class="nav-item" :class="{ active: activePage === 'library' }" type="button" @click="activePage = 'library'"><Library :size="18" /><span>游戏库</span></button>
+        <button class="nav-item" :class="{ active: activePage === 'library' || activePage === 'storage' }" type="button" @click="activePage = 'library'"><Library :size="18" /><span>游戏库</span></button>
         <button class="nav-item" :class="{ active: activePage === 'store' }" type="button" @click="openStore"><CloudDownload :size="18" /><span>游戏商店</span></button>
         <button class="nav-item" :class="{ active: activePage === 'add' }" type="button" @click="openAddGame"><Plus :size="18" /><span>添加游戏</span></button>
         <button class="nav-item" :class="{ active: activePage === 'transfers' }" type="button" @click="activePage = 'transfers'">
@@ -776,10 +945,13 @@ async function finishAddGame(completedGame?: Game) {
           <p class="breadcrumb">GameSaver <span>/</span> {{ pageTitle }}</p>
           <h1>{{ pageTitle }}</h1>
         </div>
-        <label class="search-box">
-          <Search :size="17" />
-          <input v-model="search" type="search" placeholder="搜索游戏" aria-label="搜索游戏" />
-        </label>
+        <div class="library-header-actions">
+          <button class="secondary-button" type="button" @click="openStorage('library')"><HardDrive :size="16" />存储总览</button>
+          <label class="search-box">
+            <Search :size="17" />
+            <input v-model="librarySearch" type="search" placeholder="搜索游戏" aria-label="搜索游戏" />
+          </label>
+        </div>
       </header>
       <header v-else-if="activePage === 'store'" class="topbar">
         <div>
@@ -788,15 +960,16 @@ async function finishAddGame(completedGame?: Game) {
         </div>
         <label class="search-box">
           <Search :size="17" />
-          <input v-model="search" type="search" placeholder="搜索云端游戏" aria-label="搜索云端游戏" />
+          <input v-model="storeSearch" type="search" placeholder="搜索云端游戏" aria-label="搜索云端游戏" />
         </label>
       </header>
 
       <AddGameWizard v-if="activePage === 'add'" :game-uid="pendingSetupUid" @pending="pendingSetupUid = $event" @back="leaveAddGame" @completed="finishAddGame" />
-      <GameDetailPage v-else-if="activePage === 'detail' && selectedGame" :key="selectedGame.gameUid" :game="selectedGame" :cover-url="selectedGame ? coverUrls[selectedGame.gameUid] : ''" :initial-error="selectedGameError" :pending-cover-capture="pendingCoverCapture" @back="activePage = 'library'" @settings="activePage = 'settings'" @resume-setup="resumeGameSetup(selectedGame.gameUid)" @refresh="loadGames(true)" @capture-handled="finishPendingCoverCapture" />
-      <GameStorePage v-else-if="activePage === 'store'" :games="cloudGames" :search="search" :loading="storeLoading" :load-error="storeError" :install-uid="cloudInstallUid" :install-progress="cloudInstallProgress" :install-message="cloudInstallMessage" :install-error="cloudInstallError" :install-notice="cloudInstallNotice" :page="storePage" :page-size="STORE_PAGE_SIZE" :total-count="storeTotalCount" :total-pages="storeTotalPages" :has-more="storeHasMore" @install="installAndLaunch" @delete-version="deleteCloudVersion" @retry="refreshStore" @refresh="refreshStore" @page-change="changeStorePage" />
+      <GameDetailPage v-else-if="activePage === 'detail' && selectedGame" :key="selectedGame.gameUid" :game="selectedGame" :cover-url="selectedGame ? coverUrls[selectedGame.gameUid] : ''" :initial-error="selectedGameError" :pending-cover-capture="pendingCoverCapture" @back="activePage = detailBackPage" @settings="activePage = 'settings'" @resume-setup="resumeGameSetup(selectedGame.gameUid)" @refresh="loadGames(true)" @capture-handled="finishPendingCoverCapture" />
+      <GameStorePage v-else-if="activePage === 'store'" :games="cloudGames" :search="storeSearch" :loading="storeLoading" :load-error="storeError" :install-uid="cloudInstallUid" :install-progress="cloudInstallProgress" :install-message="cloudInstallMessage" :install-error="cloudInstallError" :install-notice="cloudInstallNotice" :feedback-game-key="cloudFeedbackGameKey" :page="storePage" :page-size="STORE_PAGE_SIZE" :total-count="storeTotalCount" :total-pages="storeTotalPages" :has-more="storeHasMore" @install="installAndLaunch" @delete-version="deleteCloudVersion" @retry="refreshStore" @refresh="refreshStore" @page-change="changeStorePage" />
       <TransferCenter v-else-if="activePage === 'transfers'" :games="games" :cloud-games="cloudGames" />
-      <PlatformSettings v-else-if="activePage === 'settings'" />
+      <PlatformSettings v-else-if="activePage === 'settings'" @storage="openStorage('settings')" />
+      <LibraryStoragePage v-else-if="activePage === 'storage'" @back="activePage = storageBackPage" @open-game="openStorageGame" />
 
       <template v-else-if="activePage === 'library'">
       <div class="library-toolbar" role="tablist" aria-label="游戏库视图">
@@ -878,3 +1051,7 @@ async function finishAddGame(completedGame?: Game) {
     </section>
   </main>
 </template>
+
+<style scoped>
+.library-header-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+</style>

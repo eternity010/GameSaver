@@ -1,8 +1,9 @@
 use crate::domain::{
     path_utils::{normalize_path, strip_verbatim_prefix},
-    AppStore,
+    is_safe_path_segment, AppStore,
 };
 use std::{
+    collections::HashMap,
     fs,
     path::{Component, Path, PathBuf},
 };
@@ -33,7 +34,137 @@ impl LibraryUsage {
 
 pub struct LibraryService;
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryStorageOverview {
+    library_root: String,
+    total_bytes: u64,
+    free_bytes: Option<u64>,
+    shared_save_bytes: u64,
+    other_bytes: u64,
+    games: Vec<GameStorageUsage>,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GameStorageUsage {
+    game_uid: String,
+    display_name: String,
+    game_bytes: u64,
+    package_bytes: u64,
+    save_bytes: u64,
+}
+
 impl LibraryService {
+    pub fn storage_overview(root: &Path, store: &AppStore) -> Result<LibraryStorageOverview, String> {
+        fs::read_dir(root).map_err(|error| format!("无法读取游戏库目录：{error}"))?;
+        let mut overview = LibraryStorageOverview {
+            library_root: root.to_string_lossy().into_owned(),
+            total_bytes: 0,
+            free_bytes: super::disk_space::available_space(root).ok(),
+            shared_save_bytes: 0,
+            other_bytes: 0,
+            games: store
+                .games
+                .iter()
+                .map(|game| GameStorageUsage {
+                    game_uid: game.game_uid.clone(),
+                    display_name: game.display_name.clone(),
+                    ..GameStorageUsage::default()
+                })
+                .collect(),
+        };
+        let game_indices: HashMap<_, _> = store
+            .games
+            .iter()
+            .enumerate()
+            .map(|(index, game)| (game.game_uid.as_str(), index))
+            .collect();
+        let games_root = root.join("games");
+        let game_paths: HashMap<_, _> = store
+            .games
+            .iter()
+            .enumerate()
+            .filter_map(|(index, game)| {
+                let path = Path::new(&game.managed_path);
+                let name = path.file_name()?.to_str()?;
+                if !is_safe_path_segment(name) || !same_path(path, &games_root.join(name)) {
+                    return None;
+                }
+                Some((name.to_ascii_lowercase(), index))
+            })
+            .collect();
+        let package_paths: HashMap<_, _> = game_indices
+            .iter()
+            .map(|(uid, index)| (uid.to_ascii_lowercase(), *index))
+            .collect();
+        let mut save_owners = HashMap::new();
+        for version in &store.save_versions {
+            let Some(&owner) = game_indices.get(version.game_uid.as_str()) else {
+                continue;
+            };
+            for hash in version
+                .files
+                .iter()
+                .filter(|file| !file.deleted)
+                .filter_map(|file| file.object_hash.as_deref())
+            {
+                if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    continue;
+                }
+                save_owners
+                    .entry(hash.to_ascii_lowercase())
+                    .and_modify(|current| {
+                        if *current != Some(owner) {
+                            *current = None;
+                        }
+                    })
+                    .or_insert(Some(owner));
+            }
+        }
+        let object_prefix = Path::new(".gamesaver-repository/objects/sha256");
+        for category in MANAGED_DIRECTORIES {
+            visit_storage_files(&root.join(category), |relative, bytes| {
+                overview.total_bytes = overview.total_bytes.saturating_add(bytes);
+                let first_dir = |indices: &HashMap<String, usize>| {
+                    let name = relative.components().next()?.as_os_str().to_str()?;
+                    indices.get(&name.to_ascii_lowercase()).copied()
+                };
+                let bucket = match category {
+                    "games" if relative.components().nth(1).is_some() => {
+                        first_dir(&game_paths).map(|index| &mut overview.games[index].game_bytes)
+                    }
+                    "body-packages"
+                        if relative.components().count() == 2
+                            && relative.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")) =>
+                    {
+                        first_dir(&package_paths)
+                            .map(|index| &mut overview.games[index].package_bytes)
+                    }
+                    "saves" => relative
+                        .strip_prefix(object_prefix)
+                        .ok()
+                        .and_then(|path| {
+                            let hash = path.file_name()?.to_str()?;
+                            let shard = path.parent()?.as_os_str();
+                            if hash.len() != 64 || !shard.eq_ignore_ascii_case(hash.get(..2)?) {
+                                return None;
+                            }
+                            save_owners.get(&hash.to_ascii_lowercase()).copied()
+                        })
+                        .map(|owner| match owner {
+                            Some(index) => &mut overview.games[index].save_bytes,
+                            None => &mut overview.shared_save_bytes,
+                        }),
+                    _ => None,
+                };
+                let bucket = bucket.unwrap_or(&mut overview.other_bytes);
+                *bucket = bucket.saturating_add(bytes);
+            })?;
+        }
+        Ok(overview)
+    }
+
     pub fn usage(root: &Path) -> Result<LibraryUsage, String> {
         let mut usage = LibraryUsage::default();
         usage.games_bytes = collect_usage(&root.join("games"), &mut usage.file_count)?;
@@ -179,6 +310,29 @@ impl LibraryService {
     }
 }
 
+fn visit_storage_files(root: &Path, mut visit: impl FnMut(&Path, u64)) -> Result<(), String> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err(format!("受管存储路径不是普通目录：{}", root.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("无法访问受管存储目录：{error}")),
+    }
+    for entry in WalkDir::new(root).follow_links(false).follow_root_links(false) {
+        let entry = entry.map_err(|error| format!("统计游戏库空间失败：{error}"))?;
+        if entry.file_type().is_file() {
+            let relative = entry
+                .path()
+                .strip_prefix(root)
+                .map_err(|error| format!("无法定位受管存储文件：{error}"))?;
+            let metadata = entry
+                .metadata()
+                .map_err(|error| format!("读取游戏库文件大小失败：{error}"))?;
+            visit(relative, metadata.len());
+        }
+    }
+    Ok(())
+}
+
 fn collect_usage(root: &Path, file_count: &mut usize) -> Result<u64, String> {
     if !root.is_dir() {
         return Ok(0);
@@ -301,8 +455,74 @@ fn is_descendant(path: &Path, parent: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{rewrite_path, LibraryService};
-    use crate::test_support::TempWorkspace;
-    use std::path::Path;
+    use crate::{
+        domain::{AppStore, Game, SaveFileEntry, SaveRootType, SaveVersion},
+        test_support::TempWorkspace,
+    };
+    use std::{fs, path::Path};
+
+    #[test]
+    fn storage_overview_counts_shared_objects_once_and_accounts_for_unassigned_files() {
+        let root = TempWorkspace::new("library-storage-overview");
+        let make_game = |name: &str| {
+            Game::new_pending(name, root.join("games").join(name).to_string_lossy(), "game.exe")
+        };
+        let first = make_game("first");
+        let second = make_game("second");
+        let write = |relative: &str, size: usize| {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, vec![0; size]).unwrap();
+        };
+        write("games/first/bin/game.exe", 20);
+        write("games/.versions/stale/file", 11);
+        write(&format!("body-packages/{}/version.ZIP", first.game_uid), 10);
+        write(&format!("body-packages/{}/download.part", first.game_uid), 7);
+        write("covers/cover.png", 3);
+        let exclusive = "a".repeat(64);
+        let shared = "b".repeat(64);
+        let orphan = "c".repeat(64);
+        for (hash, size) in [(&exclusive, 4), (&shared, 6), (&orphan, 2)] {
+            write(&format!("saves/.gamesaver-repository/objects/sha256/{}/{hash}", &hash[..2]), size);
+        }
+        let version = |game: &Game, hashes: &[&str]| {
+            SaveVersion::new(
+                game.game_uid.clone(),
+                "1".to_string(),
+                hashes.iter().map(|hash| SaveFileEntry {
+                    root_type: SaveRootType::Custom,
+                    root_path: None,
+                    relative_path: "test.sav".to_string(),
+                    object_hash: Some((*hash).to_string()),
+                    size: 1024,
+                    deleted: false,
+                    mtime_ms: None,
+                }).collect(),
+            )
+        };
+        let store = AppStore {
+            save_versions: vec![
+                version(&first, &[&exclusive, &shared]),
+                version(&first, &[&exclusive]),
+                version(&second, &[&shared, &"d".repeat(64)]),
+            ],
+            games: vec![first, second],
+            ..AppStore::default()
+        };
+        let overview = LibraryService::storage_overview(&root, &store).unwrap();
+        let first = &overview.games[0];
+        assert_eq!((first.game_bytes, first.package_bytes, first.save_bytes), (20, 10, 4));
+        assert_eq!(overview.games[1].save_bytes, 0);
+        assert_eq!((overview.total_bytes, overview.shared_save_bytes, overview.other_bytes), (63, 6, 23));
+    }
+
+    #[test]
+    fn storage_overview_distinguishes_a_missing_library_from_an_empty_one() {
+        let root = TempWorkspace::new("library-storage-empty");
+        let store = AppStore::default();
+        assert_eq!(LibraryService::storage_overview(&root, &store).unwrap().total_bytes, 0);
+        assert!(LibraryService::storage_overview(&root.join("offline"), &store).is_err());
+    }
 
     #[test]
     fn rejects_overlapping_library_roots() {

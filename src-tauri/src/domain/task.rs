@@ -74,7 +74,7 @@ impl TaskCategory {
             | "remove_game_from_library"
             | "retry_game_removal"
             | "delete_game_body_package" => Self::BodyTransfer,
-            "sync_cloud_save" => Self::CloudSaveSync,
+            "sync_cloud_save" | "restore_cloud_save" => Self::CloudSaveSync,
             "restore_save_version" => Self::SaveRestore,
             "launch_game" => Self::Session,
             _ => Self::Maintenance,

@@ -102,6 +102,7 @@ pub struct CloudGameSummary {
     pub versions: Vec<RemoteBodyPackage>,
     #[serde(default)]
     pub has_cover: bool,
+    pub cover_file: Option<RemoteFile>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -115,6 +116,42 @@ pub struct CloudGamePage {
     pub has_more: bool,
 }
 
+impl CloudGamePage {
+    pub fn from_games(
+        mut games: Vec<CloudGameSummary>,
+        requested_page: usize,
+        page_size: usize,
+        search: Option<&str>,
+    ) -> Self {
+        let page_size = page_size.clamp(1, 50);
+        if let Some(keyword) = search.map(str::trim).filter(|value| !value.is_empty()) {
+            let keyword = keyword.to_lowercase();
+            games.retain(|game| {
+                game.display_name.to_lowercase().contains(&keyword)
+                    || game.game_key.to_lowercase().contains(&keyword)
+            });
+        }
+        games.sort_by(|left, right| {
+            left.display_name
+                .to_lowercase()
+                .cmp(&right.display_name.to_lowercase())
+                .then_with(|| left.game_key.cmp(&right.game_key))
+        });
+        let total_count = games.len();
+        let total_pages = total_count.div_ceil(page_size).max(1);
+        let page = requested_page.clamp(1, total_pages);
+        let start = (page - 1) * page_size;
+        Self {
+            games: games.into_iter().skip(start).take(page_size).collect(),
+            page,
+            page_size,
+            total_count,
+            total_pages,
+            has_more: page < total_pages,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CachedEntry<T> {
@@ -125,6 +162,26 @@ pub struct CachedEntry<T> {
 }
 
 pub struct CloudManifestService;
+
+fn read_store_metadata_with(
+    read_manifest: impl FnOnce() -> Result<Option<CloudBodyManifest>, String> + Send,
+    read_catalog: impl FnOnce() -> Result<Option<CloudGameCatalog>, String>,
+) -> (Option<CloudBodyManifest>, Option<CloudGameCatalog>) {
+    std::thread::scope(|scope| {
+        let manifest = scope.spawn(read_manifest);
+        let catalog = read_catalog();
+        let manifest = manifest
+            .join()
+            .unwrap_or_else(|_| Err("读取商店版本清单的线程异常退出".to_string()));
+        for error in [manifest.as_ref().err(), catalog.as_ref().err()]
+            .into_iter()
+            .flatten()
+        {
+            crate::logging::warn(error);
+        }
+        (manifest.ok().flatten(), catalog.ok().flatten())
+    })
+}
 
 /// `fetch` 失败的两种性质。`rebuild` 必须分别处置；`read` 则一视同仁（都当错误）。
 #[derive(Debug)]
@@ -323,6 +380,45 @@ impl CloudManifestService {
         let meta_bytes = serde_json::to_vec(&entry).map_err(|error| error.to_string())?;
         fs::write(meta_path, meta_bytes).map_err(|error| error.to_string())?;
         fs::write(image_path, bytes).map_err(|error| error.to_string())
+    }
+
+    pub fn validate_store_cover(remote_dir: &str, remote_cover: &RemoteFile) -> Result<(), String> {
+        if remote_cover.is_dir
+            || remote_cover.fs_id == 0
+            || remote_cover.path != Self::cover_path(remote_dir)
+        {
+            return Err("云端封面不属于当前游戏".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn read_store_metadata(
+        client: &BaiduNetdiskClient,
+        remote_files: &[RemoteFile],
+        remote_dir: &str,
+        temporary_root: &Path,
+        cache_root: &Path,
+    ) -> (Option<CloudBodyManifest>, Option<CloudGameCatalog>) {
+        read_store_metadata_with(
+            || {
+                Self::read(
+                    client,
+                    remote_files,
+                    remote_dir,
+                    temporary_root,
+                    Some(cache_root),
+                )
+            },
+            || {
+                Self::read_catalog(
+                    client,
+                    remote_files,
+                    remote_dir,
+                    temporary_root,
+                    Some(cache_root),
+                )
+            },
+        )
     }
 
     pub fn read_cover(
@@ -978,6 +1074,196 @@ fn now_iso() -> String {
 
 #[cfg(test)]
 mod tests {
+    fn store_game(index: usize, display_name: &str) -> super::CloudGameSummary {
+        super::CloudGameSummary {
+            game_key: format!("game-{index:02}"),
+            game_uid: format!("uid-{index}"),
+            display_name: display_name.to_string(),
+            executable_relative_path: Some("Game.exe".to_string()),
+            arguments: Vec::new(),
+            working_directory_relative_path: None,
+            version_id: "v1".to_string(),
+            package_path: format!("/cloud/game-{index}/body/v1.zip"),
+            package_fs_id: index as u64 + 1,
+            package_size: 100,
+            package_sha256: None,
+            file_count: Some(1),
+            total_bytes: Some(100),
+            created_at: None,
+            installed: false,
+            versions: Vec::new(),
+            has_cover: false,
+            cover_file: None,
+        }
+    }
+
+    #[test]
+    fn store_pagination_has_no_hole_after_deleted_game_is_filtered() {
+        let games = (0..19)
+            .filter(|index| *index != 12)
+            .map(|index| store_game(index, &format!("Game {index:02}")))
+            .collect::<Vec<_>>();
+        let first = super::CloudGamePage::from_games(games.clone(), 1, 9, None);
+        let second = super::CloudGamePage::from_games(games.clone(), 2, 9, None);
+        let obsolete_third = super::CloudGamePage::from_games(games, 3, 9, None);
+        assert_eq!(first.games.len(), 9);
+        assert_eq!(second.games.len(), 9);
+        assert_eq!(second.total_count, 18);
+        assert_eq!(second.total_pages, 2);
+        assert!(first.has_more);
+        assert!(!second.has_more);
+        assert!(first.games.iter().all(|game| {
+            second
+                .games
+                .iter()
+                .all(|other| other.game_key != game.game_key)
+        }));
+        assert_eq!(obsolete_third.page, 2);
+        assert_eq!(obsolete_third.games.len(), 9);
+    }
+
+    #[test]
+    fn store_pagination_order_is_independent_of_directory_order() {
+        let mut games = (0..19)
+            .map(|index| store_game(index, "Same Title"))
+            .collect::<Vec<_>>();
+        let ordered = super::CloudGamePage::from_games(games.clone(), 2, 9, None);
+        games.reverse();
+        let reversed = super::CloudGamePage::from_games(games, 2, 9, None);
+        let keys = |page: &super::CloudGamePage| {
+            page.games
+                .iter()
+                .map(|game| game.game_key.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&ordered), keys(&reversed));
+        assert_eq!(ordered.games.first().unwrap().game_key, "game-09");
+        assert_eq!(ordered.games.last().unwrap().game_key, "game-17");
+    }
+
+    #[test]
+    fn store_pagination_searches_current_display_names_before_slicing() {
+        let games = (0..19)
+            .map(|index| {
+                let display_name = if index % 2 == 0 {
+                    "存档游戏"
+                } else {
+                    "Other"
+                };
+                store_game(index, display_name)
+            })
+            .collect::<Vec<_>>();
+        let page = super::CloudGamePage::from_games(games, 2, 9, Some("  存档  "));
+        assert_eq!(page.total_count, 10);
+        assert_eq!(page.total_pages, 2);
+        assert_eq!(page.games.len(), 1);
+        assert_eq!(page.games[0].game_key, "game-18");
+    }
+
+    #[test]
+    fn store_pagination_searches_keys_without_display_name_cache() {
+        let page = super::CloudGamePage::from_games(
+            vec![store_game(0, "标题"), store_game(1, "Other")],
+            1,
+            9,
+            Some(" GAME-00 "),
+        );
+        assert_eq!(page.total_count, 1);
+        assert_eq!(page.games[0].display_name, "标题");
+    }
+
+    #[test]
+    fn store_pagination_handles_empty_and_unmatched_results() {
+        for games in [Vec::new(), vec![store_game(0, "Game")]] {
+            let page = super::CloudGamePage::from_games(games, usize::MAX, 9, Some("missing"));
+            assert!(page.games.is_empty());
+            assert_eq!(page.total_count, 0);
+            assert_eq!(page.total_pages, 1);
+            assert_eq!(page.page, 1);
+            assert!(!page.has_more);
+        }
+    }
+
+    #[test]
+    fn store_pagination_clamps_page_size_and_requested_page() {
+        let games = (0..55)
+            .map(|index| store_game(index, "Game"))
+            .collect::<Vec<_>>();
+        let first = super::CloudGamePage::from_games(games.clone(), 0, 0, Some("  "));
+        assert_eq!(first.page, 1);
+        assert_eq!(first.page_size, 1);
+        assert_eq!(first.games.len(), 1);
+        let last = super::CloudGamePage::from_games(games, usize::MAX, usize::MAX, None);
+        assert_eq!(last.page_size, 50);
+        assert_eq!(last.page, 2);
+        assert_eq!(last.games.len(), 5);
+        assert!(!last.has_more);
+    }
+
+    #[test]
+    fn store_metadata_reads_are_concurrent() {
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (resume_sender, resume_receiver) = std::sync::mpsc::channel();
+        let timeout = std::time::Duration::from_secs(2);
+        let result = super::read_store_metadata_with(
+            move || {
+                started_sender.send(()).unwrap();
+                resume_receiver.recv_timeout(timeout).unwrap();
+                Ok(None)
+            },
+            || {
+                started_receiver.recv_timeout(timeout).unwrap();
+                resume_sender.send(()).unwrap();
+                Ok(None)
+            },
+        );
+        assert!(result.0.is_none());
+        assert!(result.1.is_none());
+    }
+
+    #[test]
+    fn store_metadata_preserves_catalog_when_manifest_fails() {
+        let (manifest, catalog) = super::read_store_metadata_with(
+            || Err("injected manifest failure".to_string()),
+            || {
+                Ok(Some(super::CloudGameCatalog {
+                    format_version: 1,
+                    game_key: "game-a".to_string(),
+                    game_uid: "uid-a".to_string(),
+                    display_name: "Game A".to_string(),
+                    executable_relative_path: "Game.exe".to_string(),
+                    arguments: Vec::new(),
+                    working_directory_relative_path: None,
+                    has_cover: true,
+                }))
+            },
+        );
+        assert!(manifest.is_none());
+        assert_eq!(catalog.unwrap().display_name, "Game A");
+    }
+
+    #[test]
+    fn store_cover_rejects_files_outside_current_game() {
+        let directory = "/apps/GameSaver/games/game-a/body";
+        let mut cover = crate::services::RemoteFile {
+            path: super::CloudManifestService::cover_path(directory),
+            fs_id: 123,
+            size: 100,
+            md5: None,
+            is_dir: false,
+            server_mtime: None,
+        };
+        assert!(super::CloudManifestService::validate_store_cover(directory, &cover).is_ok());
+        cover.path = "/apps/GameSaver/games/game-b/body/cover.jpg".to_string();
+        assert!(super::CloudManifestService::validate_store_cover(directory, &cover).is_err());
+        cover.path = super::CloudManifestService::cover_path(directory);
+        cover.is_dir = true;
+        assert!(super::CloudManifestService::validate_store_cover(directory, &cover).is_err());
+        cover.is_dir = false;
+        cover.fs_id = 0;
+        assert!(super::CloudManifestService::validate_store_cover(directory, &cover).is_err());
+    }
+
     #[test]
     fn failed_cover_upload_preserves_existing_cache_and_metadata() {
         let workspace = crate::test_support::TempWorkspace::new("cover-upload-failure");

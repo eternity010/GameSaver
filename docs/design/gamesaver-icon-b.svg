@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+  <title id="title">GameSaver · 存档手柄 / 高对比版</title>
+  <path d="M75 11h106c42 0 64 22 64 64v106c0 42-22 64-64 64H75c-42 0-64-22-64-64V75c0-42 22-64 64-64Z" fill="#111E36" stroke="#2B456C" stroke-width="2"/>
+  <path d="M86 71h57v36l20-13 20 13V76c18 5 31 20 36 40l12 44c5 20-6 36-23 36-11 0-19-5-28-14l-17-16c-4-4-8-6-14-6h-42c-6 0-10 2-14 6l-17 16c-9 9-17 14-28 14-17 0-28-16-23-36l12-44c7-28 24-45 49-45Z" fill="#8FC2FF"/>
+  <path d="M75 99h14v15h15v14H89v15H75v-15H60v-14h15Z" fill="#111E36"/>
+  <circle cx="170" cy="128" r="9.5" fill="#111E36"/>
+  <circle cx="196" cy="120" r="9.5" fill="#111E36"/>
+</svg>

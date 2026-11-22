@@ -1,10 +1,9 @@
-use crate::domain::save_candidate::should_ignore_event_path;
 use crate::domain::{
     learning::ProcessLifetime,
     timestamp::{current_filetime, FILETIME_TICKS_PER_MS, FILETIME_UNIX_EPOCH},
     EtwCaptureHandle,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -12,7 +11,10 @@ use std::process::Command;
 use std::time::Instant;
 use tauri::{AppHandle, Manager};
 
-use super::transactions::{FileOperation, FileOperationKind};
+use super::{
+    trace_evidence::{uses_file_object, FileEvidence, ProcessWindows},
+    transactions::FileOperation,
+};
 
 const KERNEL_FILE_CAPTURE_KEYWORDS: u64 = 0x1EB0;
 
@@ -38,17 +40,15 @@ const ETW_TRACE_MAX_LOG_MB: u32 = 256;
 ///
 /// 同理**不加 `-ct`**：它只影响时间戳时钟（省一点 CPU），却会改变 CSV 里 ClockTime 的
 /// 量纲。生命周期过滤只接受 CSV 中可确认的 Windows FILETIME，不切换时钟类型。
-fn etw_trace_args(trace_name: &str, etl_path: &str) -> Vec<String> {
+fn etw_trace_args(trace_name: &str, etl_path: &str, providers_path: &str) -> Vec<String> {
     vec![
         "create".to_string(),
         "trace".to_string(),
         trace_name.to_string(),
         "-o".to_string(),
         etl_path.to_string(),
-        "-p".to_string(),
-        "Microsoft-Windows-Kernel-File".to_string(),
-        format!("0x{KERNEL_FILE_CAPTURE_KEYWORDS:X}"),
-        "4".to_string(),
+        "-pf".to_string(),
+        providers_path.to_string(),
         "-bs".to_string(),
         ETW_TRACE_BUFFER_SIZE_KB.to_string(),
         "-nb".to_string(),
@@ -64,6 +64,7 @@ pub(crate) struct TraceCollectionResult {
     pub(crate) files: HashSet<String>,
     pub(crate) logs: Vec<String>,
     pub(crate) operations: Vec<FileOperation>,
+    pub(crate) incomplete: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -106,6 +107,10 @@ pub(crate) fn try_start_etw_capture(
     );
     let etl_path = event_logs_dir(app)?.join(format!("{trace_name}.etl"));
     let etl_path_str = etl_path.to_string_lossy().to_string();
+    let providers_path = etl_path.with_extension("providers.txt");
+    std::fs::write(&providers_path, format!(
+        "Microsoft-Windows-Kernel-File 0x{KERNEL_FILE_CAPTURE_KEYWORDS:X} 4\r\nMicrosoft-Windows-Kernel-Process 0x10 4\r\n",
+    )).map_err(|error| format!("无法写入 ETW 采集配置：{error}"))?;
 
     let _ = {
         let mut command = Command::new("logman");
@@ -115,11 +120,11 @@ pub(crate) fn try_start_etw_capture(
 
     let created = {
         let mut command = Command::new("logman");
-        command.args(etw_trace_args(&trace_name, &etl_path_str));
-        apply_background_process_flags(&mut command)
-            .output()
-            .map_err(|err| format!("ETW 启动失败：无法执行 logman（{err}）"))?
+        command.args(etw_trace_args(&trace_name, &etl_path_str, &providers_path.to_string_lossy()));
+        apply_background_process_flags(&mut command).output()
     };
+    let _ = std::fs::remove_file(&providers_path);
+    let created = created.map_err(|err| format!("ETW 启动失败：无法执行 logman（{err}）"))?;
     if !created.status.success() {
         let stderr = String::from_utf8_lossy(&created.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&created.stdout).trim().to_string();
@@ -133,6 +138,7 @@ pub(crate) fn try_start_etw_capture(
     Ok(EtwCaptureHandle {
         trace_name,
         etl_path,
+        timed_out: Default::default(),
     })
 }
 
@@ -243,49 +249,60 @@ pub(crate) fn is_running_as_admin() -> bool {
 }
 
 pub(crate) fn collect_related_files_by_trace(
-    trace_name: Option<&str>,
-    trace_path: Option<&str>,
+    capture: &EtwCaptureHandle,
     process_lifetimes: impl FnOnce(i64) -> Vec<ProcessLifetime>,
 ) -> Result<TraceCollectionResult, String> {
     let collection_started = Instant::now();
-    let mut files = HashSet::new();
     let mut logs = Vec::new();
-    let Some(name) = trace_name else {
-        logs.push("缺少 trace 名称，无法读取 ETW 结果".to_string());
-        return Ok(TraceCollectionResult {
-            files,
-            logs,
-            operations: Vec::new(),
-        });
-    };
-    let Some(etl_path) = trace_path else {
-        logs.push("缺少 ETL 路径，无法读取 ETW 结果".to_string());
-        return Ok(TraceCollectionResult {
-            files,
-            logs,
-            operations: Vec::new(),
-        });
-    };
+    let name = &capture.trace_name;
+    let etl_path = capture.etl_path.to_string_lossy();
+    let mut incomplete = false;
 
     let stop_started = Instant::now();
     match stop_etw_capture(name) {
         Ok(()) => logs.push(format!("已停止 trace：{name}")),
-        Err(err) => logs.push(format!("停止 trace 返回警告：{err}")),
+        Err(err) => {
+            incomplete = true;
+            logs.push(format!("停止 trace 返回警告：{err}"));
+        }
     }
     logs.push(format!(
         "性能：停止 ETW {} ms",
         stop_started.elapsed().as_millis()
     ));
     logs.push(format!("ETL 文件：{etl_path}"));
+    if capture.timed_out.load(std::sync::atomic::Ordering::Acquire) {
+        incomplete = true;
+        logs.push("ETW 采集已达到时长上限，之后的写入未记录。".to_string());
+    }
+    if std::fs::metadata(&capture.etl_path).is_ok_and(|metadata| {
+        let max_bytes = u64::from(ETW_TRACE_MAX_LOG_MB) * 1024 * 1024;
+        metadata.len() >= max_bytes - u64::from(ETW_TRACE_BUFFER_SIZE_KB) * 1024
+    }) {
+        incomplete = true;
+        logs.push("ETL 达到日志大小上限，采集可能截断。".to_string());
+    }
     let capture_end = current_filetime().ok_or("无法确定 ETW 采集结束时间")?;
     let lifetimes = process_lifetimes(capture_end);
     if lifetimes.is_empty() {
         return Err("无法确认游戏进程生命周期，未使用未验证的 ETW 事件".to_string());
     }
-    let tracked: HashMap<_, _> = lifetimes.iter().map(|lifetime| (lifetime.pid, lifetime)).collect();
-    let tracked_pids: Vec<_> = lifetimes.iter().map(|lifetime| lifetime.pid).collect();
+    let tracked = match super::native_etw::collect_process_windows(&etl_path, &lifetimes, capture_end) {
+        Ok((tracked, partial, note)) => {
+            incomplete |= partial;
+            logs.push(note);
+            tracked
+        }
+        Err(error) => {
+            incomplete = true;
+            logs.push(format!("无法读取 ETW 进程启停事件，仅使用已追踪的进程：{error}"));
+            ProcessWindows::from_tracked(&lifetimes)
+        }
+    };
+    let mut tracked_pids: Vec<_> = tracked.pids().collect();
+    tracked_pids.sort_unstable();
 
-    match super::native_etw::collect_related_files_from_etl(etl_path, &tracked) {
+    match super::native_etw::collect_related_files_from_etl(&etl_path, &tracked) {
         Ok(mut native) => {
             logs.append(&mut native.logs);
             logs.push(format!(
@@ -296,16 +313,18 @@ pub(crate) fn collect_related_files_by_trace(
                 files: native.files,
                 logs,
                 operations: native.operations,
+                incomplete: incomplete || native.incomplete,
             });
         }
         Err(err) => logs.push(format!("原生 ETL 解析不可用，已回退 tracerpt CSV：{err}")),
     }
 
     let csv_path = format!("{etl_path}.csv");
+    let csv_cleanup = CsvCleanup(&csv_path);
     let convert_started = Instant::now();
     let converted = {
         let mut command = Command::new("tracerpt");
-        command.args([etl_path, "-of", "CSV", "-o", &csv_path, "-y"]);
+        command.args([etl_path.as_ref(), "-of", "CSV", "-o", &csv_path, "-y"]);
         apply_background_process_flags(&mut command)
             .output()
             .map_err(|err| format!("parse etw failed: {err}"))?
@@ -326,321 +345,90 @@ pub(crate) fn collect_related_files_by_trace(
     ));
     logs.push("tracerpt 已将 ETL 转换为 CSV".to_string());
 
-    let open_started = Instant::now();
-    let csv_file = File::open(&csv_path).map_err(|err| format!("open etw csv failed: {err}"))?;
-    let csv_size = csv_file
-        .metadata()
-        .map(|metadata| metadata.len())
-        .unwrap_or_default();
-    logs.push(format!("CSV 文件：{csv_path}（{csv_size} 字节）"));
-    let mut reader = BufReader::new(csv_file);
+    let started = Instant::now();
+    let mut reader = BufReader::new(
+        File::open(&csv_path).map_err(|error| format!("读取 ETW CSV 失败：{error}"))?,
+    );
     let mut line_buffer = Vec::new();
-    let header_bytes = reader
-        .read_until(b'\n', &mut line_buffer)
-        .map_err(|err| format!("read etw csv header failed: {err}"))?;
-    logs.push(format!(
-        "性能：打开 CSV 并读取表头 {} ms",
-        open_started.elapsed().as_millis()
-    ));
-    if header_bytes == 0 {
-        logs.push("CSV 为空，没有事件表头".to_string());
-        return Ok(TraceCollectionResult {
-            files,
-            logs,
-            operations: Vec::new(),
-        });
-    }
+    reader.read_until(b'\n', &mut line_buffer)
+        .map_err(|error| format!("读取 ETW CSV 表头失败：{error}"))?;
     let header_line = String::from_utf8_lossy(&line_buffer);
     let headers = parse_csv_line(header_line.trim_start_matches('\u{feff}').trim());
-    let pid_idx = find_header_index(&headers, &["processid", "process id", "pid"]);
-    let event_name_idx = find_header_index(&headers, &["event name", "eventname", "opcode name"]);
-    let opcode_idx = find_header_index(&headers, &["opcode"]);
-    let task_idx = find_header_index(&headers, &["task"]);
-    let keyword_idx = find_header_index(&headers, &["keyword"]);
+    let pid_idx = find_header_index(&headers, &["processid", "process id", "pid"])
+        .ok_or("ETW CSV 缺少 PID 字段")?;
+    let task_idx = find_header_index(&headers, &["task"]).ok_or("ETW CSV 缺少 Task 字段")?;
     let clock_time_idx = find_header_index(&headers, &["clock-time", "clock time", "timestamp"]);
     let user_data_idx = find_header_index(&headers, &["user data", "userdata"]);
-    let path_idx = find_header_index(
-        &headers,
-        &[
-            "filename",
-            "file name",
-            "filepath",
-            "file path",
-            "pathname",
-            "path",
-        ],
-    );
-    logs.push(format!("CSV 表头：{}", headers.join(" | ")));
-    logs.push(format!(
-        "字段定位：PID={}，Task={}，Keyword={}，UserData={}，路径={}",
-        pid_idx.map_or_else(|| "未找到".to_string(), |idx| idx.to_string()),
-        task_idx.map_or_else(|| "未找到".to_string(), |idx| idx.to_string()),
-        keyword_idx.map_or_else(|| "未找到".to_string(), |idx| idx.to_string()),
-        user_data_idx.map_or_else(|| "未找到".to_string(), |idx| idx.to_string()),
-        path_idx.map_or_else(|| "回退扫描整行".to_string(), |idx| idx.to_string())
-    ));
+    let path_idx = find_header_index(&headers, &["filename", "file name", "filepath", "file path", "pathname", "path"]);
     let device_paths = build_device_path_map();
-    logs.push(format!("设备路径映射：{} 个卷", device_paths.len()));
-    logs.push(format!("目标 PID：{:?}", tracked_pids));
+    let mut evidence = FileEvidence::default();
     let mut total_rows = 0usize;
-    let mut parsed_pid_rows = 0usize;
-    let mut matched_pid_rows = 0usize;
-    let mut outside_lifetime_rows = 0usize;
-    let mut task_prefiltered_rows = 0usize;
-    let mut write_like_rows = 0usize;
-    let mut extracted_path_rows = 0usize;
-    let mut ignored_path_rows = 0usize;
-    let mut object_path_resolved_rows = 0usize;
-    let mut observed_pids = HashSet::new();
-    let mut matched_row_samples = Vec::new();
-    let mut unparsed_pid_samples = Vec::new();
-    let mut file_object_paths = HashMap::new();
-    let mut written_file_objects = HashSet::new();
-    let mut operations = Vec::new();
-    let parse_started = Instant::now();
+    let mut matched_rows = 0usize;
+    let mut outside_lifetime = 0usize;
     loop {
         line_buffer.clear();
-        let bytes_read = reader
-            .read_until(b'\n', &mut line_buffer)
-            .map_err(|err| format!("read etw csv row failed: {err}"))?;
-        if bytes_read == 0 {
+        if reader.read_until(b'\n', &mut line_buffer)
+            .map_err(|error| format!("读取 ETW CSV 事件失败：{error}"))? == 0 {
             break;
         }
-        let line = String::from_utf8_lossy(&line_buffer);
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
         total_rows += 1;
-        let Some(pid_index) = pid_idx else {
+        let line = String::from_utf8_lossy(&line_buffer);
+        let line = line.trim();
+        if !fast_csv_field(line, 0).is_some_and(|name| name.eq_ignore_ascii_case("Microsoft-Windows-Kernel-File")) {
+            continue;
+        }
+        let Some(pid) = fast_csv_field(line, pid_idx.saturating_sub(1)).and_then(parse_u32) else {
             continue;
         };
-        let is_kernel_file = trimmed
-            .trim_start()
-            .starts_with("Microsoft-Windows-Kernel-File");
-        let actual_pid_index = if is_kernel_file {
-            pid_index.saturating_sub(1)
+        if !tracked.contains_pid(pid) {
+            continue;
+        }
+        let Some(code) = fast_csv_field(line, task_idx.saturating_sub(1)).and_then(parse_u32) else {
+            continue;
+        };
+        if !uses_file_object(code) {
+            continue;
+        }
+        let Some(event_time) = csv_event_time(line, clock_time_idx, true)
+            .filter(|time| tracked.contains(pid, *time))
+        else {
+            outside_lifetime += 1;
+            continue;
+        };
+        matched_rows += 1;
+        let row = parse_csv_line(line);
+        let path = if super::trace_evidence::reads_direct_path(code) {
+            path_idx.and_then(|idx| event_field_value(&row, idx)).and_then(|cell| extract_trace_path(cell))
+                .or_else(|| row.iter().skip(user_data_idx.map_or(0, |idx| idx.saturating_sub(1)))
+                    .find_map(|cell| extract_trace_path(cell)))
+                .map(|path| normalize_windows_path(&resolve_device_path(&path, &device_paths)))
         } else {
-            pid_index
+            None
         };
-        let Some(pid_value) = fast_csv_field(trimmed, actual_pid_index) else {
-            continue;
-        };
-        let Some(pid) = parse_u32(pid_value) else {
-            if unparsed_pid_samples.len() < 3 {
-                unparsed_pid_samples.push(pid_value.to_string());
-            }
-            continue;
-        };
-        parsed_pid_rows += 1;
-        if observed_pids.len() < 12 {
-            observed_pids.insert(pid);
-        }
-        let Some(lifetime) = tracked.get(&pid) else {
-            continue;
-        };
-        if is_kernel_file {
-            let actual_task_index = task_idx.map(|index| index.saturating_sub(1));
-            let task = actual_task_index
-                .and_then(|index| fast_csv_field(trimmed, index))
-                .and_then(parse_u32);
-            if task.is_some_and(should_skip_kernel_task) {
-                task_prefiltered_rows += 1;
-                continue;
-            }
-        }
-        let Some(event_time) = csv_event_time(trimmed, clock_time_idx, is_kernel_file, lifetime) else {
-            outside_lifetime_rows += 1;
-            continue;
-        };
-        matched_pid_rows += 1;
-        let row = parse_csv_line(trimmed);
-
-        let extracted = path_idx
-            .and_then(|idx| row.get(idx).cloned())
-            .or_else(|| row.iter().find_map(|cell| extract_trace_path(cell)));
-        let normalized_path = extracted.map(|path| {
-            extracted_path_rows += 1;
-            normalize_windows_path(&resolve_device_path(&path, &device_paths))
-        });
-        let file_object_id = event_file_object_id(&row, user_data_idx);
-        if let Some(path) = normalized_path.as_ref() {
-            if !path.is_empty() && !should_ignore_event_path(Path::new(path)) {
-                if let Some(object_id) = file_object_id.as_ref() {
-                    file_object_paths.insert(object_id.clone(), path.clone());
-                }
-            } else {
-                ignored_path_rows += 1;
-            }
-        }
-
-        let operation_path = normalized_path.clone().or_else(|| {
-            file_object_id
-                .as_ref()
-                .and_then(|object_id| file_object_paths.get(object_id).cloned())
-        });
-        if normalized_path.is_none() && operation_path.is_some() {
-            object_path_resolved_rows += 1;
-        }
-        let operation_kind = classify_file_operation(
-            event_name_idx.and_then(|idx| event_field_value(&row, idx)),
-            task_idx.and_then(|idx| event_field_value(&row, idx)),
-            opcode_idx.and_then(|idx| event_field_value(&row, idx)),
-            keyword_idx.and_then(|idx| event_field_value(&row, idx)),
-        );
-        if let (Some(path), Some(operation)) = (
-            operation_path.as_ref().filter(|path| !path.is_empty()),
-            operation_kind,
-        ) {
-            operations.push(FileOperation {
-                path: path.clone(),
-                operation,
-                timestamp_ms: Some((event_time - FILETIME_UNIX_EPOCH) / FILETIME_TICKS_PER_MS),
-                pid,
-                file_object_id: file_object_id.clone(),
-            });
-        }
-
-        let is_write_like = keyword_idx
-            .and_then(|idx| event_field_value(&row, idx))
-            .and_then(|value| parse_u64(value))
-            .is_some_and(|keyword| keyword & 0x1E00 != 0);
-        let is_mutation = is_write_like
-            || matches!(
-                operation_kind,
-                Some(FileOperationKind::Rename | FileOperationKind::Create)
-            );
-        if !is_mutation {
-            continue;
-        }
-        write_like_rows += 1;
-        if let Some(object_id) = file_object_id {
-            written_file_objects.insert(object_id);
-        }
-        if let Some(path) = operation_path {
-            if !path.is_empty() && !should_ignore_event_path(Path::new(&path)) {
-                files.insert(path);
-            }
-        }
-        if matched_row_samples.len() < 3 {
-            matched_row_samples.push(trimmed.chars().take(320).collect::<String>());
-        }
+        evidence.record(code, path, event_file_object_id(&row, user_data_idx), pid,
+            Some((event_time - FILETIME_UNIX_EPOCH) / FILETIME_TICKS_PER_MS));
     }
-
-    for object_id in &written_file_objects {
-        if let Some(path) = file_object_paths.get(object_id) {
-            files.insert(path.clone());
-        }
-    }
-
-    let mut observed_pids = observed_pids.into_iter().collect::<Vec<_>>();
-    observed_pids.sort_unstable();
     logs.push(format!(
-        "事件统计：总行 {total_rows}，PID 可解析 {parsed_pid_rows}，PID 命中 {matched_pid_rows}，Task 前置过滤 {task_prefiltered_rows}，写相关 {write_like_rows}，路径提取 {extracted_path_rows}，路径忽略 {ignored_path_rows}"
+        "CSV 事件统计：总行 {total_rows}，匹配 {matched_rows}，生命周期不匹配或时间不可用 {outside_lifetime}，有效写入 {}，文件 {}",
+        evidence.mutations, evidence.files.len(),
     ));
-    logs.push(format!("进程生命周期过滤：{outside_lifetime_rows} 条事件时间不匹配或不可用"));
-    logs.push(format!(
-        "文件对象关联：路径对象 {}，写入对象 {}",
-        file_object_paths.len(),
-        written_file_objects.len()
-    ));
-    logs.push(format!("CSV 中观察到的部分 PID：{observed_pids:?}"));
-    if !unparsed_pid_samples.is_empty() {
-        logs.push(format!("无法解析的 PID 样本：{unparsed_pid_samples:?}"));
-    }
-    for (index, sample) in matched_row_samples.iter().enumerate() {
-        logs.push(format!("PID 命中事件样本 {}：{sample}", index + 1));
-    }
-    logs.push(format!("最终去重文件：{}", files.len()));
-    logs.push(format!("结构化文件操作：{} 条", operations.len()));
-    logs.push(format!(
-        "性能：解析 CSV {} ms，共 {} 行",
-        parse_started.elapsed().as_millis(),
-        total_rows
-    ));
-    logs.push(format!(
-        "操作分类：创建 {}，写入 {}，重命名 {}，删除 {}，关闭 {}，未知 {}；对象路径回填 {}",
-        operations
-            .iter()
-            .filter(|item| item.operation == FileOperationKind::Create)
-            .count(),
-        operations
-            .iter()
-            .filter(|item| item.operation == FileOperationKind::Write)
-            .count(),
-        operations
-            .iter()
-            .filter(|item| item.operation == FileOperationKind::Rename)
-            .count(),
-        operations
-            .iter()
-            .filter(|item| item.operation == FileOperationKind::Delete)
-            .count(),
-        operations
-            .iter()
-            .filter(|item| item.operation == FileOperationKind::Close)
-            .count(),
-        operations
-            .iter()
-            .filter(|item| item.operation == FileOperationKind::Unknown)
-            .count(),
-        object_path_resolved_rows
-    ));
-    logs.push(format!(
-        "性能：ETW 结果收集总计 {} ms",
-        collection_started.elapsed().as_millis()
-    ));
-    let _ = std::fs::remove_file(&csv_path);
+    logs.push(format!("CSV 结构化操作：{}，解析耗时 {} ms", evidence.operations.len(), started.elapsed().as_millis()));
+    logs.push(format!("性能：ETW 结果收集总计 {} ms", collection_started.elapsed().as_millis()));
+    drop(reader);
+    drop(csv_cleanup);
     Ok(TraceCollectionResult {
-        files,
+        files: evidence.files,
         logs,
-        operations,
+        operations: evidence.operations,
+        incomplete: true,
     })
 }
 
-pub(super) fn classify_file_operation(
-    event_name: Option<&String>,
-    task: Option<&String>,
-    opcode: Option<&String>,
-    keyword: Option<&String>,
-) -> Option<FileOperationKind> {
-    let is_kernel_file = event_name.is_some_and(|value| {
-        value
-            .trim()
-            .eq_ignore_ascii_case("Microsoft-Windows-Kernel-File")
-    });
-    if is_kernel_file {
-        if let Some(task) = task.and_then(|value| parse_u32(value)) {
-            return match task {
-                10 | 11 | 15 | 20 | 22 | 23 | 24 | 25 => None,
-                12 | 30 => Some(FileOperationKind::Create),
-                13 | 14 => Some(FileOperationKind::Close),
-                16 | 21 => Some(FileOperationKind::Write),
-                18 | 26 => Some(FileOperationKind::Delete),
-                19 | 27 | 28 | 29 => Some(FileOperationKind::Rename),
-                _ => Some(FileOperationKind::Unknown),
-            };
-        }
-    }
+struct CsvCleanup<'a>(&'a str);
 
-    let text = [event_name, opcode, keyword]
-        .into_iter()
-        .flatten()
-        .map(|value| value.to_ascii_lowercase())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if text.contains("rename") || text.contains("renamepath") {
-        Some(FileOperationKind::Rename)
-    } else if text.contains("delete") || text.contains("cleanup") {
-        Some(FileOperationKind::Delete)
-    } else if text.contains("close") {
-        Some(FileOperationKind::Close)
-    } else if text.contains("write") || text.contains("flush") {
-        Some(FileOperationKind::Write)
-    } else if text.contains("create") || text.contains("open") {
-        Some(FileOperationKind::Create)
-    } else {
-        Some(FileOperationKind::Unknown)
+impl Drop for CsvCleanup<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
     }
 }
 
@@ -648,11 +436,10 @@ fn csv_event_time(
     row: &str,
     clock_index: Option<usize>,
     is_kernel_file: bool,
-    lifetime: &ProcessLifetime,
 ) -> Option<i64> {
     let index = clock_index?.checked_sub(usize::from(is_kernel_file))?;
     let ticks = fast_csv_field(row, index)?.parse::<i64>().ok()?;
-    (ticks >= FILETIME_UNIX_EPOCH && lifetime.contains(ticks)).then_some(ticks)
+    (ticks >= FILETIME_UNIX_EPOCH).then_some(ticks)
 }
 
 #[cfg(test)]
@@ -808,10 +595,6 @@ fn fast_csv_field(line: &str, index: usize) -> Option<&str> {
         .map(|value| value.trim().trim_matches('"'))
 }
 
-pub(super) fn should_skip_kernel_task(task: u32) -> bool {
-    matches!(task, 15 | 20 | 22 | 23 | 24 | 25)
-}
-
 fn find_header_index(headers: &[String], keywords: &[&str]) -> Option<usize> {
     headers.iter().position(|header| {
         let normalized = header
@@ -837,17 +620,6 @@ fn parse_u32(text: &str) -> Option<u32> {
         return u32::from_str_radix(hex, 16).ok();
     }
     trimmed.parse::<u32>().ok()
-}
-
-fn parse_u64(text: &str) -> Option<u64> {
-    let trimmed = text.trim().trim_matches('"');
-    if let Some(hex) = trimmed
-        .strip_prefix("0x")
-        .or_else(|| trimmed.strip_prefix("0X"))
-    {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    trimmed.parse::<u64>().ok()
 }
 
 pub(crate) fn normalize_windows_path(path: &str) -> String {
@@ -889,11 +661,12 @@ fn command_failure_detail(output: &std::process::Output, message: &str) -> Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_file_operation, etw_trace_args, event_field_value, event_file_object_id,
+        etw_trace_args, event_field_value, event_file_object_id,
         event_pid_value, fast_csv_field, is_trace_artifact, parse_csv_line,
-        csv_event_time, parse_u32, resolve_device_path, should_skip_kernel_task, ProcessLifetime,
+        csv_event_time, parse_u32, resolve_device_path, uses_file_object, ProcessLifetime,
         KERNEL_FILE_CAPTURE_KEYWORDS,
     };
+    use super::super::trace_evidence::classify_kernel_operation;
     use crate::services::learning::transactions::FileOperationKind;
     use std::path::Path;
 
@@ -919,14 +692,12 @@ mod tests {
     }
 
     #[test]
-    fn prefilters_only_known_non_mutating_kernel_tasks() {
-        for task in [15, 20, 22, 23, 24, 25] {
-            assert!(should_skip_kernel_task(task));
+    fn prefilters_unneeded_kernel_tasks() {
+        for task in [10, 11, 15, 17, 19, 20, 21, 22, 23, 24, 25, 28, 29, 32] {
+            assert!(!uses_file_object(task));
         }
-        for task in [
-            10, 11, 12, 13, 14, 16, 17, 18, 19, 21, 26, 27, 28, 29, 30, 32,
-        ] {
-            assert!(!should_skip_kernel_task(task));
+        for task in [12, 13, 14, 16, 18, 26, 27, 30] {
+            assert!(uses_file_object(task));
         }
     }
 
@@ -948,17 +719,15 @@ mod tests {
         );
         assert_eq!(event_field_value(&row, 7).map(String::as_str), Some("16"));
         assert!(matches!(
-            classify_file_operation(row.first(), event_field_value(&row, 7), None, None),
+            event_field_value(&row, 7).and_then(|task| parse_u32(task)).and_then(classify_kernel_operation),
             Some(FileOperationKind::Write)
         ));
     }
 
     #[test]
     fn ignores_known_read_only_kernel_file_tasks() {
-        let provider = "Microsoft-Windows-Kernel-File".to_string();
-        for task in [10, 11, 15, 20, 22, 23, 24, 25] {
-            let task = task.to_string();
-            assert!(classify_file_operation(Some(&provider), Some(&task), None, None).is_none());
+        for task in [10, 11, 12, 15, 20, 21, 22, 23, 24, 25] {
+            assert!(classify_kernel_operation(task).is_none());
         }
     }
 
@@ -981,7 +750,8 @@ mod tests {
 
     #[test]
     fn etw_trace_args_bound_the_capture_resources() {
-        let args = etw_trace_args("GameSaverTrace_abc", r"C:\logs\abc.etl");
+        let args = etw_trace_args("GameSaverTrace_abc", r"C:\logs\abc.etl", "providers.txt");
+        assert_eq!(flag_value(&args, "-pf"), Some("providers.txt"));
         assert_eq!(flag_value(&args, "-bs"), Some("64"), "缓冲区大小");
         assert_eq!(flag_value(&args, "-nb"), Some("16"), "缓冲区数量下界");
         // `-nb` 吃「最小值 最大值」两个值，上界是紧跟其后的第二个。
@@ -999,7 +769,7 @@ mod tests {
 
     #[test]
     fn etw_trace_args_avoid_flags_that_conflict_with_ets() {
-        let args = etw_trace_args("GameSaverTrace_abc", r"C:\logs\abc.etl");
+        let args = etw_trace_args("GameSaverTrace_abc", r"C:\logs\abc.etl", "providers.txt");
         // 本机 logman（10.0.26100.1150）实测：`-b`（起始时刻）与 `-rf`（运行时长）都与
         // `-ets` 互斥，报「参数不允许具有其他指定的参数」。一旦出现，整个会话创建会失败，
         // 且只会静默回退到快照模式 —— 用户看不到明显报错，识别质量却掉了。`-ct` 虽能用，
@@ -1027,12 +797,12 @@ mod tests {
         ] {
             let row = format!("Microsoft-Windows-Kernel-File,{time}");
             assert_eq!(
-                csv_event_time(&row, Some(2), true, &lifetime),
+                csv_event_time(&row, Some(2), true).filter(|ticks| lifetime.contains(*ticks)),
                 accepted.then_some(time)
             );
         }
         assert_eq!(
-            csv_event_time("Microsoft-Windows-Kernel-File,", Some(2), true, &lifetime),
+            csv_event_time("Microsoft-Windows-Kernel-File,", Some(2), true),
             None
         );
     }

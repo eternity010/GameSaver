@@ -1,10 +1,11 @@
+use super::run_blocking;
 use crate::{
     app_state::AppState,
     domain::{TaskCategory, TaskStatus},
     repositories::GameRepository,
     services::{
         disk_space,
-        library_service::{LibraryMigration, MigrationOutcome},
+        library_service::{LibraryMigration, LibraryStorageOverview, MigrationOutcome},
         LibraryService, TaskService,
     },
 };
@@ -68,6 +69,26 @@ pub fn get_library_settings(
             }
         }),
     })
+}
+
+#[tauri::command]
+pub async fn get_library_storage_overview(app: AppHandle) -> Result<LibraryStorageOverview, String> {
+    run_blocking(move || library_storage_overview_blocking(app)).await
+}
+
+fn library_storage_overview_blocking(app: AppHandle) -> Result<LibraryStorageOverview, String> {
+    let state = app.state::<AppState>();
+    let root = state.library_root_path()?;
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "读取游戏库记录失败".to_string())?
+        .clone();
+    let overview = LibraryService::storage_overview(&root, &store)?;
+    if root != state.library_root_path()? {
+        return Err("游戏库位置在统计期间发生变化，请刷新重试".to_string());
+    }
+    Ok(overview)
 }
 
 #[tauri::command]

@@ -1,13 +1,9 @@
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::collections::HashMap;
 use std::time::Instant;
 
 use super::etw_capture::normalize_windows_path;
-use super::etw_capture::{
-    build_device_path_map, resolve_device_path, should_skip_kernel_task, TraceCollectionResult,
-};
-use super::transactions::{FileOperation, FileOperationKind};
-use crate::domain::save_candidate::should_ignore_event_path;
+use super::etw_capture::{build_device_path_map, resolve_device_path, TraceCollectionResult};
+use super::trace_evidence::{reads_direct_path, uses_file_object, FileEvidence, ProcessHistory, ProcessWindows};
 use crate::domain::{
     learning::ProcessLifetime,
     timestamp::{FILETIME_TICKS_PER_MS, FILETIME_UNIX_EPOCH},
@@ -19,30 +15,27 @@ use windows_sys::Win32::{
     System::Diagnostics::Etw::{
         CloseTrace, OpenTraceW, ProcessTrace, TdhGetProperty, TdhGetPropertySize, EVENT_RECORD,
         EVENT_TRACE_LOGFILEW, EVENT_TRACE_LOGFILEW_0, EVENT_TRACE_LOGFILEW_1,
-        PROCESS_TRACE_MODE_EVENT_RECORD, PROPERTY_DATA_DESCRIPTOR,
+        PEVENT_RECORD_CALLBACK, PROCESS_TRACE_MODE_EVENT_RECORD, PROPERTY_DATA_DESCRIPTOR,
     },
 };
 
 const KERNEL_FILE_PROVIDER: windows_sys::core::GUID =
     windows_sys::core::GUID::from_u128(0xedd08927_9cc4_4e65_b970_c2560fb5c289);
-const FILE_OBJECT_PROPERTY_NAMES: &[&str] = &["FileObject", "FileKey"];
+const KERNEL_PROCESS_PROVIDER: windows_sys::core::GUID =
+    windows_sys::core::GUID::from_u128(0x22fb2cd6_0e7b_422b_a0c7_2fad1fd0e716);
+const FILE_OBJECT_PROPERTY_NAMES: &[&str] = &["FileObject"];
 const PATH_PROPERTY_NAMES: &[&str] = &["FileName", "FilePath", "OpenPath", "Path"];
 
 #[cfg(target_os = "windows")]
 struct NativeCollector<'a> {
-    tracked: &'a HashMap<u32, &'a ProcessLifetime>,
+    tracked: &'a ProcessWindows,
     device_paths: Vec<(String, String)>,
-    files: HashSet<String>,
-    operations: Vec<FileOperation>,
-    file_object_paths: HashMap<String, String>,
-    written_file_objects: HashSet<String>,
+    evidence: FileEvidence,
     total_events: usize,
     matched_pid_events: usize,
     outside_lifetime_events: usize,
     task_prefiltered_events: usize,
     extracted_paths: usize,
-    ignored_paths: usize,
-    object_path_resolved: usize,
     property_errors: usize,
     descriptor_samples: Vec<String>,
     path_property_by_schema: HashMap<u64, Option<usize>>,
@@ -51,21 +44,16 @@ struct NativeCollector<'a> {
 
 #[cfg(target_os = "windows")]
 impl<'a> NativeCollector<'a> {
-    fn new(tracked: &'a HashMap<u32, &'a ProcessLifetime>) -> Self {
+    fn new(tracked: &'a ProcessWindows) -> Self {
         Self {
             tracked,
             device_paths: build_device_path_map(),
-            files: HashSet::new(),
-            operations: Vec::new(),
-            file_object_paths: HashMap::new(),
-            written_file_objects: HashSet::new(),
+            evidence: FileEvidence::default(),
             total_events: 0,
             matched_pid_events: 0,
             outside_lifetime_events: 0,
             task_prefiltered_events: 0,
             extracted_paths: 0,
-            ignored_paths: 0,
-            object_path_resolved: 0,
             property_errors: 0,
             descriptor_samples: Vec::new(),
             path_property_by_schema: HashMap::new(),
@@ -79,10 +67,10 @@ impl<'a> NativeCollector<'a> {
             return;
         }
         let pid = event.EventHeader.ProcessId;
-        let Some(lifetime) = self.tracked.get(&pid) else {
+        if !self.tracked.contains_pid(pid) {
             return;
-        };
-        if !lifetime.contains(event.EventHeader.TimeStamp) {
+        }
+        if !self.tracked.contains(pid, event.EventHeader.TimeStamp) {
             self.outside_lifetime_events += 1;
             return;
         }
@@ -102,13 +90,12 @@ impl<'a> NativeCollector<'a> {
                 descriptor.Id, descriptor.Task, descriptor.Opcode
             ));
         }
-        if should_skip_kernel_task(operation_code) {
+        if !uses_file_object(operation_code) {
             self.task_prefiltered_events += 1;
             return;
         }
 
-        let operation = classify_kernel_operation(operation_code);
-        let path_result = if operation.is_some_and(needs_direct_path) {
+        let path_result = if reads_direct_path(operation_code) {
             event_property_text_cached(
                 event,
                 PATH_PROPERTY_NAMES,
@@ -134,48 +121,15 @@ impl<'a> NativeCollector<'a> {
             &mut self.file_object_property_by_schema,
             schema_key,
         ) {
-            Ok(value) => value.map(|bytes| format_file_object_id(&bytes)),
+            Ok(value) => value.and_then(|bytes| format_file_object_id(&bytes)),
             Err(()) => {
                 self.property_errors += 1;
                 None
             }
         };
-        if let Some(path) = path.as_ref() {
-            if should_ignore_event_path(Path::new(path)) {
-                self.ignored_paths += 1;
-            } else if let Some(object_id) = file_object_id.as_ref() {
-                self.file_object_paths
-                    .insert(object_id.clone(), path.clone());
-            }
-        }
-        let operation_path = path
-            .clone()
-            .filter(|path| !should_ignore_event_path(Path::new(path)))
-            .or_else(|| {
-                file_object_id
-                    .as_ref()
-                    .and_then(|object_id| self.file_object_paths.get(object_id).cloned())
-            });
-        if path.is_none() && operation_path.is_some() {
-            self.object_path_resolved += 1;
-        }
-        if let (Some(path), Some(operation)) = (operation_path.clone(), operation) {
-            self.operations.push(FileOperation {
-                path,
-                operation,
-                timestamp_ms: filetime_to_unix_ms(event.EventHeader.TimeStamp),
-                pid,
-                file_object_id: file_object_id.clone(),
-            });
-        }
-        if is_mutation_related_task(operation_code) {
-            if let Some(object_id) = file_object_id {
-                self.written_file_objects.insert(object_id);
-            }
-            if let Some(path) = operation_path {
-                self.files.insert(path);
-            }
-        }
+        self.evidence.record(
+            operation_code, path, file_object_id, pid, filetime_to_unix_ms(event.EventHeader.TimeStamp),
+        );
     }
 }
 
@@ -191,12 +145,67 @@ unsafe extern "system" fn event_record_callback(event: *mut EVENT_RECORD) {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn collect_related_files_from_etl(
+pub(super) fn collect_related_files_from_etl(
     etl_path: &str,
-    tracked: &HashMap<u32, &ProcessLifetime>,
+    tracked: &ProcessWindows,
 ) -> Result<TraceCollectionResult, String> {
     let started = Instant::now();
     let mut collector = NativeCollector::new(tracked);
+    let health = read_trace(
+        etl_path, (&mut collector as *mut NativeCollector).cast(), Some(event_record_callback),
+    )?;
+    if collector.total_events == 0 {
+        return Err("native ETL contained no events".to_string());
+    }
+    if collector.matched_pid_events == 0 {
+        return Err("native ETL contained no target process events".to_string());
+    }
+    if collector.extracted_paths == 0 {
+        return Err("native ETL contained no decodable target paths".to_string());
+    }
+    let incomplete = health.incomplete() || collector.property_errors > 0;
+    let mut tracked_pids: Vec<_> = tracked.pids().collect();
+    tracked_pids.sort_unstable();
+    use super::transactions::FileOperationKind;
+    let logs = vec![
+        "原生 ETL 解析完成（OpenTraceW + ProcessTrace + TDH）".to_string(),
+        format!("设备路径映射：{} 个卷", collector.device_paths.len()),
+        format!("目标 PID：{tracked_pids:?}"),
+        format!("进程生命周期过滤：{} 条事件时间不匹配", collector.outside_lifetime_events),
+        format!("事件描述符样本：{}", collector.descriptor_samples.join("；")),
+        format!(
+            "原生事件统计：总事件 {}，PID 命中 {}，Task 前置过滤 {}，路径提取 {}，路径忽略 {}",
+            collector.total_events, collector.matched_pid_events, collector.task_prefiltered_events,
+            collector.extracted_paths, collector.evidence.ignored_paths,
+        ),
+        format!(
+            "写入相关事件：{}，最终去重文件：{}，活动文件对象：{}，对象路径回填：{}",
+            collector.evidence.mutations, collector.evidence.files.len(),
+            collector.evidence.path_count(), collector.evidence.resolved_paths,
+        ),
+        format!(
+            "操作分类：创建 {}，写入 {}，重命名 {}，删除 {}，关闭 {}",
+            collector.evidence.operations.iter().filter(|item| item.operation == FileOperationKind::Create).count(),
+            collector.evidence.operations.iter().filter(|item| item.operation == FileOperationKind::Write).count(),
+            collector.evidence.operations.iter().filter(|item| item.operation == FileOperationKind::Rename).count(),
+            collector.evidence.operations.iter().filter(|item| item.operation == FileOperationKind::Delete).count(),
+            collector.evidence.operations.iter().filter(|item| item.operation == FileOperationKind::Close).count(),
+        ),
+        format!("原生属性解码失败：{} 次", collector.property_errors),
+        health.describe(),
+        format!("性能：原生 ETL 文件解析 {} ms", started.elapsed().as_millis()),
+    ];
+    Ok(TraceCollectionResult {
+        files: collector.evidence.files, logs, operations: collector.evidence.operations, incomplete,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn read_trace(
+    etl_path: &str,
+    context: *mut std::ffi::c_void,
+    callback: PEVENT_RECORD_CALLBACK,
+) -> Result<TraceHealth, String> {
     let mut etl_path_wide = etl_path.encode_utf16().collect::<Vec<_>>();
     etl_path_wide.push(0);
     let mut logfile = EVENT_TRACE_LOGFILEW::default();
@@ -205,9 +214,9 @@ pub(crate) fn collect_related_files_from_etl(
         ProcessTraceMode: PROCESS_TRACE_MODE_EVENT_RECORD,
     };
     logfile.Anonymous2 = EVENT_TRACE_LOGFILEW_1 {
-        EventRecordCallback: Some(event_record_callback),
+        EventRecordCallback: callback,
     };
-    logfile.Context = (&mut collector as *mut NativeCollector).cast();
+    logfile.Context = context;
     let trace_handle = unsafe { OpenTraceW(&mut logfile) };
     if trace_handle.Value == u64::MAX {
         return Err("OpenTraceW failed".to_string());
@@ -223,110 +232,113 @@ pub(crate) fn collect_related_files_from_etl(
     if close_status != ERROR_SUCCESS {
         return Err(format!("CloseTrace failed with Win32 error {close_status}"));
     }
-    if collector.total_events == 0 {
-        return Err("native ETL contained no events".to_string());
-    }
-    if collector.matched_pid_events == 0 {
-        return Err("native ETL contained no target process events".to_string());
-    }
-    if collector.matched_pid_events > 0 && collector.extracted_paths == 0 {
-        return Err("native ETL contained no decodable target paths".to_string());
-    }
-    if !collector.operations.is_empty()
-        && collector
-            .operations
-            .iter()
-            .all(|operation| operation.operation == FileOperationKind::Unknown)
-    {
-        return Err(format!(
-            "native ETL operation classification failed ({})",
-            collector.descriptor_samples.join("；")
-        ));
-    }
-    for object_id in &collector.written_file_objects {
-        if let Some(path) = collector.file_object_paths.get(object_id) {
-            collector.files.insert(path.clone());
-        }
-    }
-    let mut tracked_pids: Vec<_> = tracked.keys().copied().collect();
-    tracked_pids.sort_unstable();
-    let mut logs = vec![
-        "原生 ETL 解析完成（OpenTraceW + ProcessTrace + TDH）".to_string(),
-        format!("设备路径映射：{} 个卷", collector.device_paths.len()),
-        format!("目标 PID：{tracked_pids:?}"),
-        format!("进程生命周期过滤：{} 条事件时间不匹配", collector.outside_lifetime_events),
-        format!(
-            "事件描述符样本：{}",
-            collector.descriptor_samples.join("；")
-        ),
-        format!(
-            "原生事件统计：总事件 {}，PID 命中 {}，Task 前置过滤 {}，路径提取 {}，路径忽略 {}",
-            collector.total_events,
-            collector.matched_pid_events,
-            collector.task_prefiltered_events,
-            collector.extracted_paths,
-            collector.ignored_paths,
-        ),
-        format!(
-            "文件对象关联：路径对象 {}，写入对象 {}",
-            collector.file_object_paths.len(),
-            collector.written_file_objects.len(),
-        ),
-        format!("最终去重文件：{}", collector.files.len()),
-        format!("结构化文件操作：{} 条", collector.operations.len()),
-        format!(
-            "操作分类：创建 {}，写入 {}，重命名 {}，删除 {}，关闭 {}，未知 {}；对象路径回填 {}",
-            collector
-                .operations
-                .iter()
-                .filter(|item| item.operation == FileOperationKind::Create)
-                .count(),
-            collector
-                .operations
-                .iter()
-                .filter(|item| item.operation == FileOperationKind::Write)
-                .count(),
-            collector
-                .operations
-                .iter()
-                .filter(|item| item.operation == FileOperationKind::Rename)
-                .count(),
-            collector
-                .operations
-                .iter()
-                .filter(|item| item.operation == FileOperationKind::Delete)
-                .count(),
-            collector
-                .operations
-                .iter()
-                .filter(|item| item.operation == FileOperationKind::Close)
-                .count(),
-            collector
-                .operations
-                .iter()
-                .filter(|item| item.operation == FileOperationKind::Unknown)
-                .count(),
-            collector.object_path_resolved,
-        ),
-        format!("原生属性解码失败：{} 次", collector.property_errors),
-        format!(
-            "TDH 属性缓存：路径结构 {}，文件对象结构 {}",
-            collector.path_property_by_schema.len(),
-            collector.file_object_property_by_schema.len()
-        ),
-        format!("性能：原生 ETL 解析 {} ms", started.elapsed().as_millis()),
-    ];
-    Ok(TraceCollectionResult {
-        files: collector.files,
-        logs: std::mem::take(&mut logs),
-        operations: collector.operations,
+    let header = &logfile.LogfileHeader;
+    Ok(TraceHealth {
+        events_lost: unsafe { header.Anonymous2.Anonymous.EventsLost },
+        buffers_lost: header.BuffersLost,
+        finalized: header.EndTime > 0,
     })
 }
 
+struct TraceHealth {
+    events_lost: u32,
+    buffers_lost: u32,
+    finalized: bool,
+}
+
+impl TraceHealth {
+    fn incomplete(&self) -> bool {
+        !self.finalized || self.events_lost > 0 || self.buffers_lost > 0
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "ETL 完整性：丢失事件 {}，丢失缓冲区 {}，已正常收尾 {}",
+            self.events_lost, self.buffers_lost, self.finalized,
+        )
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct ProcessCollector {
+    history: ProcessHistory,
+    decode_failures: usize,
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn process_callback(event: *mut EVENT_RECORD) {
+    let Some(event) = event.as_ref() else { return; };
+    if !same_guid(&event.EventHeader.ProviderId, &KERNEL_PROCESS_PROVIDER) {
+        return;
+    }
+    let code = event.EventHeader.EventDescriptor.Id;
+    if !matches!(code, 1 | 2) {
+        return;
+    }
+    let Some(collector) = event.UserContext.cast::<ProcessCollector>().as_mut() else { return; };
+    let fields = (|| {
+        let pid = u32::from_le_bytes(event_property_bytes_named(event, "ProcessID").ok()??.try_into().ok()?);
+        let created = i64::from_le_bytes(event_property_bytes_named(event, "CreateTime").ok()??.try_into().ok()?);
+        Some((pid, created))
+    })();
+    let Some(key) = fields else {
+        collector.decode_failures += 1;
+        return;
+    };
+    match code {
+        1 => {
+            if let Some(parent) = event_property_bytes_named(event, "ParentProcessID")
+                .ok().flatten().and_then(|bytes| bytes.try_into().ok()).map(u32::from_le_bytes)
+            {
+                collector.history.starts.insert(key, parent);
+            } else {
+                collector.decode_failures += 1;
+            }
+        }
+        2 => {
+            if let Some(exited) = event_property_bytes_named(event, "ExitTime")
+                .ok().flatten().and_then(|bytes| bytes.try_into().ok()).map(i64::from_le_bytes)
+            {
+                collector.history.stops.insert(key, exited);
+            } else {
+                collector.decode_failures += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(super) fn collect_process_windows(
+    etl_path: &str, tracked: &[ProcessLifetime], capture_end: i64,
+) -> Result<(ProcessWindows, bool, String), String> {
+    let started = Instant::now();
+    let mut collector = ProcessCollector::default();
+    let health = read_trace(
+        etl_path, (&mut collector as *mut ProcessCollector).cast(), Some(process_callback),
+    )?;
+    let events = collector.history.starts.len() + collector.history.stops.len();
+    let (windows, added) = collector.history.resolve(tracked, capture_end);
+    let incomplete = events == 0 || collector.decode_failures > 0 || health.incomplete();
+    let note = format!(
+        "ETW 进程生命周期：记录 {}，补充短命子进程 {}，解码失败 {}，耗时 {} ms；{}",
+        events, added, collector.decode_failures, started.elapsed().as_millis(), health.describe(),
+    );
+    Ok((windows, incomplete, note))
+}
+
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn collect_related_files_from_etl(
+pub(super) fn collect_process_windows(
+    _etl_path: &str, _tracked: &[ProcessLifetime], _capture_end: i64,
+) -> Result<(ProcessWindows, bool, String), String> {
+    Err("native ETL parsing requires Windows".into())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(super) fn collect_related_files_from_etl(
     _etl_path: &str,
-    _tracked: &HashMap<u32, &ProcessLifetime>,
+    _tracked: &ProcessWindows,
 ) -> Result<TraceCollectionResult, String> {
     Err("native ETL parsing is only available on Windows".to_string())
 }
@@ -421,42 +433,20 @@ fn decode_property_text(bytes: &[u8]) -> String {
         .to_string()
 }
 
-fn format_file_object_id(bytes: &[u8]) -> String {
+fn format_file_object_id(bytes: &[u8]) -> Option<String> {
+    if !matches!(bytes.len(), 4 | 8) {
+        return None;
+    }
     let mut raw = [0u8; 8];
     for (index, value) in bytes.iter().take(8).enumerate() {
         raw[index] = *value;
     }
-    format!("0x{:016X}", u64::from_le_bytes(raw))
+    let address = u64::from_le_bytes(raw);
+    (address != 0).then(|| format!("0x{address:016X}"))
 }
 
 fn filetime_to_unix_ms(value: i64) -> Option<i64> {
     (value > 100_000_000_000_000).then(|| (value - FILETIME_UNIX_EPOCH) / FILETIME_TICKS_PER_MS)
-}
-
-fn is_mutation_related_task(task: u32) -> bool {
-    matches!(task, 12 | 16 | 19 | 21 | 27 | 28 | 29 | 30)
-}
-
-fn classify_kernel_operation(operation_code: u32) -> Option<FileOperationKind> {
-    match operation_code {
-        10 | 11 | 15 | 20 | 22 | 23 | 24 | 25 => None,
-        12 | 30 => Some(FileOperationKind::Create),
-        13 | 14 => Some(FileOperationKind::Close),
-        16 | 21 => Some(FileOperationKind::Write),
-        18 | 26 => Some(FileOperationKind::Delete),
-        19 | 27 | 28 | 29 => Some(FileOperationKind::Rename),
-        _ => Some(FileOperationKind::Unknown),
-    }
-}
-
-fn needs_direct_path(operation: FileOperationKind) -> bool {
-    matches!(
-        operation,
-        FileOperationKind::Create
-            | FileOperationKind::Rename
-            | FileOperationKind::Delete
-            | FileOperationKind::Unknown
-    )
 }
 
 fn kernel_file_operation_code(task: u16, event_id: u16, opcode: u8) -> u32 {
@@ -488,23 +478,22 @@ fn same_guid(left: &windows_sys::core::GUID, right: &windows_sys::core::GUID) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_kernel_operation, decode_property_text, event_schema_key, filetime_to_unix_ms,
-        format_file_object_id, is_mutation_related_task, kernel_file_operation_code,
-        needs_direct_path,
+        decode_property_text, event_schema_key, filetime_to_unix_ms, format_file_object_id,
+        kernel_file_operation_code, reads_direct_path, TraceHealth,
     };
+    use super::super::trace_evidence::classify_kernel_operation;
     use crate::services::learning::transactions::FileOperationKind;
 
     #[cfg(target_os = "windows")]
     #[test]
     fn native_etl_filters_reused_pids_before_decoding_properties() {
-        use super::{NativeCollector, ProcessLifetime, KERNEL_FILE_PROVIDER};
-        use std::collections::HashMap;
+        use super::{NativeCollector, ProcessLifetime, ProcessWindows, KERNEL_FILE_PROVIDER};
         use windows_sys::Win32::System::Diagnostics::Etw::EVENT_RECORD;
 
         let started_at = 134_313_202_837_027_063;
         let ended_at = started_at + 2;
         let lifetime = ProcessLifetime { pid: 42, started_at, ended_at };
-        let tracked = HashMap::from([(lifetime.pid, &lifetime)]);
+        let tracked = ProcessWindows::from_tracked(std::slice::from_ref(&lifetime));
         let mut collector = NativeCollector::new(&tracked);
         let mut event = EVENT_RECORD::default();
         event.EventHeader.ProviderId = KERNEL_FILE_PROVIDER;
@@ -517,7 +506,7 @@ mod tests {
         assert_eq!(collector.matched_pid_events, 2);
         assert_eq!(collector.outside_lifetime_events, 3);
         assert_eq!(collector.task_prefiltered_events, 2);
-        assert!(collector.operations.is_empty());
+        assert!(collector.evidence.operations.is_empty());
     }
 
     #[test]
@@ -534,9 +523,11 @@ mod tests {
     #[test]
     fn formats_file_object_identifiers_stably() {
         assert_eq!(
-            format_file_object_id(&0xFFFF_8000_0000_1234u64.to_le_bytes()),
-            "0xFFFF800000001234"
+            format_file_object_id(&0xFFFF_8000_0000_1234u64.to_le_bytes()).as_deref(),
+            Some("0xFFFF800000001234")
         );
+        assert_eq!(format_file_object_id(&[0; 8]), None);
+        assert_eq!(format_file_object_id(&[0; 16]), None);
     }
 
     #[test]
@@ -545,13 +536,17 @@ mod tests {
     }
 
     #[test]
-    fn keeps_only_mutating_file_tasks() {
-        assert!(is_mutation_related_task(16));
-        assert!(is_mutation_related_task(21));
-        assert!(is_mutation_related_task(12));
-        assert!(is_mutation_related_task(19));
-        assert!(is_mutation_related_task(27));
-        assert!(!is_mutation_related_task(15));
+    fn incomplete_trace_is_detected_from_header() {
+        let mut health = TraceHealth { events_lost: 0, buffers_lost: 0, finalized: true };
+        assert!(!health.incomplete());
+        health.buffers_lost = 1;
+        assert!(health.incomplete());
+        health.buffers_lost = 0;
+        health.events_lost = 1;
+        assert!(health.incomplete());
+        health.events_lost = 0;
+        health.finalized = false;
+        assert!(health.incomplete());
     }
 
     #[test]
@@ -563,10 +558,11 @@ mod tests {
 
     #[test]
     fn decodes_paths_only_for_operations_that_carry_names() {
-        assert!(needs_direct_path(FileOperationKind::Create));
-        assert!(needs_direct_path(FileOperationKind::Rename));
-        assert!(!needs_direct_path(FileOperationKind::Write));
-        assert!(!needs_direct_path(FileOperationKind::Close));
+        assert!(reads_direct_path(12));
+        assert!(reads_direct_path(27));
+        assert!(reads_direct_path(30));
+        assert!(!reads_direct_path(16));
+        assert!(!reads_direct_path(14));
         assert!(matches!(
             classify_kernel_operation(16),
             Some(FileOperationKind::Write)

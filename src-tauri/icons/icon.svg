@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+  <title id="title">GameSaver · 存档手柄</title>
+  <defs>
+    <linearGradient id="tile" x1="49" y1="22" x2="206" y2="240" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1B2B48"/>
+      <stop offset=".55" stop-color="#142039"/>
+      <stop offset="1" stop-color="#0D1629"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="45" y1="23" x2="201" y2="234" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#526992"/>
+      <stop offset="1" stop-color="#243452"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="88" y1="77" x2="177" y2="195" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#B0DDFF"/>
+      <stop offset=".43" stop-color="#82B8FF"/>
+      <stop offset="1" stop-color="#5C88F4"/>
+    </linearGradient>
+  </defs>
+  <path d="M85 16h86c44 0 69 25 69 69v86c0 44-25 69-69 69H85c-44 0-69-25-69-69V85c0-44 25-69 69-69Z" fill="url(#tile)" stroke="url(#rim)" stroke-width="2"/>
+  <path fill="#090F20" opacity=".44" transform="translate(0 4)" d="M94 77h52a3 3 0 0 1 3 3v23l17-11 17 11V83c15 5 25 18 30 37l11 39c5 18-6 33-22 33-10 0-17-4-25-12l-17-17c-5-5-10-7-17-7h-30c-7 0-12 2-17 7l-17 17c-8 8-15 12-25 12-16 0-27-15-22-33l11-39c7-27 24-43 51-43Z"/>
+  <path fill="url(#mark)" d="M94 77h52a3 3 0 0 1 3 3v23l17-11 17 11V83c15 5 25 18 30 37l11 39c5 18-6 33-22 33-10 0-17-4-25-12l-17-17c-5-5-10-7-17-7h-30c-7 0-12 2-17 7l-17 17c-8 8-15 12-25 12-16 0-27-15-22-33l11-39c7-27 24-43 51-43Z"/>
+  <path d="M94 81h46M188 89c9 5 15 13 19 24" fill="none" stroke="#ECF8FF" stroke-opacity=".49" stroke-width="2" stroke-linecap="round"/>
+  <path d="M84 101v38m-19-19h38" fill="none" stroke="#14233D" stroke-width="13" stroke-linecap="round"/>
+  <circle cx="169" cy="128" r="8.5" fill="#14233D"/>
+  <circle cx="191" cy="115" r="8.5" fill="#14233D"/>
+</svg>

@@ -6,6 +6,8 @@ import type { AppTask, BaiduConfigView, BaiduQuota, BaiduStatus, CloudAccountSta
 import { open } from "@tauri-apps/plugin-dialog";
 import { useTaskFeed } from "../taskFeed";
 
+const emit = defineEmits<{ storage: [] }>();
+
 const appKey = ref("");
 const secretKey = ref("");
 const config = ref<BaiduConfigView | null>(null);
@@ -386,6 +388,7 @@ onUnmounted(() => {
           <div class="library-root-row"><div><span class="settings-label">当前游戏库</span><strong class="library-path">{{ library.libraryRoot }}</strong></div><button class="secondary-button" type="button" :disabled="saving || !!libraryTaskId || !!library.pendingMigrationSource" @click="chooseLibraryRoot"><FolderOpen :size="16" />{{ libraryTaskId ? "迁移中" : "更换位置" }}</button></div>
           <div class="quota-grid library-usage-grid"><div><span>游戏本体</span><strong>{{ formatLibraryBytes(library.gamesBytes) }}</strong><small>{{ library.gamesPath }}</small></div><div><span>本体 ZIP</span><strong>{{ formatLibraryBytes(library.bodyPackagesBytes) }}</strong><small>{{ library.bodyPackagesPath }}</small></div><div><span>存档版本</span><strong>{{ formatLibraryBytes(library.savesBytes) }}</strong><small>{{ library.savesPath }}</small></div></div>
           <p class="settings-hint"><HardDrive :size="15" />已占用 {{ formatLibraryBytes(library.totalBytes) }}，包含 {{ library.fileCount.toLocaleString() }} 个文件；当前磁盘可用 {{ formatLibraryBytes(library.freeBytes) }}。迁移完成并校验后，旧位置的大文件会被清理。</p>
+          <button class="secondary-button" type="button" @click="emit('storage')"><HardDrive :size="16" />查看各游戏占用</button>
           <div v-if="libraryTaskId" class="library-migration-progress"><div class="task-progress-heading"><span>{{ libraryTaskMessage }}</span><strong>{{ libraryTaskProgress }}%</strong></div><div class="progress-track"><span :style="{ width: `${libraryTaskProgress}%` }"></span></div></div>
           <p v-if="libraryTrackingError" class="settings-alert settings-alert-error">{{ libraryTrackingError }}</p>
           <div v-if="library.pendingMigrationSource && !libraryTaskId" class="settings-alert settings-alert-error"><span>{{ library.migrationWarning }}</span><button class="secondary-button" type="button" :disabled="saving" @click="startLibraryTask()"><RefreshCw :size="16" />继续迁移 / 重试清理</button></div>

@@ -106,26 +106,32 @@ impl AppState {
 
     /// 云端存档同步的独占 key。
     ///
-    /// 刻意**不**复用整游戏独占 key：云端同步可以在游戏运行期间进行（手动上传、还原），
-    /// 而本体更新那类操作会拒绝「游戏运行中」。两者共用一把 key 会让云端操作被
-    /// `running_games` 那类无关判据挡掉。云端同步需要真正互斥的只有「同一游戏的另一次
-    /// 云端同步」，因为云端清单是读-改-写。
+    /// 云端上传与删除不修改本地存档目录，可以与本体打包并行。
     pub fn cloud_operation_key(game_uid: &str) -> String {
         format!("cloud:{}", game_uid.trim())
     }
 
-    /// 该游戏是否已持有整游戏独占或云端同步的任意一把 key。
-    ///
-    /// 判定**不区分两把 key 的种类**：它们互斥，且每种操作一次只该有一个。因此
-    /// 「集合里存在该游戏的任何操作」就等于「占用中」。
-    fn any_operation_for(&self, operations: &HashSet<String>, game_uid: &str) -> bool {
-        let game_uid = game_uid.trim();
+    fn cloud_restore_operation_key(game_uid: &str) -> String {
+        format!("cloud-restore:{}", game_uid.trim())
+    }
+
+    fn body_package_operation_key(game_uid: &str) -> String {
+        format!("body-package:{}", game_uid.trim())
+    }
+
+    fn exclusive_or_pending_operation(operations: &HashSet<String>, game_uid: &str) -> bool {
         Self::account_restore_in_progress(operations)
             || Self::library_migration_in_progress(operations)
             || operations.contains(&Self::game_operation_key(game_uid))
-            || operations.contains(&Self::cloud_operation_key(game_uid))
             || operations.contains(&Self::removal_operation_key(game_uid))
             || operations.contains(&Self::update_operation_key(game_uid))
+    }
+
+    fn any_operation_for(&self, operations: &HashSet<String>, game_uid: &str) -> bool {
+        Self::exclusive_or_pending_operation(operations, game_uid)
+            || operations.contains(&Self::cloud_operation_key(game_uid))
+            || operations.contains(&Self::cloud_restore_operation_key(game_uid))
+            || operations.contains(&Self::body_package_operation_key(game_uid))
     }
 
     fn removal_operation_key(game_uid: &str) -> String {
@@ -187,11 +193,37 @@ impl AppState {
             || Self::library_migration_in_progress(&operations)
             || operations.contains(&Self::game_operation_key(game_uid))
             || operations.contains(&Self::cloud_operation_key(game_uid))
+            || operations.contains(&Self::cloud_restore_operation_key(game_uid))
+            || operations.contains(&Self::body_package_operation_key(game_uid))
             || operations.contains(&Self::removal_operation_key(game_uid))
             || (!resume && operations.contains(&Self::update_operation_key(game_uid)))
         {
             return Err("该游戏已有操作或更新事务待恢复，请先完成后再操作".into());
         }
+        self.ensure_body_operation_idle(game_uid)?;
+        operations.insert(Self::game_operation_key(game_uid));
+        Ok(())
+    }
+
+    pub(crate) fn claim_body_package(&self, game_uid: &str) -> Result<String, String> {
+        let game_uid = game_uid.trim();
+        let mut operations = self
+            .save_operations
+            .lock()
+            .map_err(|_| "锁定游戏操作状态失败")?;
+        let key = Self::body_package_operation_key(game_uid);
+        if Self::exclusive_or_pending_operation(&operations, game_uid)
+            || operations.contains(&Self::cloud_restore_operation_key(game_uid))
+            || operations.contains(&key)
+        {
+            return Err("该游戏正在操作游戏本体、恢复存档或维护游戏库，请稍后再试".into());
+        }
+        self.ensure_body_operation_idle(game_uid)?;
+        operations.insert(key.clone());
+        Ok(key)
+    }
+
+    fn ensure_body_operation_idle(&self, game_uid: &str) -> Result<(), String> {
         if self
             .running_games
             .lock()
@@ -206,7 +238,6 @@ impl AppState {
         {
             return Err("请先关闭游戏并结束存档识别，再操作游戏本体".into());
         }
-        operations.insert(Self::game_operation_key(game_uid));
         Ok(())
     }
 
@@ -230,6 +261,8 @@ impl AppState {
             || Self::library_migration_in_progress(&operations)
             || operations.contains(&Self::game_operation_key(game_uid))
             || operations.contains(&Self::cloud_operation_key(game_uid))
+            || operations.contains(&Self::cloud_restore_operation_key(game_uid))
+            || operations.contains(&Self::body_package_operation_key(game_uid))
             || operations.contains(&Self::update_operation_key(game_uid))
             || (!resume && operations.contains(&Self::removal_operation_key(game_uid)))
         {
@@ -391,10 +424,7 @@ impl AppState {
 
     /// 认领一次整游戏独占操作。已被占用时返回 `Err`，调用方不该继续。
     ///
-    /// 除整游戏独占外也拒绝**云端同步进行中**：两边会读写同一份本地存档目录（云端
-    /// 上传/还原要打包或落盘存档，本体更新与封面处理要动受管目录与封面），必须互相
-    /// 可见。判据放在插入**之前**：`insert` 会真的写进去，发现冲突再回滚等于制造一个
-    /// 短暂的半认领状态，让并发调用看到「无冲突」。
+    /// 在同一锁内检查现有认领，再插入整游戏独占 key。
     pub fn claim_operation(&self, game_uid: &str, busy: &str) -> Result<(), String> {
         let mut operations = self
             .save_operations
@@ -415,14 +445,26 @@ impl AppState {
     /// `AppState`，于是沿用项目里既有的「认领 → 起线程 → 线程内释放」写法，
     /// 与 `save_version_commands::reserve_maintenance` 一致。
     pub fn claim_cloud_operation(&self, game_uid: &str) -> Result<String, String> {
+        self.claim_cloud_save(game_uid, false)
+    }
+
+    fn claim_cloud_save(&self, game_uid: &str, restore: bool) -> Result<String, String> {
         let mut operations = self
             .save_operations
             .lock()
             .map_err(|_| "锁定游戏操作状态失败".to_string())?;
-        if self.any_operation_for(&operations, game_uid) {
+        if Self::exclusive_or_pending_operation(&operations, game_uid)
+            || operations.contains(&Self::cloud_operation_key(game_uid))
+            || operations.contains(&Self::cloud_restore_operation_key(game_uid))
+            || (restore && operations.contains(&Self::body_package_operation_key(game_uid)))
+        {
             return Err("该游戏已有云端同步或本体操作正在进行".to_string());
         }
-        let key = Self::cloud_operation_key(game_uid);
+        let key = if restore {
+            Self::cloud_restore_operation_key(game_uid)
+        } else {
+            Self::cloud_operation_key(game_uid)
+        };
         operations.insert(key.clone());
         Ok(key)
     }
@@ -457,7 +499,7 @@ impl AppState {
         Ok(())
     }
 
-    /// 该游戏是否有云端同步或整游戏独占操作在进行（自行取锁）。
+    /// 该游戏是否有会阻止启动的操作在进行。
     ///
     /// 持锁调用方直接把 `MutexGuard` 传进来即可 —— `&MutexGuard<HashSet<_>>` 会自动
     /// 解引用成 `&HashSet<_>`。之所以不另开一个「持锁版本」，是因为
@@ -628,7 +670,8 @@ pub struct CloudOperationClaim<'a> {
 
 impl<'a> CloudOperationClaim<'a> {
     pub fn claim_restore(state: &'a AppState, game_uid: &str) -> Result<Self, String> {
-        let claim = Self::claim(state, game_uid)?;
+        let key = state.claim_cloud_save(game_uid, true)?;
+        let claim = Self { state, key };
         state.ensure_save_restore_idle(game_uid)?;
         Ok(claim)
     }
@@ -916,6 +959,50 @@ mod tests {
         assert!(CloudOperationClaim::claim(&state, "game-1").is_err());
         drop(restore);
         assert!(!occupied(&state, "game-1"));
+    }
+
+    #[test]
+    fn body_package_and_cloud_save_upload_can_overlap_in_either_order() {
+        let state = test_state();
+        let game_uid = "game-1";
+        let cloud = state.claim_cloud_operation(game_uid).unwrap();
+        let package = state.claim_body_package(game_uid).unwrap();
+        assert!(state.claim_body_package(game_uid).is_err());
+        assert!(state.claim_cloud_operation(game_uid).is_err());
+        state.release_operation(&cloud);
+        assert!(occupied(&state, game_uid));
+        let next_cloud = state.claim_cloud_operation(game_uid).unwrap();
+        state.release_operation(&package);
+        assert!(occupied(&state, game_uid));
+        state.release_operation(&next_cloud);
+        assert!(!occupied(&state, game_uid));
+    }
+
+    #[test]
+    fn body_package_blocks_operations_that_can_change_its_inputs() {
+        let state = test_state();
+        let game_uid = "game-1";
+        let package = state.claim_body_package(game_uid).unwrap();
+        assert!(CloudOperationClaim::claim_restore(&state, game_uid).is_err());
+        assert!(state.claim_operation(game_uid, "busy").is_err());
+        assert!(state.claim_game_update(game_uid, false).is_err());
+        assert!(state.claim_game_removal(game_uid, false).is_err());
+        assert!(state.claim_learning_start(game_uid).is_err());
+        assert!(state.claim_library_migration(false).is_err());
+        assert!(state.claim_account_restore().is_err());
+        state.release_operation(&package);
+
+        let restore = CloudOperationClaim::claim_restore(&state, game_uid).unwrap();
+        assert!(state.claim_body_package(game_uid).is_err());
+        drop(restore);
+        state.set_runtime(running_runtime(game_uid));
+        assert!(state.claim_body_package(game_uid).is_err());
+        state.remove_runtime(game_uid);
+        state.finish_game_update(game_uid, true);
+        assert!(state.claim_body_package(game_uid).is_err());
+        state.finish_game_update(game_uid, false);
+        state.claim_account_restore().unwrap();
+        assert!(state.claim_body_package(game_uid).is_err());
     }
 
     #[test]

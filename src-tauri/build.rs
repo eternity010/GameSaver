@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rerun-if-changed=icons/icon.ico");
     if std::env::var("PROFILE").as_deref() == Ok("release") {
         let windows = tauri_build::WindowsAttributes::new()
             .app_manifest(include_str!("windows/app.manifest"));

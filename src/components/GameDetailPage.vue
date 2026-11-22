@@ -8,6 +8,7 @@ import { armGameCoverCapture, confirmAction, deleteCloudSaveVersion, deleteGameB
 import type { BaiduConfigView, BaiduStatus } from "../api";
 import { gameStatusLabel } from "../domain/game";
 import type { CloudSaveManifestVersion, CloudSaveSyncStatusView, CoverCrop, CoverPosition, Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveProfile, SaveRootType, SaveScope, SaveVersionSummary } from "../domain/game";
+import { useTaskFeed } from "../taskFeed";
 
 const props = defineProps<{
   game: Game;
@@ -22,6 +23,7 @@ const emit = defineEmits<{
   resumeSetup: [];
   captureHandled: [captureId: string];
 }>();
+const taskFeed = useTaskFeed();
 
 const precheck = ref<LaunchPrecheck | null>(null);
 const runtime = ref<GameRuntime | null>(null);
@@ -38,6 +40,18 @@ const baiduConfig = ref<BaiduConfigView | null>(null);
 const cloudConnectionLoading = ref(true);
 const loading = ref(true);
 const busy = ref(false);
+const bodyPackageTransfer = trackDetailTransfer("package_game_body", "创建游戏本体包");
+const saveUploadTransfer = trackDetailTransfer("sync_cloud_save", "上传云端存档");
+const cloudRestoreActive = computed(() => taskFeed.tasks.value.some((task) =>
+  task.gameUid === props.game.gameUid && task.taskType === "restore_cloud_save" &&
+  (task.status === "pending" || task.status === "running"),
+));
+const foregroundBlocked = computed(() => busy.value || cloudRestoreActive.value);
+const exclusiveBusy = computed(() => foregroundBlocked.value || bodyPackageTransfer.active.value || saveUploadTransfer.active.value);
+const canPackageBody = computed(() => !foregroundBlocked.value && !bodyPackageTransfer.active.value && !runtime.value && precheck.value?.canLaunch);
+const canUploadSave = computed(() => !foregroundBlocked.value && !saveUploadTransfer.active.value && !runtime.value && baiduReady());
+const canSyncLatest = computed(() => canUploadSave.value && cloudSaveLoaded.value && !cloudSaveLoading.value &&
+  (!bodyPackageTransfer.active.value || cloudSaveStatus.value?.syncState === "local_ahead" || cloudSaveStatus.value?.syncState === "no_cloud_saves"));
 const launchPending = ref(false);
 const error = ref(props.initialError || "");
 const message = ref("");
@@ -89,7 +103,7 @@ async function openFolder(path: string) {
 }
 
 async function changeSaveDirectory(scope: SaveScope, scopeIndex: number) {
-  if (busy.value || runtime.value) return;
+  if (exclusiveBusy.value || runtime.value) return;
   busy.value = true;
   try {
     const selected = await open({
@@ -158,9 +172,11 @@ let pollTimer: ReturnType<typeof setTimeout> | undefined;
 let taskEventTimer: ReturnType<typeof setTimeout> | undefined;
 // 当前正在轮询的任务 id。用于「同一场会话不重复接回」，也让 reattach 不会死循环。
 let watchedTaskId: string | undefined;
+let taskReadGeneration = 0;
 let refreshGeneration = 0;
 let cloudOverviewPromise: Promise<void> | null = null;
 let cloudOverviewGameUid = "";
+let cloudOverviewGeneration = 0;
 
 const renaming = ref(false);
 const editingName = ref("");
@@ -210,6 +226,8 @@ async function submitRename() {
 async function refresh() {
   const gameUid = props.game.gameUid;
   const generation = ++refreshGeneration;
+  cloudOverviewGeneration++;
+  cloudOverviewPromise = null;
   loading.value = true;
   error.value = "";
   cloudSaveError.value = "";
@@ -264,6 +282,8 @@ async function refreshCloudState(gameUid: string, generation: number, forceOverv
     if (baiduReady()) {
       await loadCloudSaveOverview(forceOverview);
     } else {
+      cloudOverviewGeneration++;
+      cloudOverviewPromise = null;
       cloudSaveStatus.value = null;
       cloudSaveVersions.value = [];
       cloudSaveLoaded.value = true;
@@ -272,6 +292,8 @@ async function refreshCloudState(gameUid: string, generation: number, forceOverv
     }
   } catch (reason) {
     if (generation !== refreshGeneration || gameUid !== props.game.gameUid) return;
+    cloudOverviewGeneration++;
+    cloudOverviewPromise = null;
     cloudConnectionLoading.value = false;
     cloudSaveError.value = String(reason);
     cloudSaveLoaded.value = true;
@@ -280,33 +302,36 @@ async function refreshCloudState(gameUid: string, generation: number, forceOverv
 }
 
 function loadCloudSaveOverview(force = false): Promise<void> {
+  if (detailListenersDisposed) return Promise.resolve();
   const gameUid = props.game.gameUid;
+  if (!force && cloudOverviewPromise && cloudOverviewGameUid === gameUid) {
+    return cloudOverviewPromise;
+  }
   if (!force && cloudSaveLoaded.value && cloudOverviewGameUid === gameUid) {
     return Promise.resolve();
   }
-  if (cloudOverviewPromise && cloudOverviewGameUid === gameUid) {
-    return cloudOverviewPromise;
-  }
 
+  const generation = ++cloudOverviewGeneration;
+  const isCurrent = () => !detailListenersDisposed && generation === cloudOverviewGeneration && gameUid === props.game.gameUid;
   cloudOverviewGameUid = gameUid;
   cloudSaveLoading.value = true;
   cloudSaveError.value = "";
   const request = getCloudSaveOverview(gameUid)
     .then((overview) => {
-      if (gameUid !== props.game.gameUid) return;
+      if (!isCurrent()) return;
       cloudSaveStatus.value = overview.status;
       cloudSaveVersions.value = overview.versions;
       cloudSaveLoaded.value = true;
     })
     .catch((reason) => {
-      if (gameUid !== props.game.gameUid) return;
+      if (!isCurrent()) return;
       cloudSaveStatus.value = null;
       cloudSaveVersions.value = [];
       cloudSaveError.value = String(reason);
       cloudSaveLoaded.value = true;
     })
     .finally(() => {
-      if (cloudOverviewPromise === request) {
+      if (isCurrent() && cloudOverviewPromise === request) {
         cloudOverviewPromise = null;
         cloudSaveLoading.value = false;
       }
@@ -316,16 +341,8 @@ function loadCloudSaveOverview(force = false): Promise<void> {
 }
 
 async function uploadSave(version: SaveVersionSummary) {
-  if (busy.value || runtime.value || !baiduReady()) return;
-  busy.value = true;
-  error.value = "";
-  message.value = "准备上传存档到百度网盘";
-  try {
-    await watchTask(await startUploadSaveVersionTask(props.game.gameUid, version.versionId));
-  } catch (reason) {
-    busy.value = false;
-    error.value = String(reason);
-  }
+  if (!canUploadSave.value) return;
+  await saveUploadTransfer.start(() => startUploadSaveVersionTask(props.game.gameUid, version.versionId));
 }
 
 async function openCloudSaveDrawer() {
@@ -335,7 +352,7 @@ async function openCloudSaveDrawer() {
 }
 
 async function restoreCloudSave(cloudVersion: CloudSaveManifestVersion) {
-  if (busy.value || runtime.value) return;
+  if (exclusiveBusy.value || runtime.value) return;
   busy.value = true;
   error.value = "";
   message.value = "正在从云端还原存档";
@@ -348,7 +365,7 @@ async function restoreCloudSave(cloudVersion: CloudSaveManifestVersion) {
 }
 
 async function deleteCloudSave(cloudVersion: CloudSaveManifestVersion) {
-  if (busy.value || runtime.value) return;
+  if (exclusiveBusy.value || runtime.value) return;
   if (!(await confirmAction(`确定从百度网盘中删除 ${formatDate(cloudVersion.createdAt)} 的云端存档吗？`))) return;
   busy.value = true;
   error.value = "";
@@ -366,7 +383,7 @@ async function deleteCloudSave(cloudVersion: CloudSaveManifestVersion) {
 }
 
 async function syncLatestSave() {
-  if (busy.value || runtime.value || !baiduReady()) return;
+  if (!canSyncLatest.value) return;
   if (!cloudSaveStatus.value) return;
   if (cloudSaveStatus.value.syncState === "local_ahead" || cloudSaveStatus.value.syncState === "no_cloud_saves") {
     const latest = versions.value.find((version) => version.isCurrent);
@@ -441,14 +458,14 @@ const launchButton = computed<{ label: string; disabled: boolean; spinning: bool
   else if (loading.value && !precheck.value) label = "检测中...";
   return {
     label,
-    disabled: !!runtime.value || busy.value || !precheck.value?.canLaunch,
+    disabled: !!runtime.value || exclusiveBusy.value || !precheck.value?.canLaunch,
     spinning,
   };
 });
 
 async function start() {
   // runtime 是唯一真相源：只要后端报告有 runtime，就绝不再拉起。
-  if (busy.value || runtime.value || !precheck.value?.canLaunch) return;
+  if (exclusiveBusy.value || runtime.value || !precheck.value?.canLaunch) return;
   const gameUid = props.game.gameUid;
   busy.value = true;
   launchPending.value = true;
@@ -471,39 +488,42 @@ async function start() {
 async function watchTask(taskId: string, gameUid: string = props.game.gameUid) {
   // 会话属于某个具体游戏：组件已经切到别的游戏时不再跟踪，否则上一场的
   // message / 进度条会被写进当前页面。回到该游戏时 refresh() 会重新接回。
-  if (gameUid !== props.game.gameUid) {
+  if (detailListenersDisposed || gameUid !== props.game.gameUid) {
     // 组件已切到别的游戏：静默结束本场轮询。切换时的 watcher 已经停过定时器，
     // 这里**不能**再 stopPolling —— 那会误杀新游戏刚建立的轮询。
     if (watchedTaskId === taskId) watchedTaskId = undefined;
     return;
   }
   stopPolling();
+  const generation = ++taskReadGeneration;
   watchedTaskId = taskId;
   busy.value = true;
+  const isCurrent = () => !detailListenersDisposed && gameUid === props.game.gameUid && generation === taskReadGeneration;
   try {
     const task = await getTask(taskId);
-    if (gameUid !== props.game.gameUid) return;
-    runtime.value = await getGameRuntime(gameUid);
-    if (gameUid !== props.game.gameUid) return;
+    if (!isCurrent()) return;
+    const nextRuntime = await getGameRuntime(gameUid);
+    if (!isCurrent()) return;
+    runtime.value = nextRuntime;
     message.value = task.message;
     taskProgress.value = task.progress;
     if (task.status === "success") {
       busy.value = false;
       await refresh();
-      emit("refresh");
+      if (isCurrent()) emit("refresh");
       return;
     }
     if (task.status === "failed" || task.status === "cancelled" || task.status === "interrupted") {
       busy.value = false;
       const failure = task.error || task.message || (task.status === "interrupted" ? "任务异常中断" : "操作失败");
       await refresh();
-      error.value = failure;
+      if (isCurrent()) error.value = failure;
       return;
     }
     pollTimer = setTimeout(() => void watchTask(taskId, gameUid), TASK_POLL_FALLBACK_MS);
   } catch (reason) {
+    if (!isCurrent()) return;
     if (watchedTaskId === taskId) watchedTaskId = undefined;
-    if (gameUid !== props.game.gameUid) return;
     busy.value = false;
     error.value = String(reason);
   }
@@ -577,7 +597,7 @@ function handleTaskChanged(payload: { taskId?: string; gameUid?: string } | unde
 }
 
 async function restoreVersion(version: SaveVersionSummary) {
-  if (busy.value || runtime.value) return;
+  if (exclusiveBusy.value || runtime.value) return;
   busy.value = true;
   error.value = "";
   message.value = "准备恢复保存版本";
@@ -590,7 +610,7 @@ async function restoreVersion(version: SaveVersionSummary) {
 }
 
 async function deleteVersion(version: SaveVersionSummary) {
-  if (busy.value || runtime.value) return;
+  if (exclusiveBusy.value || runtime.value) return;
   if (!(await confirmAction("删除后将无法从这个版本恢复，确定继续吗？"))) return;
   busy.value = true;
   error.value = "";
@@ -604,7 +624,7 @@ async function deleteVersion(version: SaveVersionSummary) {
 }
 
 async function pruneVersions() {
-  if (busy.value || runtime.value) return;
+  if (exclusiveBusy.value || runtime.value) return;
   if (!(await confirmAction(`仅保留最近 ${keepVersions.value} 个版本，确定清理旧版本吗？`))) return;
   busy.value = true;
   error.value = "";
@@ -618,6 +638,7 @@ async function pruneVersions() {
 }
 
 async function changeKeepVersions(newLimit: number) {
+  if (exclusiveBusy.value || runtime.value) return;
   keepVersions.value = newLimit;
   try {
     await updateSaveProfileKeepVersions(props.game.gameUid, newLimit);
@@ -628,7 +649,7 @@ async function changeKeepVersions(newLimit: number) {
 }
 
 async function updateBody() {
-  if (busy.value || runtime.value) return;
+  if (exclusiveBusy.value || runtime.value || !precheck.value?.bodyDirectoryExists) return;
   const selected = await open({ directory: true, multiple: false });
   if (typeof selected !== "string") return;
   const confirmMsg = props.game.health === "broken"
@@ -647,29 +668,20 @@ async function updateBody() {
 }
 
 async function packageBody() {
-  if (busy.value || runtime.value) return;
+  if (!canPackageBody.value) return;
   if (!(await confirmAction("将当前受管游戏本体压缩为 ZIP，并保存到本地缓存，确定继续吗？"))) return;
-  busy.value = true;
-  error.value = "";
-  message.value = "准备创建游戏本体包";
-  try {
-    await watchTask(await packageGameBody(props.game.gameUid));
-  } catch (reason) {
-    busy.value = false;
-    error.value = String(reason);
-  }
+  if (!canPackageBody.value) return;
+  await bodyPackageTransfer.start(() => packageGameBody(props.game.gameUid));
 }
 
 async function uninstallBody() {
-  if (busy.value || runtime.value) return;
-  if (!(await confirmAction("只会删除 GameSaver 管理的本地游戏本体，存档版本、游戏设置和云端版本会保留。确定卸载吗？"))) return;
+  if (exclusiveBusy.value || runtime.value || !precheck.value?.bodyDirectoryExists) return;
+  if (!(await confirmAction("将删除本地游戏本体及该游戏的所有本地 ZIP 缓存，未上传的 ZIP 也会删除。存档版本、游戏设置和云端版本不受影响。确定卸载吗？"))) return;
   busy.value = true;
   error.value = "";
   message.value = "准备卸载游戏本体";
   try {
-    await uninstallGameBody(props.game.gameUid);
-    emit("refresh");
-    emit("back");
+    await watchTask(await uninstallGameBody(props.game.gameUid));
   } catch (reason) {
     busy.value = false;
     error.value = String(reason);
@@ -677,7 +689,7 @@ async function uninstallBody() {
 }
 
 async function removeFromLibrary() {
-  if (busy.value || runtime.value) return;
+  if (exclusiveBusy.value || runtime.value) return;
   if (!(await confirmAction(`确定要从游戏库中彻底删除《${props.game.displayName}》吗？\n\n此操作将删除该游戏在 GameSaver 中的所有记录、保护配置及受管文件，无法撤销。`))) return;
   busy.value = true;
   error.value = "";
@@ -693,8 +705,8 @@ async function removeFromLibrary() {
 }
 
 async function deleteBodyPackage(version: GameBodyVersion) {
-  if (busy.value || runtime.value || !version.packagePath) return;
-  if (!(await confirmAction(version.archivePath ? "删除本地 ZIP 后仍保留旧本体目录，确定继续吗？" : "删除本地 ZIP 后将无法从这个本体版本恢复，确定继续吗？"))) return;
+  if (exclusiveBusy.value || runtime.value || !version.packagePath) return;
+  if (!(await confirmAction("仅删除本机 ZIP，不影响游戏本体、存档或云端包。确定继续吗？"))) return;
   busy.value = true;
   error.value = "";
   message.value = "准备删除本地本体包";
@@ -707,7 +719,7 @@ async function deleteBodyPackage(version: GameBodyVersion) {
 }
 
 async function uploadBody(version: GameBodyVersion) {
-  if (busy.value || runtime.value || !version.packagePath || !baiduReady()) return;
+  if (exclusiveBusy.value || runtime.value || !version.packagePath || !baiduReady()) return;
   if (!(await confirmAction("将此版本的游戏本体 ZIP 上传到百度网盘，确定继续吗？"))) return;
   busy.value = true;
   error.value = "";
@@ -777,7 +789,7 @@ function runtimeLabel(status: GameRuntime["status"]): string {
 }
 
 function chooseCover() {
-  if (busy.value || coverSaving.value || coverLoading.value || coverCapturePending.value || coverCaptureLoadingId) return;
+  if (exclusiveBusy.value || coverSaving.value || coverLoading.value || coverCapturePending.value || coverCaptureLoadingId) return;
   coverInput.value?.click();
 }
 
@@ -1098,8 +1110,53 @@ watch(() => props.initialError, (value) => {
 
 watch(coverZoom, clampCoverPosition);
 
+function trackDetailTransfer(taskType: "package_game_body" | "sync_cloud_save", label: string) {
+  const taskId = ref<string>();
+  const submitting = ref(false);
+  const failure = ref("");
+  const task = computed(() => taskFeed.tasks.value.find((entry) =>
+    entry.gameUid === props.game.gameUid &&
+    entry.taskType === taskType &&
+    (taskId.value ? entry.taskId === taskId.value : entry.status === "pending" || entry.status === "running"),
+  ));
+  const active = computed(() => submitting.value || !!taskId.value || !!task.value);
+
+  watch(task, async (entry, previous) => {
+    if (!entry && (!previous || previous.taskId !== taskId.value)) return;
+    if (entry?.status === "pending" || entry?.status === "running") {
+      taskId.value = entry.taskId;
+      failure.value = "";
+      return;
+    }
+    taskId.value = undefined;
+    if (entry && entry.status !== "success") failure.value = entry.error || entry.message;
+    await refresh();
+    if (!detailListenersDisposed && entry?.status === "success") emit("refresh");
+  });
+  if (task.value) taskId.value = task.value.taskId;
+
+  async function start(submit: () => Promise<string>) {
+    if (detailListenersDisposed || active.value) return;
+    submitting.value = true;
+    failure.value = "";
+    try {
+      const startedId = await submit();
+      if (detailListenersDisposed) return;
+      taskId.value = startedId;
+      void taskFeed.refresh();
+    } catch (reason) {
+      if (!detailListenersDisposed) failure.value = String(reason);
+    } finally {
+      submitting.value = false;
+    }
+  }
+
+  return { active, task, failure, label, start };
+}
+
 onMounted(() => {
   void refresh();
+  void taskFeed.refresh();
   void loadCover();
   void listen<{ captureId: string; gameUid: string }>("cover-capture-ready", (event) => {
     void handleCoverCaptureReady(event.payload);
@@ -1132,6 +1189,10 @@ onMounted(() => {
 });
 onUnmounted(() => {
   detailListenersDisposed = true;
+  refreshGeneration++;
+  cloudOverviewGeneration++;
+  cloudOverviewPromise = null;
+  taskFeed.release();
   stopCoverCaptureReady?.();
   stopCoverCaptureFailed?.();
   stopRuntimeChanged?.();
@@ -1187,7 +1248,7 @@ onUnmounted(() => {
             type="button"
             title="修改游戏名称"
             aria-label="修改游戏名称"
-            :disabled="busy || !!runtime"
+            :disabled="exclusiveBusy || !!runtime"
             @click="startRename"
           >
             <Pencil :size="16" />
@@ -1207,7 +1268,7 @@ onUnmounted(() => {
           <Gamepad2 v-else :size="42" />
           <div class="cover-actions">
             <button class="cover-edit-button" type="button" :disabled="coverSaving || coverLoading || coverCapturePending" title="隐藏 GameSaver 后，按 Ctrl + Alt + S 截取当前游戏画面" @click="beginCoverCapture"><Camera :size="15" />{{ coverCapturePending ? "等待截图" : "截取游戏画面" }}</button>
-            <button class="cover-edit-button" type="button" :disabled="busy || coverSaving || coverLoading || coverCapturePending" title="上传并调整游戏封面" @click="chooseCover"><ImagePlus :size="15" />{{ coverLoading ? "正在读取" : (coverDisplayUrl ? "更换封面" : "上传封面") }}</button>
+            <button class="cover-edit-button" type="button" :disabled="exclusiveBusy || coverSaving || coverLoading || coverCapturePending" title="上传并调整游戏封面" @click="chooseCover"><ImagePlus :size="15" />{{ coverLoading ? "正在读取" : (coverDisplayUrl ? "更换封面" : "上传封面") }}</button>
           </div>
           <span v-if="coverCapturePending" class="cover-capture-hint">{{ coverCaptureShortcut }}</span>
           <input ref="coverInput" class="visually-hidden" type="file" accept="image/jpeg,image/png,image/webp" @change="handleCoverSelected" />
@@ -1216,7 +1277,7 @@ onUnmounted(() => {
           <span class="status-label">{{ runtime ? runtimeLabel(runtime.status) : (precheck ? (precheck.canLaunch ? "可启动" : "需要处理") : gameStatusLabel(game)) }}</span>
           <h2>{{ precheck ? (precheck.canLaunch ? "准备就绪" : "启动前需要处理") : (game.lifecycle === 'pending_setup' ? '需要完成设置' : (game.health !== 'ready' ? '需要处理' : '环境检测中...')) }}</h2>
           <p>{{ message || (precheck ? (precheck.canLaunch ? "游戏本体和存档保护配置均可用。" : "完成下方检查后才能启动游戏。") : "正在核对启动程序与存档保护配置...") }}</p>
-          <button v-if="game.lifecycle === 'pending_setup'" class="primary-button detail-launch" type="button" :disabled="busy" @click="emit('resumeSetup')"><ShieldCheck :size="17" />继续完成设置</button>
+          <button v-if="game.lifecycle === 'pending_setup'" class="primary-button detail-launch" type="button" :disabled="exclusiveBusy" @click="emit('resumeSetup')"><ShieldCheck :size="17" />继续完成设置</button>
           <button v-else class="primary-button detail-launch" type="button" :disabled="launchButton.disabled" @click="start">
             <LoaderCircle v-if="launchButton.spinning" :size="17" class="spin" />
             <Play v-else :size="17" />
@@ -1227,6 +1288,14 @@ onUnmounted(() => {
 
       <p v-if="error" class="error-message" role="alert">{{ error }}</p>
       <div v-if="busy" class="task-progress"><div class="task-progress-heading"><strong>{{ message || "正在处理" }}</strong><span>{{ taskProgress }}%</span></div><div class="progress-track"><span :style="{ width: `${taskProgress}%` }"></span></div></div>
+      <template v-for="transfer in [bodyPackageTransfer, saveUploadTransfer]" :key="transfer.label">
+        <div v-if="transfer.active.value" class="task-progress">
+          <div class="task-progress-heading"><strong>{{ transfer.label }}</strong><span>{{ transfer.task.value?.progress ?? 0 }}%</span></div>
+          <div class="progress-track"><span :style="{ width: `${transfer.task.value?.progress ?? 0}%` }"></span></div>
+          <small class="detail-muted">{{ transfer.task.value?.message || "正在准备..." }}</small>
+        </div>
+        <p v-if="transfer.failure.value" class="error-message" role="alert">{{ transfer.label }}：{{ transfer.failure.value }}</p>
+      </template>
 
       <div class="detail-columns">
         <section class="detail-section">
@@ -1239,8 +1308,8 @@ onUnmounted(() => {
           <div class="check-list">
             <div class="check-row">
               <span><Folder :size="16" />游戏本体目录</span>
-              <strong v-if="precheck" :class="{ good: game.managedPath && precheck.canLaunch }">{{ game.managedPath ? "已找到" : "缺失" }}</strong>
-              <strong v-else :class="{ good: !!game.managedPath }">{{ game.managedPath ? "已找到" : "检测中..." }}</strong>
+              <strong v-if="precheck" :class="{ good: precheck.bodyDirectoryExists }">{{ precheck.bodyDirectoryExists ? "已找到" : "缺失" }}</strong>
+              <strong v-else>检测中...</strong>
             </div>
             <div class="check-row">
               <span><Play :size="16" />启动程序</span>
@@ -1258,18 +1327,26 @@ onUnmounted(() => {
 
         <section class="detail-section">
           <header class="detail-section-header"><div><p class="eyebrow">游戏本体</p><h2>受管目录</h2></div><HardDrive :size="20" class="detail-muted" /></header>
-          <div class="managed-path-row">
+          <div v-if="precheck?.bodyDirectoryExists" class="managed-path-row">
             <p class="managed-path">{{ game.managedPath }}</p>
             <button class="secondary-button compact-button" type="button" title="在文件资源管理器中打开受管游戏本体目录" @click="openFolder(game.managedPath)">
               <FolderOpen :size="14" />打开本体目录
             </button>
           </div>
+          <p v-else class="field-note">{{ precheck ? "游戏本体未安装。可到游戏商店查看并下载可用的云端版本。" : "正在检测游戏本体目录..." }}</p>
           <dl class="detail-facts">
             <div><dt>启动文件</dt><dd>{{ game.launch.executableRelativePath }}</dd></div>
             <div><dt>保存版本</dt><dd>{{ loading && !precheck ? "..." : versions.length }} 个</dd></div>
-            <div><dt>旧本体版本</dt><dd>{{ loading && !precheck ? "..." : bodyVersions.length }} 个</dd></div>
+            <div><dt>本地 ZIP 缓存</dt><dd>{{ loading && !precheck ? "..." : bodyVersions.filter((version) => version.packageSize != null).length }} 个</dd></div>
           </dl>
-          <div class="body-action-row"><button class="secondary-button" type="button" :disabled="busy || !!runtime" title="选择新版游戏文件夹并更新" @click="updateBody"><LoaderCircle v-if="busy && (message.includes('更新') || message.includes('新版'))" :size="16" class="spin" /><FolderOpen v-else :size="16" />更新游戏本体</button><button class="secondary-button" type="button" :disabled="busy || !!runtime" title="创建本体 ZIP 缓存" @click="packageBody"><LoaderCircle v-if="busy && message.includes('本体包')" :size="16" class="spin" /><Archive v-else :size="16" />创建本体包</button><button class="secondary-button danger-outline-button" type="button" :disabled="busy || !!runtime" title="删除 GameSaver 管理的本地游戏本体，保留配置和云端版本" @click="uninstallBody"><Trash2 :size="16" />卸载本体</button><button class="secondary-button danger-outline-button" type="button" :disabled="busy || !!runtime" title="从游戏库中彻底删除该游戏记录及受管文件" @click="removeFromLibrary"><Trash2 :size="16" />彻底删除</button></div>
+          <div class="body-action-row">
+            <template v-if="precheck?.bodyDirectoryExists">
+              <button class="secondary-button" type="button" :disabled="exclusiveBusy || !!runtime" title="选择新版游戏文件夹并更新" @click="updateBody"><LoaderCircle v-if="busy && (message.includes('更新') || message.includes('新版'))" :size="16" class="spin" /><FolderOpen v-else :size="16" />更新游戏本体</button>
+              <button class="secondary-button" type="button" :disabled="!canPackageBody" title="创建本体 ZIP 缓存" @click="packageBody"><LoaderCircle v-if="bodyPackageTransfer.active.value" :size="16" class="spin" /><Archive v-else :size="16" />创建本体包</button>
+              <button class="secondary-button danger-outline-button" type="button" :disabled="exclusiveBusy || !!runtime" title="卸载游戏，同时删除本地 ZIP 缓存" @click="uninstallBody"><Trash2 :size="16" />卸载本体</button>
+            </template>
+            <button class="secondary-button danger-outline-button" type="button" :disabled="exclusiveBusy || !!runtime" title="从游戏库中彻底删除该游戏记录及受管文件" @click="removeFromLibrary"><Trash2 :size="16" />彻底删除</button>
+          </div>
           <div class="cloud-summary"><span class="status-dot" :class="{ active: baiduReady() }"></span><strong>百度网盘</strong><span>{{ baiduLabel() }}</span><span v-if="baiduReady()">· 云端版本请在游戏商店管理</span><button v-if="!cloudConnectionLoading && !baiduReady()" class="secondary-button compact-button" type="button" title="配置或授权百度网盘" @click="emit('settings')">{{ baiduActionLabel() }}</button></div>
           <div v-if="bodyVersions.length" class="body-version-list">
             <p class="timeline-caption">本体版本与本地包</p>
@@ -1280,8 +1357,8 @@ onUnmounted(() => {
               </div>
               <div class="body-version-size"><strong>{{ version.fileCount }} 个文件</strong><span>原始 {{ formatBytes(version.totalBytes) }}<template v-if="version.packageSize"> · ZIP {{ formatBytes(version.packageSize) }}</template></span></div>
               <div v-if="version.packagePath" class="version-actions body-version-actions">
-                <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime || !baiduReady()" title="上传本体包到百度网盘" @click="uploadBody(version)"><Upload :size="15" />上传</button>
-                <button class="icon-button danger-button" type="button" :disabled="busy || !!runtime" title="删除本地本体包" aria-label="删除本地本体包" @click="deleteBodyPackage(version)"><Trash2 :size="15" /></button>
+                <button class="secondary-button compact-button" type="button" :disabled="exclusiveBusy || !!runtime || !baiduReady()" title="上传本体包到百度网盘" @click="uploadBody(version)"><Upload :size="15" />上传</button>
+                <button class="icon-button danger-button" type="button" :disabled="exclusiveBusy || !!runtime" title="删除本地本体包" aria-label="删除本地本体包" @click="deleteBodyPackage(version)"><Trash2 :size="15" /></button>
               </div>
             </article>
           </div>
@@ -1293,11 +1370,11 @@ onUnmounted(() => {
           <div><p class="eyebrow">存档保护</p><h2>保存版本</h2></div>
           <div class="version-tools">
             <label>保留
-              <select :value="keepVersions" :disabled="busy || !!runtime" aria-label="保留保存版本数量" @change="changeKeepVersions(Number(($event.target as HTMLSelectElement).value))">
+              <select :value="keepVersions" :disabled="exclusiveBusy || !!runtime" aria-label="保留保存版本数量" @change="changeKeepVersions(Number(($event.target as HTMLSelectElement).value))">
                 <option :value="1">1 个</option><option :value="3">3 个</option><option :value="5">5 个</option><option :value="10">10 个</option><option :value="20">20 个</option>
               </select>
             </label>
-            <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime || versions.length <= keepVersions" title="清理旧保存版本" @click="pruneVersions"><Trash2 :size="15" />清理</button>
+            <button class="secondary-button compact-button" type="button" :disabled="exclusiveBusy || !!runtime || versions.length <= keepVersions" title="清理旧保存版本" @click="pruneVersions"><Trash2 :size="15" />清理</button>
           </div>
         </header>
 
@@ -1315,7 +1392,7 @@ onUnmounted(() => {
               <button class="secondary-button compact-button" type="button" title="在文件资源管理器中打开这个存档目录" @click="openFolder(scope.rootPath)">
                 <FolderOpen :size="14" />打开存档目录
               </button>
-              <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" @click="changeSaveDirectory(scope, scopeIndex)">
+              <button class="secondary-button compact-button" type="button" :disabled="exclusiveBusy || !!runtime" @click="changeSaveDirectory(scope, scopeIndex)">
                 <Pencil :size="14" />更改目录
               </button>
             </div>
@@ -1346,7 +1423,7 @@ onUnmounted(() => {
             </div>
           </div>
           <div v-if="baiduReady()" class="cloud-save-actions">
-            <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime || !cloudSaveLoaded || cloudSaveLoading" title="立即与云端同步" @click="syncLatestSave"><RefreshCw :size="14" />同步最新</button>
+            <button class="secondary-button compact-button" type="button" :disabled="!canSyncLatest" title="立即与云端同步" @click="syncLatestSave"><RefreshCw :size="14" />同步最新</button>
             <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" title="查看百度网盘上的所有历史存档" @click="openCloudSaveDrawer"><FolderOpen :size="14" />云端存档<template v-if="cloudSaveLoaded"> ({{ cloudSaveVersions.length }})</template></button>
           </div>
           <div v-else-if="!cloudConnectionLoading" class="cloud-save-actions">
@@ -1366,9 +1443,9 @@ onUnmounted(() => {
             <div class="version-copy"><strong>{{ version.isCurrent ? "当前本地版本" : (index === 0 ? "最近创建的版本" : "保存版本") }}</strong><span>{{ formatDate(version.createdAt) }}</span></div>
             <div class="version-meta"><strong>{{ version.fileCount }} 个文件</strong><span>{{ formatBytes(version.totalBytes) }}</span></div>
             <div class="version-actions">
-              <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime || !baiduReady()" title="上传这个保存版本到百度网盘" @click="uploadSave(version)"><CloudUpload :size="15" />上传云端</button>
-              <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" title="恢复这个保存版本" @click="restoreVersion(version)"><RotateCcw :size="15" />恢复</button>
-              <button class="icon-button danger-button" type="button" :disabled="busy || !!runtime || version.isCurrent" :title="version.isCurrent ? '当前本地版本不能直接删除，请先恢复其他版本' : '删除这个保存版本'" :aria-label="`删除 ${formatDate(version.createdAt)} 保存版本`" @click="deleteVersion(version)"><Trash2 :size="15" /></button>
+              <button class="secondary-button compact-button" type="button" :disabled="!canUploadSave" title="上传这个保存版本到百度网盘" @click="uploadSave(version)"><CloudUpload :size="15" />上传云端</button>
+              <button class="secondary-button compact-button" type="button" :disabled="exclusiveBusy || !!runtime" title="恢复这个保存版本" @click="restoreVersion(version)"><RotateCcw :size="15" />恢复</button>
+              <button class="icon-button danger-button" type="button" :disabled="exclusiveBusy || !!runtime || version.isCurrent" :title="version.isCurrent ? '当前本地版本不能直接删除，请先恢复其他版本' : '删除这个保存版本'" :aria-label="`删除 ${formatDate(version.createdAt)} 保存版本`" @click="deleteVersion(version)"><Trash2 :size="15" /></button>
             </div>
           </article>
         </div>
@@ -1396,8 +1473,8 @@ onUnmounted(() => {
               <span>{{ cVer.fileCount }} 个文件 · {{ formatBytes(cVer.packageSize) }}<template v-if="cVer.deviceName"> · 来自 {{ cVer.deviceName }}</template></span>
             </div>
             <div class="cloud-save-btns">
-              <button class="secondary-button compact-button" type="button" :disabled="busy || !!runtime" title="从百度网盘拉取并还原该版本" @click="restoreCloudSave(cVer)"><CloudDownload :size="14" />还原至本机</button>
-              <button class="icon-button danger-button" type="button" :disabled="busy || !!runtime" title="从网盘删除" :aria-label="`删除 ${formatDate(cVer.createdAt)} 云端存档`" @click="deleteCloudSave(cVer)"><Trash2 :size="14" /></button>
+              <button class="secondary-button compact-button" type="button" :disabled="exclusiveBusy || !!runtime" title="从百度网盘拉取并还原该版本" @click="restoreCloudSave(cVer)"><CloudDownload :size="14" />还原至本机</button>
+              <button class="icon-button danger-button" type="button" :disabled="exclusiveBusy || !!runtime" title="从网盘删除" :aria-label="`删除 ${formatDate(cVer.createdAt)} 云端存档`" @click="deleteCloudSave(cVer)"><Trash2 :size="14" /></button>
             </div>
           </article>
         </div>

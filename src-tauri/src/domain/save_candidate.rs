@@ -162,8 +162,7 @@ pub(crate) fn is_noise_path(path: &Path) -> bool {
 
 /// 目录名本身是不是「命名存档容器」。
 ///
-/// 命中意味着「这个目录里住的就是存档」，于是整目录收集是安全的；没命中则只认显式
-/// 确认过的文件 + 像存档的文件（见 R2b）。`userdata` 需要额外要求路径里含 `\steam\`：
+/// 命中只是自动收集的路径线索。`userdata` 需要额外要求路径里含 `\steam\`：
 /// 很多游戏的 `%APPDATA%\<厂商>\UserData` 只是普通用户数据目录，不是 Steam 的存档容器。
 pub(crate) fn is_save_container_directory(path: &Path) -> bool {
     let name = path
@@ -235,6 +234,17 @@ pub(crate) fn is_generic_config_file(
         && !has_explicit_save_name
 }
 
+pub(crate) fn is_automatic_save_file(path: &Path) -> bool {
+    if is_noise_path(path) {
+        return false;
+    }
+    if path_has_segment(&path.to_string_lossy(), "analytics") {
+        return false;
+    }
+    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+    !RESOURCE_EXTENSIONS.iter().any(|resource| extension.eq_ignore_ascii_case(resource))
+}
+
 /// 「这个文件像不像存档」。
 ///
 /// 四条任一成立即为真：住在命名容器目录下、路径里有存档语义的段、文件名含线索词、
@@ -245,25 +255,14 @@ pub(crate) fn is_generic_config_file(
 /// 所以它只用来「提议」或「过滤目录级收集」，不用来直接改写用户的规则。
 pub(crate) fn is_save_candidate(path: &str) -> bool {
     let path_obj = Path::new(path);
-    if is_noise_path(path_obj) {
+    if !is_automatic_save_file(path_obj) {
         return false;
     }
     let path_lower = path.to_ascii_lowercase();
-    if path_lower.contains("\\analytics\\") || path_lower.contains("/analytics/") {
-        return false;
-    }
     let extension = path_obj
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or_default();
-    let ext_lower = extension.to_ascii_lowercase();
-    if ext_lower == "log"
-        || ext_lower == "tmp"
-        || ext_lower == "dmp"
-        || RESOURCE_EXTENSIONS.contains(&ext_lower.as_str())
-    {
-        return false;
-    }
     let file_stem = path_obj
         .file_stem()
         .and_then(|value| value.to_str())
@@ -294,5 +293,5 @@ pub(crate) fn is_save_candidate(path: &str) -> bool {
     has_save_container
         || has_save_path_hint
         || has_file_hint
-        || SAVE_EXTENSIONS.contains(&ext_lower.as_str())
+        || SAVE_EXTENSIONS.iter().any(|save| extension.eq_ignore_ascii_case(save))
 }

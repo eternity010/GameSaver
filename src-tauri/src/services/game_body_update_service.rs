@@ -10,7 +10,9 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 mod workflow;
-pub(crate) use workflow::{finish_update_task, record_pending_updates, retry_update, run_update};
+pub(crate) use workflow::{
+    finish_update_task, pending_updates_at_startup, record_pending_updates, retry_update, run_update,
+};
 
 pub struct GameBodyUpdateService;
 
@@ -113,14 +115,21 @@ impl GameBodyUpdateService {
     }
 
     pub fn pending_game_uids(games_root: &Path) -> Result<Vec<String>, String> {
-        if !games_root.is_dir() {
-            return Ok(Vec::new());
-        }
         validate_directory(games_root)?;
+        let entries = match fs::read_dir(games_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let library_root = games_root.parent().ok_or("游戏库路径无效")?;
+                require_available_update_root(library_root)?;
+                return match fs::symlink_metadata(games_root) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                    _ => Err("游戏本体目录在检查期间发生变化，请重试".into()),
+                };
+            }
+            Err(error) => return Err(format!("读取更新事务失败：{error}")),
+        };
         let mut pending = Vec::new();
-        for entry in
-            fs::read_dir(games_root).map_err(|error| format!("读取更新事务失败：{error}"))?
-        {
+        for entry in entries {
             let path = entry
                 .map_err(|error| format!("读取更新事务失败：{error}"))?
                 .path();
@@ -133,14 +142,31 @@ impl GameBodyUpdateService {
         Ok(pending)
     }
 
+    pub(crate) fn has_pending_update(games_root: &Path, game_uid: &str) -> Result<bool, String> {
+        validate_uid(game_uid)?;
+        require_available_update_root(games_root)?;
+        match fs::symlink_metadata(Self::journal_path(games_root, game_uid)) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                require_available_update_root(games_root)?;
+                Ok(false)
+            }
+            Err(error) => Err(format!("读取游戏更新事务失败：{error}")),
+        }
+    }
+
+    pub(crate) fn ensure_no_pending_update(games_root: &Path, game_uid: &str) -> Result<(), String> {
+        if Self::has_pending_update(games_root, game_uid)? {
+            return Err("该游戏仍有更新事务待恢复，请在传输中心重试".into());
+        }
+        Ok(())
+    }
+
     pub fn recover_pending_updates_with(
         games_root: &Path,
         committed_archives: &HashSet<String>,
         mut settle: impl FnMut(&str, bool) -> Result<(), String>,
     ) -> Result<(), String> {
-        if !games_root.is_dir() {
-            return Ok(());
-        }
         let mut errors = Vec::new();
         for uid in Self::pending_game_uids(games_root)? {
             if let Err(error) =
@@ -629,9 +655,14 @@ fn recover_journal(
 
 fn cleanup_stale_update_artifacts(games_root: &Path) -> Result<(), String> {
     let pending = GameBodyUpdateService::pending_game_uids(games_root)?;
-    for entry in
-        fs::read_dir(games_root).map_err(|err| format!("读取游戏更新暂存目录失败：{err}"))?
-    {
+    let entries = match fs::read_dir(games_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && pending.is_empty() => {
+            return require_available_update_root(games_root.parent().ok_or("游戏库路径无效")?);
+        }
+        Err(error) => return Err(format!("读取游戏更新暂存目录失败：{error}")),
+    };
+    for entry in entries {
         let path = entry
             .map_err(|err| format!("读取游戏更新暂存目录失败：{err}"))?
             .path();
@@ -738,6 +769,15 @@ fn validate_path(path: &Path, directory: bool) -> Result<(), String> {
 
 fn validate_directory(path: &Path) -> Result<(), String> {
     validate_path(path, true)
+}
+
+fn require_available_update_root(path: &Path) -> Result<(), String> {
+    validate_directory(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata_is_link(&metadata) => Ok(()),
+        Ok(_) => Err(format!("游戏库位置不是普通目录：{}", path.display())),
+        Err(error) => Err(format!("游戏库暂不可用（{}）：{error}", path.display())),
+    }
 }
 
 fn require_same_path(actual: &Path, expected: &Path) -> Result<(), String> {
@@ -1180,6 +1220,26 @@ mod tests {
                 remote_size: None,
             }
         }
+    }
+
+    #[test]
+    fn pending_update_probe_fails_closed_when_library_disconnects_and_reconnects() {
+        let fixture = UpdateFixture::new("update-library-detached");
+        let game_uid = "game-1";
+        assert!(!GameBodyUpdateService::has_pending_update(&fixture.games, game_uid).unwrap());
+        let journal = fixture.journal();
+        let detached = fixture.root.join("detached");
+        fs::rename(&fixture.games, &detached).unwrap();
+        assert!(GameBodyUpdateService::has_pending_update(&fixture.games, game_uid).is_err());
+        assert!(GameBodyUpdateService::ensure_no_pending_update(&fixture.games, game_uid).is_err());
+        assert!(
+            GameBodyUpdateService::pending_game_uids(&detached.join("missing-library/games"))
+                .is_err()
+        );
+        fs::rename(&detached, &fixture.games).unwrap();
+        assert!(GameBodyUpdateService::ensure_no_pending_update(&fixture.games, game_uid).is_err());
+        fs::remove_file(journal).unwrap();
+        GameBodyUpdateService::ensure_no_pending_update(&fixture.games, game_uid).unwrap();
     }
 
     #[test]

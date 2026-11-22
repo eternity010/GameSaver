@@ -3,7 +3,7 @@ use crate::domain::{
     path_utils::{normalize_path, strip_verbatim_prefix},
 };
 use crate::domain::save_candidate::{
-    is_generic_config_file, is_noise_path, is_save_candidate, is_save_container_directory,
+    is_automatic_save_file, is_generic_config_file, is_noise_path, is_save_candidate, is_save_container_directory,
     path_has_save_container_ancestor, path_has_segment, should_ignore_event_path, NAME_HINTS,
     RESOURCE_EXTENSIONS, SAVE_EXTENSIONS,
 };
@@ -14,9 +14,12 @@ use crate::domain::{
     DEFAULT_MAX_FILE_BYTES,
 };
 use crate::services::learning::{
-    collect_related_files_by_trace, stop_etw_capture, try_start_etw_capture, FileOperation,
-    FileOperationKind,
+    collect_related_files_by_trace, stop_etw_capture, try_start_etw_capture, FileOperationKind,
+    FileOperationTrace,
 };
+#[cfg(test)]
+use crate::services::learning::FileOperation;
+use crate::repositories::save_repository::matching_exclusion;
 use crate::services::process_service::LearningProcessTracker;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -34,18 +37,20 @@ use tauri::AppHandle;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-/// 「这个文件像不像存档」的**判定**上限，只用来放宽候选识别的视野，
-/// 不等于我们愿意管理的体积 —— 真正入 scope 的上限是 `DEFAULT_MAX_FILE_BYTES`。
-/// 两者刻意分开：判定宽松才不会漏掉大存档，管理上限才是实际承诺。
-const MAX_CANDIDATE_FILE_BYTES: u64 = 100 * 1024 * 1024;
 /// 单个范围最多列出多少个「疑似存档但本次未变化」的文件。
 ///
 /// 这是给用户看的清单，不是收集清单；`%APPDATA%\<游戏名>` 这类目录通常只有几十个文件，
 /// 上限定这么低是为了挡住病态目录（比如误把整个安装目录当成范围根）拖慢分析。
 const MAX_PROPOSED_FILES: usize = 200;
+const MAX_PROPOSAL_SCAN_ENTRIES: usize = 8_000;
 /// 只读初稿的采集模式标记。它不是一次真正的采集 —— 单独取值是为了让前端能区分文案，
 /// 也让 `calculate_learning_confidence` 不给它任何 ETW 加分（`_ => 0`）。
 const PREVIEW_CAPTURE_MODE: &str = "preview";
+const PREVIEW_DISCOVERY_DEPTH: usize = 5;
+const PREVIEW_DISCOVERY_ENTRIES_PER_LOCATION: usize = 6_000;
+const PREVIEW_SNAPSHOT_DEPTH: usize = 8;
+const PREVIEW_SNAPSHOT_ENTRIES: usize = 24_000;
+const PREVIEW_SNAPSHOT_ENTRIES_PER_ROOT: usize = 8_000;
 /// ETW 会话的兜底时长上限。
 ///
 /// `logman` 原生的 `-rf`（运行指定时长）与 `-ets` 互斥 —— 本机实测报「参数"rf"不允许具有
@@ -214,6 +219,7 @@ impl SaveLearningService {
         if !executable_path.is_file() {
             return Err("受管游戏的启动程序不存在，请先修复游戏本体目录".to_string());
         }
+        Self::ensure_game_exited(Path::new(&game.managed_path), None)?;
         crate::logging::info(format!(
             "存档{}范围：game_uid={} roots={} paths={}",
             if validation_only {
@@ -357,6 +363,17 @@ impl SaveLearningService {
         })
     }
 
+    pub(crate) fn ensure_game_exited(
+        managed_path: &Path,
+        tracked_processes: Option<&Mutex<LearningProcessTracker>>,
+    ) -> Result<(), String> {
+        if let Some(tracked_processes) = tracked_processes {
+            let mut tracker = tracked_processes.lock().map_err(|_| "读取游戏进程树失败")?;
+            return ensure_tracked_game_exited(&mut tracker, managed_path);
+        }
+        ensure_tracked_game_exited(&mut LearningProcessTracker::default(), managed_path)
+    }
+
     pub(crate) fn finish(
         active: &ActiveLearningSession,
         on_progress: impl Fn(u8, &str),
@@ -365,19 +382,10 @@ impl SaveLearningService {
         on_progress(10, "正在读取保存后的文件状态");
         active.process_tracker_stop.store(true, Ordering::Release);
         wait_for_process_tracker(&active.process_tracker_done);
-        let any_running = active.tracked_processes.lock()
-            .map_err(|_| "读取游戏进程树失败".to_string())?
-            .any_alive();
-        if any_running {
-            crate::logging::info(
-                "分析存档时检测到游戏进程仍在运行，等待短缓冲以确保磁盘写入完成...",
-            );
-            std::thread::sleep(Duration::from_millis(500));
-        }
         let mut etw_files = HashSet::new();
         let mut etw_operations = Vec::new();
         let mut notes = Vec::new();
-        let mut event_capture_mode = "snapshot".to_string();
+        let mut etw_incomplete = false;
         if let Some(capture) = active.etw_capture.as_ref() {
             notes.push(if active.validation_only {
                 "再次验证只观察已选候选目录".to_string()
@@ -393,14 +401,13 @@ impl SaveLearningService {
                 notes.push(format!("最后一次刷新游戏进程树失败：{error}"));
             }
             match collect_related_files_by_trace(
-                Some(&capture.trace_name),
-                Some(&capture.etl_path.to_string_lossy()),
+                capture,
                 move |capture_end| tracker.lifetimes(capture_end),
             ) {
                 Ok(collection) => {
-                    event_capture_mode = "etw".to_string();
-                    etw_files = collection.files;
+                    etw_files = collection.files.iter().map(|path| normalize_path(Path::new(path))).collect();
                     etw_operations = collection.operations;
+                    etw_incomplete = collection.incomplete;
                     notes.extend(collection.logs);
                 }
                 Err(error) => notes.push(format!("无法使用 ETW 证据：{error}")),
@@ -409,50 +416,32 @@ impl SaveLearningService {
         } else if let Some(error) = active.etw_start_error.as_ref() {
             notes.push(format!("ETW 未启动，已使用快照差异：{error}"));
         }
+        let etw_write_count = etw_files.len();
+        let trace = FileOperationTrace::new(etw_operations);
+        filter_etw_candidate_files(&mut etw_files, &trace);
+        if etw_write_count > 0 {
+            notes.push(format!(
+                "ETW 候选筛选：写入路径 {etw_write_count} 个，保留 {} 个，因缺少存档线索、完整写入或命中噪音规则排除 {} 个",
+                etw_files.len(),
+                etw_write_count - etw_files.len(),
+            ));
+        }
+        let baseline = active.baseline.as_ref();
+        let mut event_capture_mode = learning_capture_mode(baseline.is_some(), !etw_files.is_empty(), etw_incomplete);
         if etw_files.is_empty() {
-            event_capture_mode = "snapshot".to_string();
             if active.baseline.is_some() {
                 notes.push("未捕获到有效 ETW 文件，已自动使用快照差异比对".to_string());
             } else {
                 notes.push(
-                    "ETW 未捕获到符合存档特征的写入文件，没有可用的保存前 baseline，未执行全量快照回退"
+                    "没有可用的 ETW 存档写入证据，也没有保存前快照，无法执行快照差异比对。可重新识别或手动添加存档目录。"
                         .to_string(),
                 );
             }
         }
         let mut effective_roots = active.roots.clone();
-        if event_capture_mode == "etw" && !active.validation_only {
+        if !etw_files.is_empty() && !active.validation_only {
             effective_roots = etw_effective_roots(&active.roots, &etw_files);
-            let etw_relevant_roots = effective_roots.clone();
-            let fallback_files = discover_save_container_files(&etw_relevant_roots, &is_cancelled)?;
-            if !fallback_files.is_empty() {
-                let existing_count = etw_files.len();
-                let added_count = fallback_files
-                    .iter()
-                    .filter(|path| !etw_files.contains(*path))
-                    .count();
-                if added_count > 0 {
-                    notes.push(format!(
-                        "已从游戏专属目录补充 {} 个常见存档容器文件（新增 {} 个）；候选仍可编辑",
-                        fallback_files.len(),
-                        added_count
-                    ));
-                    etw_files.extend(fallback_files);
-                    crate::logging::info(format!(
-                        "存档学习容器兜底：ETW 文件={}，补充文件={}，新增文件={}",
-                        existing_count,
-                        etw_files.len().saturating_sub(existing_count),
-                        added_count
-                    ));
-                }
-            } else {
-                notes.push(
-                    "ETW 未在已识别游戏目录找到常见存档容器，将仅使用 ETW 文件证据".to_string(),
-                );
-                crate::logging::info("存档学习容器兜底：未找到常见存档容器");
-            }
         }
-        let baseline = active.baseline.as_ref();
         let final_snapshot = if etw_files.is_empty() {
             if baseline.is_some() {
                 collect_snapshot(
@@ -466,8 +455,16 @@ impl SaveLearningService {
         } else {
             on_progress(45, "ETW 已定位文件，正在读取目标文件状态");
             let targeted = collect_targeted_snapshot(&effective_roots, &etw_files, &is_cancelled)?;
+            notes.push(format!(
+                "ETW 目标文件状态：候选 {} 个，当前范围内可用 {} 个",
+                etw_files.len(),
+                targeted.len(),
+            ));
             if targeted.is_empty() {
                 if baseline.is_some() {
+                    event_capture_mode = "snapshot";
+                    etw_files.clear();
+                    effective_roots.clone_from(&active.roots);
                     notes.push("ETW 文件无法直接读取，已回退完整快照差异".to_string());
                     collect_snapshot(
                         &effective_roots,
@@ -477,6 +474,7 @@ impl SaveLearningService {
                         &is_cancelled,
                     )?
                 } else {
+                    event_capture_mode = "insufficient";
                     notes.push(
                         "ETW 文件无法直接读取，且没有保存前 baseline，无法执行快照差异回退"
                             .to_string(),
@@ -491,35 +489,69 @@ impl SaveLearningService {
             return Err("任务已取消".to_string());
         }
         on_progress(92, "正在按文件夹整理存档候选");
-        let mut active_effective = active.clone();
-        active_effective.roots = effective_roots;
-        // 事务摘要与范围证据都只看候选口径的操作；原始 `etw_operations` 只保留给
-        // 「本次是否跑过采集」这个判断，不参与评分。
-        let transaction_operations = transaction_evidence(&etw_operations);
-        let (changed_files, scope_drafts, mut inference_notes) = infer_scope_drafts(
-            &active_effective.roots,
-            &final_snapshot,
-            baseline,
-            &etw_files,
-            &transaction_operations,
-        );
+        let analysis = matches!(event_capture_mode, "etw" | "etw_partial").then(|| {
+            trace.analyze(
+                |path| is_candidate_transaction_event(path, &etw_files),
+                is_etw_write_source,
+                |path| etw_files.contains(path) && final_snapshot.get(path)
+                    .is_some_and(|file| file.size <= DEFAULT_MAX_FILE_BYTES),
+            )
+        });
+        let no_completed_paths = HashMap::new();
+        let completed_paths = analysis.as_ref().map(|result| &result.completed_paths)
+            .unwrap_or(&no_completed_paths);
+        let (changed_files, mut scope_drafts, mut inference_notes) = if event_capture_mode == "insufficient" {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            infer_scope_drafts_with_mode(
+                &effective_roots, &final_snapshot, baseline, &etw_files, completed_paths,
+                ScopeInferenceMode { preview: false, validation: active.validation_only },
+            )
+        };
+        if is_cancelled() {
+            return Err("任务已取消".to_string());
+        }
         notes.append(&mut inference_notes);
-        let transaction_summary = (!etw_operations.is_empty() || active.etw_capture.is_some())
-            .then(|| crate::services::learning::analyze_save_transactions(transaction_operations));
-        let confidence = calculate_learning_confidence(
+        let mut transaction_summary = analysis.map(|result| result.summary);
+        let mut confidence = calculate_learning_confidence(
             &scope_drafts,
-            &event_capture_mode,
+            event_capture_mode,
             transaction_summary.as_ref(),
         );
+        if event_capture_mode == "etw_partial" {
+            notes.push("ETW 采集不完整，现有记录仅作候选，不视为已完整验证。".into());
+            confidence = confidence.min(64);
+            for draft in &mut scope_drafts {
+                draft.evidence_level = SaveCandidateEvidenceLevel::Review;
+                draft.evidence_reason = "采集不完整，请核对候选路径或重新识别。".into();
+                draft.confidence = draft.confidence.min(64);
+                draft.scope.unknown_file_policy = UnknownFilePolicy::Ignore;
+            }
+            if let Some(summary) = &mut transaction_summary {
+                if summary.status == "completed" {
+                    summary.status = "candidate".into();
+                }
+                summary.confidence = summary.confidence.min(64);
+            }
+        }
         Ok(SaveLearningResult {
             session_id: active.view.session_id.clone(),
             changed_files,
             scope_drafts,
             confidence,
             notes,
-            event_capture_mode,
+            event_capture_mode: event_capture_mode.to_string(),
             transaction_summary,
         })
+    }
+}
+
+fn learning_capture_mode(has_baseline: bool, has_etw_evidence: bool, partial: bool) -> &'static str {
+    match (has_baseline, has_etw_evidence, partial) {
+        (_, true, true) => "etw_partial",
+        (_, true, false) => "etw",
+        (true, false, _) => "snapshot",
+        (false, false, _) => "insufficient",
     }
 }
 
@@ -535,15 +567,19 @@ fn snapshot_analysis_progress(scan_progress: u8) -> u8 {
 fn run_capture_watchdog(
     trace_name: &str,
     duration: Duration,
+    timed_out: &AtomicBool,
     sleep: impl FnOnce(Duration),
     stop: impl FnOnce(&str) -> Result<(), String>,
 ) {
     sleep(duration);
     match stop(trace_name) {
-        Ok(()) => crate::logging::info(format!(
-            "ETW 会话已达时长上限（{} 分钟），已停止采集：{trace_name}",
-            duration.as_secs() / 60
-        )),
+        Ok(()) => {
+            timed_out.store(true, Ordering::Release);
+            crate::logging::info(format!(
+                "ETW 会话已达时长上限（{} 分钟），已停止采集：{trace_name}",
+                duration.as_secs() / 60
+            ));
+        }
         Err(error) => crate::logging::info(format!(
             "ETW 会话已达时长上限，停止时返回（会话可能已结束）：{trace_name} {error}"
         )),
@@ -551,9 +587,9 @@ fn run_capture_watchdog(
 }
 
 /// 在后台线程里按 [`MAX_CAPTURE_DURATION`] 兜住一次采集的时长。
-fn spawn_capture_watchdog(trace_name: String, duration: Duration) {
+fn spawn_capture_watchdog(trace_name: String, duration: Duration, timed_out: Arc<AtomicBool>) {
     thread::spawn(move || {
-        run_capture_watchdog(&trace_name, duration, thread::sleep, stop_etw_capture);
+        run_capture_watchdog(&trace_name, duration, &timed_out, thread::sleep, stop_etw_capture);
     });
 }
 
@@ -562,9 +598,12 @@ fn spawn_capture_watchdog(trace_name: String, duration: Duration) {
 /// 单独成函数是为了让「到底有没有把看门狗挂上去」可被断言。挂表动作本身只是
 /// `thread::spawn`，删掉它不会有任何测试变红 —— 那样这条防护就会悄无声息地消失，
 /// 而它正是 `.etl` 唯一由我们掌控的时长上界。
-fn arm_capture_watchdog(capture: Option<&EtwCaptureHandle>, arm: impl FnOnce(String, Duration)) {
+fn arm_capture_watchdog(
+    capture: Option<&EtwCaptureHandle>,
+    arm: impl FnOnce(String, Duration, Arc<AtomicBool>),
+) {
     if let Some(handle) = capture {
-        arm(handle.trace_name.clone(), MAX_CAPTURE_DURATION);
+        arm(handle.trace_name.clone(), MAX_CAPTURE_DURATION, Arc::clone(&handle.timed_out));
     }
 }
 
@@ -625,6 +664,19 @@ fn should_refresh_tracked_processes(
     now.saturating_duration_since(*idle_since.get_or_insert(now)) < PROCESS_HANDOFF_GRACE
 }
 
+fn ensure_tracked_game_exited(
+    tracker: &mut LearningProcessTracker,
+    managed_path: &Path,
+) -> Result<(), String> {
+    if !tracker.any_alive() {
+        tracker.refresh(Some(managed_path))?;
+    }
+    if tracker.any_alive() {
+        return Err("游戏或其子进程仍在运行，请完全退出游戏后再试。".into());
+    }
+    Ok(())
+}
+
 fn wait_for_process_tracker(done: &AtomicBool) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while !done.load(Ordering::Acquire) && Instant::now() < deadline {
@@ -658,6 +710,20 @@ fn managed_executable_path(game: &Game) -> Result<PathBuf, String> {
 }
 
 fn discover_scan_roots(game: &Game) -> Result<Vec<crate::domain::ScanRoot>, String> {
+    discover_scan_roots_with(game, false, &mut ScanCoverage::default())
+}
+
+#[derive(Default)]
+struct ScanCoverage {
+    unreadable: usize,
+    limited: bool,
+}
+
+fn discover_scan_roots_with(
+    game: &Game,
+    preview: bool,
+    coverage: &mut ScanCoverage,
+) -> Result<Vec<crate::domain::ScanRoot>, String> {
     let managed_path = strip_verbatim_prefix(
         &PathBuf::from(&game.managed_path)
             .canonicalize()
@@ -667,67 +733,33 @@ fn discover_scan_roots(game: &Game) -> Result<Vec<crate::domain::ScanRoot>, Stri
         root_type: SaveRootType::ManagedGame,
         physical_path: managed_path,
     }];
-    let hints = game_name_hints(game);
-    for (root, root_type) in environment_scan_roots() {
-        for path in find_candidate_directories(&root, &hints) {
-            roots.push(crate::domain::ScanRoot {
-                root_type,
-                physical_path: path,
-            });
-        }
+    let hints = if preview {
+        preview_name_hints(game)
+    } else {
+        game_name_hints(game)
+    };
+    let mut locations = environment_scan_roots();
+    if let Some(documents) = documents_root() {
+        locations.push((documents, SaveRootType::Documents));
     }
-    if let Some(documents) = documents_root().filter(|path| path.is_dir()) {
-        for path in find_candidate_directories(&documents, &hints) {
-            roots.push(crate::domain::ScanRoot {
-                root_type: SaveRootType::Documents,
-                physical_path: path,
-            });
-        }
-    }
-    if let Ok(profile) = env::var("USERPROFILE") {
+    if let Some(profile) = env::var_os("USERPROFILE") {
         let profile_root = PathBuf::from(profile);
-        let saved_games = profile_root.join("Saved Games");
-        if saved_games.is_dir() {
-            for path in find_candidate_directories(&saved_games, &hints) {
-                roots.push(crate::domain::ScanRoot {
-                    root_type: SaveRootType::SavedGames,
-                    physical_path: path,
-                });
-            }
-        }
-        let local_low = profile_root.join("AppData").join("LocalLow");
-        if local_low.is_dir() {
-            for path in find_candidate_directories(&local_low, &hints) {
-                roots.push(crate::domain::ScanRoot {
-                    root_type: SaveRootType::LocalLow,
-                    physical_path: path,
-                });
-            }
-        }
+        locations.push((profile_root.join("Saved Games"), SaveRootType::SavedGames));
+        locations.push((profile_root.join("AppData/LocalLow"), SaveRootType::LocalLow));
     }
     if let Some(public_documents) = public_documents_root() {
-        if public_documents.is_dir() {
-            for path in find_candidate_directories(&public_documents, &hints) {
-                roots.push(crate::domain::ScanRoot {
-                    root_type: SaveRootType::Documents,
-                    physical_path: path,
-                });
-            }
-            let steam_container = public_documents.join("Steam");
-            if steam_container.is_dir() {
-                for path in find_candidate_directories(&steam_container, &hints) {
-                    roots.push(crate::domain::ScanRoot {
-                        root_type: SaveRootType::Documents,
-                        physical_path: path,
-                    });
-                }
-            }
-        }
+        locations.push((public_documents.join("Steam"), SaveRootType::Documents));
+        locations.push((public_documents, SaveRootType::Documents));
     }
-    for steam_dir in find_steam_userdata_dirs() {
-        for path in find_candidate_directories(&steam_dir, &hints) {
+    locations.extend(find_steam_userdata_dirs().into_iter().map(|path| (path, SaveRootType::Custom)));
+    let mut seen_locations = HashSet::new();
+    for (root, root_type) in locations {
+        if !seen_locations.insert(normalize_path(&root)) {
+            continue;
+        }
+        for path in discover_named_directories(&root, &hints, preview, coverage) {
             roots.push(crate::domain::ScanRoot {
-                root_type: SaveRootType::Custom,
+                root_type,
                 physical_path: path,
             });
         }
@@ -758,8 +790,7 @@ fn environment_scan_roots() -> Vec<(PathBuf, SaveRootType)> {
     ENVIRONMENT_SCAN_ROOTS
         .iter()
         .filter_map(|(variable, root_type)| {
-            let path = PathBuf::from(env::var_os(variable)?);
-            path.is_dir().then_some((path, *root_type))
+            Some((PathBuf::from(env::var_os(variable)?), *root_type))
         })
         .collect()
 }
@@ -840,11 +871,11 @@ impl DirectoryHintMatcher {
     }
 
     /// `hints` 由调用方传入**已剔除通用词**的切片（不在这里过滤，避免每目录一次分配）。
-    fn matches_any(&self, hints: &[String]) -> bool {
-        hints.iter().any(|hint| self.matches(hint))
+    fn matches_any(&self, hints: &[String], exact: bool) -> bool {
+        hints.iter().any(|hint| self.matches(hint, exact))
     }
 
-    fn matches(&self, hint: &str) -> bool {
+    fn matches(&self, hint: &str, exact: bool) -> bool {
         let compact_hint = hint
             .chars()
             .filter(|character| character.is_alphanumeric())
@@ -855,7 +886,7 @@ impl DirectoryHintMatcher {
         if self.name == hint || self.compact_name == compact_hint {
             return true;
         }
-        if compact_hint.chars().count() >= 4 {
+        if !exact && compact_hint.chars().count() >= 4 {
             if self.compact_name.starts_with(&compact_hint) {
                 return true;
             }
@@ -874,7 +905,17 @@ impl DirectoryHintMatcher {
     }
 }
 
+#[cfg(test)]
 fn find_candidate_directories(root: &Path, hints: &[String]) -> Vec<PathBuf> {
+    discover_named_directories(root, hints, false, &mut ScanCoverage::default())
+}
+
+fn discover_named_directories(
+    root: &Path,
+    hints: &[String],
+    preview: bool,
+    coverage: &mut ScanCoverage,
+) -> Vec<PathBuf> {
     // 通用词提示词对**任何**目录都不匹配（原逻辑在逐 hint 调用里判），所以在这里、
     // 每个根只剔除一次。这个切片随后被所有目录共享，不产生逐目录分配。
     let usable_hints: Vec<String> = hints
@@ -883,43 +924,101 @@ fn find_candidate_directories(root: &Path, hints: &[String]) -> Vec<PathBuf> {
         .cloned()
         .collect();
     let mut candidates = Vec::new();
+    if usable_hints.is_empty() {
+        return candidates;
+    }
     let mut frontier = vec![root.to_path_buf()];
-    for depth in 0..3 {
+    let max_depth = if preview { PREVIEW_DISCOVERY_DEPTH } else { 3 };
+    let mut visited = 0;
+    for depth in 0..max_depth {
         let mut next = Vec::new();
         for parent in frontier {
-            let Ok(entries) = fs::read_dir(parent) else {
-                continue;
+            let in_packages = parent
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("Packages"));
+            let entries = match fs::read_dir(parent) {
+                Ok(entries) => entries,
+                Err(error) if depth == 0 && error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    coverage.unreadable += 1;
+                    continue;
+                }
             };
-            for entry in entries.filter_map(Result::ok) {
+            for entry in entries {
+                if preview && visited >= PREVIEW_DISCOVERY_ENTRIES_PER_LOCATION {
+                    coverage.limited = true;
+                    return candidates;
+                }
+                visited += 1;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        coverage.unreadable += 1;
+                        continue;
+                    }
+                };
                 let path = entry.path();
                 let Ok(file_type) = entry.file_type() else {
+                    coverage.unreadable += 1;
                     continue;
                 };
                 if !file_type.is_dir() {
                     continue;
                 }
                 // 这两项与提示词无关，判一次就够（原先在逐 hint 调用里被重复判断）。
-                if is_scan_noise_directory(&path) || is_save_container_directory(&path) {
+                if is_scan_noise_directory(&path) {
                     continue;
                 }
-                let Some(matcher) = DirectoryHintMatcher::new(&path, hints) else {
-                    // 命中不可达：不可能是候选，但**仍然要继续下探** —— 判定与「是否下探」
-                    // 是两件事，跳过下探会漏掉更深的候选目录。
-                    if depth < 2 {
-                        next.push(path);
+                if in_packages {
+                    if package_matches_game(&entry.file_name().to_string_lossy(), &usable_hints) {
+                        candidates.push(path);
                     }
                     continue;
-                };
-                if matcher.matches_any(&usable_hints) {
+                }
+                let is_container = is_save_container_directory(&path)
+                    || entry.file_name().eq_ignore_ascii_case("Packages");
+                if !is_container
+                    && DirectoryHintMatcher::new(&path, &usable_hints)
+                        .is_some_and(|matcher| matcher.matches_any(&usable_hints, preview))
+                {
                     candidates.push(path);
-                } else if depth < 2 {
+                } else if depth + 1 < max_depth {
                     next.push(path);
+                } else {
+                    coverage.limited = true;
                 }
             }
         }
         frontier = next;
     }
     candidates
+}
+
+fn package_matches_game(name: &str, hints: &[String]) -> bool {
+    let Some((identity, _publisher)) = name.rsplit_once('_') else {
+        return false;
+    };
+    let product = identity.rsplit('.').next().unwrap_or(identity);
+    let compact = product.chars().filter(|character| character.is_alphanumeric())
+        .collect::<String>().to_lowercase();
+    !compact.is_empty() && hints.iter().any(|hint| {
+        hint.chars().filter(|character| character.is_alphanumeric()).eq(compact.chars())
+    })
+}
+
+fn preview_name_hints(game: &Game) -> Vec<String> {
+    let executable = Path::new(&game.launch.executable_relative_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str());
+    std::iter::once(game.display_name.as_str())
+        .chain(executable)
+        .filter(|name| !is_generic_hint(name))
+        .map(|name| {
+            name.chars().filter(|character| character.is_alphanumeric())
+                .collect::<String>().to_lowercase()
+        })
+        .filter(|name| name.chars().count() >= 2 && !is_generic_hint(name))
+        .collect()
 }
 
 /// 目录发现是否**只**找到了游戏安装目录本身。
@@ -953,7 +1052,6 @@ fn is_scan_noise_directory(path: &Path) -> bool {
         "logs",
         "crashdumps",
         "shadercache",
-        "packages",
         "microsoft",
         "google",
         "mozilla",
@@ -982,7 +1080,7 @@ fn infer_scan_root_for_etw_file(
 ) -> Option<crate::domain::ScanRoot> {
     let norm_file = normalize_path(file_path);
 
-    if !is_etw_candidate(&norm_file) {
+    if !is_automatic_save_file(file_path) {
         return None;
     }
 
@@ -1054,7 +1152,7 @@ fn infer_scan_root_for_etw_file(
                 // `%PROGRAMDATA%\<厂商>\<游戏>\<文件>`：取厂商 + 游戏两级。要求至少三段，
                 // 否则第二段就是文件名本身，取两级会把文件当成范围根。
                 base.join(components[0]).join(components[1])
-            } else if components.len() >= 2
+            } else if components.len() >= 3
                 && (root_type == SaveRootType::LocalLow
                     || root_type == SaveRootType::LocalAppData
                     || root_type == SaveRootType::AppData)
@@ -1102,7 +1200,7 @@ fn etw_effective_roots(
     }
 
     for etw_file in etw_files {
-        if !is_etw_candidate(etw_file) {
+        if !is_automatic_save_file(Path::new(etw_file)) {
             continue;
         }
 
@@ -1216,119 +1314,104 @@ fn game_name_hints(game: &Game) -> Vec<String> {
     hints
 }
 
-fn discover_save_container_files(
-    roots: &[crate::domain::ScanRoot],
-    is_cancelled: &impl Fn() -> bool,
-) -> Result<HashSet<String>, String> {
-    let mut files = HashSet::new();
-    for root in roots {
-        if is_cancelled() {
-            return Err("任务已取消".to_string());
-        }
-        if !root.physical_path.is_dir() {
-            continue;
-        }
-        let mut containers = Vec::new();
-        if is_save_container_directory(&root.physical_path) {
-            containers.push(root.physical_path.clone());
-        } else if root.root_type == SaveRootType::ManagedGame {
-            let Ok(entries) = fs::read_dir(&root.physical_path) else {
-                continue;
-            };
-            containers.extend(entries.filter_map(Result::ok).filter_map(|entry| {
-                let path = entry.path();
-                entry
-                    .file_type()
-                    .ok()
-                    .filter(|kind| kind.is_dir())
-                    .and_then(|_| is_save_container_directory(&path).then_some(path))
-            }));
-        } else {
-            for entry in WalkDir::new(&root.physical_path)
-                .follow_links(false)
-                .max_depth(3)
-            {
-                let Ok(entry) = entry else {
-                    continue;
-                };
-                if entry.file_type().is_dir() && is_save_container_directory(entry.path()) {
-                    containers.push(entry.path().to_path_buf());
-                }
-            }
-        }
-        for container in containers {
-            for entry in WalkDir::new(container).follow_links(false).max_depth(6) {
-                if is_cancelled() {
-                    return Err("任务已取消".to_string());
-                }
-                let Ok(entry) = entry else {
-                    continue;
-                };
-                if !entry.file_type().is_file() || is_noise_path(entry.path()) {
-                    continue;
-                }
-                let Ok(metadata) = entry.metadata() else {
-                    continue;
-                };
-                if metadata.len() > MAX_CANDIDATE_FILE_BYTES {
-                    continue;
-                }
-                files.insert(normalize_path(entry.path()));
-            }
-        }
-    }
-    Ok(files)
-}
-
 fn collect_snapshot(
     roots: &[crate::domain::ScanRoot],
     on_progress: impl Fn(u8, &str),
     is_cancelled: &impl Fn() -> bool,
 ) -> Result<HashMap<String, FileFingerprint>, String> {
+    collect_snapshot_with_coverage(roots, on_progress, is_cancelled, None)
+}
+
+fn collect_snapshot_with_coverage(
+    roots: &[crate::domain::ScanRoot],
+    on_progress: impl Fn(u8, &str),
+    is_cancelled: &impl Fn() -> bool,
+    mut preview: Option<&mut ScanCoverage>,
+) -> Result<HashMap<String, FileFingerprint>, String> {
     let mut files = HashMap::new();
-    for (root_index, root) in roots.iter().enumerate() {
+    let mut remaining = PREVIEW_SNAPSHOT_ENTRIES;
+    'roots: for (root_index, root) in roots.iter().enumerate() {
+        if let Some(coverage) = &mut preview {
+            if remaining == 0 {
+                coverage.limited = true;
+                break;
+            }
+        }
         if !root.physical_path.is_dir() {
+            if let Some(coverage) = &mut preview {
+                coverage.unreadable += 1;
+            }
             continue;
         }
         let is_managed = root.root_type == SaveRootType::ManagedGame;
-        let walker = if is_managed {
-            WalkDir::new(&root.physical_path)
-                .follow_links(false)
-                .max_depth(4)
-        } else {
-            WalkDir::new(&root.physical_path).follow_links(false)
+        let max_depth = match (is_managed, preview.is_some()) {
+            (true, _) => Some(4),
+            (false, true) => Some(PREVIEW_SNAPSHOT_DEPTH),
+            (false, false) => None,
         };
-        for entry in walker.into_iter().filter_entry(|e| {
-            if is_noise_path(e.path()) {
-                return false;
-            }
-            if is_managed && is_managed_game_asset_dir(e.path()) {
-                return false;
-            }
-            true
-        }) {
+        let mut walker = WalkDir::new(&root.physical_path).follow_links(false);
+        if let Some(max_depth) = max_depth {
+            walker = walker.max_depth(max_depth);
+        }
+        let mut root_remaining = PREVIEW_SNAPSHOT_ENTRIES_PER_ROOT;
+        let mut entries = walker.into_iter();
+        while let Some(entry) = entries.next() {
             if is_cancelled() {
                 return Err("任务已取消".to_string());
+            }
+            if let Some(coverage) = &mut preview {
+                if remaining == 0 {
+                    coverage.limited = true;
+                    break 'roots;
+                }
+                if root_remaining == 0 {
+                    coverage.limited = true;
+                    break;
+                }
+                remaining -= 1;
+                root_remaining -= 1;
             }
             let entry = match entry {
                 Ok(e) => e,
                 Err(err) => {
+                    if let Some(coverage) = &mut preview {
+                        coverage.unreadable += 1;
+                    }
                     crate::logging::warn(format!("扫描跳过不可访问路径: {err}"));
                     continue;
                 }
             };
-            if !entry.file_type().is_file() || is_noise_path(entry.path()) {
+            if is_noise_path(entry.path()) || (is_managed && is_managed_game_asset_dir(entry.path())) {
+                if entry.file_type().is_dir() {
+                    entries.skip_current_dir();
+                }
+                continue;
+            }
+            if let Some(coverage) = &mut preview {
+                if entry.file_type().is_dir() && max_depth == Some(entry.depth()) {
+                    coverage.limited = true;
+                }
+            }
+            if !entry.file_type().is_file() {
                 continue;
             }
             let metadata = match entry.metadata() {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(_) => {
+                    if let Some(coverage) = &mut preview {
+                        coverage.unreadable += 1;
+                    }
+                    continue;
+                }
             };
-            if metadata.len() > MAX_CANDIDATE_FILE_BYTES {
+            let path = normalize_path(entry.path());
+            if metadata.len() > DEFAULT_MAX_FILE_BYTES
+                && (preview.is_some() || !is_save_candidate(&path))
+            {
                 continue;
             }
             files.insert(
-                normalize_path(entry.path()),
+                path,
                 FileFingerprint {
                     size: metadata.len(),
                     modified_unix: modified_unix(&metadata),
@@ -1346,49 +1429,54 @@ fn collect_snapshot(
 fn resolve_scope_root_and_relative(
     file_path: &Path,
     scan_root_path: &Path,
+    mode: ScopeInferenceMode,
+    shared_scan_root: bool,
 ) -> Option<(PathBuf, String)> {
     let parent = file_path.parent()?;
-    let mut current = parent;
-    let mut chosen_root = None;
     let scan_root_norm = normalize_path(scan_root_path);
-
-    loop {
-        if is_save_container_directory(current) {
-            chosen_root = Some(current.to_path_buf());
-        }
-        let current_norm = normalize_path(current);
-        if current_norm == scan_root_norm || !current_norm.starts_with(&scan_root_norm) {
-            break;
-        }
-        match current.parent() {
-            Some(p) => current = p,
-            None => break,
-        }
-    }
-
-    let root = chosen_root.unwrap_or_else(|| parent.to_path_buf());
+    let root = if mode.validation {
+        scan_root_path.to_path_buf()
+    } else {
+        parent.ancestors()
+            .take_while(|current| path_is_within_root(&normalize_path(current), scan_root_path))
+            .find(|current| {
+                is_save_container_directory(current)
+                    && (!shared_scan_root || normalize_path(current) != scan_root_norm)
+                    && (*current == parent || is_slot_branch(file_path, current))
+            })
+            .unwrap_or(parent)
+            .to_path_buf()
+    };
     let root_norm = normalize_path(&root);
     let file_norm = normalize_path(file_path);
-
-    let relative = if file_norm.starts_with(&root_norm) {
-        let remainder = file_norm[root_norm.len()..].trim_start_matches('\\');
-        remainder.replace('\\', "/")
-    } else {
-        file_path.file_name()?.to_string_lossy().replace('\\', "/")
-    };
-
+    let relative = file_norm.strip_prefix(&root_norm)?.strip_prefix('\\')?.replace('\\', "/");
     Some((root, relative))
 }
 
-/// 列出一个范围目录里「看起来是存档、但本次学习没有发生变化」的文件。
-///
-/// 只在范围根目录**不是**命名存档容器时使用：那种范围当前等于「学习那一刻的文件清单」，
-/// 之后用户新建的档位、游戏写出的带时间戳自动存档都不会再进来，也没有任何提示。这里把
-/// 目录里现存的疑似存档列出来交给用户在草稿页确认（`SaveScopeDraft::proposed_files`），
-/// **由用户决定纳不纳入，而不是直接写进规则**。
-///
-/// 之所以不直接自动纳入：`is_save_candidate` 是启发式，误收别的存档（模拟器共享的
-/// `SAVEDATA` 目录最典型）比漏收更难收拾 —— 用户会拿到一堆不属于这个游戏的版本。
+fn is_potentially_shared_save_root(root: &crate::domain::ScanRoot) -> bool {
+    root.root_type != SaveRootType::ManagedGame
+        && is_save_container_directory(&root.physical_path)
+        && !root.physical_path.file_name().is_some_and(|name| {
+            name.to_string_lossy().bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn is_slot_branch(file: &Path, container: &Path) -> bool {
+    let Some(branch) = file.strip_prefix(container).ok()
+        .and_then(|relative| relative.components().next())
+    else {
+        return false;
+    };
+    let name = branch.as_os_str().to_string_lossy();
+    let compact = name.bytes().filter(u8::is_ascii_alphanumeric)
+        .map(|byte| byte.to_ascii_lowercase()).collect::<Vec<_>>();
+    [b"slot".as_slice(), b"save", b"profile"].iter().any(|prefix| {
+        compact.strip_prefix(*prefix)
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.iter().all(u8::is_ascii_digit))
+    })
+}
+
+/// 只在实际候选范围内查找未观察到变化的疑似存档，不向外扩扫。
 fn propose_directory_saves(scope_root: &Path, confirmed: &[String]) -> Vec<String> {
     if !scope_root.is_dir() {
         return Vec::new();
@@ -1399,6 +1487,7 @@ fn propose_directory_saves(scope_root: &Path, confirmed: &[String]) -> Vec<Strin
         .max_depth(3)
         .into_iter()
         .filter_entry(|entry| entry.depth() == 0 || !is_noise_path(entry.path()))
+        .take(MAX_PROPOSAL_SCAN_ENTRIES)
     {
         if proposals.len() >= MAX_PROPOSED_FILES {
             break;
@@ -1441,6 +1530,7 @@ fn propose_directory_saves(scope_root: &Path, confirmed: &[String]) -> Vec<Strin
 /// `active.roots`**，而只读初稿（`preview_scope_drafts`，没有会话）需要复用同一份归组与
 /// 排除规则。如果为了初稿另写一份，两边的启发式必然随时间漂移 —— 正是评审 R2 教训里
 /// 「同一个判定有两份实现」那类坑。
+#[cfg(test)]
 fn infer_scope_drafts(
     roots: &[crate::domain::ScanRoot],
     final_snapshot: &HashMap<String, FileFingerprint>,
@@ -1448,6 +1538,30 @@ fn infer_scope_drafts(
     etw_files: &HashSet<String>,
     etw_operations: &[FileOperation],
 ) -> (Vec<String>, Vec<SaveScopeDraft>, Vec<String>) {
+    let analysis = crate::services::learning::analyze_save_transactions_for(etw_operations.to_vec(), |path| {
+        etw_files.contains(path) && final_snapshot.get(path)
+            .is_some_and(|file| file.size <= DEFAULT_MAX_FILE_BYTES)
+    });
+    infer_scope_drafts_with_mode(
+        roots, final_snapshot, baseline, etw_files, &analysis.completed_paths, ScopeInferenceMode::default(),
+    )
+}
+
+#[derive(Clone, Copy, Default)]
+struct ScopeInferenceMode {
+    preview: bool,
+    validation: bool,
+}
+
+fn infer_scope_drafts_with_mode(
+    roots: &[crate::domain::ScanRoot],
+    final_snapshot: &HashMap<String, FileFingerprint>,
+    baseline: Option<&HashMap<String, FileFingerprint>>,
+    etw_files: &HashSet<String>,
+    completed_paths: &HashMap<String, FileOperationKind>,
+    mode: ScopeInferenceMode,
+) -> (Vec<String>, Vec<SaveScopeDraft>, Vec<String>) {
+    let preview = mode.preview;
     let mut changed = Vec::new();
     if let Some(baseline) = baseline {
         if etw_files.is_empty() {
@@ -1480,20 +1594,15 @@ fn infer_scope_drafts(
 
     struct ScopeGroup {
         physical_path: PathBuf,
-        count: usize,
         files: Vec<String>,
         noise_exact: Vec<String>,
         root_type: SaveRootType,
+        explicit_only: bool,
     }
 
     let mut groups: BTreeMap<String, ScopeGroup> = BTreeMap::new();
     let mut unhandled_noise: Vec<(String, &FileFingerprint)> = Vec::new();
     let mut oversize_skipped = 0usize;
-    let ignored_system_noise = etw_files
-        .iter()
-        .filter(|path| is_noise_path(Path::new(path)))
-        .count();
-
     struct CachedScanRoot<'a> {
         root: &'a crate::domain::ScanRoot,
         norm_path: String,
@@ -1519,10 +1628,11 @@ fn infer_scope_drafts(
             continue;
         };
 
-        let candidate_by_etw = !etw_files.is_empty() && is_etw_candidate(path);
+        let candidate_by_etw = !etw_files.is_empty()
+            && is_automatic_save_file(Path::new(path))
+            && (is_etw_candidate(path) || completed_paths.contains_key(path));
         let candidate_by_snapshot = etw_files.is_empty() && is_save_candidate(path);
-        let is_candidate = fingerprint.size <= MAX_CANDIDATE_FILE_BYTES
-            && (candidate_by_etw || candidate_by_snapshot);
+        let is_candidate = candidate_by_etw || candidate_by_snapshot;
 
         let Some(scan_root) = cached_roots
             .iter()
@@ -1538,49 +1648,48 @@ fn infer_scope_drafts(
         };
 
         let file_path = Path::new(path);
+        let shared_scan_root = is_potentially_shared_save_root(scan_root);
         let Some((scope_root, relative)) =
-            resolve_scope_root_and_relative(file_path, &scan_root.physical_path)
+            resolve_scope_root_and_relative(file_path, &scan_root.physical_path, mode, shared_scan_root)
         else {
             continue;
         };
 
         if is_candidate {
+            if !final_snapshot.contains_key(path) {
+                continue;
+            }
+            if fingerprint.size > DEFAULT_MAX_FILE_BYTES {
+                oversize_skipped += 1;
+                continue;
+            }
             let key = normalize_path(&scope_root);
+            let explicit_only = shared_scan_root && key == normalize_path(&scan_root.physical_path);
             let entry = groups.entry(key).or_insert_with(|| ScopeGroup {
                 physical_path: scope_root,
-                count: 0,
                 files: Vec::new(),
                 noise_exact: Vec::new(),
                 root_type: scan_root.root_type,
+                explicit_only,
             });
-            entry.count += 1;
-            if final_snapshot.contains_key(path) {
-                // 超过管理上限的文件不能留在 confirmed_files 里：留下就是「看着受保护，
-                // 实际既不进版本库也不受保护」的静默缺口。这里剔除并计数，稍后统一告知。
-                if fingerprint.size > DEFAULT_MAX_FILE_BYTES {
-                    oversize_skipped += 1;
-                } else {
-                    entry.files.push(relative);
-                }
-            }
+            entry.explicit_only |= explicit_only;
+            entry.files.push(relative);
         } else {
             unhandled_noise.push((path.clone(), fingerprint));
         }
     }
 
-    for (noise_path_str, _) in unhandled_noise {
-        let noise_path = Path::new(&noise_path_str);
-        let noise_norm = normalize_path(noise_path);
-        for group in groups.values_mut() {
-            let group_norm = normalize_path(&group.physical_path);
-            if noise_norm.starts_with(&group_norm) {
-                let rel = noise_norm[group_norm.len()..]
-                    .trim_start_matches('\\')
-                    .replace('\\', "/");
+    for (noise_path, _) in unhandled_noise {
+        let noise_norm = normalize_path(Path::new(&noise_path));
+        let mut path = noise_norm.as_str();
+        while let Some((parent, _)) = path.rsplit_once('\\') {
+            if let Some(group) = groups.get_mut(parent) {
+                let rel = noise_norm[parent.len() + 1..].replace('\\', "/");
                 if !rel.is_empty() && !group.files.contains(&rel) {
                     group.noise_exact.push(rel);
                 }
             }
+            path = parent;
         }
     }
 
@@ -1592,15 +1701,11 @@ fn infer_scope_drafts(
         group.noise_exact.dedup();
 
         let protects_container = is_save_container_directory(&group.physical_path);
-        if group.files.is_empty() && !protects_container {
-            continue;
-        }
-
         let exclude_patterns: Vec<String> = DEFAULT_EXCLUDE_PATTERNS
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let mut exclude_directories: Vec<String> = DEFAULT_EXCLUDE_DIRECTORIES
+        let exclude_directories: Vec<String> = DEFAULT_EXCLUDE_DIRECTORIES
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -1610,40 +1715,26 @@ fn infer_scope_drafts(
             if group.files.contains(&noise) {
                 continue;
             }
-            if let Some((dir, _)) = noise.split_once('/') {
-                let dir_norm = dir.to_ascii_lowercase();
-                // 同理：若已确认是存档的文件就住在这个子目录里，说明该目录不是纯噪音目录，
-                // 排除整目录会连真存档一起挡掉。
-                let dir_prefix = format!("{dir_norm}/");
-                let holds_confirmed_file = group
-                    .files
-                    .iter()
-                    .any(|file| file.to_ascii_lowercase().starts_with(&dir_prefix));
-                if !holds_confirmed_file
-                    && !exclude_directories
-                        .iter()
-                        .any(|d| d.to_ascii_lowercase() == dir_norm)
-                {
-                    exclude_directories.push(dir.to_string());
-                }
-            }
             // 刻意**不**按噪音文件的扩展名注入 `*.ext`：
             // `is_excluded` 同时喂收集侧和 `scope_matches_entry_*`（恢复归组），一旦出现
             // 一个 `settings.json` 就把 `*.json` 整族排除，同组里真存档若也是 `.json`
-            // 会既不被备份、又让恢复找不到范围。宁可多留几个噪音文件（由精确路径与
-            // 目录排除兜住），也不冒丢存档的风险。
+            // 会既不被备份、又让恢复找不到范围。伴生噪音只排除其精确路径。
             if !exclude_exact.contains(&noise) {
                 exclude_exact.push(noise);
             }
         }
 
-        // 策略不再按「是不是容器」分化：容器与否改由收集侧那道门从 `root_path` 现推
-        // （见 `save_repository::scope_admits_directory_file`），这个字段从此只当**用户开关**用。
-        //
         // 默认 Protect = 前端徽章上的「自动保护新存档」，也正是 R2b 补上的那一半：学习**之后**
         // 才出现的档位、游戏写出的带时间戳自动存档，会按候选启发式自动纳入版本库。用户想收窄成
         // 「仅保护已确认文件」，在向导里把这个范围切到 Ignore 即可。
-        let unknown_file_policy = UnknownFilePolicy::Protect;
+        let has_unknown_format = !etw_files.is_empty() && group.files.iter().any(|file| {
+            !is_etw_candidate(&normalize_path(&group.physical_path.join(file)))
+        });
+        let unknown_file_policy = if preview || group.explicit_only || has_unknown_format {
+            UnknownFilePolicy::Ignore
+        } else {
+            UnknownFilePolicy::Protect
+        };
 
         let physical_root_str = strip_verbatim_prefix(&group.physical_path)
             .to_string_lossy()
@@ -1651,32 +1742,41 @@ fn infer_scope_drafts(
 
         let (evidence_level, evidence_reason, confidence) = classify_scope_evidence(
             &group.physical_path,
-            group.count,
+            &group.files,
             etw_files.is_empty(),
-            etw_operations,
+            completed_paths,
         );
-        // 提议是 **Ignore 档的兜底**：Protect 档下这些文件已经由收集侧自动纳入了，前端不再展示
-        // 这份清单；但数据照常算出来 —— 用户在向导里把范围切回 Ignore 时立刻可用，不必重跑学习。
-        let proposed_files = if protects_container {
+        let mut scope = SaveScope {
+            root_type: group.root_type,
+            root_path: physical_root_str,
+            confirmed_files: group.files.clone(),
+            include_directories: vec![".".to_string()],
+            exclude_exact,
+            exclude_patterns,
+            exclude_directories,
+            unknown_file_policy,
+            max_file_bytes: Some(DEFAULT_MAX_FILE_BYTES),
+        };
+        for file in &group.files {
+            while let Some(rule) = matching_exclusion(file, &scope).map(str::to_owned) {
+                scope.exclude_exact.retain(|value| value != &rule);
+                scope.exclude_patterns.retain(|value| value != &rule);
+                scope.exclude_directories.retain(|value| value != &rule);
+            }
+        }
+        let mut proposed_files = if preview || mode.validation || group.explicit_only
+            || (etw_files.is_empty() && protects_container)
+        {
             Vec::new()
         } else {
             propose_directory_saves(&group.physical_path, &group.files)
         };
+        proposed_files.retain(|file| matching_exclusion(file, &scope).is_none());
+        if !etw_files.is_empty() && !proposed_files.is_empty() {
+            scope.unknown_file_policy = UnknownFilePolicy::Ignore;
+        }
         drafts.push(SaveScopeDraft {
-            scope: SaveScope {
-                root_type: group.root_type,
-                root_path: physical_root_str,
-                confirmed_files: group.files.clone(),
-                // 所有范围都开目录级收集。容器范围整目录收（行为不变）；普通目录（典型是
-                // `%APPDATA%\<游戏名>`）只收「像存档的」—— 由 `scope_admits_directory_file`
-                // 那道门把关，收集侧与恢复侧共用同一份判定。
-                include_directories: vec![".".to_string()],
-                exclude_exact,
-                exclude_patterns,
-                exclude_directories,
-                unknown_file_policy,
-                max_file_bytes: Some(DEFAULT_MAX_FILE_BYTES),
-            },
+            scope,
             changed_files: group.files,
             proposed_files,
             confidence,
@@ -1686,13 +1786,15 @@ fn infer_scope_drafts(
     }
 
     let limit_mb = DEFAULT_MAX_FILE_BYTES / (1024 * 1024);
-    let mut notes = vec![(if etw_files.is_empty() {
+    let mut notes = vec![(if preview {
+        "初稿默认仅保护列表中的文件，不会自动纳入其他档位。"
+    } else if etw_files.is_empty() {
         "当前使用快照差异按文件夹归类，已自动注入标准排除规则与伴生噪音过滤。"
     } else {
         "当前优先使用 ETW 写入证据按文件夹归类，已自动注入标准排除规则与伴生噪音过滤。"
     })
     .to_string()];
-    if drafts.is_empty() {
+    if drafts.is_empty() && !preview && oversize_skipped == 0 {
         if discovered_only_the_install_dir(roots) {
             // A3：这时候「换个方式再识别一次」是无效建议 —— 完整识别走的是同一份发现逻辑。
             notes.push(
@@ -1705,22 +1807,32 @@ fn infer_scope_drafts(
                     .to_string(),
             );
         }
-    } else {
+    } else if !drafts.is_empty() {
         notes.push(format!(
             "默认只保护 {limit_mb} MB 以内的存档文件，大文件、日志与噪音缓存已自动排除。"
+        ));
+    }
+    let observed_unknown_files = drafts.iter().map(|draft| {
+        draft.scope.confirmed_files.iter().filter(|file| {
+            !is_etw_candidate(&normalize_path(&Path::new(&draft.scope.root_path).join(file)))
+        }).count()
+    }).sum::<usize>();
+    if !etw_files.is_empty() && observed_unknown_files > 0 {
+        notes.push(format!(
+            "ETW 已记录 {observed_unknown_files} 个未知格式候选的完整写入，请核对文件。启用自动保护后，也可保护同目录中扩展名和编号命名规则一致的新档位。"
         ));
     }
     if oversize_skipped > 0 {
         notes.push(format!(
             "已跳过 {oversize_skipped} 个超过 {limit_mb} MB 的文件：它们不会进入版本库，恢复时也不受保护。"
         ));
+        if drafts.is_empty() {
+            notes.push("本次观察到存档候选，但没有符合大小上限的可保护文件。".to_string());
+        }
     }
-    if ignored_system_noise > 0 {
-        notes.push(format!(
-            "已忽略 {ignored_system_noise} 项系统噪声文件，不会纳入存档候选。"
-        ));
-    }
-    let proposed_total: usize = drafts.iter().map(|draft| draft.proposed_files.len()).sum();
+    let proposed_total: usize = drafts.iter()
+        .filter(|draft| draft.scope.unknown_file_policy == UnknownFilePolicy::Ignore)
+        .map(|draft| draft.proposed_files.len()).sum();
     if proposed_total > 0 {
         notes.push(format!(
             "目录里还有 {proposed_total} 个疑似存档、本次没有变化：它们不会被自动纳入，确认后可在对应范围里勾选。"
@@ -1746,8 +1858,10 @@ fn preview_drafts_from_roots(
     // 「这些目录里哪些文件看起来像存档」。若走 ETW 口径，反而会把没有写入证据的文件判成候选。
     let empty_baseline = HashMap::new();
     let etw_files = HashSet::new();
-    let (_, mut drafts, notes) =
-        infer_scope_drafts(roots, snapshot, Some(&empty_baseline), &etw_files, &[]);
+    let (_, mut drafts, notes) = infer_scope_drafts_with_mode(
+        roots, snapshot, Some(&empty_baseline), &etw_files, &HashMap::new(),
+        ScopeInferenceMode { preview: true, validation: false },
+    );
 
     for draft in &mut drafts {
         draft.evidence_level = SaveCandidateEvidenceLevel::Review;
@@ -1767,18 +1881,23 @@ fn preview_result(
     drafts: Vec<SaveScopeDraft>,
     mut notes: Vec<String>,
     root_count: usize,
+    coverage: &ScanCoverage,
 ) -> SaveLearningResult {
-    notes.insert(
-        0,
-        format!(
-            "只读初稿：没有启动游戏，也没有记录任何写入证据，仅按 {root_count} 个候选目录的目录名与文件特征推断。"
-        ),
-    );
-    if drafts.is_empty() {
-        // 刻意**不**说「改用完整识别就能解决」：发现失败时它走同一份逻辑，同样找不到。
-        // 真正的解释与出路由 `infer_scope_drafts` 的说明给出，这里只补「初稿为空」这件事。
-        notes.push("初稿没有推断出候选范围；可以在确认界面手动添加存档目录。".to_string());
+    let mut summary = if coverage.unreadable > 0 || coverage.limited {
+        "只读初稿：扫描未覆盖所有位置。".to_string()
+    } else {
+        format!("只读初稿：已检查 {root_count} 个候选目录，没有记录游戏写入。")
+    };
+    if coverage.unreadable > 0 {
+        summary.push_str(&format!("有 {} 项无法读取。", coverage.unreadable));
     }
+    if coverage.limited {
+        summary.push_str("部分位置达到扫描深度或数量上限。");
+    }
+    if drafts.is_empty() {
+        summary.push_str("已检查的位置没有推断出候选范围；仍可启动识别或手动添加存档目录。");
+    }
+    notes.insert(0, summary);
     let confidence = calculate_learning_confidence(&drafts, PREVIEW_CAPTURE_MODE, None);
     SaveLearningResult {
         session_id: String::new(),
@@ -1794,22 +1913,20 @@ fn preview_result(
 
 /// 只读推断一份存档范围初稿（不启动游戏、不采集 ETW）。
 fn preview_scope_drafts(game: &Game) -> Result<SaveLearningResult, String> {
-    let roots = discover_scan_roots(game)?;
-    // 这里**不需要**判空：`discover_scan_roots` 的第一个根恒为游戏安装目录，`retain` 只做去重，
-    // 所以它结构上不可能返回空。原先那句「没有推断出可扫描的存档目录，请改用完整识别」因此是
-    // 不可达的死分支 —— 而且建议本身也是错的（完整识别走的是同一份发现逻辑）。
-    // 「发现失败」改由 `discovered_only_the_install_dir` 在 notes 里说清。
-    let snapshot = collect_snapshot(&roots, |_, _| {}, &|| false)?;
+    let mut coverage = ScanCoverage::default();
+    let roots = discover_scan_roots_with(game, true, &mut coverage)?;
+    let snapshot = collect_snapshot_with_coverage(&roots, |_, _| {}, &|| false, Some(&mut coverage))?;
     let (drafts, notes) = preview_drafts_from_roots(&roots, &snapshot);
-    Ok(preview_result(drafts, notes, roots.len()))
+    Ok(preview_result(drafts, notes, roots.len(), &coverage))
 }
 
 fn classify_scope_evidence(
     scope_root: &Path,
-    file_count: usize,
+    confirmed_files: &[String],
     snapshot_only: bool,
-    operations: &[FileOperation],
+    completed_paths: &HashMap<String, FileOperationKind>,
 ) -> (SaveCandidateEvidenceLevel, String, u8) {
+    let file_count = confirmed_files.len();
     if snapshot_only {
         return (
             SaveCandidateEvidenceLevel::Review,
@@ -1818,42 +1935,32 @@ fn classify_scope_evidence(
         );
     }
 
-    let mut has_write = false;
-    let mut has_close = false;
-    let mut has_rename = false;
-    let mut has_create = false;
-    for operation in operations {
-        if !path_is_within_root(&operation.path, scope_root) {
-            continue;
-        }
-        match operation.operation {
-            FileOperationKind::Write => has_write = true,
-            FileOperationKind::Close => has_close = true,
-            FileOperationKind::Rename => has_rename = true,
-            FileOperationKind::Create => has_create = true,
-            FileOperationKind::Delete | FileOperationKind::Unknown => {}
-        }
-    }
-
-    if (has_write && (has_close || has_rename)) || has_rename {
-        return (
-            SaveCandidateEvidenceLevel::Strong,
-            "ETW 已确认写入并完成关闭或重命名。".to_string(),
-            if has_rename { 92 } else { 88 },
-        );
-    }
-    if has_write || has_close || has_rename || has_create {
+    if confirmed_files.iter().any(|file| {
+        let path = normalize_path(&scope_root.join(file));
+        !is_etw_candidate(&path) && completed_paths.contains_key(&path)
+    }) {
         return (
             SaveCandidateEvidenceLevel::Review,
-            "检测到 ETW 文件操作，但缺少完整保存提交证据。".to_string(),
-            if file_count >= 2 { 75 } else { 68 },
+            "ETW 已关联到文件的完整写入，但缺少常见存档特征，请确认这些文件是否为存档。".to_string(),
+            72,
         );
     }
-    (
-        SaveCandidateEvidenceLevel::Review,
-        "文件命中候选范围，但未关联到可确认的保存操作。".to_string(),
-        if file_count >= 2 { 65 } else { 58 },
-    )
+
+    let mut completed = confirmed_files.iter()
+        .filter_map(|file| completed_paths.get(&normalize_path(&scope_root.join(file))));
+    match completed.next() {
+        Some(first) if *first == FileOperationKind::Rename || completed.any(|kind| *kind == FileOperationKind::Rename) => (
+            SaveCandidateEvidenceLevel::Strong, "ETW 已关联到写入后重命名为该存档的文件。".to_string(), 92,
+        ),
+        Some(_) => (
+            SaveCandidateEvidenceLevel::Strong, "ETW 已关联到同一存档的写入与关闭。".to_string(), 88,
+        ),
+        None => (
+            SaveCandidateEvidenceLevel::Review,
+            "检测到候选文件变更，但没有足够证据确认同一存档完成写入并关闭或重命名。".to_string(),
+            if file_count >= 2 { 75 } else { 68 },
+        ),
+    }
 }
 
 fn calculate_learning_confidence(
@@ -1887,7 +1994,8 @@ fn calculate_learning_confidence(
     };
 
     let total = (max_draft_confidence as i16) + (container_bonus as i16) + mode_adjustment;
-    total.clamp(30, 95) as u8
+    let ceiling = if scope_drafts.iter().any(|draft| draft.evidence_level == SaveCandidateEvidenceLevel::Strong) { 95 } else { 84 };
+    total.clamp(30, ceiling) as u8
 }
 
 fn collect_targeted_snapshot(
@@ -1996,15 +2104,35 @@ fn is_etw_candidate(path: &str) -> bool {
 /// 是日志和截图。
 ///
 /// 这里统一收口一次，口径与 `infer_scope_drafts` 判定候选时用的 `is_etw_candidate`
-/// 对齐。唯一例外是原子保存的中间产物：`.tmp`/`.temp`/`.bak` 本身不是存档文件
+/// 对齐；已通过完整写入证据进入候选的未知格式也保留。原子保存的中间产物：
+/// `.tmp`/`.temp`/`.bak` 本身不是存档文件
 /// （它们在草稿里落到 `noise_exact` → `exclude_exact`），但「写临时文件再重命名」
 /// 正是最常见的保存动作；连同它们一起丢掉，会让真实的原子保存在事务摘要里退化成
 /// 「证据不足」，反而丢掉它应得的置信度。噪音目录优先于这条例外——`\logs\x.tmp`
 /// 仍然被 `should_ignore_event_path` 挡在前面。
-fn transaction_evidence(operations: &[FileOperation]) -> Vec<FileOperation> {
+fn filter_etw_candidate_files(files: &mut HashSet<String>, trace: &FileOperationTrace) {
+    let completed_paths: HashSet<_> = trace.completed_writes()
+        .filter(|(source, target)| {
+            is_etw_write_source(&source.path) && is_automatic_save_file(Path::new(&target.path))
+        })
+        .map(|(_, target)| normalize_path(Path::new(&target.path)))
+        .collect();
+    files.retain(|path| is_etw_candidate(path) || completed_paths.contains(path));
+}
+
+fn is_etw_write_source(path: &str) -> bool {
+    is_automatic_save_file(Path::new(path)) || is_transaction_evidence_path(path)
+}
+
+fn is_candidate_transaction_event(path: &str, candidates: &HashSet<String>) -> bool {
+    is_transaction_evidence_path(path) || candidates.contains(&normalize_path(Path::new(path)))
+}
+
+#[cfg(test)]
+fn transaction_evidence(operations: &[FileOperation], candidates: &HashSet<String>) -> Vec<FileOperation> {
     operations
         .iter()
-        .filter(|operation| is_transaction_evidence_path(&operation.path))
+        .filter(|operation| is_candidate_transaction_event(&operation.path, candidates))
         .cloned()
         .collect()
 }
@@ -2054,11 +2182,11 @@ mod tests {
 
     use super::{
         arm_capture_watchdog, calculate_learning_confidence, classify_scope_evidence, ActiveLearningSession,
-        collect_snapshot, collect_targeted_snapshot, discover_save_container_files,
+        collect_snapshot, collect_targeted_snapshot,
         discovered_only_the_install_dir, etw_effective_roots, find_candidate_directories,
         infer_scope_drafts, is_etw_candidate, is_transaction_evidence_path, path_is_within_root,
         preview_drafts_from_roots, preview_result, propose_directory_saves, run_capture_watchdog,
-        snapshot_analysis_progress, transaction_evidence, MAX_CANDIDATE_FILE_BYTES,
+        snapshot_analysis_progress, transaction_evidence,
         MAX_CAPTURE_DURATION,
     };
     use crate::domain::path_utils::normalize_path;
@@ -2085,6 +2213,58 @@ mod tests {
     /// `remove_dir_all`（`assert!` 一失败就执行不到，目录会永久堆积）。
     fn temp_root(label: &str) -> TempWorkspace {
         TempWorkspace::new(label)
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn learning_rejects_analysis_until_the_tracked_process_exits() {
+        let workspace = temp_root("learning-game-must-exit");
+        let managed_path = workspace.join("managed");
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let tracker = Mutex::new(super::LearningProcessTracker::from_child(&child));
+        let blocked = super::SaveLearningService::ensure_game_exited(&managed_path, Some(&tracker));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(blocked.unwrap_err().contains("仍在运行"));
+        super::SaveLearningService::ensure_game_exited(&managed_path, Some(&tracker)).unwrap();
+    }
+
+    #[test]
+    fn learned_scope_keeps_confirmed_csv_and_ignores_noise_in_a_sibling_directory() {
+        let workspace = temp_root("learn-save-exclusion-boundary");
+        let root = workspace.join("game");
+        let roots = [ScanRoot {
+            root_type: SaveRootType::ManagedGame,
+            physical_path: root.clone(),
+        }];
+        let snapshot = [
+            "Saves/slot.csv",
+            "Saves/shots/screenshot.png",
+            "Saves_backup/screenshot.png",
+        ]
+        .into_iter()
+        .map(|relative| {
+            (
+                normalize_path(&root.join(relative)),
+                FileFingerprint { size: 8, modified_unix: 1 },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+        let files = snapshot.keys().cloned().collect::<HashSet<_>>();
+        let (_, drafts, _) = infer_scope_drafts(&roots, &snapshot, None, &files, &[]);
+        assert_eq!(drafts.len(), 1);
+        let scope = &drafts[0].scope;
+        assert_eq!(scope.confirmed_files, ["slot.csv"]);
+        assert_eq!(super::matching_exclusion("slot.csv", scope), None);
+        assert!(scope.exclude_patterns.iter().any(|rule| rule == "*.log"));
+        assert!(!scope.exclude_directories.iter().any(|rule| rule == "shots"));
+        assert!(!scope.exclude_directories.iter().any(|rule| rule == "_backup"));
+        assert_eq!(scope.exclude_exact, ["shots/screenshot.png"]);
     }
 
     fn operation(path: &str, operation: FileOperationKind) -> FileOperation {
@@ -2136,15 +2316,18 @@ mod tests {
     fn capture_watchdog_stops_the_session_when_the_deadline_passes() {
         let mut slept = None;
         let mut stopped = None;
+        let timed_out = AtomicBool::new(false);
         run_capture_watchdog(
             "GameSaverTrace_deadline",
             Duration::from_secs(60),
+            &timed_out,
             |duration| slept = Some(duration),
             |name| {
                 stopped = Some(name.to_string());
                 Ok(())
             },
         );
+        assert!(timed_out.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(slept, Some(Duration::from_secs(60)), "必须先等满上限");
         assert_eq!(
             stopped.as_deref(),
@@ -2157,15 +2340,18 @@ mod tests {
     #[test]
     fn capture_watchdog_tolerates_a_session_that_is_already_gone() {
         let mut attempts = 0;
+        let timed_out = AtomicBool::new(false);
         run_capture_watchdog(
             "GameSaverTrace_gone",
             Duration::from_secs(1),
+            &timed_out,
             |_| {},
             |_| {
                 attempts += 1;
                 Err("找不到数据收集器集".to_string())
             },
         );
+        assert!(!timed_out.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(attempts, 1, "即便会报错也要尝试停一次");
     }
 
@@ -2176,10 +2362,12 @@ mod tests {
         let handle = EtwCaptureHandle {
             trace_name: "GameSaverTrace_armed".to_string(),
             etl_path: PathBuf::from(r"C:\logs\armed.etl"),
+            timed_out: Default::default(),
         };
         let mut armed = None;
-        arm_capture_watchdog(Some(&handle), |name, duration| {
-            armed = Some((name, duration))
+        arm_capture_watchdog(Some(&handle), |name, duration, flag| {
+            assert!(Arc::ptr_eq(&handle.timed_out, &flag));
+            armed = Some((name, duration));
         });
         assert_eq!(
             armed,
@@ -2191,14 +2379,215 @@ mod tests {
     #[test]
     fn capture_watchdog_is_not_armed_without_a_session() {
         let mut armed = false;
-        arm_capture_watchdog(None, |_, _| armed = true);
+        arm_capture_watchdog(None, |_, _, _| armed = true);
         assert!(!armed, "ETW 不可用时没有会话可停，不该挂表");
+    }
+
+    #[test]
+    fn etw_without_baseline_never_claims_snapshot_fallback() {
+        assert_eq!(super::learning_capture_mode(false, false, false), "insufficient");
+        assert_eq!(super::learning_capture_mode(false, false, true), "insufficient");
+        assert_eq!(super::learning_capture_mode(true, false, true), "snapshot");
+        assert_eq!(super::learning_capture_mode(false, true, true), "etw_partial");
+        assert_eq!(super::learning_capture_mode(false, true, false), "etw");
     }
 
     #[test]
     fn etw_candidates_accept_non_resource_files() {
         assert!(is_etw_candidate(r"C:\GameSaver\save\slot.xml"));
         assert!(is_etw_candidate(r"C:\GameSaver\Data\profile.bin"));
+    }
+
+    #[test]
+    fn unknown_save_formats_do_not_require_path_heuristics() {
+        let root = r"C:\Users\Player\AppData\LocalLow\TiramisuLovesNtr\Ntraholic";
+        for name in [
+            "ntr1.dontdeletethisdata",
+            "chapter1.never_seen_format",
+            "user_settings.DONTDELETETHISDATA",
+            "record001",
+        ] {
+            let path = format!(r"{root}\{name}");
+            assert!(!is_etw_candidate(&path), "unexpected path heuristic: {name}");
+            assert!(!is_save_candidate(&path), "unexpected snapshot heuristic: {name}");
+            let operations = vec![
+                operation(&path, FileOperationKind::Write),
+                operation(&path, FileOperationKind::Close),
+            ];
+            let mut files = HashSet::from([normalize_path(Path::new(&path))]);
+            super::filter_etw_candidate_files(&mut files, &super::FileOperationTrace::new(operations.clone()));
+            assert_eq!(files.len(), 1, "completed unknown format: {name}");
+            assert_eq!(transaction_evidence(&operations, &files).len(), 2);
+        }
+    }
+
+    #[test]
+    fn ntraholic_etw_writes_reach_review_scope_without_baseline() {
+        let (root, mut roots, _) = preview_fixture(
+            "ntraholic-etw",
+            &[
+                ("ntr1.dontdeletethisdata", b"save"),
+                ("user_settings.dontdeletethisdata", b"settings"),
+                ("Player.log", b"log"),
+            ],
+        );
+        roots[0].root_type = SaveRootType::LocalLow;
+        let names = ["ntr1.dontdeletethisdata", "user_settings.dontdeletethisdata"];
+        let mut files = HashSet::new();
+        let mut operations = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let path = normalize_path(&root.join(name));
+            files.insert(path.clone());
+            for (kind, timestamp) in [
+                (FileOperationKind::Write, 1_000),
+                (FileOperationKind::Close, 1_100),
+            ] {
+                operations.push(FileOperation {
+                    path: path.clone(),
+                    operation: kind,
+                    timestamp_ms: Some(timestamp),
+                    pid: 10,
+                    file_object_id: Some(format!("object-{index}")),
+                });
+            }
+        }
+        let trace = super::FileOperationTrace::new(operations);
+        super::filter_etw_candidate_files(&mut files, &trace);
+        let effective = etw_effective_roots(&roots, &files);
+        let snapshot = collect_targeted_snapshot(&effective, &files, &|| false).unwrap();
+        assert_eq!(snapshot.len(), 2);
+        let analysis = trace.analyze(
+            |path| super::is_candidate_transaction_event(path, &files),
+            super::is_etw_write_source,
+            |path| snapshot.contains_key(path),
+        );
+        assert_eq!(analysis.completed_paths.len(), 2);
+        let (_, drafts, _) = super::infer_scope_drafts_with_mode(
+            &effective, &snapshot, None, &files, &analysis.completed_paths, Default::default(),
+        );
+        assert_eq!(drafts.len(), 1);
+        let draft = &drafts[0];
+        assert_eq!(normalize_path(Path::new(&draft.scope.root_path)), normalize_path(&root));
+        assert_eq!(draft.scope.root_type, SaveRootType::LocalLow);
+        assert_eq!(draft.scope.confirmed_files, names);
+        assert_eq!(draft.evidence_level, SaveCandidateEvidenceLevel::Review);
+        assert!(draft.evidence_reason.contains("完整写入"));
+        assert_eq!(draft.scope.unknown_file_policy, UnknownFilePolicy::Ignore);
+    }
+
+    #[test]
+    fn unknown_format_preview_does_not_guess_without_write_evidence() {
+        let (_root, roots, snapshot) = preview_fixture(
+            "ntraholic-preview",
+            &[("ntr1.dontdeletethisdata", b"save")],
+        );
+        let (drafts, _) = preview_drafts_from_roots(&roots, &snapshot);
+        assert!(drafts.is_empty());
+    }
+
+    #[test]
+    fn unknown_formats_require_completed_writes_and_keep_noise_filters() {
+        let root = r"C:\Users\Player\AppData\LocalLow\Studio\Game";
+        for (name, kinds) in [
+            ("logs/record.xyz", vec![FileOperationKind::Write, FileOperationKind::Close]),
+            ("cache/record.xyz", vec![FileOperationKind::Write, FileOperationKind::Close]),
+            ("record.png", vec![FileOperationKind::Write, FileOperationKind::Close]),
+            ("record.xyz", vec![FileOperationKind::Write]),
+            ("record.xyz", vec![FileOperationKind::Close]),
+            ("record.xyz", vec![FileOperationKind::Create, FileOperationKind::Close]),
+        ] {
+            let path = format!(r"{root}\{}", name.replace('/', "\\"));
+            let operations = kinds.into_iter().map(|kind| operation(&path, kind)).collect::<Vec<_>>();
+            let mut files = HashSet::from([normalize_path(Path::new(&path))]);
+            super::filter_etw_candidate_files(&mut files, &super::FileOperationTrace::new(operations));
+            assert!(files.is_empty(), "unexpected unknown-format candidate: {name}");
+        }
+    }
+
+    #[test]
+    fn unknown_format_atomic_rename_keeps_intermediate_evidence() {
+        let target = r"C:\Users\Player\AppData\LocalLow\Studio\Game\record.novel_format";
+        for intermediate in ["record.tmp", "91ac_4b7", "91ac_4b7.staging"] {
+            let source = Path::new(target).with_file_name(intermediate);
+            let mut write = operation(source.to_str().unwrap(), FileOperationKind::Write);
+            write.file_object_id = Some("object".into());
+            let mut rename = operation(target, FileOperationKind::Rename);
+            rename.file_object_id = Some("object".into());
+            let trace = super::FileOperationTrace::new(vec![write, rename]);
+            let target_path = normalize_path(Path::new(target));
+            let mut files = HashSet::from([normalize_path(&source), target_path.clone()]);
+            super::filter_etw_candidate_files(&mut files, &trace);
+            assert_eq!(files, HashSet::from([target_path.clone()]));
+            let analysis = trace.analyze(
+                |path| super::is_candidate_transaction_event(path, &files),
+                super::is_etw_write_source,
+                |path| files.contains(path),
+            );
+            assert!(matches!(
+                analysis.completed_paths.get(&target_path),
+                Some(FileOperationKind::Rename),
+            ));
+            assert_eq!(analysis.summary.operation_count, 2);
+        }
+    }
+
+    #[test]
+    fn unknown_format_rename_cannot_borrow_noise_or_reused_object_writes() {
+        let target = r"C:\Game\record.novel_format";
+        let target_path = normalize_path(Path::new(target));
+        let mut rename = operation(target, FileOperationKind::Rename);
+        rename.file_object_id = Some("object".into());
+
+        let mut noise = operation(r"C:\Game\cache\record.tmp", FileOperationKind::Write);
+        noise.file_object_id = rename.file_object_id.clone();
+        let mut write = operation(r"C:\Game\original.unknown", FileOperationKind::Write);
+        write.file_object_id = rename.file_object_id.clone();
+        let mut reuse = operation(r"C:\Game\new_object.dll", FileOperationKind::Create);
+        reuse.file_object_id = rename.file_object_id.clone();
+
+        for operations in [vec![noise, rename.clone()], vec![write, reuse, rename]] {
+            let mut files = HashSet::from([target_path.clone()]);
+            let trace = super::FileOperationTrace::new(operations);
+            super::filter_etw_candidate_files(&mut files, &trace);
+            assert!(files.is_empty());
+        }
+    }
+
+    #[test]
+    fn unknown_format_writes_cannot_borrow_another_process_or_objects_close() {
+        let path = r"C:\Users\Player\AppData\LocalLow\Studio\Game\record.unknown";
+        for mismatch in ["pid", "object", "timestamp", "missing_timestamp"] {
+            let mut write = operation(path, FileOperationKind::Write);
+            write.file_object_id = Some("object".into());
+            let mut close = operation(path, FileOperationKind::Close);
+            close.file_object_id = Some("object".into());
+            match mismatch {
+                "pid" => close.pid += 1,
+                "object" => close.file_object_id = Some("other-object".into()),
+                "timestamp" => close.timestamp_ms = Some(4_000),
+                _ => close.timestamp_ms = None,
+            }
+            let mut files = HashSet::from([normalize_path(Path::new(path))]);
+            super::filter_etw_candidate_files(&mut files, &super::FileOperationTrace::new(vec![write, close]));
+            assert!(files.is_empty(), "incorrect completion: {mismatch}");
+        }
+    }
+
+    #[test]
+    fn etw_unknown_format_can_infer_its_standard_external_root() {
+        let profile = PathBuf::from(std::env::var_os("USERPROFILE").expect("user profile"));
+        let directory = profile.join("AppData/LocalLow/Studio/Game");
+        let path = normalize_path(&directory.join("record.unknown_format"));
+        let mut files = HashSet::from([path.clone()]);
+        let operations = vec![
+            operation(&path, FileOperationKind::Write),
+            operation(&path, FileOperationKind::Close),
+        ];
+        super::filter_etw_candidate_files(&mut files, &super::FileOperationTrace::new(operations));
+        let effective = etw_effective_roots(&[], &files);
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].root_type, SaveRootType::LocalLow);
+        assert_eq!(normalize_path(&effective[0].physical_path), normalize_path(&directory));
     }
 
     #[test]
@@ -2227,7 +2616,7 @@ mod tests {
                 FileOperationKind::Write,
             ),
         ];
-        let kept = transaction_evidence(&operations);
+        let kept = transaction_evidence(&operations, &HashSet::new());
         assert_eq!(
             kept.iter()
                 .map(|item| item.path.as_str())
@@ -2247,7 +2636,7 @@ mod tests {
             // 噪音目录优先于这条例外。
             operation(r"C:\GameSaver\logs\scratch.tmp", FileOperationKind::Write),
         ];
-        let kept = transaction_evidence(&operations);
+        let kept = transaction_evidence(&operations, &HashSet::new());
         assert_eq!(
             kept.iter()
                 .map(|item| item.path.as_str())
@@ -2272,7 +2661,7 @@ mod tests {
             analyze_save_transactions(operations.clone()).status,
             "completed"
         );
-        let filtered = analyze_save_transactions(transaction_evidence(&operations));
+        let filtered = analyze_save_transactions(transaction_evidence(&operations, &HashSet::new()));
         assert_eq!(filtered.status, "insufficient_evidence");
         assert_eq!(filtered.transaction_count, 0);
         assert!(filtered.affected_files.is_empty());
@@ -2308,9 +2697,9 @@ mod tests {
         ];
         let (level, _, confidence) = classify_scope_evidence(
             Path::new(r"C:\Users\Player\SaveData"),
-            1,
+            &["slot.sav".to_string()],
             false,
-            &operations,
+            &crate::services::learning::analyze_save_transactions_for(operations, |_| true).completed_paths,
         );
         assert_eq!(level, SaveCandidateEvidenceLevel::Strong);
         assert!(confidence >= 88);
@@ -2318,8 +2707,9 @@ mod tests {
 
     #[test]
     fn snapshot_only_scope_stays_review_candidate() {
-        let (level, _, confidence) =
-            classify_scope_evidence(Path::new(r"C:\Users\Player\SaveData"), 1, true, &[]);
+        let (level, _, confidence) = classify_scope_evidence(
+            Path::new(r"C:\Users\Player\SaveData"), &["slot.sav".to_string()], true, &HashMap::new(),
+        );
         assert_eq!(level, SaveCandidateEvidenceLevel::Review);
         assert_eq!(confidence, 60);
     }
@@ -2472,32 +2862,75 @@ mod tests {
     }
 
     #[test]
-    fn fallback_collects_files_from_a_game_specific_save_container() {
+    fn etw_supplements_only_real_hit_scopes_and_keeps_old_files_as_proposals() {
         let root = temp_root("save-container");
         let save_data = root.join("SaveData");
+        let other = root.join("OtherGame").join("SaveData");
         fs::create_dir_all(&save_data).expect("create SaveData directory");
-        fs::write(save_data.join("PlayerData0.sav"), b"save").expect("write save file");
-        let large_file =
-            fs::File::create(save_data.join("large-resource.bin")).expect("create oversized file");
-        large_file
-            .set_len(MAX_CANDIDATE_FILE_BYTES + 1)
-            .expect("set oversized file len");
-        drop(large_file);
-        fs::write(root.join("Player.log"), b"log").expect("write loose log");
+        fs::create_dir_all(&other).expect("create unrelated container");
+        let real = save_data.join("slot0.sav");
+        fs::write(&real, b"save").expect("write save file");
+        fs::write(save_data.join("slot1.sav"), b"old").expect("write old save");
+        fs::write(other.join("slot2.sav"), b"other").expect("write unrelated save");
+        let files = HashSet::from([normalize_path(&real), normalize_path(&other.join("missing.sav"))]);
+        let roots = [ScanRoot { root_type: SaveRootType::LocalAppData, physical_path: root.to_path_buf() }];
+        let snapshot = collect_targeted_snapshot(&roots, &files, &|| false).expect("targeted snapshot");
+        let (changed, drafts, _) = infer_scope_drafts(&roots, &snapshot, None, &files, &[]);
+        assert_eq!(changed, vec![normalize_path(&real)]);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].scope.confirmed_files, ["slot0.sav"]);
+        assert_eq!(drafts[0].proposed_files, ["slot1.sav"]);
+        assert_eq!(drafts[0].scope.unknown_file_policy, UnknownFilePolicy::Ignore);
+        let missing = HashSet::from([normalize_path(&other.join("missing.sav"))]);
+        let snapshot = collect_targeted_snapshot(&roots, &missing, &|| false).expect("missing target snapshot");
+        assert!(snapshot.is_empty());
+        assert!(infer_scope_drafts(&roots, &snapshot, None, &missing, &[]).1.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
 
-        let files = discover_save_container_files(
-            &[ScanRoot {
-                root_type: SaveRootType::LocalAppData,
-                physical_path: root.to_path_buf(),
-            }],
-            &|| false,
-        )
-        .expect("discover save container files");
+    #[test]
+    fn candidate_grouping_keeps_shared_save_root_out_of_automatic_protection() {
+        let parent = Path::new(r"c:\users\player\appdata\roaming\vendor");
+        let shared = parent.join("saves");
+        let game = shared.join("game-a");
+        let nested = game.join("savedata");
+        for (scan, folder) in [(&shared, &game), (&shared, &nested), (&parent.to_path_buf(), &game)] {
+            let file = normalize_path(&folder.join("slot.sav"));
+            let roots = [ScanRoot { root_type: SaveRootType::AppData, physical_path: scan.clone() }];
+            let snapshot = HashMap::from([(file.clone(), FileFingerprint { size: 5, modified_unix: 1 })]);
+            let (_, drafts, _) = infer_scope_drafts(&roots, &snapshot, None, &HashSet::from([file]), &[]);
+            assert_eq!(drafts.len(), 1);
+            assert_eq!(normalize_path(Path::new(&drafts[0].scope.root_path)), normalize_path(folder));
+        }
+        let file = normalize_path(&shared.join("game-a.sav"));
+        let roots = [ScanRoot { root_type: SaveRootType::AppData, physical_path: shared }];
+        let snapshot = HashMap::from([(file.clone(), FileFingerprint { size: 5, modified_unix: 1 })]);
+        let (_, drafts, _) = infer_scope_drafts(&roots, &snapshot, None, &HashSet::from([file]), &[]);
+        assert_eq!(drafts[0].scope.unknown_file_policy, UnknownFilePolicy::Ignore);
+    }
 
-        assert_eq!(files.len(), 1);
-        assert!(files
-            .iter()
-            .any(|path| path.ends_with(r"\savedata\playerdata0.sav")));
+    #[test]
+    fn oversized_etw_and_snapshot_files_cannot_supply_a_protection_scope() {
+        let root = temp_root("large-save");
+        let save_data = root.join("SaveData");
+        fs::create_dir_all(&save_data).expect("create save container");
+        let medium = save_data.join("medium.sav");
+        let large = save_data.join("large.sav");
+        for (path, size) in [(&medium, 20 * 1024 * 1024), (&large, 101 * 1024 * 1024)] {
+            fs::File::create(path).unwrap().set_len(size).unwrap();
+        }
+        let roots = [ScanRoot { root_type: SaveRootType::LocalAppData, physical_path: root.to_path_buf() }];
+        let files = HashSet::from([normalize_path(&medium), normalize_path(&large)]);
+        let snapshot = collect_snapshot(&roots, |_, _| {}, &|| false).expect("snapshot");
+        assert_eq!(snapshot.len(), 2);
+        let operations = [operation(&normalize_path(&medium), FileOperationKind::Write),
+            operation(&normalize_path(&medium), FileOperationKind::Close)];
+        for targets in [files, HashSet::new()] {
+            let (_, drafts, notes) = infer_scope_drafts(&roots, &snapshot, Some(&HashMap::new()), &targets, &operations);
+            assert!(drafts.is_empty());
+            assert!(notes.iter().any(|note| note.contains("已跳过 2 个超过")));
+            assert_eq!(calculate_learning_confidence(&drafts, "etw", None), 0);
+        }
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2617,6 +3050,7 @@ mod tests {
             draft.scope.root_path
         );
         assert_eq!(draft.scope.confirmed_files, vec!["slot1.sav".to_string()]);
+        assert_eq!(draft.scope.unknown_file_policy, UnknownFilePolicy::Ignore);
         // 没有任何写入证据 ⇒ 证据等级必须是「待确认」，且说明里要写清这是只读推断。
         assert_eq!(draft.evidence_level, SaveCandidateEvidenceLevel::Review);
         assert!(
@@ -2667,7 +3101,7 @@ mod tests {
             evidence_reason: "只读初稿（测试夹具）".to_string(),
         };
 
-        let result = preview_result(vec![draft], vec![], 3);
+        let result = preview_result(vec![draft], vec![], 3, &super::ScanCoverage::default());
 
         assert!(
             result.changed_files.is_empty(),
@@ -2698,7 +3132,12 @@ mod tests {
     /// 初稿推不出任何范围时，说明里要给出下一步 —— 不能静默返回空结果让用户干瞪眼。
     #[test]
     fn preview_result_explains_an_empty_draft() {
-        let result = preview_result(vec![], vec!["原有的采集说明".to_string()], 0);
+        let result = preview_result(
+            vec![],
+            vec!["原有的采集说明".to_string()],
+            0,
+            &super::ScanCoverage::default(),
+        );
 
         assert!(
             result
@@ -3313,6 +3752,8 @@ mod tests {
         let real_save = r"c:\users\player\saved games\mygame\savedata\slot1\save.dat".to_string();
         let noisy_image =
             r"c:\users\player\saved games\mygame\savedata\slot1\avatar.png".to_string();
+        let future_slot_preview =
+            r"c:\users\player\saved games\mygame\savedata\slot2\preview.png".to_string();
 
         let mut final_snapshot = HashMap::new();
         final_snapshot.insert(
@@ -3329,6 +3770,7 @@ mod tests {
                 modified_unix: 200,
             },
         );
+        final_snapshot.insert(future_slot_preview, FileFingerprint { size: 512, modified_unix: 200 });
 
         let etw_empty = HashSet::new();
         let (_, drafts, _) = infer_scope_drafts(
@@ -3366,6 +3808,8 @@ mod tests {
             "噪音自身仍要被精确排除：{:?}",
             scope.exclude_exact
         );
+        assert!(scope.exclude_exact.iter().any(|rule| rule == "slot2/preview.png"));
+        assert!(super::matching_exclusion("slot2/save.sav", scope).is_none());
     }
 
     #[test]
@@ -3739,6 +4183,57 @@ mod tests {
     }
 
     #[test]
+    fn preview_matches_exact_game_under_containers_but_not_similarly_named_games() {
+        let workspace = temp_root("preview-exact-discovery");
+        let root = workspace.join("locations");
+        let under_saves = root.join("Saves/Studio/Engine/Profiles/Alpha");
+        let exact_package = root.join("Packages/Vendor.Alpha_abc");
+        for path in [
+            under_saves.clone(),
+            exact_package.clone(),
+            root.join("AlphaBeta"),
+            root.join("Vendor/OtherAlpha"),
+            root.join("Packages/Vendor.AlphaBeta_abc/LocalState/Alpha"),
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let game = crate::domain::Game::new_pending("Alpha", "managed", "Game.exe");
+        let hints = super::preview_name_hints(&game);
+        assert_eq!(hints, ["alpha"]);
+        let mut coverage = super::ScanCoverage::default();
+        let found = super::discover_named_directories(&root, &hints, true, &mut coverage)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(found, HashSet::from([under_saves, exact_package]));
+        assert_eq!(coverage.unreadable, 0);
+    }
+
+    #[test]
+    fn preview_distinguishes_read_failure_and_depth_limit_from_no_matches() {
+        let workspace = temp_root("preview-partial-coverage");
+        let blocked = workspace.join("not-a-directory");
+        fs::write(&blocked, b"file").unwrap();
+        let mut coverage = super::ScanCoverage::default();
+        let found = super::discover_named_directories(&blocked, &["alpha".into()], true, &mut coverage);
+        assert!(found.is_empty());
+        assert_eq!(coverage.unreadable, 1);
+        let root = workspace.join("root");
+        let deep = root.join("vendor/one/two/three/four/five/six/seven/eight");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("slot.sav"), b"save").unwrap();
+        let roots = [ScanRoot { root_type: SaveRootType::Custom, physical_path: root }];
+        let snapshot = super::collect_snapshot_with_coverage(
+            &roots, |_, _| {}, &|| false, Some(&mut coverage),
+        ).unwrap();
+        assert!(snapshot.is_empty());
+        assert!(coverage.limited);
+        let result = preview_result(vec![], vec![], 1, &coverage);
+        assert!(result.notes[0].contains("无法读取"));
+        assert!(result.notes[0].contains("扫描深度或数量上限"));
+        assert!(result.notes[0].contains("已检查的位置"));
+    }
+
+    #[test]
     fn is_save_container_directory_rejects_appdata_user_data() {
         assert!(!is_save_container_directory(Path::new(
             r"C:\Users\Player\AppData\Local\rmmz-game\User Data"
@@ -3798,10 +4293,15 @@ mod tests {
                 timestamp_ms: Some(1050),
             },
         ];
-        let (level, reason, confidence) =
-            super::classify_scope_evidence(scope_root, 1, false, &operations);
+        let analysis = crate::services::learning::analyze_save_transactions_for(operations, is_etw_candidate);
+        let (level, reason, confidence) = super::classify_scope_evidence(
+            scope_root, &["slot.sav".to_string()], false, &analysis.completed_paths,
+        );
         assert_eq!(level, SaveCandidateEvidenceLevel::Strong);
         assert_eq!(confidence, 92);
         assert!(reason.contains("重命名"));
+        assert_eq!(super::classify_scope_evidence(
+            scope_root, &["other.sav".to_string()], false, &analysis.completed_paths,
+        ).0, SaveCandidateEvidenceLevel::Review);
     }
 }

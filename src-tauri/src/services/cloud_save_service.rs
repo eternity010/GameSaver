@@ -434,16 +434,16 @@ impl CloudSaveService {
         )?;
         let state = app.state::<crate::app_state::AppState>();
         state.ensure_save_restore_idle(&game.game_uid)?;
-        let plan = SaveRepository::plan_restore(game, profile, &imported)?;
+        let plan = SaveRepository::plan_restore(app, game, profile, &imported)?;
         check_progress(&on_progress, 84, "等待确认存档恢复目录")?;
         confirm_targets(&plan)?;
         state.ensure_save_restore_idle(&game.game_uid)?;
         check_progress(&on_progress, 85, "正在保护当前本地存档")?;
-        protect_current_save_version(app, game, profile)?;
+        let current_backup = protect_current_save_version(app, game, profile)?;
         check_progress(&on_progress, 89, "正在准备恢复物理存档")?;
         begin_commit()?;
         on_progress(90, "正在恢复物理存档文件");
-        let receipt = SaveRepository::restore_confirmed(app, plan, |pct, msg| {
+        let receipt = SaveRepository::restore_confirmed(app, game, profile, plan, current_backup.as_ref(), |pct, msg| {
             let _ = on_progress(90 + (pct as f32 * 0.1) as u8, msg);
         })?;
         let state = app.state::<crate::app_state::AppState>();
@@ -995,7 +995,7 @@ fn protect_current_save_version(
     app: &AppHandle,
     game: &Game,
     profile: &SaveProfile,
-) -> Result<(), String> {
+) -> Result<Option<SaveVersion>, String> {
     let state = app.state::<crate::app_state::AppState>();
     let latest = {
         let store = state
@@ -1011,13 +1011,13 @@ fn protect_current_save_version(
             store
                 .save_versions
                 .iter()
-                .find(|version| &version.version_id == version_id)
+                .find(|version| &version.version_id == version_id && version.game_uid == game.game_uid)
                 .cloned()
         })
     };
     let protected = SaveRepository::commit(app, game, profile, latest.as_ref(), |_, _| {})?;
     let Some(protected) = protected else {
-        return Ok(());
+        return Ok(latest);
     };
 
     let pending = protected.clone();
@@ -1034,7 +1034,7 @@ fn protect_current_save_version(
         Ok(())
     });
     crate::repositories::release_pending_objects(&pending);
-    result
+    result.map(|()| Some(pending))
 }
 
 /// 取出版本中某个条目的字节，并保证返回的字节与条目记录的哈希一致。

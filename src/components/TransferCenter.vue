@@ -174,6 +174,7 @@ const TASK_TITLES: Record<string, string> = {
   remove_game_from_library: "从库中移除游戏",
   retry_game_removal: "继续卸载或删除清理",
   sync_cloud_save: "云存档同步",
+  restore_cloud_save: "恢复云端存档",
   restore_save_version: "恢复存档版本",
   launch_game: "启动游戏",
 };
@@ -182,6 +183,7 @@ const TASK_TITLES: Record<string, string> = {
 const TASK_ICONS: Record<string, Component> = {
   upload_game_body_package: CloudUpload,
   download_game_body_package: CloudDownload,
+  restore_cloud_save: CloudDownload,
   install_cloud_game: CloudDownload,
   delete_remote_body_package: Trash2,
   delete_game_body_package: Trash2,

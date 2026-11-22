@@ -19,6 +19,8 @@ pub mod library_service;
 pub mod process_service;
 pub mod save_learning_service;
 pub mod task_service;
+#[cfg(target_os = "windows")]
+pub(crate) mod window_placement;
 
 pub use add_game_service::AddGameService;
 #[cfg(test)]
@@ -28,7 +30,7 @@ pub use baidu_netdisk_service::{
 };
 pub use cloud_account_service::{CloudAccountProfile, CloudAccountService};
 pub use cloud_manifest_service::{
-    CachedEntry, CloudGameCatalog, CloudGamePage, CloudGameSummary, CloudManifestService,
+    CloudGamePage, CloudGameSummary, CloudManifestService,
     RemoteBodyPackageList,
 };
 pub use cloud_save_service::{

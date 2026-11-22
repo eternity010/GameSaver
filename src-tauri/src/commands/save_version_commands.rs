@@ -242,7 +242,7 @@ fn restore_version_task(
         "正在确认存档恢复范围",
         None,
     );
-    let plan = SaveRepository::plan_restore(game, profile, version)?;
+    let plan = SaveRepository::plan_restore(app, game, profile, version)?;
     confirm_restore_targets(app, game, &plan)?;
     ensure_maintenance_allowed(&state, &game.game_uid)?;
     TaskService::update(
@@ -316,7 +316,7 @@ fn restore_version_task(
         "当前存档已保护，正在校验目标版本",
         None,
     );
-    let receipt = SaveRepository::restore_confirmed(app, plan, |progress, message| {
+    let receipt = SaveRepository::restore_confirmed(app, game, profile, plan, pending_protected.as_ref().or(latest), |progress, message| {
         TaskService::update(
             &state,
             task_id,
@@ -371,11 +371,19 @@ pub(crate) fn confirm_restore_targets(
         .collect::<Vec<_>>()
         .join("\n");
     let (written, removed) = plan.file_counts();
-    let warning = if plan.unmatched_deletions == 0 {
-        String::new()
-    } else {
-        format!("\n另有 {} 条删除记录无法匹配当前范围，将跳过。", plan.unmatched_deletions)
-    };
+    let mut warning = String::new();
+    if plan.unmatched_deletions > 0 {
+        warning.push_str(&format!(
+            "\n另有 {} 条删除记录无法匹配当前范围，将跳过。",
+            plan.unmatched_deletions
+        ));
+    }
+    if plan.excluded_entries > 0 {
+        warning.push_str(&format!(
+            "\n有 {} 条历史记录命中当前排除规则，将跳过，不覆盖或删除对应文件。",
+            plan.excluded_entries
+        ));
+    }
     let dialog = app.dialog()
         .message(format!(
             "将恢复「{}」的存档。\n\n目标目录：\n{targets}\n\n写入 {written} 个文件，移除 {removed} 个目标版本不包含的受保护文件。{warning}\n确认后会先保护当前存档，再开始恢复。",

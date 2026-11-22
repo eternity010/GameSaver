@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { ChevronLeft, ChevronRight, CloudDownload, CloudUpload, Gamepad2, RefreshCw, Trash2, X } from "@lucide/vue";
-import { getCloudGameCoverUrl, type CloudGameSummary, type CloudGameVersion } from "../api";
+import { getCloudGameCoverPath, getCloudGameCoverUrl, type CloudGameSummary, type CloudGameVersion } from "../api";
 
 const props = defineProps<{
   games: CloudGameSummary[];
@@ -13,6 +13,7 @@ const props = defineProps<{
   installMessage: string;
   installError: string;
   installNotice: string;
+  feedbackGameKey: string;
   page: number;
   pageSize?: number;
   totalCount: number;
@@ -64,17 +65,38 @@ const pageItems = computed(() => {
 
 const selectedGame = ref<CloudGameSummary | null>(null);
 const selectedVersion = ref<CloudGameVersion | null>(null);
+const detailFeedbackMatches = computed(() => {
+  const game = selectedGame.value;
+  return Boolean(game && props.feedbackGameKey && cloudGameKey(game) === props.feedbackGameKey);
+});
 const storeCoverUrls = ref<Record<string, string>>({});
+let coverLoadGeneration = 0;
 
-function loadStoreCovers(games: CloudGameSummary[]) {
+async function loadStoreCovers(games: CloudGameSummary[]) {
+  const generation = ++coverLoadGeneration;
+  const pending = games.filter((game) => game.hasCover);
   const nextUrls: Record<string, string> = {};
-  for (const game of games) {
-    if (game.hasCover) {
-      const key = game.gameKey || game.gameUid;
-      nextUrls[key] = getCloudGameCoverUrl(key);
-    }
+  for (const game of pending) {
+    const key = cloudGameKey(game);
+    const url = getCloudGameCoverUrl(key, JSON.stringify(game.coverFile));
+    if (storeCoverUrls.value[key] === url) nextUrls[key] = url;
   }
   storeCoverUrls.value = nextUrls;
+  let nextIndex = 0;
+  await Promise.all(Array.from({ length: Math.min(3, pending.length) }, async () => {
+    while (generation === coverLoadGeneration && nextIndex < pending.length) {
+      const game = pending[nextIndex++];
+      const key = cloudGameKey(game);
+      try {
+        const path = await getCloudGameCoverPath(key, game.coverFile);
+        if (generation !== coverLoadGeneration) return;
+        if (path) storeCoverUrls.value[key] = getCloudGameCoverUrl(key, JSON.stringify(game.coverFile));
+      } catch (reason) {
+        if (generation !== coverLoadGeneration) return;
+        console.warn("读取商店封面失败", key, reason);
+      }
+    }
+  }));
 }
 
 function cloudGameKey(game: CloudGameSummary): string {
@@ -179,6 +201,7 @@ watch(
 
 onMounted(() => window.addEventListener("keydown", handleKeydown));
 onUnmounted(() => {
+  coverLoadGeneration++;
   window.removeEventListener("keydown", handleKeydown);
   storeCoverUrls.value = {};
 });
@@ -188,8 +211,6 @@ onUnmounted(() => {
   <section class="store-page page-enter">
     <header class="store-header">
       <div>
-        <p class="eyebrow">百度网盘游戏库</p>
-        <h1>游戏商店</h1>
         <p>从云端下载游戏本体，安装完成后它会出现在游戏库。</p>
       </div>
       <div class="store-header-actions">
@@ -236,8 +257,8 @@ onUnmounted(() => {
         </div>
       </article>
     </div>
-    <p v-if="installNotice" class="notice-message store-install-notice" role="status">{{ installNotice }}</p>
-    <p v-if="installError" class="error-message store-install-error" role="alert">{{ installError }}</p>
+    <p v-if="installNotice && !selectedGame" class="notice-message store-install-notice" role="status">{{ installNotice }}</p>
+    <p v-if="installError && !selectedGame" class="error-message store-install-error" role="alert">{{ installError }}</p>
     <nav v-if="!loadError && totalCount > 0" class="store-pagination" aria-label="云端游戏分页">
       <button
         class="pagination-btn"
@@ -331,8 +352,8 @@ onUnmounted(() => {
           </section>
 
           <div v-if="installUid === selectedGame.gameUid" class="store-detail-progress"><div class="task-progress-heading"><span>{{ installMessage }}</span><strong>{{ installProgress }}%</strong></div><div class="progress-track"><span :style="{ width: `${installProgress}%` }"></span></div></div>
-          <p v-if="installError" class="error-message store-detail-message" role="alert">{{ installError }}</p>
-          <p v-if="installNotice" class="notice-message store-detail-message" role="status">{{ installNotice }}</p>
+          <p v-if="installError && detailFeedbackMatches" class="error-message store-detail-message" role="alert">{{ installError }}</p>
+          <p v-if="installNotice && detailFeedbackMatches" class="notice-message store-detail-message" role="status">{{ installNotice }}</p>
         </div>
 
         <footer class="store-detail-footer">

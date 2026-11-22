@@ -197,6 +197,7 @@ export interface CloudGameSummary {
   installed: boolean;
   versions: CloudGameVersion[];
   hasCover?: boolean;
+  coverFile?: RemoteFile;
 }
 
 export interface CloudGameVersion {
@@ -253,8 +254,39 @@ export function getGameCoverPaths(): Promise<Record<string, string>> {
   return invokeCommand<Record<string, string>>("get_game_cover_paths");
 }
 
-export function getCloudGameCoverPath(gameKey: string): Promise<string | null> {
-  return invokeCommand<string | null>("get_cloud_game_cover_path", { gameKey });
+const cloudCoverRequests = new Map<string, { signature: string; promise: Promise<string | null> }>();
+const cloudCoverWaiters: (() => void)[] = [];
+let activeCloudCoverRequests = 0;
+
+async function requestCloudGameCover(gameKey: string, remoteCover: RemoteFile): Promise<string | null> {
+  if (activeCloudCoverRequests >= 3) {
+    await new Promise<void>((resolve) => cloudCoverWaiters.push(resolve));
+  } else {
+    activeCloudCoverRequests++;
+  }
+  try {
+    return await invokeCommand<string | null>("get_cloud_game_cover_path", { gameKey, remoteCover });
+  } finally {
+    const resume = cloudCoverWaiters.shift();
+    if (resume) resume();
+    else activeCloudCoverRequests--;
+  }
+}
+
+export function getCloudGameCoverPath(gameKey: string, remoteCover?: RemoteFile): Promise<string | null> {
+  if (!remoteCover) return invokeCommand<string | null>("get_cloud_game_cover_path", { gameKey });
+  const signature = JSON.stringify(remoteCover);
+  const previous = cloudCoverRequests.get(gameKey);
+  if (previous?.signature === signature) return previous.promise;
+  const promise = (previous?.promise.catch(() => null) ?? Promise.resolve(null)).then(() =>
+    requestCloudGameCover(gameKey, remoteCover),
+  );
+  cloudCoverRequests.set(gameKey, { signature, promise });
+  const release = () => {
+    if (cloudCoverRequests.get(gameKey)?.promise === promise) cloudCoverRequests.delete(gameKey);
+  };
+  void promise.then(release, release);
+  return promise;
 }
 
 export function getCloudGameCoverPaths(): Promise<Record<string, string>> {
@@ -270,8 +302,9 @@ export function getGameCoverCaptureUrl(captureId: string): string {
   return `http://gamesaver-cover.localhost/capture/${encodeURIComponent(captureId)}`;
 }
 
-export function getCloudGameCoverUrl(gameKey: string): string {
-  return `http://gamesaver-cover.localhost/cloud/${encodeURIComponent(gameKey)}`;
+export function getCloudGameCoverUrl(gameKey: string, cacheKey?: string): string {
+  const base = `http://gamesaver-cover.localhost/cloud/${encodeURIComponent(gameKey)}`;
+  return cacheKey ? `${base}?v=${encodeURIComponent(cacheKey)}` : base;
 }
 
 export function startAddGameTask(input: {
@@ -333,6 +366,27 @@ export interface LibrarySettings {
 
 export function getLibrarySettings(): Promise<LibrarySettings> {
   return invokeCommand<LibrarySettings>("get_library_settings");
+}
+
+export interface GameStorageUsage {
+  gameUid: string;
+  displayName: string;
+  gameBytes: number;
+  packageBytes: number;
+  saveBytes: number;
+}
+
+export interface LibraryStorageOverview {
+  libraryRoot: string;
+  totalBytes: number;
+  freeBytes: number | null;
+  sharedSaveBytes: number;
+  otherBytes: number;
+  games: GameStorageUsage[];
+}
+
+export function getLibraryStorageOverview(): Promise<LibraryStorageOverview> {
+  return invokeCommand<LibraryStorageOverview>("get_library_storage_overview");
 }
 
 export function startSetLibraryRootTask(targetRoot: string): Promise<string> {

@@ -36,6 +36,8 @@ pub struct RemovalPlan {
     physical_root: String,
     phase: RemovalPhase,
     body_was_present: bool,
+    #[serde(default)]
+    cleanup_local_packages: bool,
     original_lifecycle: GameLifecycle,
     original_health: GameHealth,
 }
@@ -98,6 +100,7 @@ impl GameRemovalService {
                 return Err("该游戏有未完成的更新或安装事务，请先恢复后再删除".into());
             }
         }
+        let body_was_present = games_root.join(&game.game_uid).exists();
         let plan = RemovalPlan {
             schema_version: 1,
             game_uid: game.game_uid.clone(),
@@ -106,7 +109,8 @@ impl GameRemovalService {
             token: Uuid::new_v4().simple().to_string(),
             physical_root: physical_root(library_root)?,
             phase: RemovalPhase::Prepared,
-            body_was_present: games_root.join(&game.game_uid).exists(),
+            body_was_present,
+            cleanup_local_packages: kind == RemovalKind::Uninstall && body_was_present,
             original_lifecycle: game.lifecycle.clone(),
             original_health: game.health.clone(),
         };
@@ -242,7 +246,7 @@ impl GameRemovalService {
     pub fn cleanup(
         library_root: &Path,
         plan: &RemovalPlan,
-        mut collect_garbage: impl FnMut() -> Result<usize, String>,
+        mut finalize_storage: impl FnMut() -> Result<usize, String>,
         mut on_progress: impl FnMut(u8, &str),
     ) -> Result<RemovalOutcome, String> {
         validate_plan(library_root, plan)?;
@@ -265,9 +269,14 @@ impl GameRemovalService {
         }
         if plan.kind == RemovalKind::Delete {
             on_progress(90, "正在回收不再引用的存档对象");
-            match collect_garbage() {
+            match finalize_storage() {
                 Ok(count) => outcome.removed_objects = count,
                 Err(error) => outcome.failed_paths.push(format!("存档对象回收：{error}")),
+            }
+        } else if plan.cleanup_local_packages && outcome.failed_paths.is_empty() {
+            on_progress(90, "正在清理本体包记录");
+            if let Err(error) = finalize_storage() {
+                outcome.failed_paths.push(format!("清理本体包记录：{error}"));
             }
         }
         if outcome.failed_paths.is_empty() {
@@ -277,6 +286,32 @@ impl GameRemovalService {
         }
         outcome.cleanup_pending = !outcome.failed_paths.is_empty();
         Ok(outcome)
+    }
+
+    pub(crate) fn forget_local_packages(
+        store: &mut AppStore,
+        game_uid: &str,
+        version_id: Option<&str>,
+    ) -> bool {
+        let mut changed = false;
+        store.body_versions.retain_mut(|version| {
+            if version.game_uid != game_uid
+                || version_id.is_some_and(|id| version.version_id != id)
+                || version.package_path.is_none()
+            {
+                return true;
+            }
+            changed = true;
+            version.package_path = None;
+            if version.remote_path.is_some() {
+                return true;
+            }
+            version.sha256 = None;
+            version.excluded_items.clear();
+            version.upload_status = None;
+            !version.archive_path.trim().is_empty()
+        });
+        changed
     }
 
     pub fn pending_game_uids(library_root: &Path) -> Result<Vec<String>, String> {
@@ -326,7 +361,17 @@ impl GameRemovalService {
                             RemovalRecovery::Cleanup(plan) => Self::cleanup(
                                 library_root,
                                 &plan,
-                                || collect_garbage(&store.save_versions),
+                                || {
+                                    if plan.kind == RemovalKind::Delete {
+                                        return collect_garbage(&store.save_versions);
+                                    }
+                                    let mut candidate = store.clone();
+                                    if Self::forget_local_packages(&mut candidate, &game_uid, None) {
+                                        persist(&candidate)?;
+                                        *store = candidate;
+                                    }
+                                    Ok(0)
+                                },
                                 |_, _| {},
                             ),
                             RemovalRecovery::Finished(outcome) => Ok(outcome),
@@ -424,13 +469,12 @@ fn journal_path(root: &Path, uid: &str) -> PathBuf {
 
 fn cleanup_targets(root: &Path, plan: &RemovalPlan) -> Vec<(&'static str, PathBuf)> {
     let mut targets = vec![("正在清理本体文件", quarantine_path(root, plan))];
+    if plan.kind == RemovalKind::Delete || plan.cleanup_local_packages {
+        targets.push(("正在清理本体包", root.join("body-packages").join(&plan.game_uid)));
+    }
     if plan.kind == RemovalKind::Delete {
         targets.extend([
             ("正在清理封面", root.join("covers").join(&plan.game_uid)),
-            (
-                "正在清理本体包",
-                root.join("body-packages").join(&plan.game_uid),
-            ),
             (
                 "正在清理历史本体",
                 root.join("games/.versions").join(&plan.game_uid),
@@ -694,34 +738,76 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_preserves_metadata_assets_and_external_saves() {
+    fn uninstall_cleans_local_packages_but_preserves_cloud_records_and_saves() {
         let mut fixture = Fixture::new();
         let cover = fixture.write("covers/game-a/cover/display.jpg");
         let package = fixture.write("body-packages/game-a/body.zip");
+        let other_package = fixture.write("body-packages/game-b/body.zip");
         let external = fixture._workspace.join("save.dat");
         fs::write(&external, b"save").unwrap();
         fixture
             .store
             .save_versions
             .push(SaveVersion::new("game-a".into(), "1".into(), Vec::new()));
+        let record = serde_json::from_value::<crate::domain::GameBodyVersion>(serde_json::json!({
+            "versionId": "v1",
+            "gameUid": "game-a",
+            "createdAt": "1",
+            "archivePath": "",
+            "fileCount": 1,
+            "totalBytes": 7,
+            "packagePath": package,
+            "remotePath": "/apps/GameSaver/games/game-a/v1.zip",
+            "uploadStatus": "synced",
+        }))
+        .unwrap();
+        fixture.store.body_versions.push(record);
         let mut plan = fixture.plan(RemovalKind::Uninstall);
         fixture.commit(&mut plan);
-        let outcome = GameRemovalService::cleanup(
+        assert!(package.is_file());
+        let notices = GameRemovalService::recover_pending(
             &fixture.root,
-            &plan,
-            || panic!("uninstall must not collect CAS"),
-            |_, _| {},
+            &mut fixture.store,
+            |_| Ok(()),
+            |_| panic!("uninstall must not collect CAS"),
         )
         .unwrap();
+        let outcome = notices[0].result.as_ref().unwrap();
         assert!(!outcome.cleanup_pending);
         assert_eq!(fixture.store.games[0].lifecycle, GameLifecycle::NeedsRepair);
         assert_eq!(fixture.store.save_versions.len(), 1);
-        assert!(cover.is_file() && package.is_file() && external.is_file());
+        assert!(cover.is_file() && other_package.is_file() && external.is_file());
+        assert!(!package.exists());
+        let record = &fixture.store.body_versions[0];
+        assert!(record.package_path.is_none());
+        assert!(record.remote_path.is_some());
+        assert_eq!(record.upload_status.as_deref(), Some("synced"));
         assert!(!managed_path(&fixture.root, &plan).exists());
         assert!(!quarantine_path(&fixture.root, &plan).exists());
         assert!(GameRemovalService::pending_game_uids(&fixture.root)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn uninstall_recovery_does_not_expand_an_older_removal_plan() {
+        let mut fixture = Fixture::new();
+        let package = fixture.write("body-packages/game-a/body.zip");
+        let plan = fixture.plan(RemovalKind::Uninstall);
+        let mut legacy = serde_json::to_value(plan).unwrap();
+        legacy.as_object_mut().unwrap().remove("cleanupLocalPackages");
+        let mut plan = serde_json::from_value::<RemovalPlan>(legacy).unwrap();
+        fixture.commit(&mut plan);
+
+        let outcome = GameRemovalService::cleanup(
+            &fixture.root,
+            &plan,
+            || panic!("older uninstall did not authorize removing local packages"),
+            |_, _| {},
+        )
+        .unwrap();
+        assert!(!outcome.cleanup_pending);
+        assert!(package.is_file());
     }
 
     #[test]

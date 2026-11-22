@@ -73,6 +73,7 @@ export interface GameBodyVersion {
 export interface LaunchPrecheck {
   gameUid: string;
   canLaunch: boolean;
+  bodyDirectoryExists: boolean;
   executableExists: boolean;
   saveProfileReady: boolean;
   validScopeCount: number;

@@ -43,7 +43,7 @@ pub struct BaiduConnectionStatus {
     pub reauthorization_required: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteFile {
     pub path: String,

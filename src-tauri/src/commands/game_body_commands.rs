@@ -1,11 +1,14 @@
 use crate::{
     app_state::AppState,
     domain::{
-        compare_created_at, GameBodyVersion, GameLifecycle, SaveProfile, SaveVersion, TaskCategory,
-        TaskStatus,
+        compare_created_at, is_safe_path_segment, path_utils::normalize_path, AppStore,
+        GameBodyVersion, GameLifecycle, SaveProfile, SaveVersion, TaskCategory, TaskStatus,
     },
     repositories::{BaiduConfigRepository, GameRepository},
-    services::{BodyPackageService, GameBodyUpdateService, GameLibraryService, TaskService},
+    services::{
+        game_removal_service::validate_target, BodyPackageService, GameBodyUpdateService,
+        GameLibraryService, TaskService,
+    },
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -167,12 +170,15 @@ pub fn package_game_body(
     if let Some(task_id) = active_body_package_task(&state, &game_uid) {
         return Ok(task_id);
     }
-    if let Err(error) = reserve_update(&state, &game_uid) {
-        if let Some(task_id) = active_body_package_task(&state, &game_uid) {
-            return Ok(task_id);
+    let package_claim = match state.claim_body_package(&game_uid) {
+        Ok(claim) => claim,
+        Err(error) => {
+            if let Some(task_id) = active_body_package_task(&state, &game_uid) {
+                return Ok(task_id);
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
     let context = (|| {
         let game = load_body_game(&state, &game_uid)?;
         let protected_paths = body_save_exclusion_paths(&state, &game)?;
@@ -181,7 +187,7 @@ pub fn package_game_body(
     let (game, protected_paths) = match context {
         Ok(value) => value,
         Err(error) => {
-            release_update(&state, &game_uid);
+            state.release_operation(&package_claim);
             return Err(error);
         }
     };
@@ -194,7 +200,7 @@ pub fn package_game_body(
     ) {
         Ok(task_id) => task_id,
         Err(error) => {
-            release_update(&state, &game_uid);
+            state.release_operation(&package_claim);
             return Err(error);
         }
     };
@@ -203,7 +209,7 @@ pub fn package_game_body(
     std::thread::spawn(move || {
         let result =
             package_game_body_task(&app_handle, &task_id_for_thread, &game, &protected_paths);
-        release_update(&app_handle.state(), &game_uid);
+        app_handle.state::<AppState>().release_operation(&package_claim);
         match result {
             Ok(summary) => {
                 let version_id = summary
@@ -264,15 +270,12 @@ pub fn delete_game_body_package(
     let version_id = version_id.trim().to_string();
     reserve_update(&state, &game_uid)?;
     let context = (|| {
-        let (game, version, _, _) = load_body_package_context(&state, &game_uid, &version_id)?;
-        let package_path = BodyPackageService::package_path(
-            &body_package_cache_root(&app)?,
-            &game_uid,
-            &version_id,
-        )?;
-        Ok::<_, String>((game, version, package_path))
+        let root = state.library_root_path()?;
+        let store = state.store.lock().map_err(|_| "读取游戏记录失败")?;
+        let version = local_package_for_deletion(&store, &game_uid, &version_id)?;
+        Ok::<_, String>((version, root))
     })();
-    let (game, version, package_path) = match context {
+    let (version, root) = match context {
         Ok(value) => value,
         Err(error) => {
             release_update(&state, &game_uid);
@@ -298,9 +301,8 @@ pub fn delete_game_body_package(
         let result = delete_game_body_package_task(
             &app_handle,
             &task_id_for_thread,
-            &game,
             &version,
-            package_path,
+            &root,
         );
         release_update(&app_handle.state(), &game_uid);
         match result {
@@ -344,9 +346,8 @@ pub fn uninstall_game_body(
 fn delete_game_body_package_task(
     app: &AppHandle,
     task_id: &str,
-    game: &crate::domain::Game,
-    version: &crate::domain::GameBodyVersion,
-    package_path: PathBuf,
+    version: &GameBodyVersion,
+    root: &Path,
 ) -> Result<serde_json::Value, String> {
     let state = app.state::<AppState>();
     TaskService::update(
@@ -354,45 +355,41 @@ fn delete_game_body_package_task(
         task_id,
         TaskStatus::Running,
         20,
-        "正在更新本体版本记录",
+        "正在清理本地 ZIP 缓存",
         None,
     );
-    let keeps_archive = state.with_store_mut(|candidate| {
-        let Some(record) = candidate.body_versions.iter_mut().find(|item| {
-            item.game_uid == game.game_uid
-                && item.version_id == version.version_id
-                && item.package_path.is_some()
-        }) else {
-            return Err("游戏本体包版本不存在".to_string());
-        };
-        let keeps_archive = !record.archive_path.trim().is_empty();
-        if keeps_archive {
-            record.package_path = None;
-            record.sha256 = None;
-            record.excluded_items.clear();
-            record.upload_status = None;
-        } else {
-            candidate
-                .body_versions
-                .retain(|item| item.version_id != version.version_id);
+    let package_path = validated_local_package_path(root, version)?;
+    if let Err(error) = std::fs::remove_file(&package_path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(format!("清理本地 ZIP 缓存失败，已保留记录：{error}"));
         }
-        GameRepository::persist(app, candidate)
-            .map_err(|error| format!("保存本体版本记录失败：{error}"))?;
-        Ok(keeps_archive)
-    })?;
+    }
     TaskService::update(
         &state,
         task_id,
         TaskStatus::Running,
         70,
-        "正在清理本地 ZIP 缓存",
+        "正在更新本体版本记录",
         None,
     );
-    if let Err(error) = std::fs::remove_file(&package_path) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            return Err(format!("本体版本记录已更新，但清理 ZIP 缓存失败：{error}"));
-        }
-    }
+    let keeps_archive = state.with_store_mut(|candidate| {
+        let Some(record) = candidate.body_versions.iter().find(|item| {
+            item.game_uid == version.game_uid
+                && item.version_id == version.version_id
+                && item.package_path == version.package_path
+        }) else {
+            return Err("游戏本体包版本不存在".to_string());
+        };
+        let keeps_archive = !record.archive_path.trim().is_empty();
+        crate::services::GameRemovalService::forget_local_packages(
+            candidate,
+            &version.game_uid,
+            Some(&version.version_id),
+        );
+        GameRepository::persist(app, candidate)
+            .map_err(|error| format!("保存本体版本记录失败：{error}"))?;
+        Ok(keeps_archive)
+    })?;
     Ok(serde_json::json!({ "versionId": version.version_id, "keepsArchive": keeps_archive }))
 }
 
@@ -470,29 +467,16 @@ fn load_body_game(state: &AppState, game_uid: &str) -> Result<crate::domain::Gam
     Ok(game)
 }
 
-fn load_body_package_context(
-    state: &AppState,
+fn local_package_for_deletion(
+    store: &AppStore,
     game_uid: &str,
     version_id: &str,
-) -> Result<
-    (
-        crate::domain::Game,
-        crate::domain::GameBodyVersion,
-        Option<SaveProfile>,
-        Option<SaveVersion>,
-    ),
-    String,
-> {
-    let store = state
-        .store
-        .lock()
-        .map_err(|_| "lock GameSaver store failed".to_string())?;
-    let game =
-        GameLibraryService::find(&store, game_uid).ok_or_else(|| "游戏不存在".to_string())?;
-    if !matches!(game.lifecycle, GameLifecycle::Active) {
-        return Err("游戏尚未完成设置".to_string());
+) -> Result<GameBodyVersion, String> {
+    let game = store.games.iter().find(|game| game.game_uid == game_uid).ok_or("游戏不存在")?;
+    if matches!(game.lifecycle, GameLifecycle::Removing) {
+        return Err("该游戏正在删除".to_string());
     }
-    let version = store
+    store
         .body_versions
         .iter()
         .find(|item| {
@@ -501,27 +485,27 @@ fn load_body_package_context(
                 && item.package_path.is_some()
         })
         .cloned()
-        .ok_or_else(|| "游戏本体包版本不存在".to_string())?;
-    let profile = game
-        .save_profile_id
-        .as_ref()
-        .and_then(|profile_id| {
-            store.save_profiles.iter().find(|item| {
-                item.profile_id == *profile_id && item.game_uid == game_uid && item.enabled
-            })
-        })
-        .cloned();
-    let latest = game
-        .latest_save_version_id
-        .as_ref()
-        .and_then(|save_id| {
-            store
-                .save_versions
-                .iter()
-                .find(|item| item.version_id == *save_id && item.game_uid == game_uid)
-        })
-        .cloned();
-    Ok((game, version, profile, latest))
+        .ok_or_else(|| "游戏本体包版本不存在".to_string())
+}
+
+fn validated_local_package_path(root: &Path, version: &GameBodyVersion) -> Result<PathBuf, String> {
+    let recorded = Path::new(version.package_path.as_deref().ok_or("没有本地 ZIP 缓存")?);
+    let file_name = recorded
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| is_safe_path_segment(name))
+        .ok_or("本地 ZIP 文件名无效")?;
+    if !is_safe_path_segment(&version.game_uid)
+        || !recorded.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+    {
+        return Err("本地 ZIP 缓存记录无效".to_string());
+    }
+    let expected = root.join("body-packages").join(&version.game_uid).join(file_name);
+    if normalize_path(recorded) != normalize_path(&expected) {
+        return Err("本地 ZIP 不在该游戏的缓存目录内，已停止删除".to_string());
+    }
+    validate_target(root, &expected)?;
+    Ok(expected)
 }
 
 fn body_save_exclusion_paths(
@@ -673,4 +657,44 @@ fn now_iso() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|value| value.as_secs().to_string())
         .unwrap_or_else(|_| "0".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{domain::Game, test_support::TempWorkspace};
+
+    #[test]
+    fn local_zip_deletion_accepts_an_uninstalled_game_and_uses_its_recorded_cache_path() {
+        let root = TempWorkspace::new("local-zip-delete");
+        let mut game = Game::new_pending("test", root.join("games/test").to_string_lossy(), "game.exe");
+        game.lifecycle = GameLifecycle::NeedsRepair;
+        let package = root.join("body-packages").join(&game.game_uid).join("install-transaction.zip");
+        let uid = game.game_uid.clone();
+        let mut store = AppStore {
+            games: vec![game],
+            body_versions: vec![GameBodyVersion {
+                version_id: "v1".into(),
+                game_uid: uid.clone(),
+                created_at: "1".into(),
+                archive_path: String::new(),
+                file_count: 1,
+                total_bytes: 10,
+                package_path: Some(package.to_string_lossy().into_owned()),
+                sha256: None,
+                excluded_items: Vec::new(),
+                upload_status: None,
+                remote_path: None,
+                remote_fs_id: None,
+                remote_size: None,
+            }],
+            ..AppStore::default()
+        };
+        let mut version = local_package_for_deletion(&store, &uid, "v1").unwrap();
+        assert_eq!(validated_local_package_path(&root, &version).unwrap(), package);
+        version.package_path = Some(root.join("body-packages/other/other.zip").to_string_lossy().into_owned());
+        assert!(validated_local_package_path(&root, &version).is_err());
+        store.games[0].lifecycle = GameLifecycle::Removing;
+        assert!(local_package_for_deletion(&store, &uid, "v1").is_err());
+    }
 }

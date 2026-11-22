@@ -413,6 +413,14 @@ fn run_game_removal(
         root,
         &plan,
         || {
+            if plan.kind == RemovalKind::Uninstall {
+                return state.with_store_mut(|store| {
+                    if GameRemovalService::forget_local_packages(store, game_uid, None) {
+                        GameRepository::persist(app, store)?;
+                    }
+                    Ok(0)
+                });
+            }
             let store = state.store.lock().map_err(|_| "读取存档引用失败")?;
             SaveRepository::collect_garbage_in_library(root, &store.save_versions)
         },

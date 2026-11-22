@@ -24,6 +24,7 @@ pub fn restart_as_admin(app: AppHandle) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
+        crate::services::window_placement::save_main_window(&app);
         relaunch_as_admin()?;
         crate::logging::info("已请求管理员模式重启");
         app.exit(0);

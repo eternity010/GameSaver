@@ -139,6 +139,7 @@ pub fn start_upload_save_version_task(
     // 退出游戏时的自动同步与用户手动同步正是可以并发的两条路径，所以这里必须互斥。
     let task_id = begin_sync(
         &state,
+        "sync_cloud_save",
         &format!("上传【{}】游戏存档至百度网盘", game.display_name),
         &game.game_uid,
     )?;
@@ -239,6 +240,7 @@ fn start_restore_cloud_save_task_blocking(
 
     let task_id = begin_sync(
         &state,
+        "restore_cloud_save",
         &format!("从云端还原【{}】游戏存档", game.display_name),
         &game_uid,
     )?;
@@ -397,10 +399,15 @@ fn restore_save_worker(
     Ok(())
 }
 
-fn begin_sync(state: &AppState, title: &str, game_uid: &str) -> Result<String, String> {
+fn begin_sync(
+    state: &AppState,
+    task_type: &str,
+    title: &str,
+    game_uid: &str,
+) -> Result<String, String> {
     let task_id = TaskService::create(
         state,
-        "sync_cloud_save",
+        task_type,
         TaskCategory::CloudSaveSync,
         Some(game_uid.to_string()),
         title,
@@ -525,16 +532,17 @@ mod tests {
         let dir = TempWorkspace::new("cloud-save-commands");
         let state = test_state(&dir);
 
-        let task_id =
-            begin_sync(&state, "上传【样例】游戏存档至百度网盘", "game-1").expect("创建同步任务");
-        let task = TaskService::get(&state, &task_id).expect("任务应当存在");
+        for task_type in ["sync_cloud_save", "restore_cloud_save"] {
+            let task_id = begin_sync(&state, task_type, "云端存档", "game-1").expect("创建同步任务");
+            let task = TaskService::get(&state, &task_id).expect("任务应当存在");
 
-        assert_eq!(task.task_type, "sync_cloud_save");
-        assert_eq!(task.category, Some(TaskCategory::CloudSaveSync));
-        assert_eq!(task.game_uid.as_deref(), Some("game-1"));
-        assert_eq!(task.status, TaskStatus::Running);
-        assert_eq!(task.progress, 0);
-        assert_eq!(task.message, "任务已创建");
+            assert_eq!(task.task_type, task_type);
+            assert_eq!(task.category, Some(TaskCategory::CloudSaveSync));
+            assert_eq!(task.game_uid.as_deref(), Some("game-1"));
+            assert_eq!(task.status, TaskStatus::Running);
+            assert_eq!(task.progress, 0);
+            assert_eq!(task.message, "任务已创建");
+        }
     }
 
     /// 成功路径：终态 Success、进度 100、**不**挂重试载荷。
@@ -546,8 +554,8 @@ mod tests {
     fn finish_sync_records_success_and_persists_it() {
         let dir = TempWorkspace::new("cloud-save-commands");
         let state = test_state(&dir);
-        let task_id =
-            begin_sync(&state, "上传【样例】游戏存档至百度网盘", "game-1").expect("创建同步任务");
+        let task_id = begin_sync(&state, "sync_cloud_save", "上传存档", "game-1")
+            .expect("创建同步任务");
 
         finish_sync(
             &state,
@@ -578,8 +586,8 @@ mod tests {
     fn finish_sync_records_failure_with_prefix_and_retry() {
         let dir = TempWorkspace::new("cloud-save-commands");
         let state = test_state(&dir);
-        let task_id =
-            begin_sync(&state, "上传【样例】游戏存档至百度网盘", "game-1").expect("创建同步任务");
+        let task_id = begin_sync(&state, "sync_cloud_save", "上传存档", "game-1")
+            .expect("创建同步任务");
 
         finish_sync(
             &state,
@@ -604,7 +612,7 @@ mod tests {
     fn finish_cloud_save_cancel_persists_cancelled_and_retry_without_error() {
         let dir = TempWorkspace::new("cloud-save-cancel");
         let state = test_state(&dir);
-        let task_id = begin_sync(&state, "sync", "game-1").unwrap();
+        let task_id = begin_sync(&state, "sync_cloud_save", "sync", "game-1").unwrap();
         TaskService::update(&state, &task_id, TaskStatus::Running, 42, "uploading", None);
         finish_sync(
             &state,

@@ -1,10 +1,13 @@
 use crate::{
     app_state::AppState,
-    domain::{GameBodyVersion, GameHealth, GameLifecycle, SaveProfile, SaveVersion, TaskStatus},
+    domain::{
+        AppStore, AppTask, GameBodyVersion, GameHealth, GameLifecycle, SaveProfile, SaveVersion,
+        TaskStatus,
+    },
     repositories::{GameRepository, SaveRepository},
     services::{GameBodyUpdateService, TaskService},
 };
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
@@ -19,6 +22,7 @@ pub(crate) fn run_update(
     let state = app.state::<AppState>();
     SaveRepository::ensure_no_pending_restore(app, &game.game_uid)?;
     let games_root = state.games_root()?;
+    GameBodyUpdateService::ensure_no_pending_update(&games_root, &game.game_uid)?;
     GameBodyUpdateService::validate_managed_game(&games_root, game)?;
     TaskService::update(
         &state,
@@ -100,6 +104,7 @@ pub(crate) fn run_update(
         return Err("任务已取消".to_string());
     }
     let save_target = protected.as_ref().or(latest);
+    let restored_version_id = save_target.map(|version| version.version_id.clone());
     let version_id = Uuid::new_v4().to_string();
     let archive_path = games_root
         .join(".versions")
@@ -145,7 +150,7 @@ pub(crate) fn run_update(
         };
     let receipt = match save_target {
         Some(target) => {
-            match SaveRepository::restore(app, game, profile, target, |progress, message| {
+            match SaveRepository::restore_after_body_swap(app, game, profile, target, |progress, message| {
                 TaskService::update(
                     &state,
                     task_id,
@@ -158,6 +163,7 @@ pub(crate) fn run_update(
                 Ok(receipt) => Some(receipt),
                 Err(error) => {
                     return rollback_update(
+                        app,
                         game,
                         &swap,
                         &journal_path,
@@ -191,6 +197,7 @@ pub(crate) fn run_update(
         Ok(store) => store,
         Err(_) => {
             return rollback_update(
+                app,
                 game,
                 &swap,
                 &journal_path,
@@ -201,75 +208,78 @@ pub(crate) fn run_update(
         }
     };
     let mut candidate = guard.clone();
-    if let Some(protected) = protected {
-        candidate.save_versions.push(protected);
-    }
-    candidate.body_versions.push(body_version);
-    let Some(game_record) = candidate
-        .games
-        .iter_mut()
-        .find(|item| item.game_uid == game.game_uid)
-    else {
+    if let Err(error) = record_update(
+        &mut candidate,
+        body_version,
+        protected,
+        restored_version_id,
+    ) {
         drop(guard);
         return rollback_update(
+            app,
             game,
             &swap,
             &journal_path,
             receipt,
             pending_protected.as_ref(),
-            "游戏记录不存在".to_string(),
+            error,
         );
-    };
-    if let Some(protected) = candidate
-        .save_versions
-        .last()
-        .filter(|version| version.game_uid == game.game_uid)
-    {
-        game_record.latest_save_version_id = Some(protected.version_id.clone());
     }
-    game_record.lifecycle = GameLifecycle::Active;
-    game_record.health = GameHealth::Ready;
     if let Some(receipt) = receipt.as_ref() {
         receipt.record_commit(&mut candidate);
     }
     if let Err(error) = GameRepository::persist(app, &candidate) {
         drop(guard);
-        let save_rollback = receipt.map(SaveRepository::rollback_restore);
-        let body_rollback = GameBodyUpdateService::rollback(Path::new(&game.managed_path), &swap);
-        if let Some(version) = pending_protected.as_ref() {
-            crate::repositories::release_pending_objects(version);
-        }
-        let journal_cleanup = if body_rollback.is_ok() && !matches!(save_rollback, Some(Err(_))) {
-            GameBodyUpdateService::clear_journal(&journal_path)
-        } else {
-            Ok(())
-        };
-        let mut errors = vec![format!("保存本体更新记录失败：{error}")];
-        if let Err(cleanup_error) = journal_cleanup {
-            errors.push(format!("更新回滚完成，但事务清理失败：{cleanup_error}"));
-        }
-        if let Some(Err(save_error)) = save_rollback {
-            errors.push(format!("存档回滚失败：{save_error}"));
-        }
-        if let Err(body_error) = body_rollback {
-            errors.push(format!("游戏本体回滚失败：{body_error}"));
-        }
-        return Err(errors.join("；"));
+        return rollback_update(
+            app,
+            game,
+            &swap,
+            &journal_path,
+            receipt,
+            pending_protected.as_ref(),
+            format!("保存本体更新记录失败：{error}"),
+        );
     }
-    if let Some(receipt) = receipt {
-        SaveRepository::finalize_restore(receipt, &mut candidate);
-    }
+    let save_cleanup = receipt.map_or(Ok(()), |receipt| {
+        SaveRepository::try_finalize_restore(receipt, &mut candidate)
+    });
     *guard = candidate;
     drop(guard);
     if let Some(version) = pending_protected.as_ref() {
         crate::repositories::release_pending_objects(version);
     }
+    save_cleanup.map_err(|error| {
+        format!("新版已安装，存档恢复事务尚未收尾；旧本体与事务均已保留，请重试：{error}")
+    })?;
     let committed = std::collections::HashSet::from([crate::domain::path_utils::normalize_path(
         &swap.archive_path,
     )]);
     settle_update(app, &game.game_uid, &committed)
         .map_err(|error| format!("游戏本体已更新，但旧文件或事务清理未完成：{error}"))?;
     Ok(serde_json::json!({ "fileCount": plan.file_count, "totalBytes": plan.total_bytes }))
+}
+
+fn record_update(
+    store: &mut AppStore,
+    body_version: GameBodyVersion,
+    protected: Option<SaveVersion>,
+    restored_version_id: Option<String>,
+) -> Result<(), String> {
+    let game = store
+        .games
+        .iter_mut()
+        .find(|game| game.game_uid == body_version.game_uid)
+        .ok_or("游戏记录不存在")?;
+    if let Some(version_id) = restored_version_id {
+        game.latest_save_version_id = Some(version_id);
+    }
+    game.lifecycle = GameLifecycle::Active;
+    game.health = GameHealth::Ready;
+    if let Some(protected) = protected {
+        store.save_versions.push(protected);
+    }
+    store.body_versions.push(body_version);
+    Ok(())
 }
 
 fn settle_update(
@@ -303,9 +313,17 @@ pub(crate) fn retry_update(
         task_id,
         TaskStatus::Running,
         90,
-        "正在恢复更新事务并清理旧本体",
+        "正在恢复存档和本体更新事务",
         None,
     );
+    let root = state.games_root()?;
+    let has_update = GameBodyUpdateService::has_pending_update(&root, game_uid)?;
+    state.with_store_mut(|store| {
+        SaveRepository::recover_game_restore_journals(app, store, game_uid)
+    })?;
+    if !has_update {
+        return Ok(serde_json::json!({ "committed": false }));
+    }
     let committed = state
         .store
         .lock()
@@ -326,10 +344,17 @@ pub(crate) fn finish_update_task(
     result: Result<serde_json::Value, String>,
 ) -> bool {
     let state = app.state::<AppState>();
-    let pending = state
+    let remaining = state
         .games_root()
-        .and_then(|root| GameBodyUpdateService::pending_game_uids(&root))
-        .map_or(true, |uids| uids.iter().any(|uid| uid == game_uid));
+        .and_then(|root| GameBodyUpdateService::has_pending_update(&root, game_uid))
+        .and_then(|has_update| {
+            if has_update {
+                Ok(true)
+            } else {
+                SaveRepository::has_pending_restore(app, game_uid)
+            }
+        });
+    let pending = remaining.as_ref().copied().unwrap_or(true);
     if pending {
         if let Err(error) = TaskService::set_retry(
             &state,
@@ -347,13 +372,14 @@ pub(crate) fn finish_update_task(
         }
     }
     let success = result.is_ok() && !pending;
+    state.finish_game_update(game_uid, pending);
     match result {
         Ok(summary) if !pending => TaskService::finish(
             &state,
             task_id,
             TaskStatus::Success,
             100,
-            "游戏本体更新或事务恢复完成，旧本体已清理",
+            "游戏本体更新或事务恢复完成",
             Some(summary),
             None,
         ),
@@ -369,6 +395,7 @@ pub(crate) fn finish_update_task(
         result => {
             let error = result
                 .err()
+                .or_else(|| remaining.err())
                 .unwrap_or_else(|| "更新事务记录尚未完成清理".into());
             TaskService::finish(
                 &state,
@@ -385,8 +412,38 @@ pub(crate) fn finish_update_task(
             );
         }
     }
-    state.finish_game_update(game_uid, pending);
     success
+}
+
+pub(crate) fn pending_updates_at_startup(
+    games_root: &Path,
+    tasks: &HashMap<String, AppTask>,
+) -> Vec<String> {
+    match GameBodyUpdateService::pending_game_uids(games_root) {
+        Ok(uids) => uids,
+        Err(error) => {
+            crate::logging::warn(format!(
+                "无法检查游戏库中的更新事务，将保留已知更新任务的恢复入口：{error}"
+            ));
+            let mut uids = tasks
+                .values()
+                .filter(|task| {
+                    matches!(
+                        task.task_type.as_str(),
+                        "update_game_body" | "retry_game_body_update"
+                    )
+                        && (task.status == TaskStatus::Interrupted
+                            || task.retry.as_ref().is_some_and(|retry| {
+                                retry.operation == "retry_game_body_update"
+                            }))
+                })
+                .filter_map(|task| task.game_uid.clone())
+                .collect::<Vec<_>>();
+            uids.sort_unstable();
+            uids.dedup();
+            uids
+        }
+    }
 }
 
 pub(crate) fn record_pending_updates(app: &AppHandle, uids: Vec<String>) {
@@ -436,6 +493,7 @@ pub(crate) fn record_pending_updates(app: &AppHandle, uids: Vec<String>) {
 }
 
 fn rollback_update(
+    app: &AppHandle,
     game: &crate::domain::Game,
     swap: &crate::services::game_body_update_service::BodySwap,
     journal_path: &Path,
@@ -446,24 +504,19 @@ fn rollback_update(
     if let Some(version) = pending_version {
         crate::repositories::release_pending_objects(version);
     }
-    let save_rollback = receipt.map(SaveRepository::rollback_restore);
-    let body_rollback = GameBodyUpdateService::rollback(Path::new(&game.managed_path), swap);
-    let journal_cleanup = if body_rollback.is_ok() && !matches!(save_rollback, Some(Err(_))) {
-        GameBodyUpdateService::clear_journal(journal_path)
-    } else {
-        Ok(())
-    };
-    let mut errors = vec![error];
-    if let Some(Err(save_error)) = save_rollback {
-        errors.push(format!("存档回滚失败：{save_error}"));
+    let save_rollback = receipt
+        .map_or(Ok(()), SaveRepository::rollback_restore)
+        .and_then(|()| SaveRepository::ensure_no_pending_restore(app, &game.game_uid));
+    if let Err(save_error) = save_rollback {
+        return Err(format!("{error}；存档回滚尚未收尾，本体和事务已保留：{save_error}"));
     }
-    if let Err(body_error) = body_rollback {
-        errors.push(format!("游戏本体回滚失败：{body_error}"));
+    if let Err(body_error) = GameBodyUpdateService::rollback(Path::new(&game.managed_path), swap) {
+        return Err(format!("{error}；游戏本体回滚失败：{body_error}"));
     }
-    if let Err(cleanup_error) = journal_cleanup {
-        errors.push(format!("更新事务清理失败：{cleanup_error}"));
+    if let Err(cleanup_error) = GameBodyUpdateService::clear_journal(journal_path) {
+        return Err(format!("{error}；更新事务清理失败：{cleanup_error}"));
     }
-    Err(errors.join("；"))
+    Err(error)
 }
 
 fn now_iso() -> String {
@@ -471,4 +524,56 @@ fn now_iso() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|value| value.as_secs().to_string())
         .unwrap_or_else(|_| "0".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::Game;
+
+    #[test]
+    fn update_records_the_actual_restored_version_instead_of_the_last_entry() {
+        let mut game = Game::new_pending("Test", "game", "game.exe");
+        let restored = SaveVersion::new(game.game_uid.clone(), "1".into(), Vec::new());
+        let newer = SaveVersion::new(game.game_uid.clone(), "2".into(), Vec::new());
+        game.latest_save_version_id = Some(restored.version_id.clone());
+        let mut store = AppStore {
+            games: vec![game],
+            save_versions: vec![restored.clone(), newer],
+            ..AppStore::default()
+        };
+        let body = GameBodyVersion {
+            version_id: "updated-body".into(),
+            game_uid: restored.game_uid.clone(),
+            created_at: "3".into(),
+            archive_path: String::new(),
+            file_count: 1,
+            total_bytes: 1,
+            package_path: None,
+            sha256: None,
+            excluded_items: Vec::new(),
+            upload_status: None,
+            remote_path: None,
+            remote_fs_id: None,
+            remote_size: None,
+        };
+        record_update(
+            &mut store,
+            body.clone(),
+            None,
+            Some(restored.version_id.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            store.games[0].latest_save_version_id.as_deref(),
+            Some(restored.version_id.as_str())
+        );
+        assert_eq!(store.save_versions.len(), 2);
+
+        let protected = SaveVersion::new(restored.game_uid, "4".into(), Vec::new());
+        let protected_id = protected.version_id.clone();
+        record_update(&mut store, body, Some(protected), Some(protected_id.clone())).unwrap();
+        assert_eq!(store.games[0].latest_save_version_id, Some(protected_id));
+        assert_eq!(store.save_versions.len(), 3);
+    }
 }
