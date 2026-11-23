@@ -464,6 +464,8 @@ fn finish_game_session(
         .unwrap_or(false)
     {
         "游戏已退出，存档版本已提交"
+    } else if profile.is_none() {
+        "游戏已退出，未启用存档保护"
     } else {
         "游戏已退出，没有新的存档变化"
     };
@@ -698,7 +700,7 @@ fn running_session_message(profile_ready: bool) -> &'static str {
     if profile_ready {
         "游戏正在运行，退出后将提交存档版本"
     } else {
-        "游戏正在运行，存档保护尚未设置"
+        "游戏正在运行，未启用存档保护"
     }
 }
 

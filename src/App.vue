@@ -1025,7 +1025,7 @@ async function finishAddGame(completedGame?: Game) {
               <h2>{{ game.displayName }}</h2>
               <div class="game-card-status">
                 <span class="status-label">{{ gameStatusLabel(game) }}</span>
-                <span v-if="game.saveProtectionSkipped" class="status-label status-label-unprotected">存档未保护</span>
+                <span v-if="game.lifecycle === 'active' && !game.saveProfileId" class="status-label status-label-unprotected">未启用存档保护</span>
                 <span v-if="needsStoreUpload(game)" class="store-upload-badge">待上传商店</span>
                 <span v-if="unsyncedGameUids.has(game.gameUid)" class="status-label status-label-warn" title="最近一次自动同步存档失败，可在传输中心重试">存档未同步</span>
               </div>

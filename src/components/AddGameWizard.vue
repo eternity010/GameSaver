@@ -50,6 +50,7 @@ const progress = ref(0);
 const message = ref("");
 const error = ref("");
 const completedGame = ref<Game | null>(null);
+const configuringExistingGame = ref(false);
 const confirming = ref(false);
 const previewing = ref(false);
 // 目录推断前置（评审 A1 第 2 项）：选定本体后**自动**跑一次只读推断，把候选目录先摆出来，
@@ -75,8 +76,8 @@ let disposed = false;
 
 const isBusy = computed(() => resuming.value || confirming.value || !!taskId.value || phase.value === "copying" || phase.value === "analyzing" || phase.value === "discarding");
 const canStart = computed(() => !resuming.value && !taskId.value && Boolean(displayName.value.trim() && sourcePath.value.trim() && executablePath.value.trim()) && phase.value === "form");
-const stepNumber = computed(() => phase.value === "form" || phase.value === "copying" ? 1 : phase.value === "ready" || phase.value === "capturing" ? 2 : phase.value === "analyzing" || phase.value === "review" ? 3 : 4);
-const stepTitle = computed(() => phase.value === "form" || phase.value === "copying" ? "选择并复制游戏本体" : phase.value === "ready" || phase.value === "capturing" ? "完成一次游戏内保存" : phase.value === "analyzing" ? "分析存档变化" : phase.value === "review" ? "确认存档保护范围" : "添加完成");
+const stepNumber = computed(() => (phase.value === "form" || phase.value === "copying" ? 1 : phase.value === "ready" || phase.value === "capturing" ? 2 : phase.value === "analyzing" || phase.value === "review" ? 3 : 4) - (configuringExistingGame.value ? 1 : 0));
+const stepTitle = computed(() => phase.value === "form" || phase.value === "copying" ? "选择并复制游戏本体" : phase.value === "ready" || phase.value === "capturing" ? "完成一次游戏内保存" : phase.value === "analyzing" ? "分析存档变化" : phase.value === "review" ? "确认存档保护范围" : (configuringExistingGame.value ? "设置完成" : "添加完成"));
 const canConfirm = computed(() => reviewScopes.value.length > 0 && reviewScopes.value.every((scope) =>
   scope.confirmedFiles.length > 0 || (scope.unknownFilePolicy === "protect" && scope.includeDirectories.length > 0),
 ));
@@ -285,11 +286,12 @@ async function resumeSetup() {
     const context = await getPendingGameSetup(props.gameUid);
     if (disposed) return;
     completedGame.value = context.game;
+    configuringExistingGame.value = context.game?.lifecycle === "active" && !context.game.saveProfileId;
     session.value = context.session;
     validatingCandidates.value = context.validationOnly;
     if (context.game) {
       emit("pending", context.game.gameUid);
-      phase.value = context.game.lifecycle === "pending_setup" ? (context.session ? "capturing" : "ready") : "done";
+      phase.value = context.game.lifecycle === "pending_setup" || configuringExistingGame.value ? (context.session ? "capturing" : "ready") : "done";
     }
     if (context.taskId && phase.value !== "done") {
       taskId.value = context.taskId;
@@ -655,11 +657,15 @@ async function finishWithoutSaveProtection() {
   const gameUid = completedGame.value?.gameUid;
   const stage = phase.value;
   if (!gameUid || isBusy.value || previewing.value || (stage !== "ready" && stage !== "review")) return;
+  if (configuringExistingGame.value) {
+    await abandonPendingGame();
+    return;
+  }
   confirming.value = true;
   error.value = "";
   try {
     const accepted = await confirmAction(
-      "游戏可以正常游玩。GameSaver 不会为它自动备份或同步存档，也无法通过 GameSaver 恢复这次游玩的进度。确定加入游戏库吗？",
+      "此游戏未启用存档保护，可以正常游玩。GameSaver 不会为它自动备份或同步存档，也无法通过 GameSaver 恢复这次游玩的进度。确定加入游戏库吗？",
     );
     if (!accepted || disposed || phase.value !== stage || completedGame.value?.gameUid !== gameUid) return;
     const game = await finishAddGameWithoutSaveProtection(gameUid);
@@ -713,8 +719,8 @@ async function abandonPendingGame() {
     if (completedGame.value) emit("completed", completedGame.value);
     return;
   }
-  if (isBusy.value) {
-    error.value = "请先等待或取消当前任务，再放弃添加";
+  if (isBusy.value || cancelling.value) {
+    error.value = "请先等待或取消当前任务，再离开设置";
     return;
   }
   if (!completedGame.value) {
@@ -726,15 +732,23 @@ async function abandonPendingGame() {
     return;
   }
   try {
+    cancelling.value = true;
     if (session.value?.sessionId) {
       await cancelSaveLearning(session.value.sessionId);
       session.value = null;
+    }
+    if (configuringExistingGame.value) {
+      stopPolling();
+      emit("completed", completedGame.value);
+      return;
     }
     taskId.value = await discardPendingGame(completedGame.value.gameUid);
     phase.value = "discarding";
     await watchTask(async () => { emit("back"); }, "已取消放弃添加", "清理未完成，可在传输中心重试");
   } catch (reason) {
     error.value = String(reason);
+  } finally {
+    cancelling.value = false;
   }
 }
 
@@ -745,13 +759,13 @@ onUnmounted(() => { disposed = true; stopPolling(); });
 <template>
   <section class="wizard-page page-enter">
     <header class="wizard-header">
-      <button class="icon-button" type="button" title="返回游戏库" aria-label="返回游戏库" :disabled="isBusy" @click="abandonPendingGame"><ArrowLeft :size="18" /></button>
-      <div><p class="eyebrow">添加游戏</p><h1>把游戏加入 GameSaver</h1><p>先复制游戏本体，再确认它的存档保护范围。</p></div>
+      <button class="icon-button" type="button" title="返回游戏库" aria-label="返回游戏库" :disabled="isBusy || cancelling" @click="abandonPendingGame"><ArrowLeft :size="18" /></button>
+      <div><p class="eyebrow">{{ configuringExistingGame ? "游戏设置" : "添加游戏" }}</p><h1>{{ configuringExistingGame ? "设置存档保护" : "把游戏加入 GameSaver" }}</h1><p>{{ configuringExistingGame ? "确认存档保护范围后启用；取消设置会保留现有游戏。" : "先复制游戏本体，再确认它的存档保护范围。" }}</p></div>
     </header>
 
     <div class="step-indicator">
-      <span class="step" :class="{ active: stepNumber >= 1 }">1</span><i></i><span class="step" :class="{ active: stepNumber >= 2 }">2</span><i></i><span class="step" :class="{ active: stepNumber >= 3 }">3</span><i></i><span class="step" :class="{ active: stepNumber >= 4 }">4</span>
-      <div><strong>{{ stepTitle }}</strong><small>第 {{ stepNumber }} 步，共 4 步</small></div>
+      <template v-for="step in (configuringExistingGame ? 3 : 4)" :key="step"><span class="step" :class="{ active: stepNumber >= step }">{{ step }}</span><i v-if="step < (configuringExistingGame ? 3 : 4)"></i></template>
+      <div><strong>{{ stepTitle }}</strong><small>第 {{ stepNumber }} 步，共 {{ configuringExistingGame ? 3 : 4 }} 步</small></div>
     </div>
 
     <section v-if="resuming || resumeFailed" class="wizard-form"><span v-if="resuming" class="loader"></span><p>正在接续添加流程…</p><p v-if="error" class="error-message">{{ error }}</p><button v-if="resumeFailed" class="primary-button" type="button" @click="resumeSetup">重试接续</button></section>
@@ -797,9 +811,9 @@ onUnmounted(() => { disposed = true; stopPolling(); });
       </section>
       <p v-if="error" class="error-message" role="alert">{{ error }}</p>
       <footer class="wizard-actions">
-        <button class="secondary-button" type="button" :disabled="cancelling || confirming" @click="abandonPendingGame">放弃添加</button>
+        <button class="secondary-button" type="button" :disabled="cancelling || confirming" @click="abandonPendingGame">{{ configuringExistingGame ? "取消设置，返回游戏库" : "放弃添加" }}</button>
         <template v-if="phase === 'ready'">
-          <button class="secondary-button" type="button" :disabled="isBusy || previewing" @click="finishWithoutSaveProtection">暂不保护存档，加入游戏库</button>
+          <button v-if="!configuringExistingGame" class="secondary-button" type="button" :disabled="isBusy || previewing" @click="finishWithoutSaveProtection">暂不启用存档保护，加入游戏库</button>
           <button class="secondary-button" type="button" :disabled="confirming || previewing || inferringDrafts" title="不启动游戏，直接按存档目录名与文件特征推断一份待确认的初稿" @click="previewDraft"><LoaderCircle v-if="previewing" :size="16" class="spin" /><FolderOpen v-else :size="16" />{{ previewing ? "正在推断" : "跳过识别，先看初稿" }}</button>
           <button class="primary-button" type="button" :disabled="confirming || previewing" @click="beginLearning"><Gamepad2 :size="17" />启动并开始识别</button>
         </template>
@@ -861,20 +875,20 @@ onUnmounted(() => { disposed = true; stopPolling(); });
         <div class="editor-block"><div class="editor-label"><strong>排除模式</strong><span>{{ scope.excludePatterns.length }} 项</span></div><div class="chip-list"><span v-for="(pattern, patternIndex) in scope.excludePatterns" :key="pattern" class="file-chip exclude-chip">{{ pattern }}<button type="button" :aria-label="`删除排除模式 ${pattern}`" title="删除排除模式" @click="removePattern(scopeIndex, patternIndex)"><X :size="13" /></button></span><span v-if="!scope.excludePatterns.length" class="muted-text">暂未添加排除模式</span></div><div class="inline-editor"><input v-model="newPatternByScope[scopeIndex]" type="text" placeholder="输入排除模式，例如 *.log" @keyup.enter="addPattern(scopeIndex)" /><button class="secondary-button" type="button" @click="addPattern(scopeIndex)"><Plus :size="15" />添加排除</button></div></div>
         <p class="scope-note">{{ evidenceForScope(scope).reason }}</p>
       </section>
-      <div v-if="!reviewScopes.length && !learningResult?.registrySaveKey" class="empty-review"><strong>没有自动识别到存档范围</strong><p>可以手动添加存档目录，或暂不保护存档并加入游戏库。</p></div>
+      <div v-if="!reviewScopes.length && !learningResult?.registrySaveKey" class="empty-review"><strong>没有自动识别到存档范围</strong><p>可以重新识别或手动添加存档目录。未启用存档保护时，游戏仍可正常游玩。</p></div>
       <button class="secondary-button add-scope-button" type="button" @click="addDirectoryScope"><Plus :size="16" />手动添加存档目录</button>
       <div v-if="learningResult?.notes.length" class="notes-panel"><strong>识别说明</strong><p v-for="note in learningResult.notes" :key="note">{{ note }}</p></div>
       <p v-if="error" class="error-message" role="alert">{{ error }}</p>
       <footer class="wizard-actions">
-        <button class="secondary-button" type="button" :disabled="confirming" @click="abandonPendingGame">放弃添加</button>
-        <button v-if="isPreviewDraft || captureInsufficient" class="secondary-button" type="button" :disabled="confirming" title="返回上一步重新开始识别" @click="backToFullLearning"><ArrowLeft :size="16" />{{ isPreviewDraft ? "改回完整识别" : "重新识别" }}</button>
+        <button class="secondary-button" type="button" :disabled="confirming || cancelling" @click="abandonPendingGame">{{ configuringExistingGame ? "取消设置，返回游戏库" : "放弃添加" }}</button>
+        <button class="secondary-button" type="button" :disabled="confirming || cancelling" title="返回上一步重新开始识别" @click="backToFullLearning"><ArrowLeft :size="16" />{{ isPreviewDraft ? "改回完整识别" : "重新识别" }}</button>
         <button v-if="hasReviewCandidates" class="secondary-button" type="button" :disabled="confirming" @click="beginCandidateVerification"><Gamepad2 :size="17" />再次保存验证</button>
-        <button :class="canConfirm ? 'secondary-button' : 'primary-button'" type="button" :disabled="isBusy" @click="finishWithoutSaveProtection">暂不保护存档，加入游戏库</button>
-        <button v-if="canConfirm" class="primary-button" type="button" :disabled="confirming" @click="confirm"><LoaderCircle v-if="confirming" :size="17" class="spin" /><Check v-else :size="17" />{{ confirming ? "正在保存" : "确认并加入游戏库" }}</button>
+        <button v-if="!configuringExistingGame" :class="canConfirm ? 'secondary-button' : 'primary-button'" type="button" :disabled="isBusy" @click="finishWithoutSaveProtection">暂不启用存档保护，加入游戏库</button>
+        <button v-if="canConfirm" class="primary-button" type="button" :disabled="confirming || cancelling" @click="confirm"><LoaderCircle v-if="confirming" :size="17" class="spin" /><Check v-else :size="17" />{{ confirming ? "正在保存" : (configuringExistingGame ? "确认并启用存档保护" : "确认并加入游戏库") }}</button>
       </footer>
     </section>
 
-    <div v-else class="wizard-success"><CheckCircle2 :size="34" /><div><h2>{{ completedGame?.displayName }} 已加入游戏库</h2><p>{{ completedGame?.saveProtectionSkipped ? "现在可以从游戏库启动。此游戏未启用 GameSaver 存档保护。" : "存档保护范围已确认，现在可以从游戏库启动它。" }}</p></div><button class="primary-button" type="button" @click="emit('completed', completedGame!)">返回游戏库</button></div>
+    <div v-else class="wizard-success"><CheckCircle2 :size="34" /><div><h2>{{ completedGame?.displayName }}{{ configuringExistingGame ? " 已启用存档保护" : " 已加入游戏库" }}</h2><p>{{ completedGame?.saveProtectionSkipped ? "现在可以从游戏库启动。此游戏未启用存档保护。" : "存档保护范围已确认，现在可以从游戏库启动它。" }}</p></div><button class="primary-button" type="button" @click="emit('completed', completedGame!)">返回游戏库</button></div>
   </section>
 
   <Teleport to="body">

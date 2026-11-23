@@ -427,6 +427,112 @@ async function optionalSaveProtectionChecks() {
     assert.equal(wizard.phase.value, "done");
     wizard.dispose();
   });
+  for (const skipped of [false, true]) {
+    await check(`an existing unprotected game opens setup without reimporting (skipped=${skipped})`, async () => {
+      const active = { ...gameA, saveProtectionSkipped: skipped };
+      const events = [];
+      let removed = 0;
+      const wizard = load("src/components/AddGameWizard.vue", ["completedGame", "phase", "configuringExistingGame", "resumeSetup", "abandonPendingGame"], {
+        defineEmits: () => (...event) => events.push(event),
+        getPendingGameSetup: async () => ({ game: active, validationOnly: false }),
+        previewSaveScopes: async () => null,
+        discardPendingGame: async () => { removed++; },
+      });
+      await wizard.resumeSetup();
+      assert.equal(wizard.configuringExistingGame.value, true);
+      assert.equal(wizard.phase.value, "ready");
+      await wizard.abandonPendingGame();
+      assert.equal(removed, 0);
+      assert.deepEqual(events.at(-1), ["completed", active]);
+      assert.deepEqual(wizard.completedGame.value, active);
+      wizard.dispose();
+    });
+  }
+  await check("leaving existing game setup cancels learning once and never removes the game", async () => {
+    const cancelled = deferred();
+    const events = [];
+    let cancellations = 0;
+    let removals = 0;
+    const wizard = load("src/components/AddGameWizard.vue", ["phase", "session", "resumeSetup", "abandonPendingGame"], {
+      defineEmits: () => (...event) => events.push(event),
+      getPendingGameSetup: async () => ({ game: gameA, session: { sessionId: "session-a" }, validationOnly: false }),
+      cancelSaveLearning: async () => { cancellations++; await cancelled.promise; },
+      discardPendingGame: async () => { removals++; },
+    });
+    await wizard.resumeSetup();
+    assert.equal(wizard.phase.value, "capturing");
+    const leaving = wizard.abandonPendingGame();
+    await wizard.abandonPendingGame();
+    assert.equal(cancellations, 1);
+    assert.equal(events.filter(event => event[0] === "completed").length, 0);
+    cancelled.resolve();
+    await leaving;
+    assert.equal(wizard.session.value, null);
+    assert.equal(removals, 0);
+    assert.deepEqual(events.at(-1), ["completed", gameA]);
+    wizard.dispose();
+  });
+  await check("failed learning cancellation keeps existing game setup open", async () => {
+    const events = [];
+    const wizard = load("src/components/AddGameWizard.vue", ["session", "error", "resumeSetup", "abandonPendingGame"], {
+      defineEmits: () => (...event) => events.push(event),
+      getPendingGameSetup: async () => ({ game: gameA, session: { sessionId: "session-a" }, validationOnly: false }),
+      cancelSaveLearning: async () => { throw new Error("cancel failed"); },
+    });
+    await wizard.resumeSetup();
+    await wizard.abandonPendingGame();
+    assert.equal(wizard.session.value.sessionId, "session-a");
+    assert.match(wizard.error.value, /cancel failed/);
+    assert.equal(events.filter(event => event[0] === "completed").length, 0);
+    wizard.dispose();
+  });
+  await check("enabling protection later keeps game identity and clears the skipped flag", async () => {
+    const active = { ...gameA, saveProtectionSkipped: true };
+    const protectedGame = { ...active, saveProtectionSkipped: false, saveProfileId: "profile-a" };
+    const calls = [];
+    const wizard = load("src/components/AddGameWizard.vue", ["phase", "completedGame", "reviewScopes", "resumeSetup", "confirm"], {
+      getPendingGameSetup: async () => ({ game: active, validationOnly: false }),
+      previewSaveScopes: async () => null,
+      confirmSaveProfile: async (uid, scopes) => { calls.push({ uid, scopes }); return { profileId: "profile-a" }; },
+      getGame: async () => protectedGame,
+    });
+    await wizard.resumeSetup();
+    wizard.phase.value = "review";
+    wizard.reviewScopes.value = [{ confirmedFiles: ["slot.sav"] }];
+    await wizard.confirm();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].uid, gameA.gameUid);
+    assert.equal(wizard.phase.value, "done");
+    assert.deepEqual(wizard.completedGame.value, protectedGame);
+    wizard.dispose();
+  });
+  await check("setting protection requires an idle installed game and hides invalid save actions", async () => {
+    const events = [];
+    let updates = 0;
+    const detail = load("src/components/GameDetailPage.vue", ["precheck", "runtime", "busy", "saveProtectionEnabled", "canConfigureSaveProtection", "canUploadSave", "configureSaveProtection", "changeKeepVersions"], {
+      defineEmits: () => (...event) => events.push(event),
+      updateSaveProfileKeepVersions: async () => { updates++; },
+    });
+    assert.equal(detail.saveProtectionEnabled.value, false);
+    assert.equal(detail.canConfigureSaveProtection.value, true);
+    assert.equal(detail.canUploadSave.value, false);
+    detail.configureSaveProtection();
+    assert.equal(events.length, 0);
+    detail.precheck.value = { canLaunch: true, saveProfileReady: false };
+    detail.runtime.value = { status: "running" };
+    detail.configureSaveProtection();
+    assert.equal(events.length, 0);
+    detail.runtime.value = null;
+    detail.busy.value = true;
+    detail.configureSaveProtection();
+    assert.equal(events.length, 0);
+    detail.busy.value = false;
+    detail.configureSaveProtection();
+    assert.deepEqual(events, [["resumeSetup"]]);
+    await detail.changeKeepVersions(3);
+    assert.equal(updates, 0);
+    detail.dispose();
+  });
 }
 
 const watchdog = setTimeout(() => { console.error("State regression timed out"); process.exit(1); }, 15000);

@@ -226,6 +226,11 @@ impl Game {
         true
     }
 
+    pub fn can_configure_save_protection(&self) -> bool {
+        self.save_profile_id.is_none()
+            && matches!(self.lifecycle, GameLifecycle::PendingSetup | GameLifecycle::Active)
+    }
+
     #[allow(dead_code)]
     pub fn activate(&mut self, save_profile_id: impl Into<String>) {
         self.save_profile_id = Some(save_profile_id.into());
@@ -250,6 +255,22 @@ mod tests {
         assert_eq!(game.health, GameHealth::Ready);
         assert_eq!(game.save_profile_id.as_deref(), Some("profile-1"));
         assert_eq!(game.game_key, "test game");
+    }
+
+    #[test]
+    fn save_protection_can_be_configured_after_joining_without_it() {
+        let mut game = Game::new_pending("Test", "games/test", "game.exe");
+        assert!(game.can_configure_save_protection());
+        game.lifecycle = GameLifecycle::Active;
+        assert!(game.can_configure_save_protection());
+        game.save_protection_skipped = true;
+        assert!(game.can_configure_save_protection());
+        game.lifecycle = GameLifecycle::NeedsRepair;
+        assert!(!game.can_configure_save_protection());
+        game.lifecycle = GameLifecycle::Active;
+        game.activate("profile-1");
+        assert!(!game.can_configure_save_protection());
+        assert!(!game.save_protection_skipped);
     }
 
     #[test]

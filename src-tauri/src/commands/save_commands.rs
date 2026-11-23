@@ -3,7 +3,7 @@ use crate::{
     commands::save_version_commands::{release_maintenance, reserve_maintenance},
     domain::{
         path_utils::{normalize_path, strip_verbatim_prefix}, save_profile::SaveRootBinding,
-        Game, GameLifecycle, SaveLearningResult, SaveProfile, SaveRootType, SaveScope,
+        Game, SaveLearningResult, SaveProfile, SaveRootType, SaveScope,
         TaskCategory, TaskStatus,
     },
     repositories::{
@@ -70,7 +70,7 @@ pub fn get_pending_game_setup(
             .first()
             .filter(|task| {
                 matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
-                    || (game_uid.is_some()
+                    || (game.as_ref().is_some_and(|game| game.lifecycle == crate::domain::GameLifecycle::PendingSetup)
                         && task.task_type == "analyze_saves"
                         && task.status == TaskStatus::Success)
             })
@@ -103,8 +103,8 @@ pub fn start_save_learning_task(
             .map_err(|_| "lock GameSaver store failed".to_string())?;
         let game =
             GameLibraryService::find(&store, &game_uid).ok_or_else(|| "游戏不存在".to_string())?;
-        if !matches!(game.lifecycle, GameLifecycle::PendingSetup) {
-            return Err("只有等待设置的游戏可以开始存档识别".to_string());
+        if !game.can_configure_save_protection() {
+            return Err("只有尚未启用存档保护的可用游戏可以开始识别".to_string());
         }
         game
     };
@@ -136,8 +136,8 @@ pub fn start_save_learning_task(
                         .map_err(|_| "读取游戏记录失败".to_string())?;
                     let current =
                         GameLibraryService::find(&store, &game.game_uid).ok_or("游戏已不存在")?;
-                    if current.lifecycle != GameLifecycle::PendingSetup {
-                        return Err("游戏已完成设置".into());
+                    if !current.can_configure_save_protection() {
+                        return Err("游戏状态已变化，无法继续设置存档保护".into());
                     }
                     current
                 };
@@ -268,8 +268,8 @@ pub fn start_save_candidate_verification_task(
             .map_err(|_| "lock GameSaver store failed".to_string())?;
         let game =
             GameLibraryService::find(&store, &game_uid).ok_or_else(|| "游戏不存在".to_string())?;
-        if !matches!(game.lifecycle, GameLifecycle::PendingSetup) {
-            return Err("只有等待设置的游戏可以再次验证存档候选".to_string());
+        if !game.can_configure_save_protection() {
+            return Err("只有尚未启用存档保护的可用游戏可以验证候选".to_string());
         }
         game
     };
@@ -676,8 +676,8 @@ fn confirm_save_profile_blocking(
     let profile = state.with_store_mut(|store| {
         let game =
             GameLibraryService::find(store, &game_uid).ok_or_else(|| "游戏不存在".to_string())?;
-        if !matches!(game.lifecycle, GameLifecycle::PendingSetup) {
-            return Err("该游戏已经完成设置".to_string());
+        if !game.can_configure_save_protection() {
+            return Err("该游戏已启用存档保护，或当前状态不允许设置".to_string());
         }
         SaveLearningService::ensure_game_exited(Path::new(&game.managed_path), None)?;
         for scope in &scopes {

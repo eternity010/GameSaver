@@ -50,7 +50,7 @@ const cloudRestoreActive = computed(() => taskFeed.tasks.value.some((task) =>
 const foregroundBlocked = computed(() => busy.value || cloudRestoreActive.value);
 const exclusiveBusy = computed(() => foregroundBlocked.value || bodyPackageTransfer.active.value || saveUploadTransfer.active.value);
 const canPackageBody = computed(() => !foregroundBlocked.value && !bodyPackageTransfer.active.value && !runtime.value && precheck.value?.canLaunch);
-const canUploadSave = computed(() => !foregroundBlocked.value && !saveUploadTransfer.active.value && !runtime.value && baiduReady());
+const canUploadSave = computed(() => saveProtectionEnabled.value && !foregroundBlocked.value && !saveUploadTransfer.active.value && !runtime.value && baiduReady());
 const canSyncLatest = computed(() => canUploadSave.value && cloudSaveLoaded.value && !cloudSaveLoading.value &&
   (!bodyPackageTransfer.active.value || cloudSaveStatus.value?.syncState === "local_ahead" || cloudSaveStatus.value?.syncState === "no_cloud_saves"));
 const launchPending = ref(false);
@@ -75,11 +75,18 @@ const heroDescription = computed(() => {
   const check = precheck.value;
   if (!check) return "正在核对启动程序与存档保护配置...";
   if (!check.canLaunch) return "完成下方检查后才能启动游戏。";
-  return check.saveProfileReady ? "游戏本体和存档保护配置均可用。" : "游戏本体可启动，尚未设置存档保护。";
+  return check.saveProfileReady ? "游戏本体和存档保护配置均可用。" : "游戏本体可启动，未启用存档保护。";
 });
 const taskProgress = ref(0);
 const keepVersions = ref(5);
 const saveProfile = ref<SaveProfile | null>(null);
+const saveProtectionEnabled = computed(() => precheck.value?.saveProfileReady ?? Boolean(props.game.saveProfileId));
+const canConfigureSaveProtection = computed(() => props.game.lifecycle === "active" && !props.game.saveProfileId);
+
+function configureSaveProtection() {
+  if (!canConfigureSaveProtection.value || exclusiveBusy.value || runtime.value || !precheck.value?.canLaunch) return;
+  emit("resumeSetup");
+}
 
 const rootTypeLabel: Record<SaveRootType, string> = {
   managed_game: "游戏目录",
@@ -660,7 +667,7 @@ async function pruneVersions() {
 }
 
 async function changeKeepVersions(newLimit: number) {
-  if (exclusiveBusy.value || runtime.value) return;
+  if (!saveProtectionEnabled.value || exclusiveBusy.value || runtime.value) return;
   keepVersions.value = newLimit;
   try {
     await updateSaveProfileKeepVersions(props.game.gameUid, newLimit);
@@ -1354,7 +1361,7 @@ onUnmounted(() => {
             </div>
             <div class="check-row">
               <span><ShieldCheck :size="16" />存档保护</span>
-              <strong v-if="precheck" :class="{ good: precheck.saveProfileReady && precheck.validScopeCount > 0 }">{{ precheck.saveProfileReady ? `${precheck.validScopeCount} 个范围` : (game.saveProtectionSkipped ? "未启用" : "未设置") }}</strong>
+              <strong v-if="precheck" :class="{ good: precheck.saveProfileReady && precheck.validScopeCount > 0 }">{{ precheck.saveProfileReady ? `${precheck.validScopeCount} 个范围` : "未启用存档保护" }}</strong>
               <strong v-else>检测中...</strong>
             </div>
           </div>
@@ -1408,8 +1415,8 @@ onUnmounted(() => {
 
       <section class="detail-section save-timeline">
         <header class="detail-section-header version-header">
-          <div><p class="eyebrow">存档保护</p><h2>保存版本</h2></div>
-          <div class="version-tools">
+          <div><p class="eyebrow">存档保护</p><h2>{{ saveProtectionEnabled ? "保存版本" : "未启用存档保护" }}</h2></div>
+          <div v-if="saveProtectionEnabled" class="version-tools">
             <label>保留
               <select :value="keepVersions" :disabled="exclusiveBusy || !!runtime" aria-label="保留保存版本数量" @change="changeKeepVersions(Number(($event.target as HTMLSelectElement).value))">
                 <option :value="1">1 个</option><option :value="3">3 个</option><option :value="5">5 个</option><option :value="10">10 个</option><option :value="20">20 个</option>
@@ -1422,6 +1429,7 @@ onUnmounted(() => {
         <div class="detail-scopes-card">
           <div class="detail-scopes-header">
             <p class="timeline-caption">受保护的存档目录</p>
+            <button v-if="canConfigureSaveProtection" class="secondary-button compact-button" type="button" :disabled="exclusiveBusy || !!runtime || !precheck?.canLaunch" @click="configureSaveProtection"><ShieldCheck :size="14" />设置存档保护</button>
           </div>
           <div v-if="saveProfile?.scopes?.length">
             <div v-for="(scope, scopeIndex) in saveProfile.scopes" :key="scopeIndex" class="detail-scope-row">
@@ -1442,11 +1450,11 @@ onUnmounted(() => {
             <p class="empty-hint">正在读取受保护的存档目录...</p>
           </div>
           <div v-else class="detail-scope-empty">
-            <p class="empty-hint">暂未配置存档目录。</p>
+            <p class="empty-hint">未启用存档保护。可以正常游玩，GameSaver 不会自动备份或同步存档。</p>
           </div>
         </div>
 
-        <div class="cloud-save-banner">
+        <div v-if="saveProtectionEnabled" class="cloud-save-banner">
           <div class="cloud-save-main">
             <div class="cloud-save-icon"><Cloud :size="18" /></div>
             <div class="cloud-save-info">
@@ -1472,12 +1480,12 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <p class="timeline-caption">游戏退出后自动提交；恢复前会先保护当前存档，恢复后不属于该版本的存档文件会被移除</p>
+        <p v-if="saveProtectionEnabled" class="timeline-caption">游戏退出后自动提交；恢复前会先保护当前存档，恢复后不属于该版本的存档文件会被移除</p>
         <div v-if="loading && !precheck" class="timeline-empty">
           <span class="loader"></span>
           <p>正在载入保存历史...</p>
         </div>
-        <div v-else-if="!versions.length" class="timeline-empty"><ShieldCheck :size="22" /><p>{{ game.saveProtectionSkipped ? "此游戏未启用存档保护，GameSaver 不会创建存档版本。" : "还没有保存版本。启动游戏并正常退出一次后，GameSaver 会在这里记录版本。" }}</p></div>
+        <div v-else-if="!versions.length" class="timeline-empty"><ShieldCheck :size="22" /><p>{{ !saveProtectionEnabled ? "未启用存档保护。确认存档范围并启用后，才会创建存档版本。" : "还没有保存版本。启动游戏并正常退出一次后，GameSaver 会在这里记录版本。" }}</p></div>
         <div v-else class="version-list">
           <article v-for="(version, index) in versions" :key="version.versionId" class="version-row">
             <div class="version-icon"><Clock3 :size="17" /></div>
