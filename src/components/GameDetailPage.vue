@@ -6,7 +6,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { AlertTriangle, Archive, ArrowLeft, Camera, Check, CheckCircle2, Clock3, Cloud, CloudDownload, CloudUpload, Folder, FolderOpen, Gamepad2, HardDrive, ImagePlus, LoaderCircle, Pencil, Play, RefreshCw, RotateCcw, ShieldCheck, Trash2, Upload, X } from "@lucide/vue";
 import { armGameCoverCapture, confirmAction, deleteCloudSaveVersion, deleteGameBodyPackage, deleteSaveVersion, discardGameCoverCapture, getBaiduConfig, getBaiduStatus, getCloudSaveOverview, getGameCover, getGameCoverCaptureUrl, getGameCoverUrl, getGameDetailView, getGameRuntime, getSaveProfile, getTask, launchGame, listGameBodyVersions, openPathInExplorer, packageGameBody, precheckGameLaunch, pruneSaveVersions, rebindSaveScope, removeGameFromLibrary, renameGame, restoreSaveVersion, saveGameCover, startRestoreCloudSaveTask, startUploadSaveVersionTask, uninstallGameBody, updateGameBody, uploadGameBodyPackage, updateSaveProfileKeepVersions } from "../api";
 import type { BaiduConfigView, BaiduStatus } from "../api";
-import { gameStatusLabel } from "../domain/game";
+import { gameStatusLabel, needsStoreUpload } from "../domain/game";
 import type { CloudSaveManifestVersion, CloudSaveSyncStatusView, CoverCrop, CoverPosition, Game, GameBodyVersion, GameRuntime, LaunchPrecheck, SaveProfile, SaveRootType, SaveScope, SaveVersionSummary } from "../domain/game";
 import { useTaskFeed } from "../taskFeed";
 
@@ -21,6 +21,7 @@ const emit = defineEmits<{
   refresh: [];
   settings: [];
   resumeSetup: [];
+  findInStore: [];
   captureHandled: [captureId: string];
 }>();
 const taskFeed = useTaskFeed();
@@ -53,8 +54,29 @@ const canUploadSave = computed(() => !foregroundBlocked.value && !saveUploadTran
 const canSyncLatest = computed(() => canUploadSave.value && cloudSaveLoaded.value && !cloudSaveLoading.value &&
   (!bodyPackageTransfer.active.value || cloudSaveStatus.value?.syncState === "local_ahead" || cloudSaveStatus.value?.syncState === "no_cloud_saves"));
 const launchPending = ref(false);
+const selectingBodyFolder = ref(false);
+const needsGameBody = computed(() => {
+  const check = precheck.value;
+  const canRepair = props.game.lifecycle === "active" || props.game.lifecycle === "needs_repair";
+  return !!check && !runtime.value && canRepair && (!check.bodyDirectoryExists || !check.executableExists);
+});
+const bodyActionBlocked = computed(() => exclusiveBusy.value || !!runtime.value || selectingBodyFolder.value);
 const error = ref(props.initialError || "");
 const message = ref("");
+const heroTitle = computed(() => {
+  if (needsGameBody.value) return "需要游戏本体";
+  if (props.game.lifecycle === "pending_setup") return "需要完成设置";
+  if (precheck.value) return precheck.value.canLaunch ? "准备就绪" : "启动前需要处理";
+  return props.game.health === "ready" ? "环境检测中..." : "需要处理";
+});
+const heroDescription = computed(() => {
+  if (message.value) return message.value;
+  if (needsGameBody.value) return "从商店下载云端版本，或选择电脑上的游戏文件夹。";
+  const check = precheck.value;
+  if (!check) return "正在核对启动程序与存档保护配置...";
+  if (!check.canLaunch) return "完成下方检查后才能启动游戏。";
+  return check.saveProfileReady ? "游戏本体和存档保护配置均可用。" : "游戏本体可启动，尚未设置存档保护。";
+});
 const taskProgress = ref(0);
 const keepVersions = ref(5);
 const saveProfile = ref<SaveProfile | null>(null);
@@ -649,21 +671,31 @@ async function changeKeepVersions(newLimit: number) {
 }
 
 async function updateBody() {
-  if (exclusiveBusy.value || runtime.value || !precheck.value?.bodyDirectoryExists) return;
-  const selected = await open({ directory: true, multiple: false });
-  if (typeof selected !== "string") return;
-  const confirmMsg = props.game.health === "broken"
-    ? "将使用所选游戏文件夹恢复并更新游戏本体。确定继续吗？"
-    : "新版游戏文件夹会覆盖当前受管游戏本体。当前存档会先保护，确定开始更新吗？";
-  if (!(await confirmAction(confirmMsg))) return;
-  busy.value = true;
-  error.value = "";
-  message.value = "准备更新游戏本体";
+  if (bodyActionBlocked.value || (!needsGameBody.value && !precheck.value?.bodyDirectoryExists)) return;
+  const repairing = needsGameBody.value;
+  const gameUid = props.game.gameUid;
+  selectingBodyFolder.value = true;
   try {
-    await watchTask(await updateGameBody(props.game.gameUid, selected));
+    const selected = await open({ directory: true, multiple: false });
+    if (typeof selected !== "string" || detailListenersDisposed) return;
+    const copyMessage = precheck.value?.bodyDirectoryExists
+      ? "所选文件夹将替换库中现有的本体，保留这条游戏记录。"
+      : "所选文件夹将复制到游戏库，并关联到当前游戏记录。";
+    const executable = props.game.launch.executableRelativePath;
+    const confirmMsg = repairing
+      ? copyMessage + "\n\n所选文件夹中须包含启动程序 " + executable + "。确定添加吗？"
+      : "新版游戏文件夹会覆盖当前受管游戏本体。当前存档会先保护，确定开始更新吗？";
+    if (!(await confirmAction(confirmMsg)) || detailListenersDisposed || gameUid !== props.game.gameUid ||
+      exclusiveBusy.value || runtime.value || repairing !== needsGameBody.value) return;
+    busy.value = true;
+    error.value = "";
+    message.value = repairing ? "准备添加游戏本体" : "准备更新游戏本体";
+    await watchTask(await updateGameBody(gameUid, selected), gameUid);
   } catch (reason) {
     busy.value = false;
     error.value = String(reason);
+  } finally {
+    selectingBodyFolder.value = false;
   }
 }
 
@@ -1275,9 +1307,13 @@ onUnmounted(() => {
         </div>
         <div class="detail-hero-copy">
           <span class="status-label">{{ runtime ? runtimeLabel(runtime.status) : (precheck ? (precheck.canLaunch ? "可启动" : "需要处理") : gameStatusLabel(game)) }}</span>
-          <h2>{{ precheck ? (precheck.canLaunch ? "准备就绪" : "启动前需要处理") : (game.lifecycle === 'pending_setup' ? '需要完成设置' : (game.health !== 'ready' ? '需要处理' : '环境检测中...')) }}</h2>
-          <p>{{ message || (precheck ? (precheck.canLaunch ? "游戏本体和存档保护配置均可用。" : "完成下方检查后才能启动游戏。") : "正在核对启动程序与存档保护配置...") }}</p>
-          <button v-if="game.lifecycle === 'pending_setup'" class="primary-button detail-launch" type="button" :disabled="exclusiveBusy" @click="emit('resumeSetup')"><ShieldCheck :size="17" />继续完成设置</button>
+          <h2>{{ heroTitle }}</h2>
+          <p>{{ heroDescription }}</p>
+          <div v-if="needsGameBody" class="detail-launch detail-body-actions">
+            <button class="primary-button" type="button" :disabled="bodyActionBlocked" @click="emit('findInStore')"><CloudDownload :size="17" />从商店下载</button>
+            <button class="secondary-button" type="button" :disabled="bodyActionBlocked" @click="updateBody"><FolderOpen :size="17" />添加游戏本体</button>
+          </div>
+          <button v-else-if="game.lifecycle === 'pending_setup'" class="primary-button detail-launch" type="button" :disabled="exclusiveBusy" @click="emit('resumeSetup')"><ShieldCheck :size="17" />继续完成设置</button>
           <button v-else class="primary-button detail-launch" type="button" :disabled="launchButton.disabled" @click="start">
             <LoaderCircle v-if="launchButton.spinning" :size="17" class="spin" />
             <Play v-else :size="17" />
@@ -1318,7 +1354,7 @@ onUnmounted(() => {
             </div>
             <div class="check-row">
               <span><ShieldCheck :size="16" />存档保护</span>
-              <strong v-if="precheck" :class="{ good: precheck.saveProfileReady && (precheck.validScopeCount || 0) > 0 }">{{ precheck.saveProfileReady ? `${precheck.validScopeCount} 个范围` : "未设置" }}</strong>
+              <strong v-if="precheck" :class="{ good: precheck.saveProfileReady && precheck.validScopeCount > 0 }">{{ precheck.saveProfileReady ? `${precheck.validScopeCount} 个范围` : (game.saveProtectionSkipped ? "未启用" : "未设置") }}</strong>
               <strong v-else>检测中...</strong>
             </div>
           </div>
@@ -1327,6 +1363,11 @@ onUnmounted(() => {
 
         <section class="detail-section">
           <header class="detail-section-header"><div><p class="eyebrow">游戏本体</p><h2>受管目录</h2></div><HardDrive :size="20" class="detail-muted" /></header>
+          <div v-if="precheck?.executableExists && needsStoreUpload(game)" class="body-upload-notice">
+            <span class="store-upload-badge">待上传商店</span>
+            <p v-if="game.pendingBodyUpload?.packageVersionIds.some((id) => bodyVersions.some((version) => version.versionId === id && version.packageSize != null))">上传当前本体包后，商店才会提供这个版本。</p>
+            <p v-else>创建本体包并上传后，商店会提供这个版本。</p>
+          </div>
           <div v-if="precheck?.bodyDirectoryExists" class="managed-path-row">
             <p class="managed-path">{{ game.managedPath }}</p>
             <button class="secondary-button compact-button" type="button" title="在文件资源管理器中打开受管游戏本体目录" @click="openFolder(game.managedPath)">
@@ -1341,7 +1382,7 @@ onUnmounted(() => {
           </dl>
           <div class="body-action-row">
             <template v-if="precheck?.bodyDirectoryExists">
-              <button class="secondary-button" type="button" :disabled="exclusiveBusy || !!runtime" title="选择新版游戏文件夹并更新" @click="updateBody"><LoaderCircle v-if="busy && (message.includes('更新') || message.includes('新版'))" :size="16" class="spin" /><FolderOpen v-else :size="16" />更新游戏本体</button>
+              <button v-if="!needsGameBody" class="secondary-button" type="button" :disabled="bodyActionBlocked" title="选择新版游戏文件夹并更新" @click="updateBody"><LoaderCircle v-if="busy && (message.includes('更新') || message.includes('新版'))" :size="16" class="spin" /><FolderOpen v-else :size="16" />更新游戏本体</button>
               <button class="secondary-button" type="button" :disabled="!canPackageBody" title="创建本体 ZIP 缓存" @click="packageBody"><LoaderCircle v-if="bodyPackageTransfer.active.value" :size="16" class="spin" /><Archive v-else :size="16" />创建本体包</button>
               <button class="secondary-button danger-outline-button" type="button" :disabled="exclusiveBusy || !!runtime" title="卸载游戏，同时删除本地 ZIP 缓存" @click="uninstallBody"><Trash2 :size="16" />卸载本体</button>
             </template>
@@ -1436,7 +1477,7 @@ onUnmounted(() => {
           <span class="loader"></span>
           <p>正在载入保存历史...</p>
         </div>
-        <div v-else-if="!versions.length" class="timeline-empty"><ShieldCheck :size="22" /><p>还没有保存版本。启动游戏并正常退出一次后，GameSaver 会在这里记录版本。</p></div>
+        <div v-else-if="!versions.length" class="timeline-empty"><ShieldCheck :size="22" /><p>{{ game.saveProtectionSkipped ? "此游戏未启用存档保护，GameSaver 不会创建存档版本。" : "还没有保存版本。启动游戏并正常退出一次后，GameSaver 会在这里记录版本。" }}</p></div>
         <div v-else class="version-list">
           <article v-for="(version, index) in versions" :key="version.versionId" class="version-row">
             <div class="version-icon"><Clock3 :size="17" /></div>

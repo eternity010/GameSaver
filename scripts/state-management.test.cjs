@@ -294,6 +294,64 @@ async function navigationChecks() {
 }
 
 async function searchAndPaginationChecks() {
+  await check("store upload badges disappear for the published game after background completion", async () => {
+    const { needsStoreUpload } = load("src/domain/game.ts", ["needsStoreUpload"]);
+    const gameWithReminder = game => ({ ...game, pendingBodyUpload: { packageVersionIds: ["new"] } });
+    const tasks = vue.ref([]);
+    let latest = [gameWithReminder(gameA), gameWithReminder(gameB)];
+    const app = load("src/App.vue", ["loadGames", "pendingStoreUploadKeys"], {
+      needsStoreUpload,
+      useTaskFeed: () => ({ tasks, release() {} }),
+      listGames: async () => latest,
+    });
+    await app.loadGames(true);
+    assert.deepEqual([...app.pendingStoreUploadKeys.value], [gameA.gameKey, gameB.gameKey]);
+    latest = [gameA, gameWithReminder(gameB)];
+    tasks.value = [{ taskId: "upload", taskType: "upload_game_body_package", status: "success" }];
+    await flush();
+    app.clock.fire(120);
+    await flush();
+    assert.deepEqual([...app.pendingStoreUploadKeys.value], [gameB.gameKey]);
+    assert.equal(needsStoreUpload(gameWithReminder({ ...gameA, health: "broken" })), false);
+    app.dispose();
+  });
+  await check("body recovery opens the store on page one with the current game key", async () => {
+    const requests = [];
+    const app = load("src/App.vue", ["findGameInStore", "storeSearch", "librarySearch", "activePage", "storePage"], {
+      listCloudGames: async (page, _, keyword) => { requests.push([page, keyword]); return emptyPage; },
+    });
+    app.activePage.value = "detail";
+    app.librarySearch.value = "library term";
+    app.storePage.value = 3;
+    app.findGameInStore(gameA);
+    await flush();
+    app.clock.fire(280);
+    await flush();
+    assert.equal(app.activePage.value, "store");
+    assert.equal(app.storeSearch.value, gameA.gameKey);
+    assert.equal(app.librarySearch.value, "library term");
+    assert.deepEqual(requests, [[1, gameA.gameKey]]);
+    app.dispose();
+  });
+  await check("local body recovery submits the selected folder for the same game", async () => {
+    const calls = [];
+    const game = { ...gameA, lifecycle: "needs_repair", launch: { executableRelativePath: "game.exe" } };
+    const detail = load("src/components/GameDetailPage.vue", ["needsGameBody", "precheck", "updateBody"], {
+      defineProps: () => ({ game }),
+      open: async () => "E:\\RecoveredGame",
+      confirmAction: async () => true,
+      updateGameBody: async (uid, folder) => { calls.push([uid, folder]); return "body-task"; },
+      getTask: async () => ({ status: "running", progress: 1, message: "复制中" }),
+      getGameRuntime: async () => null,
+    });
+    detail.precheck.value = { bodyDirectoryExists: false, executableExists: false };
+    assert.equal(detail.needsGameBody.value, true);
+    await detail.updateBody();
+    assert.deepEqual(calls, [[game.gameUid, "E:\\RecoveredGame"]]);
+    detail.precheck.value = { bodyDirectoryExists: true, executableExists: true };
+    assert.equal(detail.needsGameBody.value, false);
+    detail.dispose();
+  });
   await check("library and store searches are isolated and leaving cancels debounce", async () => {
     const requests = [];
     const app = load("src/App.vue", ["librarySearch", "storeSearch", "openStore", "activePage"], {
@@ -341,6 +399,36 @@ async function searchAndPaginationChecks() {
   });
 }
 
+async function optionalSaveProtectionChecks() {
+  await check("adding without save protection requires consent and completes once", async () => {
+    const pending = { ...gameA, lifecycle: "pending_setup" };
+    const active = { ...gameA, saveProtectionSkipped: true };
+    const decision = deferred();
+    const calls = [];
+    let confirms = 0;
+    const wizard = load("src/components/AddGameWizard.vue", ["completedGame", "phase", "resumeSetup", "finishWithoutSaveProtection"], {
+      getPendingGameSetup: async () => ({ game: pending, validationOnly: false }),
+      previewSaveScopes: async () => null,
+      confirmAction: async () => (++confirms === 1 ? false : decision.promise),
+      finishAddGameWithoutSaveProtection: async uid => { calls.push(uid); return active; },
+    });
+    await wizard.resumeSetup();
+    wizard.phase.value = "review";
+    await wizard.finishWithoutSaveProtection();
+    assert.equal(wizard.phase.value, "review");
+    assert.deepEqual(calls, []);
+    const submitted = wizard.finishWithoutSaveProtection();
+    await wizard.finishWithoutSaveProtection();
+    assert.equal(confirms, 2);
+    decision.resolve(true);
+    await submitted;
+    assert.deepEqual(calls, [pending.gameUid]);
+    assert.deepEqual(wizard.completedGame.value, active);
+    assert.equal(wizard.phase.value, "done");
+    wizard.dispose();
+  });
+}
+
 const watchdog = setTimeout(() => { console.error("State regression timed out"); process.exit(1); }, 15000);
 (async () => {
   await taskFeedChecks();
@@ -348,5 +436,6 @@ const watchdog = setTimeout(() => { console.error("State regression timed out");
   await cloudOperationChecks();
   await navigationChecks();
   await searchAndPaginationChecks();
+  await optionalSaveProtectionChecks();
   console.log(JSON.stringify({ passed: passed.length, tests: passed }));
 })().catch(error => { console.error(error); process.exitCode = 1; }).finally(() => clearTimeout(watchdog));

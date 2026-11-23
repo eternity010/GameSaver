@@ -155,6 +155,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nvidia_driver_profile_writes_are_never_save_evidence() {
+        let mut evidence = FileEvidence::default();
+        let driver_file = r"C:\ProgramData\NVIDIA Corporation\Drs\nvapptimestamps";
+        evidence.record(12, Some(driver_file.into()), Some("driver".into()), 10, Some(1));
+        evidence.record(16, None, Some("driver".into()), 10, Some(2));
+        evidence.record(14, None, Some("driver".into()), 10, Some(3));
+        assert!(evidence.files.is_empty());
+        assert!(evidence.operations.is_empty());
+        assert_eq!(evidence.ignored_paths, 1);
+    }
+
+    #[test]
     fn read_only_open_and_flush_do_not_count_as_writes() {
         let mut evidence = FileEvidence::default();
         evidence.record(12, Some("C:/Saves/old.sav".into()), Some("key".into()), 10, Some(1));

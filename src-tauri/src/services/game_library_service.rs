@@ -47,6 +47,21 @@ impl GameLibraryService {
             .collect()
     }
 
+    pub fn finish_without_save_protection(store: &mut AppStore, game_uid: &str) -> Result<Game, String> {
+        let game = store
+            .games
+            .iter_mut()
+            .find(|game| game.game_uid == game_uid)
+            .ok_or_else(|| "游戏不存在".to_string())?;
+        if game.lifecycle != GameLifecycle::PendingSetup || game.save_profile_id.is_some() {
+            return Err("只有尚未完成设置的游戏可以跳过存档保护".into());
+        }
+        game.lifecycle = GameLifecycle::Active;
+        game.health = GameHealth::Ready;
+        game.save_protection_skipped = true;
+        Ok(game.clone())
+    }
+
     pub fn is_installed(game: &Game) -> bool {
         let root = Path::new(&game.managed_path);
         root.is_dir() && root.join(&game.launch.executable_relative_path).is_file()
@@ -63,6 +78,9 @@ impl GameLibraryService {
     fn derive_health(store: &AppStore, game: &Game) -> GameHealth {
         if !Self::is_installed(game) {
             return GameHealth::Broken;
+        }
+        if game.lifecycle == GameLifecycle::Active && game.save_protection_skipped {
+            return GameHealth::Ready;
         }
         let profile = store.save_profiles.iter().find(|profile| {
             profile.game_uid == game.game_uid
@@ -203,6 +221,36 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].lifecycle, GameLifecycle::PendingSetup);
         assert_eq!(listed[0].health, crate::domain::GameHealth::NeedsAttention);
+    }
+
+    #[test]
+    fn explicitly_skipping_save_protection_makes_the_game_launchable() {
+        use crate::{domain::GameHealth, services::LaunchService};
+
+        let root = test_root();
+        let executable = root.join("game.exe");
+        fs::write(&executable, b"test executable").unwrap();
+        let game = Game::new_pending("Test game", root.to_string_lossy(), "game.exe");
+        let uid = game.game_uid.clone();
+        let mut store = AppStore {
+            games: vec![game],
+            ..Default::default()
+        };
+        assert!(!LaunchService::precheck(&store, &uid).unwrap().can_launch);
+        let joined = GameLibraryService::finish_without_save_protection(&mut store, &uid).unwrap();
+        assert_eq!(joined.lifecycle, GameLifecycle::Active);
+        assert!(joined.save_protection_skipped);
+        assert!(joined.save_profile_id.is_none());
+        assert!(store.save_profiles.is_empty());
+        let check = LaunchService::precheck(&store, &uid).unwrap();
+        assert!(check.can_launch);
+        assert!(!check.save_profile_ready);
+        assert_eq!(GameLibraryService::list(&store)[0].health, GameHealth::Ready);
+        assert!(GameLibraryService::finish_without_save_protection(&mut store, &uid).is_err());
+
+        fs::remove_file(executable).unwrap();
+        assert!(!LaunchService::precheck(&store, &uid).unwrap().can_launch);
+        assert_eq!(GameLibraryService::list(&store)[0].health, GameHealth::Broken);
     }
 
     #[test]

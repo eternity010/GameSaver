@@ -40,9 +40,11 @@ export interface Game {
   launch: LaunchConfig;
   cover?: GameCover;
   saveProfileId?: string;
+  saveProtectionSkipped?: boolean;
   lastPlayedAt?: string;
   latestSaveVersionId?: string;
   addedAt?: string;
+  pendingBodyUpload?: { packageVersionIds: string[] };
 }
 
 export interface GameRuntime {
@@ -200,6 +202,7 @@ export interface SaveLearningResult {
   notes: string[];
   eventCaptureMode: "etw" | "snapshot" | string;
   transactionSummary?: SaveTransactionSummary;
+  registrySaveKey?: string;
 }
 
 export interface SaveTransactionSummary {
@@ -256,4 +259,8 @@ export function gameStatusLabel(game: Game): string {
     return "需要处理";
   }
   return "可启动";
+}
+
+export function needsStoreUpload(game: Game): boolean {
+  return !!game.pendingBodyUpload && game.lifecycle === "active" && game.health !== "broken";
 }

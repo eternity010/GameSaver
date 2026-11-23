@@ -5,7 +5,7 @@ import { AlertTriangle, ChevronLeft, ChevronRight, CloudDownload, CloudUpload, G
 import { confirmAction, confirmAppExit, deleteRemoteBodyPackage, discardGameCoverCapture, getElevationStatus, getGameCoverUrl, getGameRuntime, getTask, installCloudGame, launchGame, listCloudGames, listGames, restartAsAdmin } from "./api";
 import type { AppTask, ElevationStatus } from "./api";
 import type { CloudGamePage, CloudGameSummary, CloudGameVersion } from "./api";
-import { gameStatusLabel, type Game } from "./domain/game";
+import { gameStatusLabel, needsStoreUpload, type Game } from "./domain/game";
 import { taskPolicyOf, useTaskFeed } from "./taskFeed";
 import AddGameWizard from "./components/AddGameWizard.vue";
 import GameDetailPage from "./components/GameDetailPage.vue";
@@ -23,6 +23,9 @@ const savedSort = localStorage.getItem("gamesaver_library_sort") as LibrarySort;
 
 const games = ref<Game[]>([]);
 const cloudGames = ref<CloudGameSummary[]>([]);
+const pendingStoreUploadKeys = computed(() =>
+  new Set(games.value.filter(needsStoreUpload).map((game) => game.gameKey)),
+);
 const coverUrls = ref<Record<string, string>>({});
 const activePage = ref<AppPage>("library");
 const storageBackPage = ref<"library" | "settings">("library");
@@ -402,11 +405,16 @@ watch(tasks, (nextTasks) => {
   let libraryMigrated = false;
   let localRemovalChanged = false;
   let cloudStoreChanged = false;
+  let cloudPublicationFinished = false;
   for (const task of nextTasks) {
     const previousStatus = observedTaskStatuses.get(task.taskId);
     if (["upload_game_body_package", "delete_remote_body_package", "repair_cloud_body_manifest"].includes(task.taskType)
         && !isActiveTask(task) && previousStatus !== task.status) {
       cloudStoreChanged = true;
+    }
+    if (["upload_game_body_package", "repair_cloud_body_manifest"].includes(task.taskType)
+        && task.status === "success" && previousStatus !== "success") {
+      cloudPublicationFinished = true;
     }
     if (["uninstall_game_body", "remove_game_from_library", "retry_game_removal", "update_game_body", "retry_game_body_update"].includes(task.taskType)) {
       if ((task.progress >= 30 && !observedRemovalCommits.has(task.taskId))
@@ -429,8 +437,8 @@ watch(tasks, (nextTasks) => {
     }
     observedTaskStatuses.set(task.taskId, task.status);
   }
-  if (sessionFinished || installationFinished || accountRestored || libraryMigrated || localRemovalChanged) {
-    if (accountRestored || libraryMigrated || localRemovalChanged) gamesLoadedAt = 0;
+  if (sessionFinished || installationFinished || accountRestored || libraryMigrated || localRemovalChanged || cloudPublicationFinished) {
+    if (accountRestored || libraryMigrated || localRemovalChanged || cloudPublicationFinished) gamesLoadedAt = 0;
     scheduleLibraryRefresh();
   }
   if (installationFinished || cloudStoreChanged || accountRestored || localRemovalChanged) {
@@ -638,6 +646,16 @@ function openStore() {
   const fromSettings = activePage.value === "settings";
   activePage.value = "store";
   void loadStore(fromSettings);
+}
+
+function findGameInStore(game: Game) {
+  const keyword = game.gameKey || game.displayName;
+  activePage.value = "store";
+  if (storeSearch.value === keyword) {
+    void loadStore(false, 1, keyword);
+  } else {
+    storeSearch.value = keyword;
+  }
 }
 
 function openGame(game: Game, detailError = "") {
@@ -965,8 +983,8 @@ async function finishAddGame(completedGame?: Game) {
       </header>
 
       <AddGameWizard v-if="activePage === 'add'" :game-uid="pendingSetupUid" @pending="pendingSetupUid = $event" @back="leaveAddGame" @completed="finishAddGame" />
-      <GameDetailPage v-else-if="activePage === 'detail' && selectedGame" :key="selectedGame.gameUid" :game="selectedGame" :cover-url="selectedGame ? coverUrls[selectedGame.gameUid] : ''" :initial-error="selectedGameError" :pending-cover-capture="pendingCoverCapture" @back="activePage = detailBackPage" @settings="activePage = 'settings'" @resume-setup="resumeGameSetup(selectedGame.gameUid)" @refresh="loadGames(true)" @capture-handled="finishPendingCoverCapture" />
-      <GameStorePage v-else-if="activePage === 'store'" :games="cloudGames" :search="storeSearch" :loading="storeLoading" :load-error="storeError" :install-uid="cloudInstallUid" :install-progress="cloudInstallProgress" :install-message="cloudInstallMessage" :install-error="cloudInstallError" :install-notice="cloudInstallNotice" :feedback-game-key="cloudFeedbackGameKey" :page="storePage" :page-size="STORE_PAGE_SIZE" :total-count="storeTotalCount" :total-pages="storeTotalPages" :has-more="storeHasMore" @install="installAndLaunch" @delete-version="deleteCloudVersion" @retry="refreshStore" @refresh="refreshStore" @page-change="changeStorePage" />
+      <GameDetailPage v-else-if="activePage === 'detail' && selectedGame" :key="selectedGame.gameUid" :game="selectedGame" :cover-url="selectedGame ? coverUrls[selectedGame.gameUid] : ''" :initial-error="selectedGameError" :pending-cover-capture="pendingCoverCapture" @back="activePage = detailBackPage" @settings="activePage = 'settings'" @resume-setup="resumeGameSetup(selectedGame.gameUid)" @find-in-store="findGameInStore(selectedGame)" @refresh="loadGames(true)" @capture-handled="finishPendingCoverCapture" />
+      <GameStorePage v-else-if="activePage === 'store'" :games="cloudGames" :pending-store-upload-keys="pendingStoreUploadKeys" :search="storeSearch" :loading="storeLoading" :load-error="storeError" :install-uid="cloudInstallUid" :install-progress="cloudInstallProgress" :install-message="cloudInstallMessage" :install-error="cloudInstallError" :install-notice="cloudInstallNotice" :feedback-game-key="cloudFeedbackGameKey" :page="storePage" :page-size="STORE_PAGE_SIZE" :total-count="storeTotalCount" :total-pages="storeTotalPages" :has-more="storeHasMore" @install="installAndLaunch" @delete-version="deleteCloudVersion" @retry="refreshStore" @refresh="refreshStore" @page-change="changeStorePage" />
       <TransferCenter v-else-if="activePage === 'transfers'" :games="games" :cloud-games="cloudGames" />
       <PlatformSettings v-else-if="activePage === 'settings'" @storage="openStorage('settings')" />
       <LibraryStoragePage v-else-if="activePage === 'storage'" @back="activePage = storageBackPage" @open-game="openStorageGame" />
@@ -1002,7 +1020,19 @@ async function finishAddGame(completedGame?: Game) {
             <img v-if="coverUrls[game.gameUid]" :src="coverUrls[game.gameUid]" :alt="`${game.displayName} 封面`" loading="lazy" @error="delete coverUrls[game.gameUid]" />
             <div v-else class="cover-placeholder"><Gamepad2 :size="34" /></div>
           </div>
-          <div class="game-card-body"><div><h2>{{ game.displayName }}</h2><span class="status-label">{{ gameStatusLabel(game) }}</span><span v-if="unsyncedGameUids.has(game.gameUid)" class="status-label status-label-warn" title="最近一次自动同步存档失败，可在传输中心重试">存档未同步</span></div><button class="launch-button" type="button" :disabled="game.lifecycle !== 'active' || runningGameUids.has(game.gameUid)" @click.stop="quickLaunch(game)">{{ runningGameUids.has(game.gameUid) ? "运行中" : "启动" }}</button></div>
+          <div class="game-card-body">
+            <div>
+              <h2>{{ game.displayName }}</h2>
+              <div class="game-card-status">
+                <span class="status-label">{{ gameStatusLabel(game) }}</span>
+                <span v-if="game.saveProtectionSkipped" class="status-label status-label-unprotected">存档未保护</span>
+                <span v-if="needsStoreUpload(game)" class="store-upload-badge">待上传商店</span>
+                <span v-if="unsyncedGameUids.has(game.gameUid)" class="status-label status-label-warn" title="最近一次自动同步存档失败，可在传输中心重试">存档未同步</span>
+              </div>
+            </div>
+            <button v-if="activeView === 'attention' && !runningGameUids.has(game.gameUid)" class="launch-button" type="button" @click.stop="openGame(game)" @keyup.enter.stop>处理</button>
+            <button v-else class="launch-button" type="button" :disabled="runningGameUids.has(game.gameUid)" @click.stop="quickLaunch(game)" @keyup.enter.stop>{{ runningGameUids.has(game.gameUid) ? "运行中" : "启动" }}</button>
+          </div>
         </article>
       </div>
       <nav v-if="filteredGames.length" class="library-pagination" aria-label="游戏库分页">

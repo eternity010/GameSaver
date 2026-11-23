@@ -5,6 +5,7 @@ import { getCloudGameCoverPath, getCloudGameCoverUrl, type CloudGameSummary, typ
 
 const props = defineProps<{
   games: CloudGameSummary[];
+  pendingStoreUploadKeys: ReadonlySet<string>;
   search: string;
   loading: boolean;
   loadError: string;
@@ -250,7 +251,13 @@ onUnmounted(() => {
           <span class="store-cover-size">{{ packageSize(game.packageSize) }}</span>
         </div>
         <div class="store-game-body">
-          <div class="store-game-heading"><div><h2>{{ game.displayName }}</h2><p>{{ game.versions.length }} 个云端版本</p></div><span class="store-status-label" :class="{ installed: game.installed }">{{ game.installed ? "已在游戏库" : "可下载" }}</span></div>
+          <div class="store-game-heading">
+            <div><h2>{{ game.displayName }}</h2><p>{{ game.versions.length }} 个云端版本</p></div>
+            <div class="store-card-status">
+              <span class="store-status-label" :class="{ installed: game.installed }">{{ game.installed ? "已在游戏库" : "可下载" }}</span>
+              <span v-if="game.installed && pendingStoreUploadKeys.has(game.gameKey)" class="store-upload-badge">待上传商店</span>
+            </div>
+          </div>
           <div class="store-game-meta"><span>{{ game.fileCount?.toLocaleString() || "未知" }} 个文件</span><span>安装后 {{ game.totalBytes ? packageSize(game.totalBytes) : "未知" }}</span></div>
           <span class="store-card-detail-hint">查看云端详情</span>
           <div v-if="installUid === game.gameUid" class="store-install-progress"><div class="task-progress-heading"><span>{{ installMessage }}</span><strong>{{ installProgress }}%</strong></div><div class="progress-track"><span :style="{ width: `${installProgress}%` }"></span></div></div>

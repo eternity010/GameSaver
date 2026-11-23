@@ -106,7 +106,7 @@ pub fn update_game_body(
             &app_handle,
             &task_id_for_thread,
             &game,
-            &profile,
+            profile.as_ref(),
             latest.as_ref(),
             &source_path,
         );
@@ -436,14 +436,19 @@ fn package_game_body_task(
         remote_fs_id: None,
         remote_size: None,
     };
-    state.with_store_mut(|candidate| {
+    if let Err(error) = state.with_store_mut(|candidate| {
+        let current = candidate
+            .games
+            .iter_mut()
+            .find(|current| current.game_uid == game.game_uid)
+            .ok_or_else(|| "游戏已移除，无法登记本体包".to_string())?;
+        current.record_pending_body_package(&version_id);
         candidate.body_versions.push(body_version);
-        if let Err(error) = GameRepository::persist(app, candidate) {
-            let _ = std::fs::remove_file(&result.package_path);
-            return Err(format!("保存游戏本体包记录失败：{error}"));
-        }
-        Ok(())
-    })?;
+        GameRepository::persist(app, candidate)
+    }) {
+        let _ = std::fs::remove_file(&result.package_path);
+        return Err(format!("保存游戏本体包记录失败：{error}"));
+    }
     Ok(serde_json::json!({
         "versionId": version_id,
         "packagePath": result.package_path,
@@ -598,14 +603,21 @@ fn auto_upload_enabled(app: &AppHandle) -> bool {
 fn load_update_context(
     state: &AppState,
     game_uid: &str,
-) -> Result<(crate::domain::Game, SaveProfile, Option<SaveVersion>), String> {
+) -> Result<(crate::domain::Game, Option<SaveProfile>, Option<SaveVersion>), String> {
     let store = state
         .store
         .lock()
         .map_err(|_| "lock GameSaver store failed".to_string())?;
+    update_context(&store, game_uid)
+}
+
+fn update_context(
+    store: &AppStore,
+    game_uid: &str,
+) -> Result<(crate::domain::Game, Option<SaveProfile>, Option<SaveVersion>), String> {
     let game =
-        GameLibraryService::find(&store, game_uid).ok_or_else(|| "游戏不存在".to_string())?;
-    if !matches!(game.lifecycle, GameLifecycle::Active) {
+        GameLibraryService::find(store, game_uid).ok_or_else(|| "游戏不存在".to_string())?;
+    if !matches!(game.lifecycle, GameLifecycle::Active | GameLifecycle::NeedsRepair) {
         return Err("游戏尚未完成设置".to_string());
     }
     let profile = store
@@ -616,18 +628,18 @@ fn load_update_context(
                 && profile.game_uid == game_uid
                 && profile.enabled
         })
-        .cloned()
-        .ok_or_else(|| "存档保护配置不存在".to_string())?;
-    let latest = game
-        .latest_save_version_id
-        .as_ref()
-        .and_then(|id| {
-            store
-                .save_versions
-                .iter()
-                .find(|version| &version.version_id == id)
-        })
         .cloned();
+    if profile.is_none() && !game.save_protection_skipped && GameLibraryService::is_installed(&game) {
+        return Err("存档保护配置不存在".to_string());
+    }
+    let latest = profile.as_ref().and_then(|_| {
+        let id = game.latest_save_version_id.as_deref()?;
+        store
+            .save_versions
+            .iter()
+            .find(|version| version.game_uid == game_uid && version.version_id == id)
+            .cloned()
+    });
     Ok((game, profile, latest))
 }
 
@@ -663,6 +675,41 @@ fn now_iso() -> String {
 mod tests {
     use super::*;
     use crate::{domain::Game, test_support::TempWorkspace};
+
+    #[test]
+    fn body_repair_uses_existing_game_record_even_without_save_profile() {
+        let root = TempWorkspace::new("repair-missing-game");
+        let game_path = root.join("managed-game");
+        let mut game = Game::new_pending("Test", game_path.to_string_lossy(), "game.exe");
+        let uid = game.game_uid.clone();
+        let latest = SaveVersion::new(uid.clone(), "1".into(), Vec::new());
+        game.latest_save_version_id = Some(latest.version_id.clone());
+        let mut store = AppStore {
+            games: vec![game],
+            save_versions: vec![latest],
+            ..AppStore::default()
+        };
+        assert!(update_context(&store, &uid).is_err());
+
+        store.games[0].lifecycle = GameLifecycle::NeedsRepair;
+        let (target, profile, latest) = update_context(&store, &uid).unwrap();
+        assert_eq!(target.game_uid, uid);
+        assert_eq!(target.game_key, store.games[0].game_key);
+        assert!(profile.is_none() && latest.is_none());
+
+        let profile = SaveProfile::new(uid.clone(), "hash".into(), Vec::new(), 100, "2".into());
+        store.games[0].save_profile_id = Some(profile.profile_id.clone());
+        store.save_profiles.push(profile);
+        let (_, profile, latest) = update_context(&store, &uid).unwrap();
+        assert!(profile.is_some());
+        assert_eq!(latest.unwrap().version_id, store.save_versions[0].version_id);
+
+        std::fs::create_dir(&game_path).unwrap();
+        std::fs::write(game_path.join("game.exe"), b"fixture").unwrap();
+        store.games[0].lifecycle = GameLifecycle::Active;
+        store.save_profiles.clear();
+        assert!(update_context(&store, &uid).is_err());
+    }
 
     #[test]
     fn local_zip_deletion_accepts_an_uninstalled_game_and_uses_its_recorded_cache_path() {

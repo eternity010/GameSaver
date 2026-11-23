@@ -731,6 +731,7 @@ mod tests {
             health: GameHealth::Ready,
             cloud_status: CloudStatus::Disabled,
             save_profile_id: None,
+            save_protection_skipped: false,
             launch: LaunchConfig {
                 executable_relative_path: "test.exe".to_string(),
                 arguments: vec![],
@@ -740,6 +741,7 @@ mod tests {
             last_played_at: None,
             latest_save_version_id: None,
             added_at: None,
+            pending_body_upload: None,
         }
     }
 

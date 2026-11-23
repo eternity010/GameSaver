@@ -113,6 +113,8 @@ pub(crate) fn should_ignore_event_path(path: &Path) -> bool {
         "\\nvidia\\dxcache\\",
         "\\nvidia\\glcache\\",
         "\\nvidia\\compute_cache\\",
+        "\\programdata\\nvidia corporation\\drs\\",
+        "/programdata/nvidia corporation/drs/",
         "\\wettype\\",
         "\\inputmethod\\",
         "\\microsoft\\inputmethod\\",

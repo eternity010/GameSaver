@@ -15,7 +15,7 @@ pub(crate) fn run_update(
     app: &AppHandle,
     task_id: &str,
     game: &crate::domain::Game,
-    profile: &SaveProfile,
+    profile: Option<&SaveProfile>,
     latest: Option<&SaveVersion>,
     source: &Path,
 ) -> Result<serde_json::Value, String> {
@@ -75,7 +75,7 @@ pub(crate) fn run_update(
         "正在保护并恢复当前存档",
         None,
     );
-    let protected = if Path::new(&game.managed_path).is_dir() {
+    let protected = if let Some(profile) = profile.filter(|_| Path::new(&game.managed_path).is_dir()) {
         match SaveRepository::commit(app, game, profile, latest, |progress, message| {
             TaskService::update(
                 &state,
@@ -103,8 +103,8 @@ pub(crate) fn run_update(
         let _ = std::fs::remove_dir_all(&staging);
         return Err("任务已取消".to_string());
     }
-    let save_target = protected.as_ref().or(latest);
-    let restored_version_id = save_target.map(|version| version.version_id.clone());
+    let save_target = profile.zip(protected.as_ref().or(latest));
+    let restored_version_id = save_target.map(|(_, version)| version.version_id.clone());
     let version_id = Uuid::new_v4().to_string();
     let archive_path = games_root
         .join(".versions")
@@ -149,7 +149,7 @@ pub(crate) fn run_update(
             }
         };
     let receipt = match save_target {
-        Some(target) => {
+        Some((profile, target)) => {
             match SaveRepository::restore_after_body_swap(app, game, profile, target, |progress, message| {
                 TaskService::update(
                     &state,
@@ -213,6 +213,7 @@ pub(crate) fn run_update(
         body_version,
         protected,
         restored_version_id,
+        profile.is_some(),
     ) {
         drop(guard);
         return rollback_update(
@@ -264,6 +265,7 @@ fn record_update(
     body_version: GameBodyVersion,
     protected: Option<SaveVersion>,
     restored_version_id: Option<String>,
+    has_save_profile: bool,
 ) -> Result<(), String> {
     let game = store
         .games
@@ -274,7 +276,12 @@ fn record_update(
         game.latest_save_version_id = Some(version_id);
     }
     game.lifecycle = GameLifecycle::Active;
-    game.health = GameHealth::Ready;
+    game.mark_body_upload_pending();
+    game.health = if has_save_profile || game.save_protection_skipped {
+        GameHealth::Ready
+    } else {
+        GameHealth::NeedsAttention
+    };
     if let Some(protected) = protected {
         store.save_versions.push(protected);
     }
@@ -562,6 +569,7 @@ mod tests {
             body.clone(),
             None,
             Some(restored.version_id.clone()),
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -572,7 +580,7 @@ mod tests {
 
         let protected = SaveVersion::new(restored.game_uid, "4".into(), Vec::new());
         let protected_id = protected.version_id.clone();
-        record_update(&mut store, body, Some(protected), Some(protected_id.clone())).unwrap();
+        record_update(&mut store, body, Some(protected), Some(protected_id.clone()), true).unwrap();
         assert_eq!(store.games[0].latest_save_version_id, Some(protected_id));
         assert_eq!(store.save_versions.len(), 3);
     }

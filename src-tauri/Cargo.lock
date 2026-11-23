@@ -994,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "gamesaver_next"
-version = "1.0.37"
+version = "1.0.39"
 dependencies = [
  "hex",
  "image",

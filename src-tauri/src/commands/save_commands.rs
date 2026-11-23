@@ -427,13 +427,13 @@ fn start_finish_save_learning(app: AppHandle, session_id: String) -> Result<Stri
         key: AppState::game_operation_key(&game_uid),
         active: true,
     };
-    let managed_path = {
+    let game = {
         let store = state.store.lock().map_err(|_| "读取游戏记录失败")?;
         store
             .games
             .iter()
             .find(|game| game.game_uid == game_uid)
-            .map(|game| PathBuf::from(&game.managed_path))
+            .cloned()
             .ok_or("游戏记录已不存在")?
     };
     let tracked_processes = state
@@ -443,7 +443,7 @@ fn start_finish_save_learning(app: AppHandle, session_id: String) -> Result<Stri
         .get(&session_id)
         .map(|active| active.tracked_processes.clone())
         .ok_or("存档识别会话不存在")?;
-    SaveLearningService::ensure_game_exited(&managed_path, Some(&tracked_processes))?;
+    SaveLearningService::ensure_game_exited(Path::new(&game.managed_path), Some(&tracked_processes))?;
     let active = state
         .learning_sessions
         .lock()
@@ -473,6 +473,7 @@ fn start_finish_save_learning(app: AppHandle, session_id: String) -> Result<Stri
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 SaveLearningService::finish(
                     &active,
+                    &game,
                     |progress, message| {
                         TaskService::update(
                             &app_handle.state(),
@@ -755,6 +756,43 @@ fn confirm_save_profile_blocking(
         profile.profile_id
     ));
     Ok(profile)
+}
+
+#[tauri::command]
+pub async fn finish_add_game_without_save_protection(
+    app: AppHandle,
+    game_uid: String,
+) -> Result<Game, String> {
+    super::run_blocking(move || {
+        let state = app.state::<AppState>();
+        let game_uid = game_uid.trim();
+        state.claim_operation(game_uid, "该游戏已有操作正在进行，请稍后确认添加")?;
+        let _operation_guard = SaveProfileOperationGuard {
+            state: &state,
+            key: AppState::game_operation_key(game_uid),
+            active: true,
+        };
+        state.ensure_save_restore_idle(game_uid)?;
+        if state
+            .learning_sessions
+            .lock()
+            .map_err(|_| "读取存档识别会话失败")?
+            .values()
+            .any(|session| session.view.game_uid == game_uid)
+        {
+            return Err("请先停止存档识别，再确认添加游戏".into());
+        }
+        state.with_store_mut(|store| {
+            let game = GameLibraryService::finish_without_save_protection(store, game_uid)?;
+            SaveLearningService::ensure_game_exited(Path::new(&game.managed_path), None)?;
+            if !managed_executable_path(&game)?.is_file() {
+                return Err("启动程序不存在，请先修复游戏本体".into());
+            }
+            GameRepository::persist(&app, store)?;
+            Ok(game)
+        })
+    })
+    .await
 }
 
 struct SaveProfileOperationGuard<'a> {

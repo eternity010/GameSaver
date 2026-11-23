@@ -346,6 +346,7 @@ pub fn run() {
             commands::save_commands::start_finish_save_learning_task,
             commands::save_commands::cancel_save_learning,
             commands::save_commands::confirm_save_profile,
+            commands::save_commands::finish_add_game_without_save_protection,
             commands::save_commands::get_save_profile,
             commands::save_commands::preview_save_scopes,
             commands::save_commands::update_save_profile_keep_versions,

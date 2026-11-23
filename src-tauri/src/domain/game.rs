@@ -85,6 +85,12 @@ pub struct GameCover {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct PendingBodyUpload {
+    package_version_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct Game {
     pub game_uid: String,
     #[serde(default)]
@@ -100,11 +106,15 @@ pub struct Game {
     #[serde(default)]
     pub save_profile_id: Option<String>,
     #[serde(default)]
+    pub save_protection_skipped: bool,
+    #[serde(default)]
     pub last_played_at: Option<String>,
     #[serde(default)]
     pub latest_save_version_id: Option<String>,
     #[serde(default)]
     pub added_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_body_upload: Option<PendingBodyUpload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,15 +196,40 @@ impl Game {
             },
             cover: None,
             save_profile_id: None,
+            save_protection_skipped: false,
             last_played_at: None,
             latest_save_version_id: None,
             added_at: Some(now_epoch_secs()),
+            pending_body_upload: None,
         }
+    }
+
+    pub fn mark_body_upload_pending(&mut self) {
+        self.pending_body_upload = Some(PendingBodyUpload {
+            package_version_ids: Vec::new(),
+        });
+    }
+
+    pub fn record_pending_body_package(&mut self, version_id: &str) {
+        if let Some(pending) = &mut self.pending_body_upload {
+            pending.package_version_ids.push(version_id.to_string());
+        }
+    }
+
+    pub fn complete_body_upload(&mut self, version_id: &str) -> bool {
+        if !self.pending_body_upload.as_ref().is_some_and(|pending| {
+            pending.package_version_ids.iter().any(|current| current == version_id)
+        }) {
+            return false;
+        }
+        self.pending_body_upload = None;
+        true
     }
 
     #[allow(dead_code)]
     pub fn activate(&mut self, save_profile_id: impl Into<String>) {
         self.save_profile_id = Some(save_profile_id.into());
+        self.save_protection_skipped = false;
         self.lifecycle = GameLifecycle::Active;
         self.health = GameHealth::Ready;
     }
@@ -223,5 +258,24 @@ mod tests {
             Game::derive_game_key("  Monster   Black Market  "),
             "monster black market"
         );
+    }
+
+    #[test]
+    fn upload_reminder_is_opt_in_and_a_new_body_invalidates_older_packages() {
+        let mut game = Game::new_pending("Test", "games/test", "game.exe");
+        let legacy = serde_json::to_value(&game).unwrap();
+        assert!(legacy.get("pendingBodyUpload").is_none());
+        assert!(serde_json::from_value::<Game>(legacy).unwrap().pending_body_upload.is_none());
+
+        game.mark_body_upload_pending();
+        game.record_pending_body_package("previous");
+        game.mark_body_upload_pending();
+        game.record_pending_body_package("current-first");
+        game.record_pending_body_package("current-second");
+        assert!(!game.complete_body_upload("previous"));
+        let saved = serde_json::to_vec(&game).unwrap();
+        let mut reopened: Game = serde_json::from_slice(&saved).unwrap();
+        assert!(reopened.complete_body_upload("current-first"));
+        assert!(reopened.pending_body_upload.is_none());
     }
 }

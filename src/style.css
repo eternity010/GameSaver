@@ -114,6 +114,11 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--focus-ring)
 .store-game-meta span { min-width: 0; overflow-wrap: anywhere; }
 .store-status-label { display: inline-flex; align-items: center; padding: 5px 8px; border-radius: 4px; color: var(--brand); background: #253149; font-size: 11px; white-space: nowrap; }
 .store-status-label.installed { color: var(--success); background: #20372e; }
+.store-upload-badge { display: inline-flex; align-items: center; padding: 4px 8px; border-radius: 4px; color: #f0c67c; background: #3b3021; font-size: 11px; white-space: nowrap; }
+.store-card-status, .game-card-status { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.game-card-status .status-label-warn { margin-left: 0; }
+.body-upload-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 7px 10px; margin-bottom: 14px; }
+.body-upload-notice p { color: var(--text-secondary); font-size: 12px; }
 .store-card-detail-hint { color: #aebbd0; font-size: 11px; font-weight: 600; }
 .store-install-progress { display: grid; gap: 7px; }
 .store-install-progress .task-progress-heading { margin: 0; font-size: 11px; }
@@ -247,6 +252,7 @@ h1 { margin-bottom: 0; font-size: 30px; letter-spacing: 0; }
 .game-card-body { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px; }
 .game-card h2 { max-width: 150px; margin-bottom: 7px; overflow-wrap: anywhere; font-size: 15px; }
 .status-label { color: var(--success); font-size: 12px; }
+.status-label-unprotected { color: #f0c67c; }
 .launch-button, .primary-button, .state-panel button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; border: 0; border-radius: 5px; }
 .launch-button { min-width: 56px; padding: 8px 11px; color: #152033; background: var(--brand); }
 .launch-button:disabled { cursor: not-allowed; opacity: .4; }
@@ -312,6 +318,7 @@ h1 { margin-bottom: 0; font-size: 30px; letter-spacing: 0; }
 .detail-hero-copy h2 { margin-bottom: 8px; font-size: 24px; }
 .detail-hero-copy p { max-width: 560px; margin-bottom: 22px; color: var(--text-secondary); line-height: 1.55; }
 .detail-launch { margin-top: auto; }
+.detail-body-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 .detail-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; margin-bottom: 18px; }
 .detail-section { min-width: 0; padding: 20px; border: 1px solid #2d323b; border-radius: 8px; background: var(--surface-panel); }
 .detail-section-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 18px; }
@@ -419,7 +426,7 @@ h1 { margin-bottom: 0; font-size: 30px; letter-spacing: 0; }
 .path-row button, .secondary-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 9px 13px; border: 1px solid #3b4350; border-radius: 5px; color: var(--text-primary); background: var(--surface-raised); white-space: nowrap; }
 .path-row button:hover, .secondary-button:hover { border-color: #68778e; }
 .path-row button:disabled, .secondary-button:disabled { cursor: not-allowed; opacity: .45; }
-.wizard-actions { display: flex; justify-content: flex-end; gap: 9px; padding-top: 8px; }
+.wizard-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 9px; padding-top: 8px; }
 .task-progress { display: grid; gap: 10px; padding: 16px; border: 1px solid #33445e; border-radius: 8px; background: #1b2534; }
 .task-progress-heading { display: flex; justify-content: space-between; gap: 12px; color: var(--text-secondary); font-size: 13px; }
 .task-progress-heading strong { color: var(--text-primary); }

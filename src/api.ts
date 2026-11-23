@@ -427,6 +427,10 @@ export function confirmSaveProfile(gameUid: string, scopes: SaveScope[], confide
   return invokeCommand<SaveProfile>("confirm_save_profile", { gameUid, scopes, confidence, captureMode });
 }
 
+export function finishAddGameWithoutSaveProtection(gameUid: string): Promise<Game> {
+  return invokeCommand<Game>("finish_add_game_without_save_protection", { gameUid });
+}
+
 /**
  * 只读推断一份存档范围初稿：不启动游戏、不采集 ETW。
  *

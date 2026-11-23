@@ -59,6 +59,8 @@ pub struct SaveLearningResult {
     pub event_capture_mode: String,
     #[serde(default)]
     pub transaction_summary: Option<SaveTransactionSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_save_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

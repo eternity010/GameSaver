@@ -2,7 +2,7 @@ use crate::{
     app_state::AppState,
     commands::{game_commands::safe_cover_path, run_blocking},
     domain::{
-        compare_optional_created_at, is_safe_path_segment, Game, GameBodyVersion, GameLifecycle,
+        compare_optional_created_at, is_safe_path_segment, AppStore, Game, GameBodyVersion, GameLifecycle,
         TaskCategory, TaskRetry, TaskStatus,
     },
     repositories::GameRepository,
@@ -12,6 +12,7 @@ use crate::{
         RemoteBodyPackageList, RemoteFile, TaskService,
     },
 };
+use crate::services::cloud_manifest_service::CloudBodyManifest;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
@@ -1133,9 +1134,9 @@ fn upload_body_task(
         "本体包已上传，正在更新云端版本清单",
         None,
     );
-    if let Err(error) = sync_cloud_manifest(app, &state, &client, &game.game_uid) {
-        return Err(format!("{BODY_MANIFEST_PENDING_PREFIX}{error}"));
-    }
+    sync_cloud_manifest(app, &state, &client, &game.game_uid)
+        .and_then(|manifest| persist_body_publication(app, &state, &game.game_uid, &manifest))
+        .map_err(|error| format!("{BODY_MANIFEST_PENDING_PREFIX}{error}"))?;
     TaskService::update(
         &state,
         task_id,
@@ -1424,7 +1425,7 @@ fn sync_cloud_manifest(
     state: &AppState,
     client: &BaiduNetdiskClient,
     game_uid: &str,
-) -> Result<(), String> {
+) -> Result<CloudBodyManifest, String> {
     let store = state
         .store
         .lock()
@@ -1441,7 +1442,7 @@ fn sync_cloud_manifest(
     let remote_files = client.list(&remote_dir)?;
     let versions = store.body_versions;
     let temporary_root = app_data_dir(app)?.join("cloud-manifest-temp");
-    CloudManifestService::rebuild(
+    let manifest = CloudManifestService::rebuild(
         client,
         &remote_dir,
         &game_key,
@@ -1450,7 +1451,49 @@ fn sync_cloud_manifest(
         &versions,
         &temporary_root,
     )?;
-    sync_cloud_catalog(app, state, client, game_uid, &remote_dir)
+    sync_cloud_catalog(app, state, client, game_uid, &remote_dir)?;
+    Ok(manifest)
+}
+
+fn persist_body_publication(
+    app: &AppHandle,
+    state: &AppState,
+    game_uid: &str,
+    manifest: &CloudBodyManifest,
+) -> Result<(), String> {
+    state.with_store_mut(|candidate| {
+        if record_body_publication(candidate, game_uid, manifest) {
+            GameRepository::persist(app, candidate)?;
+        }
+        Ok(())
+    })
+}
+
+fn record_body_publication(store: &mut AppStore, game_uid: &str, manifest: &CloudBodyManifest) -> bool {
+    let Some(game) = store.games.iter_mut().find(|game| {
+        game.game_uid == game_uid && game.game_key == manifest.game_key
+            && game.pending_body_upload.is_some()
+    }) else {
+        return false;
+    };
+    for entry in manifest.versions.iter().filter(|entry| entry.file_count > 0) {
+        let published = store.body_versions.iter_mut().find(|version| {
+            version.game_uid == game_uid
+                && version.version_id == entry.version_id
+                && version.remote_path.as_deref() == Some(entry.package_path.as_str())
+                && version.remote_fs_id == Some(entry.package_fs_id)
+                && version.remote_size == Some(entry.package_size)
+                && version.sha256.is_some()
+                && version.sha256 == entry.package_sha256
+        });
+        if let Some(version) = published {
+            if game.complete_body_upload(&version.version_id) {
+                version.upload_status = Some("synced".to_string());
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn repair_cloud_body_manifest_task(
@@ -1509,6 +1552,7 @@ fn repair_cloud_body_manifest_task(
         &app_data_dir(app)?.join("cloud-manifest-temp"),
     )?;
     sync_cloud_catalog(app, &state, &client, &game.game_uid, directory)?;
+    persist_body_publication(app, &state, &game.game_uid, &manifest)?;
     Ok(serde_json::json!({
         "versionCount": manifest.versions.len(),
         "remoteFileCount": remote_files.len(),
@@ -1818,6 +1862,7 @@ fn install_cloud_game_task(
                     existing_game.lifecycle = game.lifecycle.clone();
                     existing_game.health = game.health.clone();
                     existing_game.cloud_status = game.cloud_status.clone();
+                    existing_game.pending_body_upload = None;
                     existing_game.launch = game.launch.clone();
                     if existing_game.cover.is_none() {
                         existing_game.cover = game.cover.clone();
@@ -2106,6 +2151,72 @@ mod tests {
         is_safe_path_segment, remote_body_dir, reserve_transfer, validate_remote_package_path,
         CloudInstallPackageGuard, CloudInstallStagingGuard, Game,
     };
+
+    #[test]
+    fn upload_reminder_requires_store_manifest_to_contain_the_current_zip() {
+        use super::{record_body_publication, AppStore, CloudBodyManifest, GameBodyVersion};
+        use crate::services::cloud_manifest_service::CloudBodyManifestVersion;
+
+        let mut game = Game::new_pending("Reminder game", "games/test", "game.exe");
+        let uid = game.game_uid.clone();
+        let game_key = game.game_key.clone();
+        let old_entry = CloudBodyManifestVersion {
+            version_id: "old".into(),
+            created_at: "1".into(),
+            package_path: "/games/test/body/old.zip".into(),
+            package_fs_id: 10,
+            package_size: 50,
+            package_sha256: Some("a".repeat(64)),
+            file_count: 1,
+            total_bytes: 50,
+        };
+        let current_entry = CloudBodyManifestVersion {
+            version_id: "current".into(),
+            package_path: "/games/test/body/current.zip".into(),
+            package_fs_id: 11,
+            ..old_entry.clone()
+        };
+        let versions = [&old_entry, &current_entry].map(|entry| GameBodyVersion {
+            version_id: entry.version_id.clone(),
+            game_uid: uid.clone(),
+            created_at: entry.created_at.clone(),
+            archive_path: String::new(),
+            file_count: entry.file_count,
+            total_bytes: entry.total_bytes,
+            package_path: None,
+            sha256: entry.package_sha256.clone(),
+            excluded_items: Vec::new(),
+            upload_status: Some("manifest_pending".into()),
+            remote_path: Some(entry.package_path.clone()),
+            remote_fs_id: Some(entry.package_fs_id),
+            remote_size: Some(entry.package_size),
+        });
+        game.mark_body_upload_pending();
+        game.record_pending_body_package("current");
+        let mut store = AppStore {
+            games: vec![game],
+            body_versions: versions.into(),
+            ..Default::default()
+        };
+        let mut manifest = CloudBodyManifest {
+            format_version: 1,
+            game_key,
+            game_uid: uid.clone(),
+            updated_at: "2".into(),
+            versions: vec![old_entry],
+        };
+        assert!(!record_body_publication(&mut store, &uid, &manifest));
+        assert!(store.games[0].pending_body_upload.is_some());
+        manifest.versions.push(CloudBodyManifestVersion {
+            package_fs_id: 12,
+            ..current_entry.clone()
+        });
+        assert!(!record_body_publication(&mut store, &uid, &manifest));
+        manifest.versions[1] = current_entry;
+        assert!(record_body_publication(&mut store, &uid, &manifest));
+        assert!(store.games[0].pending_body_upload.is_none());
+        assert_eq!(store.body_versions[1].upload_status.as_deref(), Some("synced"));
+    }
 
     #[test]
     fn transfer_reservation_respects_cloud_save_operations() {

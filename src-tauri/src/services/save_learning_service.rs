@@ -376,6 +376,7 @@ impl SaveLearningService {
 
     pub(crate) fn finish(
         active: &ActiveLearningSession,
+        game: &Game,
         on_progress: impl Fn(u8, &str),
         is_cancelled: impl Fn() -> bool,
     ) -> Result<SaveLearningResult, String> {
@@ -534,6 +535,13 @@ impl SaveLearningService {
                 summary.confidence = summary.confidence.min(64);
             }
         }
+        let registry_save_key = if scope_drafts.is_empty() && !active.validation_only {
+            managed_executable_path(game)
+                .ok()
+                .and_then(|path| crate::services::learning::detect_unity_player_prefs(&path))
+        } else {
+            None
+        };
         Ok(SaveLearningResult {
             session_id: active.view.session_id.clone(),
             changed_files,
@@ -542,6 +550,7 @@ impl SaveLearningService {
             notes,
             event_capture_mode: event_capture_mode.to_string(),
             transaction_summary,
+            registry_save_key,
         })
     }
 }
@@ -1908,6 +1917,7 @@ fn preview_result(
         notes,
         event_capture_mode: PREVIEW_CAPTURE_MODE.to_string(),
         transaction_summary: None,
+        registry_save_key: None,
     }
 }
 
@@ -3915,9 +3925,11 @@ mod tests {
             },
             cover: None,
             save_profile_id: None,
+            save_protection_skipped: false,
             last_played_at: None,
             latest_save_version_id: None,
             added_at: None,
+            pending_body_upload: None,
         };
 
         let hints = super::game_name_hints(&game);
@@ -4107,9 +4119,11 @@ mod tests {
             },
             cover: None,
             save_profile_id: None,
+            save_protection_skipped: false,
             last_played_at: None,
             latest_save_version_id: None,
             added_at: None,
+            pending_body_upload: None,
         };
 
         let hints = super::game_name_hints(&game);

@@ -5,8 +5,10 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   cancelSaveLearning,
   cancelTask,
+  confirmAction,
   confirmSaveProfile,
   discardPendingGame,
+  finishAddGameWithoutSaveProtection,
   getGame,
   getPendingGameSetup,
   getTask,
@@ -71,7 +73,7 @@ const proposedByScope = ref<Record<string, string[]>>({});
 let pollTimer: ReturnType<typeof setTimeout> | undefined;
 let disposed = false;
 
-const isBusy = computed(() => resuming.value || !!taskId.value || phase.value === "copying" || phase.value === "analyzing" || phase.value === "discarding");
+const isBusy = computed(() => resuming.value || confirming.value || !!taskId.value || phase.value === "copying" || phase.value === "analyzing" || phase.value === "discarding");
 const canStart = computed(() => !resuming.value && !taskId.value && Boolean(displayName.value.trim() && sourcePath.value.trim() && executablePath.value.trim()) && phase.value === "form");
 const stepNumber = computed(() => phase.value === "form" || phase.value === "copying" ? 1 : phase.value === "ready" || phase.value === "capturing" ? 2 : phase.value === "analyzing" || phase.value === "review" ? 3 : 4);
 const stepTitle = computed(() => phase.value === "form" || phase.value === "copying" ? "选择并复制游戏本体" : phase.value === "ready" || phase.value === "capturing" ? "完成一次游戏内保存" : phase.value === "analyzing" ? "分析存档变化" : phase.value === "review" ? "确认存档保护范围" : "添加完成");
@@ -370,7 +372,7 @@ async function start() {
 }
 
 async function beginLearning() {
-  if (!completedGame.value || phase.value !== "ready") return;
+  if (!completedGame.value || phase.value !== "ready" || isBusy.value) return;
   error.value = "";
   message.value = "准备启动游戏并记录存档变化";
   phase.value = "capturing";
@@ -429,7 +431,7 @@ async function analyze() {
  */
 async function previewDraft() {
   const gameUid = completedGame.value?.gameUid;
-  if (!gameUid || phase.value !== "ready" || previewing.value || inferringDrafts.value) return;
+  if (!gameUid || phase.value !== "ready" || confirming.value || previewing.value || inferringDrafts.value) return;
   if (inferredForGameUid === gameUid && inferredDrafts.value) {
     openInferredDraft();
     return;
@@ -635,7 +637,7 @@ async function confirm() {
   confirming.value = true;
   try {
     const profile = await confirmSaveProfile(completedGame.value.gameUid, reviewScopes.value, confidence.value, learningResult.value?.eventCaptureMode ?? null);
-    completedGame.value = { ...completedGame.value, lifecycle: "active", health: "ready", saveProfileId: profile.profileId };
+    completedGame.value = { ...completedGame.value, lifecycle: "active", health: "ready", saveProfileId: profile.profileId, saveProtectionSkipped: false };
     phase.value = "done";
     try {
       completedGame.value = await getGame(completedGame.value.gameUid);
@@ -644,6 +646,28 @@ async function confirm() {
     }
   } catch (reason) {
     error.value = String(reason);
+  } finally {
+    confirming.value = false;
+  }
+}
+
+async function finishWithoutSaveProtection() {
+  const gameUid = completedGame.value?.gameUid;
+  const stage = phase.value;
+  if (!gameUid || isBusy.value || previewing.value || (stage !== "ready" && stage !== "review")) return;
+  confirming.value = true;
+  error.value = "";
+  try {
+    const accepted = await confirmAction(
+      "游戏可以正常游玩。GameSaver 不会为它自动备份或同步存档，也无法通过 GameSaver 恢复这次游玩的进度。确定加入游戏库吗？",
+    );
+    if (!accepted || disposed || phase.value !== stage || completedGame.value?.gameUid !== gameUid) return;
+    const game = await finishAddGameWithoutSaveProtection(gameUid);
+    if (disposed) return;
+    completedGame.value = game;
+    phase.value = "done";
+  } catch (reason) {
+    if (!disposed) error.value = String(reason);
   } finally {
     confirming.value = false;
   }
@@ -772,7 +796,18 @@ onUnmounted(() => { disposed = true; stopPolling(); });
         </template>
       </section>
       <p v-if="error" class="error-message" role="alert">{{ error }}</p>
-      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="cancelling" @click="abandonPendingGame">放弃添加</button><button v-if="phase === 'capturing'" class="secondary-button" type="button" :disabled="cancelling" @click="cancelTaskOrLearning"><LoaderCircle v-if="cancelling" :size="16" class="spin" /><X v-else :size="16" />{{ cancelling ? "正在停止" : `停止${validatingCandidates ? "验证" : "识别"}` }}</button><button v-if="phase === 'ready'" class="secondary-button" type="button" :disabled="previewing || inferringDrafts" title="不启动游戏，直接按存档目录名与文件特征推断一份待确认的初稿" @click="previewDraft"><LoaderCircle v-if="previewing" :size="16" class="spin" /><FolderOpen v-else :size="16" />{{ previewing ? "正在推断" : "跳过识别，先看初稿" }}</button><button v-if="phase === 'ready'" class="primary-button" type="button" :disabled="previewing" @click="beginLearning"><Gamepad2 :size="17" />启动并开始识别</button><button v-else class="primary-button" type="button" @click="analyze"><Check :size="17" />完成保存，开始{{ validatingCandidates ? "验证" : "分析" }}</button></footer>
+      <footer class="wizard-actions">
+        <button class="secondary-button" type="button" :disabled="cancelling || confirming" @click="abandonPendingGame">放弃添加</button>
+        <template v-if="phase === 'ready'">
+          <button class="secondary-button" type="button" :disabled="isBusy || previewing" @click="finishWithoutSaveProtection">暂不保护存档，加入游戏库</button>
+          <button class="secondary-button" type="button" :disabled="confirming || previewing || inferringDrafts" title="不启动游戏，直接按存档目录名与文件特征推断一份待确认的初稿" @click="previewDraft"><LoaderCircle v-if="previewing" :size="16" class="spin" /><FolderOpen v-else :size="16" />{{ previewing ? "正在推断" : "跳过识别，先看初稿" }}</button>
+          <button class="primary-button" type="button" :disabled="confirming || previewing" @click="beginLearning"><Gamepad2 :size="17" />启动并开始识别</button>
+        </template>
+        <template v-else>
+          <button class="secondary-button" type="button" :disabled="cancelling" @click="cancelTaskOrLearning"><LoaderCircle v-if="cancelling" :size="16" class="spin" /><X v-else :size="16" />{{ cancelling ? "正在停止" : `停止${validatingCandidates ? "验证" : "识别"}` }}</button>
+          <button class="primary-button" type="button" @click="analyze"><Check :size="17" />完成保存，开始{{ validatingCandidates ? "验证" : "分析" }}</button>
+        </template>
+      </footer>
     </section>
 
     <section v-else-if="phase === 'analyzing'" class="wizard-form">
@@ -781,7 +816,24 @@ onUnmounted(() => { disposed = true; stopPolling(); });
     </section>
 
     <section v-else-if="phase === 'review'" class="wizard-form">
-      <section class="wizard-section result-summary"><div><p class="eyebrow">{{ isPreviewDraft ? "只读初稿" : "识别结果" }}</p><h2>确认存档保护范围</h2><p v-if="isPreviewDraft">没有启动游戏，也没有记录任何写入证据；以下 {{ reviewScopes.length }} 个候选范围只按目录名与文件特征推断，请逐项确认，或改回完整识别。</p><p v-else-if="captureInsufficient">本次没有可验证的写入或快照差异。可以重新识别，或手动添加存档目录。</p><p v-else>{{ learningResult?.changedFiles.length || 0 }} 个候选文件，已按目录整理为 {{ reviewScopes.length }} 个候选范围。</p><div class="evidence-summary"><span>{{ captureEvidenceLabel }}</span><span v-if="learningResult?.transactionSummary">事务 {{ learningResult.transactionSummary.transactionCount }} 个 · {{ learningResult.transactionSummary.operationCount }} 条操作 · {{ learningResult.transactionSummary.status === "completed" ? "已确认" : learningResult.transactionSummary.status === "candidate" ? "候选" : "证据不足" }}</span></div></div><div v-if="isPreviewDraft" class="confidence-score"><strong>初稿</strong><span>只读推断 · 未经写入证据校验</span></div><div v-else-if="capturePartial || captureInsufficient" class="confidence-score"><strong>{{ capturePartial ? "待核对" : "证据不足" }}</strong><span>未完成可靠验证</span></div><div v-else class="confidence-score"><strong>{{ confidenceBand }}</strong><span>识别置信度 · 评分 {{ confidence }}/100</span></div></section>
+      <section class="wizard-section result-summary">
+        <div>
+          <p class="eyebrow">{{ isPreviewDraft ? "只读初稿" : "识别结果" }}</p>
+          <h2>确认存档保护范围</h2>
+          <p v-if="isPreviewDraft">没有启动游戏，也没有记录任何写入证据；以下 {{ reviewScopes.length }} 个候选范围只按目录名与文件特征推断，请逐项确认，或改回完整识别。</p>
+          <template v-else-if="learningResult?.registrySaveKey">
+            <p>本次没有找到存档文件。发现该游戏的 Unity PlayerPrefs 注册表项，游戏可能把进度保存在这里。当前仅支持保护文件存档。</p>
+            <p><code>{{ learningResult.registrySaveKey }}</code></p>
+          </template>
+          <p v-else-if="captureInsufficient">本次没有可验证的写入或快照差异。可以重新识别，或手动添加存档目录。</p>
+          <p v-else>{{ learningResult?.changedFiles.length || 0 }} 个候选文件，已按目录整理为 {{ reviewScopes.length }} 个候选范围。</p>
+          <div class="evidence-summary"><span>{{ captureEvidenceLabel }}</span><span v-if="learningResult?.transactionSummary">事务 {{ learningResult.transactionSummary.transactionCount }} 个 · {{ learningResult.transactionSummary.operationCount }} 条操作 · {{ learningResult.transactionSummary.status === "completed" ? "已确认" : learningResult.transactionSummary.status === "candidate" ? "候选" : "证据不足" }}</span></div>
+        </div>
+        <div v-if="isPreviewDraft" class="confidence-score"><strong>初稿</strong><span>只读推断 · 未经写入证据校验</span></div>
+        <div v-else-if="learningResult?.registrySaveKey" class="confidence-score"><strong>注册表</strong><span>尚未纳入保护</span></div>
+        <div v-else-if="capturePartial || captureInsufficient" class="confidence-score"><strong>{{ capturePartial ? "待核对" : "证据不足" }}</strong><span>未完成可靠验证</span></div>
+        <div v-else class="confidence-score"><strong>{{ confidenceBand }}</strong><span>识别置信度 · 评分 {{ confidence }}/100</span></div>
+      </section>
       <section v-for="(scope, scopeIndex) in reviewScopes" :key="`${scope.rootPath}-${scopeIndex}`" class="wizard-section scope-editor">
         <header class="scope-heading">
           <div>
@@ -809,14 +861,20 @@ onUnmounted(() => { disposed = true; stopPolling(); });
         <div class="editor-block"><div class="editor-label"><strong>排除模式</strong><span>{{ scope.excludePatterns.length }} 项</span></div><div class="chip-list"><span v-for="(pattern, patternIndex) in scope.excludePatterns" :key="pattern" class="file-chip exclude-chip">{{ pattern }}<button type="button" :aria-label="`删除排除模式 ${pattern}`" title="删除排除模式" @click="removePattern(scopeIndex, patternIndex)"><X :size="13" /></button></span><span v-if="!scope.excludePatterns.length" class="muted-text">暂未添加排除模式</span></div><div class="inline-editor"><input v-model="newPatternByScope[scopeIndex]" type="text" placeholder="输入排除模式，例如 *.log" @keyup.enter="addPattern(scopeIndex)" /><button class="secondary-button" type="button" @click="addPattern(scopeIndex)"><Plus :size="15" />添加排除</button></div></div>
         <p class="scope-note">{{ evidenceForScope(scope).reason }}</p>
       </section>
-      <div v-if="!reviewScopes.length" class="empty-review"><strong>没有自动识别到存档范围</strong><p>可以手动添加一个存档目录，或放弃本次设置稍后重新学习。</p></div>
+      <div v-if="!reviewScopes.length && !learningResult?.registrySaveKey" class="empty-review"><strong>没有自动识别到存档范围</strong><p>可以手动添加存档目录，或暂不保护存档并加入游戏库。</p></div>
       <button class="secondary-button add-scope-button" type="button" @click="addDirectoryScope"><Plus :size="16" />手动添加存档目录</button>
       <div v-if="learningResult?.notes.length" class="notes-panel"><strong>识别说明</strong><p v-for="note in learningResult.notes" :key="note">{{ note }}</p></div>
       <p v-if="error" class="error-message" role="alert">{{ error }}</p>
-      <footer class="wizard-actions"><button class="secondary-button" type="button" :disabled="confirming" @click="abandonPendingGame">放弃添加</button><button v-if="isPreviewDraft || captureInsufficient" class="secondary-button" type="button" :disabled="confirming" title="返回上一步重新开始识别" @click="backToFullLearning"><ArrowLeft :size="16" />{{ isPreviewDraft ? "改回完整识别" : "重新识别" }}</button><button v-if="hasReviewCandidates" class="secondary-button" type="button" :disabled="confirming" @click="beginCandidateVerification"><Gamepad2 :size="17" />再次保存验证</button><button class="primary-button" type="button" :disabled="!canConfirm || confirming" @click="confirm"><LoaderCircle v-if="confirming" :size="17" class="spin" /><Check v-else :size="17" />{{ confirming ? "正在保存" : "确认并加入游戏库" }}</button></footer>
+      <footer class="wizard-actions">
+        <button class="secondary-button" type="button" :disabled="confirming" @click="abandonPendingGame">放弃添加</button>
+        <button v-if="isPreviewDraft || captureInsufficient" class="secondary-button" type="button" :disabled="confirming" title="返回上一步重新开始识别" @click="backToFullLearning"><ArrowLeft :size="16" />{{ isPreviewDraft ? "改回完整识别" : "重新识别" }}</button>
+        <button v-if="hasReviewCandidates" class="secondary-button" type="button" :disabled="confirming" @click="beginCandidateVerification"><Gamepad2 :size="17" />再次保存验证</button>
+        <button :class="canConfirm ? 'secondary-button' : 'primary-button'" type="button" :disabled="isBusy" @click="finishWithoutSaveProtection">暂不保护存档，加入游戏库</button>
+        <button v-if="canConfirm" class="primary-button" type="button" :disabled="confirming" @click="confirm"><LoaderCircle v-if="confirming" :size="17" class="spin" /><Check v-else :size="17" />{{ confirming ? "正在保存" : "确认并加入游戏库" }}</button>
+      </footer>
     </section>
 
-    <div v-else class="wizard-success"><CheckCircle2 :size="34" /><div><h2>{{ completedGame?.displayName }} 已加入游戏库</h2><p>存档保护范围已确认，现在可以从游戏库启动它。</p></div><button class="primary-button" type="button" @click="emit('completed', completedGame!)">返回游戏库</button></div>
+    <div v-else class="wizard-success"><CheckCircle2 :size="34" /><div><h2>{{ completedGame?.displayName }} 已加入游戏库</h2><p>{{ completedGame?.saveProtectionSkipped ? "现在可以从游戏库启动。此游戏未启用 GameSaver 存档保护。" : "存档保护范围已确认，现在可以从游戏库启动它。" }}</p></div><button class="primary-button" type="button" @click="emit('completed', completedGame!)">返回游戏库</button></div>
   </section>
 
   <Teleport to="body">

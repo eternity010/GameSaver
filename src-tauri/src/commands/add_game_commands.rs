@@ -138,6 +138,7 @@ pub fn start_add_game_task(
                     );
                     game.game_uid = game_uid.clone();
                     game.game_key = game_key.clone();
+                    game.mark_body_upload_pending();
                     let copied_message = format!(
                         "游戏已加入，复制 {} 个文件（{} MB），等待存档设置",
                         copy_result.file_count,

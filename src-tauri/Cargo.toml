@@ -1,6 +1,6 @@
 [package]
 name = "gamesaver_next"
-version = "1.0.37"
+version = "1.0.39"
 description = "GameSaver next-generation game library"
 authors = ["GameSaver"]
 edition = "2021"
@@ -27,6 +27,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Diagnostics_Etw",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
+    "Win32_System_Registry",
     "Win32_System_SystemServices",
     "Win32_System_Time",
     "Win32_System_Threading",

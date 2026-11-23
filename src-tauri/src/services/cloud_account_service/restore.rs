@@ -158,6 +158,7 @@ pub(crate) fn merge_profile(
             .find(|item| &item.game_uid == local_uid)
         {
             local.save_profile_id = Some(profile_id);
+            local.save_protection_skipped = false;
         }
     }
     candidate.normalize();

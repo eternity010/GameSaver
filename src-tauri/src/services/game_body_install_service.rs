@@ -176,6 +176,7 @@ impl GameBodyInstallService {
         game.lifecycle = GameLifecycle::Active;
         game.health = GameHealth::NeedsAttention;
         game.cloud_status = CloudStatus::Synced;
+        game.pending_body_upload = None;
         game.launch = LaunchConfig {
             executable_relative_path: catalog.executable_relative_path.clone(),
             arguments: catalog.arguments.clone(),

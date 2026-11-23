@@ -1078,9 +1078,11 @@ mod tests {
                 launch: LaunchConfig::default(),
                 cover: None,
                 save_profile_id: None,
+                save_protection_skipped: false,
                 last_played_at: None,
                 latest_save_version_id: None,
                 added_at: None,
+                pending_body_upload: None,
             });
         }
 
