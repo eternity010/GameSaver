@@ -189,6 +189,12 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--focus-ring)
 .settings-status { margin-left: auto; padding: 6px 9px; border-radius: 5px; color: var(--warning); background: #3a3021; font-size: 12px; white-space: nowrap; }
 .settings-status.connected { color: var(--success); background: #20372e; }
 .settings-form { display: grid; gap: 13px; max-width: 640px; }
+.settings-credential-guide { display: grid; gap: 9px; padding: 14px 16px; border: 1px solid #343b47; border-radius: 6px; background: var(--surface-app); font-size: 13px; }
+.settings-credential-guide > strong { color: var(--text-primary); font-weight: 600; }
+.settings-credential-guide > p { margin: 0; color: var(--text-secondary); line-height: 1.65; overflow-wrap: anywhere; }
+.settings-credential-links { display: flex; flex-wrap: wrap; gap: 10px 20px; }
+.settings-credential-links a[aria-disabled="true"] { opacity: .6; cursor: wait; }
+.settings-credential-guide > .settings-hint-warning { color: var(--warning); }
 .settings-form label, .code-field { display: grid; grid-template-columns: 110px minmax(0, 1fr); align-items: center; gap: 12px; color: var(--text-secondary); font-size: 13px; }
 .settings-form input, .code-field input { min-width: 0; padding: 10px 11px; border: 1px solid #3b4350; border-radius: 5px; color: var(--text-primary); background: #191c22; }
 .settings-form input::placeholder, .code-field input::placeholder { color: #707a8a; }

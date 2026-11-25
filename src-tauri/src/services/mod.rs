@@ -4,6 +4,7 @@ pub mod baidu_netdisk_service;
 pub mod cloud_account_service;
 pub mod cloud_manifest_service;
 pub mod cloud_save_service;
+pub(crate) mod cloud_store_cache;
 pub mod cover_capture_service;
 pub mod disk_space;
 pub mod game_body_install_service;

@@ -80,6 +80,15 @@ impl BaiduAuthService {
         Self::open_authorization_with(app_data_dir, open_in_default_browser)
     }
 
+    pub(crate) fn open_developer_page(page: &str) -> Result<(), String> {
+        let url = match page {
+            "console" => "https://pan.baidu.com/union/console/applist",
+            "docs" => "https://pan.baidu.com/union/doc/%E4%BD%BF%E7%94%A8%E5%85%A5%E9%97%A8/%E5%88%9B%E5%BB%BA%E5%BA%94%E7%94%A8/",
+            _ => return Err("不支持的百度开放平台页面".into()),
+        };
+        open_in_default_browser(url)
+    }
+
     fn open_authorization_with(
         app_data_dir: &Path,
         open: impl FnOnce(&str) -> Result<(), String>,
@@ -211,7 +220,7 @@ fn open_in_default_browser(url: &str) -> Result<(), String> {
     } as isize;
     if result <= 32 {
         return Err(format!(
-            "打开默认浏览器失败（系统错误码 {result}），请检查默认浏览器设置，或复制授权地址手动打开"
+            "打开默认浏览器失败（系统错误码 {result}），请检查默认浏览器设置，或复制页面地址手动打开"
         ));
     }
     Ok(())
@@ -219,7 +228,7 @@ fn open_in_default_browser(url: &str) -> Result<(), String> {
 
 #[cfg(not(target_os = "windows"))]
 fn open_in_default_browser(_: &str) -> Result<(), String> {
-    Err("当前平台暂不支持自动打开授权页面，请复制授权地址手动打开".into())
+    Err("当前平台暂不支持自动打开浏览器，请复制页面地址手动打开".into())
 }
 
 fn now_millis() -> u64 {

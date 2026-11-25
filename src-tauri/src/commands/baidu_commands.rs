@@ -191,8 +191,12 @@ pub async fn list_cloud_games(
     page: Option<usize>,
     page_size: Option<usize>,
     search: Option<String>,
+    force: Option<bool>,
 ) -> Result<CloudGamePage, String> {
-    run_blocking(move || list_cloud_games_blocking(app, page, page_size, search)).await
+    run_blocking(move || {
+        list_cloud_games_blocking(app, page, page_size, search, force.unwrap_or(false))
+    })
+    .await
 }
 
 fn list_cloud_games_blocking(
@@ -200,24 +204,56 @@ fn list_cloud_games_blocking(
     page: Option<usize>,
     page_size: Option<usize>,
     search: Option<String>,
+    force: bool,
 ) -> Result<CloudGamePage, String> {
     let started = std::time::Instant::now();
     let state = app.state::<AppState>();
     let client = load_baidu_client(&app)?;
-    let client_elapsed = started.elapsed();
+    let authorization = client.store_cache_scope()?;
+    let (games, cached, remaining) = state
+        .cloud_store_cache
+        .get_or_load(authorization, force, || read_cloud_store(&app, &state, &client))?;
+    client.store_cache_scope()?;
+    let mut result = CloudGamePage::from_games(
+        games,
+        page.unwrap_or(1),
+        page_size.unwrap_or(9),
+        search.as_deref(),
+    );
+    result.cache_ttl_ms = Some(remaining.as_millis() as u64);
+    let local_games = state
+        .store
+        .lock()
+        .map_err(|_| "读取本地游戏信息失败".to_string())?
+        .games
+        .clone();
+    for summary in &mut result.games {
+        summary.installed = local_games.iter().any(|game| {
+            game.lifecycle == GameLifecycle::Active
+                && game.game_key == summary.game_key
+                && Path::new(&game.managed_path)
+                    .join(&game.launch.executable_relative_path)
+                    .is_file()
+        });
+    }
+    crate::logging::info(format!(
+        "商店分页加载：第 {} / {} 页，{} 个游戏，搜索后 {} 个，完整列表缓存命中 {}，总计 {} ms",
+        result.page, result.total_pages, result.games.len(), result.total_count,
+        cached, started.elapsed().as_millis()
+    ));
+    Ok(result)
+}
+
+fn read_cloud_store(
+    app: &AppHandle,
+    state: &AppState,
+    client: &BaiduNetdiskClient,
+) -> Result<Vec<CloudGameSummary>, String> {
     let root_started = std::time::Instant::now();
-    let page_size = page_size.unwrap_or(9).clamp(1, 50);
     let all_files = match client.list(REMOTE_ROOT) {
         Ok(files) => files,
         Err(error) if error.contains("(-9)") || error.contains("(-8)") => {
-            return Ok(CloudGamePage {
-                games: Vec::new(),
-                page: 1,
-                page_size,
-                total_count: 0,
-                total_pages: 1,
-                has_more: false,
-            });
+            return Ok(Vec::new());
         }
         Err(error) => return Err(error),
     };
@@ -229,7 +265,7 @@ fn list_cloud_games_blocking(
         .clone();
     let local_games = local_store.games;
     let local_body_versions = local_store.body_versions;
-    let base_data_dir = app_data_dir(&app)?;
+    let base_data_dir = app_data_dir(app)?;
     let temporary_root = base_data_dir.join("cloud-manifest-temp");
     let cache_root = base_data_dir.join("cloud-manifest-cache");
 
@@ -253,7 +289,7 @@ fn list_cloud_games_blocking(
         let batch_summaries = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(batch.len());
             for (remote_game_key, directory) in batch.iter().cloned() {
-                let client_ref = &client;
+                let client_ref = client;
                 let temporary_root_ref = &temporary_root;
                 let cache_root_ref = &cache_root;
                 let local_games_ref = &local_games;
@@ -344,11 +380,6 @@ fn list_cloud_games_blocking(
                         else {
                             return Ok(None);
                         };
-                        let installed = local.is_some_and(|game| {
-                            Path::new(&game.managed_path)
-                                .join(&game.launch.executable_relative_path)
-                                .is_file()
-                        });
                         Ok(Some(CloudGameSummary {
                             game_key: remote_game_key.clone(),
                             game_uid: remote_game_uid,
@@ -384,7 +415,7 @@ fn list_cloud_games_blocking(
                             file_count: package.file_count,
                             total_bytes: package.total_bytes,
                             created_at: package.created_at,
-                            installed,
+                            installed: false,
                             versions: packages,
                             has_cover,
                             cover_file,
@@ -403,24 +434,15 @@ fn list_cloud_games_blocking(
         })?;
         summaries.extend(batch_summaries.into_iter().flatten());
     }
-    let valid_count = summaries.len();
-    let result =
-        CloudGamePage::from_games(summaries, page.unwrap_or(1), page_size, search.as_deref());
     crate::logging::info(format!(
-        "商店分页加载：第 {} / {} 页，{} 个游戏，目录 {} 个，有效游戏 {} 个，搜索后 {} 个，客户端准备 {} ms，根目录 {} ms，卡片读取 {} ms，总计 {} ms；封面独立加载",
-        result.page,
-        result.total_pages,
-        result.games.len(),
+        "商店完整列表读取：目录 {} 个，有效游戏 {} 个，根目录 {} ms，卡片读取 {} ms；封面独立加载",
         directories.len(),
-        valid_count,
-        result.total_count,
-        client_elapsed.as_millis(),
+        summaries.len(),
         root_elapsed.as_millis(),
-        cards_started.elapsed().as_millis(),
-        started.elapsed().as_millis()
+        cards_started.elapsed().as_millis()
     ));
 
-    Ok(result)
+    Ok(summaries)
 }
 
 #[tauri::command]

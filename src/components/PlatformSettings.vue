@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { CheckCircle2, CloudDownload, CloudUpload, ExternalLink, FolderOpen, HardDrive, KeyRound, RefreshCw, Save, ShieldCheck, XCircle } from "@lucide/vue";
-import { buildBaiduAuthorizeUrl, confirmAction, exchangeBaiduCode, getBaiduConfig, getBaiduQuota, getBaiduStatus, getCloudAccountStatus, getLibrarySettings, openBaiduAuthorizePage, resumeLibraryMigrationTask, saveBaiduConfig, setBaiduAutoUpload, startDownloadCloudAccountTask, startSetLibraryRootTask, startUploadCloudAccountTask, updateBaiduSaveSyncSettings } from "../api";
+import { buildBaiduAuthorizeUrl, confirmAction, exchangeBaiduCode, getBaiduConfig, getBaiduQuota, getBaiduStatus, getCloudAccountStatus, getLibrarySettings, openBaiduAuthorizePage, openBaiduDeveloperPage, resumeLibraryMigrationTask, saveBaiduConfig, setBaiduAutoUpload, startDownloadCloudAccountTask, startSetLibraryRootTask, startUploadCloudAccountTask, updateBaiduSaveSyncSettings } from "../api";
 import type { AppTask, BaiduConfigView, BaiduQuota, BaiduStatus, CloudAccountStatus, LibrarySettings } from "../api";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useTaskFeed } from "../taskFeed";
@@ -20,6 +20,12 @@ const saving = ref(false);
 const authorizing = ref(false);
 const openingAuthorization = ref(false);
 const browserOpenError = ref("");
+const baiduDeveloperPages = {
+  console: { url: "https://pan.baidu.com/union/console/applist", label: "前往控制台获取凭证" },
+  docs: { url: "https://pan.baidu.com/union/doc/%E4%BD%BF%E7%94%A8%E5%85%A5%E9%97%A8/%E5%88%9B%E5%BB%BA%E5%BA%94%E7%94%A8/", label: "查看应用创建指南" },
+};
+const openingDeveloperPage = ref(false);
+const developerPageError = ref("");
 const error = ref("");
 const message = ref("");
 const library = ref<LibrarySettings | null>(null);
@@ -39,6 +45,19 @@ const libraryTrackingError = computed(() => libraryTaskId.value && accountTaskFe
 let disposed = false;
 let authorizationGeneration = 0;
 let refreshGeneration = 0;
+
+async function openDeveloperPage(page: "console" | "docs") {
+  if (disposed || openingDeveloperPage.value) return;
+  openingDeveloperPage.value = true;
+  developerPageError.value = "";
+  try {
+    await openBaiduDeveloperPage(page);
+  } catch (reason) {
+    if (!disposed) developerPageError.value = `${String(reason)}。可复制此地址到浏览器打开：${baiduDeveloperPages[page].url}`;
+  } finally {
+    if (!disposed) openingDeveloperPage.value = false;
+  }
+}
 
 watch([appKey, secretKey], () => {
   authorizeUrl.value = "";
@@ -398,6 +417,14 @@ onUnmounted(() => {
       <section class="settings-card">
         <div class="settings-card-heading"><div class="settings-card-icon"><KeyRound :size="20" /></div><div><p class="eyebrow">云端服务</p><h2>百度网盘</h2><p>用于上传和下载游戏本体 ZIP。GameSaver 直连百度网盘，不使用代理。</p></div><span class="settings-status" :class="{ connected: status?.authorized && !status.expired && !status.refreshError }">{{ statusLabel() }}</span></div>
         <div class="settings-form">
+          <div class="settings-credential-guide">
+            <strong>还没有 AppKey 和 SecretKey？</strong>
+            <p>登录百度账号，在开放平台控制台创建或选择应用，从应用详情获取这两项凭证。填入下方并保存后，再完成账号授权。</p>
+            <div class="settings-credential-links">
+              <a v-for="(page, key) in baiduDeveloperPages" :key="key" class="settings-link" :href="page.url" target="_blank" rel="noopener noreferrer" :aria-disabled="openingDeveloperPage" @click.prevent="openDeveloperPage(key)"><ExternalLink :size="14" />{{ page.label }}</a>
+            </div>
+            <p v-if="developerPageError" class="settings-hint settings-hint-warning" role="alert">{{ developerPageError }}</p>
+          </div>
           <label><span>AppKey</span><input v-model="appKey" type="text" autocomplete="off" :disabled="saving || authorizing" placeholder="输入百度开放平台 AppKey" /></label>
           <label><span>SecretKey</span><input v-model="secretKey" type="password" autocomplete="new-password" :disabled="saving || authorizing" :placeholder="config?.secretKeyConfigured ? '已保存，如需更换请重新输入' : '输入百度开放平台 SecretKey'" /></label>
           <p class="settings-hint"><ShieldCheck :size="15" />SecretKey 和授权 Token 使用 Windows 本机加密保存，不会写入日志、迁移包或云端。</p>

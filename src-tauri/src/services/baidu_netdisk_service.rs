@@ -358,6 +358,13 @@ impl BaiduNetdiskClient {
         Ok(())
     }
 
+    pub(crate) fn store_cache_scope(&self) -> Result<&str, String> {
+        self.synchronize_authorization()?;
+        self.authorization_revision
+            .as_deref()
+            .ok_or_else(|| AUTHORIZATION_CHANGED.to_string())
+    }
+
     fn synchronize_authorization(&self) -> Result<(), String> {
         let Some(revision) = self.authorization_revision.as_deref() else {
             return Ok(());

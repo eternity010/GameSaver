@@ -1,5 +1,5 @@
 use crate::{
-    domain::{AppStore, AppTask, GameRuntime},
+    domain::{AppStore, AppTask, GameRuntime, TaskCategory, TaskStatus},
     services::save_learning_service::ActiveLearningSession,
 };
 use std::{
@@ -30,11 +30,8 @@ pub struct AppState {
     pub save_operations: Mutex<HashSet<String>>,
     pub library_migration: Mutex<bool>,
     pub cloud_account_sync: Mutex<bool>,
-    /// 是否已由用户确认「游戏运行中仍要退出应用」。
-    ///
-    /// 关闭请求的拦截在 `lib.rs` 的 `on_window_event` 里完成：只要有游戏在
-    /// 运行就 `prevent_close` 并提示。用户确认后由 `confirm_app_exit` 置位
-    /// 此标记，之后的关闭请求直接放行。一旦置位不撤销——它只在退出前一刻设置。
+    pub(crate) cloud_store_cache: crate::services::cloud_store_cache::CloudStoreCache,
+    /// 用户是否已确认在游戏或后台任务未结束时退出。
     exit_confirmed: AtomicBool,
     /// 应用级事件推送器，setup 阶段注入（见 [`EventEmitter`]）。
     ///
@@ -63,6 +60,7 @@ impl AppState {
             save_operations: Mutex::new(HashSet::new()),
             library_migration: Mutex::new(false),
             cloud_account_sync: Mutex::new(false),
+            cloud_store_cache: Default::default(),
             exit_confirmed: AtomicBool::new(false),
             event_emitter: Mutex::new(None),
         }
@@ -519,7 +517,29 @@ impl AppState {
             .unwrap_or_default()
     }
 
-    /// 用户是否已确认「知悉存档风险、仍要退出应用」。
+    pub(crate) fn invalidate_cloud_store(&self, reset: bool) {
+        self.cloud_store_cache.invalidate();
+        self.broadcast(
+            "cloud-store-invalidated",
+            serde_json::json!({ "reset": reset }),
+        );
+    }
+
+    pub fn active_background_task_count(&self) -> usize {
+        let tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
+        tasks
+            .values()
+            .filter(|task| {
+                matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+                    && task
+                        .category
+                        .unwrap_or_else(|| TaskCategory::infer(&task.task_type))
+                        != TaskCategory::Session
+            })
+            .count()
+    }
+
+    /// 用户是否已确认退出风险。
     pub fn exit_confirmed(&self) -> bool {
         self.exit_confirmed.load(Ordering::SeqCst)
     }
@@ -912,7 +932,59 @@ mod tests {
         assert!(state.store.try_lock().is_ok(), "闭包结束后必须释放锁");
     }
 
-    /// 退出拦截的判定完全依赖这两个状态：运行中游戏数量、用户确认标记。
+    #[test]
+    fn exit_guard_counts_only_unfinished_background_tasks() {
+        let state = test_state();
+        assert_eq!(state.active_background_task_count(), 0);
+        for task_type in [
+            "package_game_body",
+            "upload_game_body_package",
+            "download_game_body_package",
+            "sync_cloud_save",
+            "cloud_account_sync",
+            "restore_save_version",
+            "analyze_saves",
+            "launch_game",
+        ] {
+            let mut task: AppTask = serde_json::from_value(serde_json::json!({
+                "taskId": "exit-test",
+                "taskType": task_type,
+                "status": "pending",
+                "progress": 0,
+                "message": "test"
+            }))
+            .unwrap();
+            for category in [None, Some(TaskCategory::infer(task_type))] {
+                task.category = category;
+                for status in [
+                    TaskStatus::Pending,
+                    TaskStatus::Running,
+                    TaskStatus::Success,
+                    TaskStatus::Failed,
+                    TaskStatus::Cancelled,
+                    TaskStatus::Interrupted,
+                ] {
+                    task.status = status.clone();
+                    task.cancel_requested = true;
+                    state
+                        .tasks
+                        .lock()
+                        .unwrap()
+                        .insert(task.task_id.clone(), task.clone());
+                    let expected = usize::from(
+                        task_type != "launch_game"
+                            && matches!(status, TaskStatus::Pending | TaskStatus::Running),
+                    );
+                    assert_eq!(
+                        state.active_background_task_count(),
+                        expected,
+                        "{task_type}: {status:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn exit_guard_tracks_running_games_and_confirmation() {
         let state = test_state();

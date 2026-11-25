@@ -1,4 +1,5 @@
 use crate::{
+    app_state::AppState,
     commands::run_blocking,
     repositories::{BaiduConfigRepository, BaiduConfigView},
     services::baidu_auth_service::BaiduAuthService,
@@ -19,6 +20,7 @@ pub fn save_baidu_config(
 ) -> Result<BaiduConfigView, String> {
     let app_data_dir = app_data_dir(&app)?;
     BaiduAuthService::save_config(&app_data_dir, &app_key, &secret_key)?;
+    app.state::<AppState>().invalidate_cloud_store(true);
     BaiduConfigRepository::view(&app_data_dir)
 }
 
@@ -63,12 +65,22 @@ pub async fn open_baidu_authorize_page(app: AppHandle) -> Result<String, String>
     run_blocking(move || BaiduAuthService::open_authorization_page(&app_data_dir(&app)?)).await
 }
 
+#[tauri::command]
+pub async fn open_baidu_developer_page(page: String) -> Result<(), String> {
+    run_blocking(move || BaiduAuthService::open_developer_page(&page)).await
+}
+
 /// 用授权码换取 token。
 ///
 /// 体内 `Client::builder() … .send()` 是一次 OAuth 往返，必须在阻塞线程池上执行。
 #[tauri::command]
 pub async fn exchange_baidu_code(app: AppHandle, code: String) -> Result<(), String> {
-    run_blocking(move || BaiduAuthService::exchange_code(&app_data_dir(&app)?, &code)).await
+    run_blocking(move || {
+        BaiduAuthService::exchange_code(&app_data_dir(&app)?, &code)?;
+        app.state::<AppState>().invalidate_cloud_store(true);
+        Ok(())
+    })
+    .await
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {

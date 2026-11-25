@@ -35,12 +35,12 @@ pub fn run() {
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .on_window_event(|window, event| {
-            // 只有「用户点击关闭」这一条路径需要拦截。运行中关闭 GameSaver
-            // 会让承载游戏会话的线程随进程消亡，而游戏进程仍活着——本次游玩
-            // 的存档将永远不会被提交。这里把静默失败变成一次显式确认。
             let tauri::WindowEvent::CloseRequested { api, .. } = event else {
                 return;
             };
+            if window.label() != "main" {
+                return;
+            }
             let app = window.app_handle();
             #[cfg(target_os = "windows")]
             if window.label() == "main" {
@@ -54,16 +54,17 @@ pub fn run() {
                 return;
             }
             let running = state.running_game_count();
-            if running == 0 {
+            let active_tasks = state.active_background_task_count();
+            if running == 0 && active_tasks == 0 {
                 return;
             }
             api.prevent_close();
             logging::info(format!(
-                "拦截关闭请求：仍有 {running} 个游戏正在运行，等待用户确认"
+                "拦截关闭请求：{running} 个游戏正在运行，{active_tasks} 项后台任务未结束，等待用户确认"
             ));
             let _ = app.emit(
                 "app-exit-blocked",
-                serde_json::json!({ "runningCount": running }),
+                serde_json::json!({ "runningCount": running, "activeTaskCount": active_tasks }),
             );
         })
         .setup(|app| {
@@ -381,6 +382,7 @@ pub fn run() {
             commands::baidu_config_commands::save_baidu_config,
             commands::baidu_config_commands::build_baidu_authorize_url,
             commands::baidu_config_commands::open_baidu_authorize_page,
+            commands::baidu_config_commands::open_baidu_developer_page,
             commands::baidu_config_commands::exchange_baidu_code,
             commands::baidu_config_commands::set_baidu_auto_upload,
             commands::baidu_commands::get_baidu_quota,

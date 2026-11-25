@@ -59,9 +59,9 @@ const storeTotalPages = ref(1);
 const storeHasMore = ref(false);
 const STORE_PAGE_SIZE = 9;
 const LIBRARY_PAGE_SIZE = 9;
-const storePageCache = new Map<string, { loadedAt: number; page: CloudGamePage }>();
+const storePageCache = new Map<string, { expiresAt: number; page: CloudGamePage }>();
 const storePageRequests = new Map<string, { epoch: number; promise: Promise<CloudGamePage> }>();
-const STORE_CACHE_TTL_MS = 30_000;
+const STORE_CACHE_TTL_MS = 5 * 60_000;
 let storeCacheEpoch = 0;
 /**
  * 游戏库列表的缓存有效期。
@@ -135,6 +135,7 @@ let cloudInstallTimer: ReturnType<typeof setTimeout> | undefined;
 let cloudFeedbackTimer: ReturnType<typeof setTimeout> | undefined;
 let stopCoverCaptureRoute: UnlistenFn | undefined;
 let stopExitGuard: UnlistenFn | undefined;
+let stopStoreInvalidation: UnlistenFn | undefined;
 let appDisposed = false;
 let exitPromptOpen = false;
 let gamesLoadGeneration = 0;
@@ -462,6 +463,22 @@ function invalidateStoreCache() {
   storeLoading.value = false;
 }
 
+function handleStoreInvalidated(payload: { reset?: boolean } | undefined) {
+  if (appDisposed) return;
+  invalidateStoreCache();
+  if (payload?.reset) {
+    cloudGames.value = [];
+    storePage.value = 1;
+    storeTotalCount.value = 0;
+    storeTotalPages.value = 1;
+    storeHasMore.value = false;
+    storeError.value = "";
+    endCloudOperation();
+    clearCloudInstallFeedback();
+  }
+  if (activePage.value === "store") void loadStore(false);
+}
+
 function applyStorePage(result: CloudGamePage) {
   cloudGames.value = result.games;
   storePage.value = result.page;
@@ -479,21 +496,25 @@ async function loadStore(force = false, page = storePage.value, keyword = storeS
   const generation = ++storeLoadGeneration;
   storeError.value = "";
   const cached = storePageCache.get(key);
-  if (cached && Date.now() - cached.loadedAt < STORE_CACHE_TTL_MS) {
+  if (cached && Date.now() < cached.expiresAt) {
     applyStorePage(cached.page);
     storeLoading.value = false;
     return;
   }
   storeLoading.value = true;
   const pending = storePageRequests.get(key);
+  const requestedAt = Date.now();
   const request = pending?.epoch === epoch
     ? pending.promise
-    : listCloudGames(page, STORE_PAGE_SIZE, normalizedKeyword);
+    : listCloudGames(page, STORE_PAGE_SIZE, normalizedKeyword, force);
   storePageRequests.set(key, { epoch, promise: request });
   try {
     const result = await request;
     if (epoch !== storeCacheEpoch || appDisposed) return;
-    storePageCache.set(key, { loadedAt: Date.now(), page: result });
+    storePageCache.set(key, {
+      expiresAt: requestedAt + Math.min(result.cacheTtlMs ?? STORE_CACHE_TTL_MS, STORE_CACHE_TTL_MS),
+      page: result,
+    });
     if (storePageCache.size > 12) {
       const oldestKey = storePageCache.keys().next().value;
       if (oldestKey !== undefined) storePageCache.delete(oldestKey);
@@ -553,23 +574,21 @@ async function restartWithAdmin() {
   }
 }
 
-/**
- * 后端在「有游戏运行中却收到关闭请求」时会拦截关闭，并推送此事件。
- *
- * 这次确认是唯一能阻止「静默丢失本次存档」的关口：用户一旦确认退出，
- * 承载游戏会话的线程随进程消亡，本次游玩的存档不会被提交。
- */
-async function handleExitBlocked(payload: { runningCount?: number } | undefined) {
+async function handleExitBlocked(payload: { runningCount?: number; activeTaskCount?: number } | undefined) {
   if (exitPromptOpen) return;
   exitPromptOpen = true;
   try {
-    const count = payload?.runningCount ?? 1;
-    // 必须 await：confirmAction 返回 Promise，且 Tauri 已经把 window.confirm 换成了
-    // 一个永远 reject 的 async 函数 —— 同步写法会让「有游戏在运行时退出」这道闸门失效。
+    const count = payload?.runningCount ?? 0;
+    const taskCount = payload?.activeTaskCount ?? 0;
+    const warnings: string[] = [];
+    if (count > 0) {
+      warnings.push(`有 ${count} 个游戏正在运行。\n现在关闭 GameSaver，本次游玩的存档将不会被自动提交，也不会生成新的存档版本。`);
+    }
+    if (taskCount > 0) {
+      warnings.push(`有 ${taskCount} 项后台任务尚未完成。\n关闭会中断正在进行的同步、压缩、上传等操作，未完成的任务可能需要重试。`);
+    }
     const confirmed = await confirmAction(
-      `有 ${count} 个游戏正在运行。\n\n` +
-        "现在关闭 GameSaver，本次游玩的存档将不会被自动提交，也不会生成新的存档版本。\n\n" +
-        "仍要关闭吗？",
+      [...warnings, "仍要关闭 GameSaver 吗？"].join("\n\n"),
     );
     if (!confirmed) return;
     await confirmAppExit();
@@ -581,6 +600,14 @@ async function handleExitBlocked(payload: { runningCount?: number } | undefined)
 }
 
 onMounted(() => {
+  void listen<{ reset: boolean }>("cloud-store-invalidated", (event) => {
+    handleStoreInvalidated(event.payload);
+  }).then((unlisten) => {
+    if (appDisposed) unlisten();
+    else stopStoreInvalidation = unlisten;
+  }).catch((reason) => {
+    console.error("监听商店缓存变更失败", reason);
+  });
   void loadGames().finally(scheduleLibraryRefreshCheck);
   void loadElevationStatus();
   void listen<{ captureId: string; gameUid: string }>("cover-capture-ready", async (event) => {
@@ -605,7 +632,7 @@ onMounted(() => {
   }).catch((reason) => {
     console.error("监听封面截图跳转事件失败", reason);
   });
-  void listen<{ runningCount: number }>("app-exit-blocked", (event) => {
+  void listen<{ runningCount: number; activeTaskCount: number }>("app-exit-blocked", (event) => {
     void handleExitBlocked(event.payload);
   }).then((unlisten) => {
     if (appDisposed) unlisten();
@@ -619,6 +646,7 @@ onUnmounted(() => {
   clearCloudInstallFeedback();
   stopCoverCaptureRoute?.();
   stopExitGuard?.();
+  stopStoreInvalidation?.();
   taskFeed.release();
   endCloudOperation();
   if (storeSearchTimer) clearTimeout(storeSearchTimer);
@@ -643,9 +671,8 @@ function leaveAddGame() {
 }
 
 function openStore() {
-  const fromSettings = activePage.value === "settings";
   activePage.value = "store";
-  void loadStore(fromSettings);
+  void loadStore(false);
 }
 
 function findGameInStore(game: Game) {

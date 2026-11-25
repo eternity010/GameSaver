@@ -130,6 +130,7 @@ impl TaskService {
         error: Option<String>,
     ) {
         let message = message.into();
+        let mut cloud_store_changed = false;
         if matches!(&status, TaskStatus::Failed) {
             crate::logging::error(format!(
                 "后台任务失败：task_id={task_id} message={} error={}",
@@ -139,6 +140,12 @@ impl TaskService {
         }
         let updated = if let Ok(mut tasks) = state.tasks.lock() {
             if let Some(task) = tasks.get_mut(task_id) {
+                cloud_store_changed = matches!(
+                    task.task_type.as_str(),
+                    "upload_game_body_package"
+                        | "delete_remote_body_package"
+                        | "repair_cloud_body_manifest"
+                );
                 task.status = status;
                 task.progress = if matches!(task.status, TaskStatus::Failed | TaskStatus::Cancelled)
                     && progress >= 100
@@ -159,6 +166,9 @@ impl TaskService {
             false
         };
         if updated {
+            if cloud_store_changed {
+                state.invalidate_cloud_store(false);
+            }
             notify_changed(state, task_id, "finished");
         }
     }
@@ -719,8 +729,34 @@ mod tests {
         );
     }
 
-    /// 分类是前端分流任务的唯一依据，创建时必须落盘——否则前端拿到 `null`，
-    /// 任务会静默落到「不展示」分支。
+    #[test]
+    fn remote_body_task_completion_invalidates_store_cache_even_after_partial_failure() {
+        let dir = temp_root();
+        let state = test_state(&dir);
+        for operation in [
+            "upload_game_body_package",
+            "delete_remote_body_package",
+            "repair_cloud_body_manifest",
+        ] {
+            for status in [TaskStatus::Success, TaskStatus::Failed, TaskStatus::Cancelled] {
+                state
+                    .cloud_store_cache
+                    .get_or_load("account", false, || Ok(Vec::new()))
+                    .unwrap();
+                let task_id = TaskService::create(
+                    &state, operation, TaskCategory::BodyTransfer, None, "test",
+                )
+                .unwrap();
+                TaskService::finish(&state, &task_id, status, 100, "done", None, None);
+                let (_, cached, _) = state
+                    .cloud_store_cache
+                    .get_or_load("account", false, || Ok(Vec::new()))
+                    .unwrap();
+                assert!(!cached, "{operation}");
+            }
+        }
+    }
+
     #[test]
     fn created_tasks_carry_their_category_on_disk() {
         let dir = temp_root();

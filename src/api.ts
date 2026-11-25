@@ -568,6 +568,10 @@ export function openBaiduAuthorizePage(): Promise<string> {
   return invokeCommand<string>("open_baidu_authorize_page");
 }
 
+export function openBaiduDeveloperPage(page: "console" | "docs"): Promise<void> {
+  return invokeCommand<void>("open_baidu_developer_page", { page });
+}
+
 export function exchangeBaiduCode(code: string): Promise<void> {
   return invokeCommand<void>("exchange_baidu_code", { code });
 }
@@ -601,13 +605,15 @@ export interface CloudGamePage {
   totalCount: number;
   totalPages: number;
   hasMore: boolean;
+  cacheTtlMs?: number;
 }
 
-export function listCloudGames(page = 1, pageSize = 9, search?: string): Promise<CloudGamePage> {
+export function listCloudGames(page = 1, pageSize = 9, search?: string, force = false): Promise<CloudGamePage> {
   return invokeCommand<CloudGamePage>("list_cloud_games", {
     page,
     pageSize,
     search: search?.trim() || undefined,
+    force,
   });
 }
 

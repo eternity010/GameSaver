@@ -114,6 +114,7 @@ pub struct CloudGamePage {
     pub total_count: usize,
     pub total_pages: usize,
     pub has_more: bool,
+    pub cache_ttl_ms: Option<u64>,
 }
 
 impl CloudGamePage {
@@ -148,6 +149,7 @@ impl CloudGamePage {
             total_count,
             total_pages,
             has_more: page < total_pages,
+            cache_ttl_ms: None,
         }
     }
 }
@@ -1095,6 +1097,32 @@ mod tests {
             has_cover: false,
             cover_file: None,
         }
+    }
+
+    #[test]
+    fn store_cached_list_supports_other_pages_and_searches_without_reloading() {
+        let cache = crate::services::cloud_store_cache::CloudStoreCache::default();
+        let (games, _, _) = cache
+            .get_or_load("account", false, || {
+                Ok((0..20)
+                    .map(|index| store_game(index, &format!("Game {index:02}")))
+                    .collect())
+            })
+            .unwrap();
+        let mut first = super::CloudGamePage::from_games(games, 1, 9, None);
+        assert_eq!(first.total_count, 20);
+        first.games[0].installed = true;
+        first.games[0].display_name = "changed projection".into();
+        let (games, cached, _) = cache
+            .get_or_load("account", false, || panic!("must reuse complete list"))
+            .unwrap();
+        assert!(cached);
+        let second = super::CloudGamePage::from_games(games.clone(), 2, 9, None);
+        assert_eq!(second.games.len(), 9);
+        assert_eq!(second.games[0].game_key, "game-09");
+        let search = super::CloudGamePage::from_games(games, 1, 9, Some("Game 00"));
+        assert_eq!(search.total_count, 1);
+        assert!(!search.games[0].installed);
     }
 
     #[test]

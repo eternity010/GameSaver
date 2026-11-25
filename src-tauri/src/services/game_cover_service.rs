@@ -261,6 +261,7 @@ fn maybe_sync_cover_to_cloud_async(app: AppHandle, game_key: String, display_byt
                 ) {
                     crate::logging::error(format!("封面已保存在本地，但云端同步失败：{error}"));
                 }
+                app.state::<AppState>().invalidate_cloud_store(false);
             })
         });
     if let Err(error) = spawn {

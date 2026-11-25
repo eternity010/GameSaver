@@ -109,6 +109,7 @@ fn maybe_sync_catalog_to_cloud_async(app: AppHandle, game: crate::domain::Game) 
             &catalog,
             &temporary_root,
         );
+        app.state::<AppState>().invalidate_cloud_store(false);
         if let Some(remote_catalog) = remote_files.iter().find(|file| {
             file.path == crate::services::CloudManifestService::catalog_path(&remote_dir)
         }) {

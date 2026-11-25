@@ -535,6 +535,117 @@ async function optionalSaveProtectionChecks() {
   });
 }
 
+async function storeCacheChecks() {
+  await check("store pages remain cached beyond thirty seconds and expire after five minutes", async () => {
+    let now = 1_000_000;
+    let requests = 0;
+    const app = load("src/App.vue", ["loadStore"], {
+      Date: { now: () => now },
+      listCloudGames: async () => { requests++; return { ...emptyPage, cacheTtlMs: 300000 }; },
+    });
+    await app.loadStore(false, 1, "");
+    now += 60000;
+    await app.loadStore(false, 1, "");
+    assert.equal(requests, 1);
+    now += 240001;
+    await app.loadStore(false, 1, "");
+    assert.equal(requests, 2);
+    app.dispose();
+  });
+  await check("store page caching preserves the remaining backend lifetime", async () => {
+    let now = 1_000_000;
+    let requests = 0;
+    const app = load("src/App.vue", ["loadStore"], {
+      Date: { now: () => now },
+      listCloudGames: async () => { requests++; return { ...emptyPage, cacheTtlMs: 1000 }; },
+    });
+    await app.loadStore(false, 1, "");
+    now += 1001;
+    await app.loadStore(false, 1, "");
+    assert.equal(requests, 2);
+    app.dispose();
+  });
+  await check("returning from settings reuses the store cache until authorization actually changes", async () => {
+    const requests = [];
+    const app = load("src/App.vue", ["loadStore", "openStore", "activePage"], {
+      listCloudGames: async (_, __, ___, force) => { requests.push(force); return emptyPage; },
+    });
+    await app.loadStore(false, 1, "");
+    app.activePage.value = "settings";
+    app.openStore();
+    await flush();
+    assert.deepEqual(requests, [false]);
+    app.dispose();
+  });
+  await check("manual store refresh bypasses both page and backend caches", async () => {
+    const requests = [];
+    const app = load("src/App.vue", ["loadStore"], {
+      listCloudGames: async (_, __, ___, force) => { requests.push(force); return emptyPage; },
+    });
+    await app.loadStore(false, 1, "");
+    await app.loadStore(false, 1, "");
+    await app.loadStore(true, 1, "");
+    assert.deepEqual(requests, [false, true]);
+    app.dispose();
+  });
+  await check("account invalidation clears visible store data and rejects old pending responses", async () => {
+    const response = deferred();
+    let requests = 0;
+    const oldPage = { ...emptyPage, games: [{ gameKey: "old-account" }], totalCount: 1 };
+    const app = load("src/App.vue", ["loadStore", "handleStoreInvalidated", "cloudGames", "storeTotalCount"], {
+      listCloudGames: async () => ++requests === 1 ? oldPage : response.promise,
+    });
+    await app.loadStore(false, 1, "");
+    assert.equal(app.cloudGames.value.length, 1);
+    const pending = app.loadStore(true, 1, "");
+    app.handleStoreInvalidated({ reset: true });
+    assert.equal(app.cloudGames.value.length, 0);
+    assert.equal(app.storeTotalCount.value, 0);
+    response.resolve(oldPage);
+    await pending;
+    assert.equal(app.cloudGames.value.length, 0);
+    app.dispose();
+  });
+}
+
+async function exitGuardChecks() {
+  await check("exit prompt describes active tasks and cancelling keeps the application open", async () => {
+    const messages = [];
+    let exits = 0;
+    const app = load("src/App.vue", ["handleExitBlocked"], {
+      confirmAction: async message => { messages.push(message); return false; },
+      confirmAppExit: async () => { exits++; },
+    });
+    await app.handleExitBlocked({ runningCount: 0, activeTaskCount: 2 });
+    assert.match(messages[0], /2 项后台任务/);
+    assert.doesNotMatch(messages[0], /个游戏正在运行/);
+    assert.equal(exits, 0);
+    app.dispose();
+  });
+  await check("exit prompt combines games and tasks and ignores repeated close requests", async () => {
+    const decision = deferred();
+    let prompts = 0;
+    let exits = 0;
+    const app = load("src/App.vue", ["handleExitBlocked"], {
+      confirmAction: message => {
+        prompts++;
+        assert.match(message, /1 个游戏正在运行/);
+        assert.match(message, /3 项后台任务/);
+        return decision.promise;
+      },
+      confirmAppExit: async () => { exits++; },
+    });
+    const closing = app.handleExitBlocked({ runningCount: 1, activeTaskCount: 3 });
+    await app.handleExitBlocked({ runningCount: 1, activeTaskCount: 3 });
+    assert.equal(prompts, 1);
+    assert.equal(exits, 0);
+    decision.resolve(true);
+    await closing;
+    assert.equal(exits, 1);
+    app.dispose();
+  });
+}
+
 const watchdog = setTimeout(() => { console.error("State regression timed out"); process.exit(1); }, 15000);
 (async () => {
   await taskFeedChecks();
@@ -543,5 +654,7 @@ const watchdog = setTimeout(() => { console.error("State regression timed out");
   await navigationChecks();
   await searchAndPaginationChecks();
   await optionalSaveProtectionChecks();
+  await exitGuardChecks();
+  await storeCacheChecks();
   console.log(JSON.stringify({ passed: passed.length, tests: passed }));
 })().catch(error => { console.error(error); process.exitCode = 1; }).finally(() => clearTimeout(watchdog));

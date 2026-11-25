@@ -255,6 +255,20 @@ impl SaveRepository {
         Self::apply_restore(app, plan, &protection, on_progress)
     }
 
+    #[cfg(test)]
+    pub(crate) fn restore_new_machine_fixture(
+        objects_root: &Path,
+        journal_directory: &Path,
+        game: &Game,
+        profile: &SaveProfile,
+        version: &SaveVersion,
+        current_backup: Option<&SaveVersion>,
+    ) -> Result<RestoreReceipt, String> {
+        let plan = Self::plan_restore_with_history(game, profile, version, &KnownSavePaths::new())?;
+        let protection = RestoreProtection::from_version(game, profile, current_backup);
+        Self::restore_plan(objects_root, journal_directory, plan, &protection, |_, _| {})
+    }
+
     fn apply_restore(
         app: &AppHandle,
         plan: RestorePlan,
@@ -1728,12 +1742,14 @@ pub(crate) fn scope_root(game: &Game, scope: &SaveScope) -> PathBuf {
 fn can_create_missing_restore_root(root_type: SaveRootType) -> bool {
     matches!(
         root_type,
-        SaveRootType::AppData
+        SaveRootType::ManagedGame
+            | SaveRootType::AppData
             | SaveRootType::LocalAppData
             | SaveRootType::LocalLow
             | SaveRootType::Documents
             | SaveRootType::SavedGames
             | SaveRootType::UserProfile
+            | SaveRootType::ProgramData
     )
 }
 

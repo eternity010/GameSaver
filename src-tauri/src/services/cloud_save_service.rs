@@ -20,6 +20,8 @@ use uuid::Uuid;
 use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
 mod manifest;
+#[cfg(test)]
+mod new_machine_tests;
 
 const MANIFEST_VERSION: u32 = 1;
 const REMOTE_SAVES_ROOT: &str = "/apps/GameSaver/saves";
