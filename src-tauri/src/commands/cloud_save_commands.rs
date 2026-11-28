@@ -144,39 +144,49 @@ pub fn start_upload_save_version_task(
         &game.game_uid,
     )?;
     let task_id_for_thread = task_id.clone();
+    let task_id_for_finish = task_id.clone();
     let app_for_thread = app.clone();
-    // 交接给工作线程：`disarm` 之后守卫不再释放，由线程在结束时释放这把 key。
+    let app_for_finish = app.clone();
+    let success_message = format!("【{}】游戏存档已成功同步至百度网盘", game.display_name);
+    let failed_prefix = format!("【{}】游戏存档云端同步失败", game.display_name);
+    let retry = TaskRetry {
+        operation: "sync_cloud_save".to_string(),
+        game_uid: game.game_uid.clone(),
+        game_key: None,
+        version_id: Some(version.version_id.clone()),
+        remote_path: None,
+        remote_fs_id: None,
+    };
     let claim_key = claim.disarm();
-
-    std::thread::spawn(move || {
-        let result = upload_save_worker(
-            &app_for_thread,
-            &task_id_for_thread,
-            &game,
-            &profile,
-            &version,
-            keep_limit,
-        );
-        // 释放必须早于 `finish_sync`：任务状态一旦推送成功，前端就可能立刻发起下一次
-        // 同步，此刻若 key 还没释放，用户会莫名收到「已有同步任务正在进行」。
-        let state = app_for_thread.state::<AppState>();
-        state.release_operation(&claim_key);
-        finish_sync(
-            &state,
-            &task_id_for_thread,
-            result,
-            &format!("【{}】游戏存档已成功同步至百度网盘", game.display_name),
-            &format!("【{}】游戏存档云端同步失败", game.display_name),
-            TaskRetry {
-                operation: "sync_cloud_save".to_string(),
-                game_uid: game.game_uid.clone(),
-                game_key: None,
-                version_id: Some(version.version_id.clone()),
-                remote_path: None,
-                remote_fs_id: None,
-            },
-        );
-    });
+    spawn_sync_worker(
+        move || {
+            upload_save_worker(
+                &app_for_thread,
+                &task_id_for_thread,
+                &game,
+                &profile,
+                &version,
+                keep_limit,
+            )
+        },
+        move |result| {
+            finish_sync(
+                &app_for_finish.state::<AppState>(),
+                &task_id_for_finish,
+                &claim_key,
+                result,
+                &success_message,
+                &failed_prefix,
+                retry.clone(),
+            )
+        },
+        |job| {
+            std::thread::Builder::new()
+                .name("cloud-save-upload".into())
+                .spawn(job)
+                .map(|_| ())
+        },
+    )?;
 
     Ok(task_id)
 }
@@ -245,37 +255,48 @@ fn start_restore_cloud_save_task_blocking(
         &game_uid,
     )?;
     let task_id_for_thread = task_id.clone();
+    let task_id_for_finish = task_id.clone();
     let app_for_thread = app.clone();
-    // 交接给工作线程：`disarm` 之后守卫不再释放，由线程在结束时释放这把 key。
+    let app_for_finish = app.clone();
+    let success_message = format!("【{}】云端存档已成功还原至本地", game.display_name);
+    let failed_prefix = format!("【{}】云端存档还原失败", game.display_name);
+    let retry = TaskRetry {
+        operation: "restore_cloud_save".to_string(),
+        game_uid: game.game_uid.clone(),
+        game_key: None,
+        version_id: Some(remote_version.version_id.clone()),
+        remote_path: None,
+        remote_fs_id: None,
+    };
     let claim_key = claim.disarm();
-
-    std::thread::spawn(move || {
-        let result = restore_save_worker(
-            &app_for_thread,
-            &task_id_for_thread,
-            &game,
-            &profile,
-            &remote_version,
-        );
-        // 同上传：先放掉 key 再推送任务状态，别让紧随其后的操作被自己的 key 挡住。
-        let state = app_for_thread.state::<AppState>();
-        state.release_operation(&claim_key);
-        finish_sync(
-            &state,
-            &task_id_for_thread,
-            result,
-            &format!("【{}】云端存档已成功还原至本地", game.display_name),
-            &format!("【{}】云端存档还原失败", game.display_name),
-            TaskRetry {
-                operation: "restore_cloud_save".to_string(),
-                game_uid: game.game_uid.clone(),
-                game_key: None,
-                version_id: Some(remote_version.version_id.clone()),
-                remote_path: None,
-                remote_fs_id: None,
-            },
-        );
-    });
+    spawn_sync_worker(
+        move || {
+            restore_save_worker(
+                &app_for_thread,
+                &task_id_for_thread,
+                &game,
+                &profile,
+                &remote_version,
+            )
+        },
+        move |result| {
+            finish_sync(
+                &app_for_finish.state::<AppState>(),
+                &task_id_for_finish,
+                &claim_key,
+                result,
+                &success_message,
+                &failed_prefix,
+                retry.clone(),
+            )
+        },
+        |job| {
+            std::thread::Builder::new()
+                .name("cloud-save-restore".into())
+                .spawn(job)
+                .map(|_| ())
+        },
+    )?;
 
     Ok(task_id)
 }
@@ -399,6 +420,14 @@ fn restore_save_worker(
     Ok(())
 }
 
+fn spawn_sync_worker(
+    worker: impl FnOnce() -> Result<(), String> + Send + 'static,
+    finish: impl Fn(Result<(), String>) + Send + Sync + 'static,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) -> Result<(), String> {
+    TaskService::spawn_worker("云端存档任务", worker, finish, spawn)
+}
+
 fn begin_sync(
     state: &AppState,
     task_type: &str,
@@ -424,11 +453,13 @@ fn begin_sync(
 fn finish_sync(
     state: &AppState,
     task_id: &str,
+    claim_key: &str,
     result: Result<(), String>,
     success_message: &str,
     failed_prefix: &str,
     retry: TaskRetry,
 ) {
+    state.release_operation(claim_key);
     match result {
         Ok(_) => {
             // 必须用 finish 而不是 update：update 只改内存、不落盘，任务终态和 error
@@ -494,7 +525,7 @@ fn load_baidu_client(app: &AppHandle) -> Result<BaiduNetdiskClient, String> {
 /// 这是**有意不做**，不是遗漏。
 #[cfg(test)]
 mod tests {
-    use super::{begin_sync, finish_sync};
+    use super::{begin_sync, finish_sync, spawn_sync_worker};
     use crate::{
         app_state::AppState,
         domain::{AppStore, TaskCategory, TaskRetry, TaskStatus},
@@ -523,6 +554,306 @@ mod tests {
         }
     }
 
+    fn dispatch_for_test(
+        state: std::sync::Arc<AppState>,
+        restore: bool,
+        worker: impl FnOnce() -> Result<(), String> + Send + 'static,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    ) -> (String, Result<(), String>) {
+        let claim = if restore {
+            crate::app_state::CloudOperationClaim::claim_restore(&state, "game-1")
+        } else {
+            crate::app_state::CloudOperationClaim::claim(&state, "game-1")
+        }
+        .unwrap();
+        let mut retry = retry();
+        if restore {
+            retry.operation = "restore_cloud_save".into();
+        }
+        let id = begin_sync(&state, &retry.operation, "prepare", "game-1").unwrap();
+        let key = claim.disarm();
+        let completed_id = id.clone();
+        let completed_state = state.clone();
+        let result = spawn_sync_worker(
+            worker,
+            move |result| {
+                finish_sync(
+                    &completed_state,
+                    &completed_id,
+                    &key,
+                    result,
+                    "done",
+                    "failed",
+                    retry.clone(),
+                );
+            },
+            spawn,
+        );
+        (id, result)
+    }
+
+    fn spawn_and_join(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+        std::thread::Builder::new().spawn(job)?.join().unwrap();
+        Ok(())
+    }
+
+    fn assert_completed_worker(restore: bool, result: Result<(), String>, expected: TaskStatus) {
+        let dir = TempWorkspace::new("cloud-save-worker");
+        let state = std::sync::Arc::new(test_state(&dir));
+        let other_key = state.claim_cloud_operation("game-2").unwrap();
+        let (id, started) =
+            dispatch_for_test(state.clone(), restore, move || result, spawn_and_join);
+        started.unwrap();
+        let task = TaskService::get(&state, &id).unwrap();
+        assert_eq!(task.status, expected);
+        assert_eq!(
+            task.progress,
+            if expected == TaskStatus::Success {
+                100
+            } else {
+                0
+            }
+        );
+        assert_eq!(task.retry.is_some(), expected != TaskStatus::Success);
+        assert_eq!(task.error.is_some(), expected == TaskStatus::Failed);
+        if let Some(retry) = &task.retry {
+            assert_eq!(
+                retry.operation,
+                if restore {
+                    "restore_cloud_save"
+                } else {
+                    "sync_cloud_save"
+                }
+            );
+        }
+        let persisted = TaskRepository::load(&state.tasks_path).unwrap();
+        assert_eq!(persisted[&id].status, expected);
+        assert_eq!(persisted[&id].error, task.error);
+        assert_eq!(
+            serde_json::to_value(&persisted[&id].retry).unwrap(),
+            serde_json::to_value(&task.retry).unwrap()
+        );
+        assert_eq!(
+            *state.save_operations.lock().unwrap(),
+            std::collections::HashSet::from([other_key.clone()])
+        );
+        state.release_operation(&other_key);
+        let next = crate::app_state::CloudOperationClaim::claim_restore(&state, "game-1").unwrap();
+        drop(next);
+    }
+
+    #[test]
+    fn upload_worker_success_persists_and_releases_only_its_claim() {
+        assert_completed_worker(false, Ok(()), TaskStatus::Success);
+    }
+
+    #[test]
+    fn restore_worker_success_persists_and_releases_only_its_claim() {
+        assert_completed_worker(true, Ok(()), TaskStatus::Success);
+    }
+
+    #[test]
+    fn upload_worker_early_error_is_retryable_and_releases_claim() {
+        assert_completed_worker(
+            false,
+            Err("credentials unavailable".into()),
+            TaskStatus::Failed,
+        );
+    }
+
+    #[test]
+    fn restore_worker_early_error_is_retryable_and_releases_claim() {
+        assert_completed_worker(true, Err("archive unavailable".into()), TaskStatus::Failed);
+    }
+
+    #[test]
+    fn upload_worker_cancel_is_persisted_without_an_error() {
+        assert_completed_worker(false, Err("任务已取消".into()), TaskStatus::Cancelled);
+    }
+
+    #[test]
+    fn restore_worker_cancel_is_persisted_without_an_error() {
+        assert_completed_worker(true, Err("任务已取消".into()), TaskStatus::Cancelled);
+    }
+
+    fn assert_spawn_failure(restore: bool) {
+        let dir = TempWorkspace::new("cloud-save-spawn-failure");
+        let state = std::sync::Arc::new(test_state(&dir));
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_ran = ran.clone();
+        let (id, result) = dispatch_for_test(
+            state.clone(),
+            restore,
+            move || {
+                worker_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            |_| Err(std::io::Error::other("injected spawn failure")),
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("injected spawn failure"));
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(state.save_operations.lock().unwrap().is_empty());
+        let loaded = TaskRepository::load(&state.tasks_path).unwrap();
+        assert_eq!(loaded[&id].status, TaskStatus::Failed);
+        assert_eq!(loaded[&id].error.as_deref(), Some(error.as_str()));
+        assert_eq!(
+            loaded[&id].retry.as_ref().unwrap().operation,
+            if restore {
+                "restore_cloud_save"
+            } else {
+                "sync_cloud_save"
+            }
+        );
+        let next = crate::app_state::CloudOperationClaim::claim_restore(&state, "game-1").unwrap();
+        drop(next);
+    }
+
+    #[test]
+    fn upload_thread_start_failure_is_reported_and_releases_claim() {
+        assert_spawn_failure(false);
+    }
+
+    #[test]
+    fn restore_thread_start_failure_is_reported_and_releases_claim() {
+        assert_spawn_failure(true);
+    }
+
+    #[test]
+    fn worker_keeps_claim_until_completion_and_preserves_failure_progress() {
+        for restore in [false, true] {
+            let dir = TempWorkspace::new("cloud-save-worker-handoff");
+            let state = std::sync::Arc::new(test_state(&dir));
+            let worker_state = state.clone();
+            let (ready_send, ready_receive) = std::sync::mpsc::channel();
+            let (resume_send, resume_receive) = std::sync::mpsc::channel();
+            let mut handle = None;
+            let (id, started) = dispatch_for_test(
+                state.clone(),
+                restore,
+                move || {
+                    let id = worker_state
+                        .tasks
+                        .lock()
+                        .unwrap()
+                        .keys()
+                        .next()
+                        .unwrap()
+                        .clone();
+                    TaskService::update(
+                        &worker_state,
+                        &id,
+                        TaskStatus::Running,
+                        43,
+                        "working",
+                        None,
+                    );
+                    ready_send.send(()).unwrap();
+                    resume_receive
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .map_err(|error| error.to_string())?;
+                    Err("worker interrupted".into())
+                },
+                |job| {
+                    handle = Some(std::thread::Builder::new().spawn(job)?);
+                    Ok(())
+                },
+            );
+            started.unwrap();
+            ready_receive
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let duplicate_rejected =
+                crate::app_state::CloudOperationClaim::claim(&state, "game-1").is_err();
+            let running = TaskService::get(&state, &id).unwrap();
+            resume_send.send(()).unwrap();
+            handle.unwrap().join().unwrap();
+            assert!(duplicate_rejected);
+            assert_eq!(running.status, TaskStatus::Running);
+            assert_eq!(running.progress, 43);
+            assert!(state.save_operations.lock().unwrap().is_empty());
+            let loaded = TaskRepository::load(&state.tasks_path).unwrap();
+            assert_eq!(loaded[&id].status, TaskStatus::Failed);
+            assert_eq!(loaded[&id].progress, 43);
+        }
+    }
+
+    #[test]
+    fn completion_releases_claim_before_the_frontend_can_react_to_finished_event() {
+        for restore in [false, true] {
+            let dir = TempWorkspace::new("cloud-save-completion-order");
+            let state = std::sync::Arc::new(test_state(&dir));
+            let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = observed.clone();
+            let weak_state = std::sync::Arc::downgrade(&state);
+            state.attach_event_emitter(Box::new(move |_, payload| {
+                if payload["kind"] == "finished" {
+                    let state = weak_state.upgrade().unwrap();
+                    let next =
+                        crate::app_state::CloudOperationClaim::claim_restore(&state, "game-1");
+                    captured.lock().unwrap().push(next.is_ok());
+                }
+            }));
+            let (_, started) = dispatch_for_test(
+                state,
+                restore,
+                || Err("worker failed".into()),
+                spawn_and_join,
+            );
+            started.unwrap();
+            assert_eq!(*observed.lock().unwrap(), vec![true]);
+        }
+    }
+
+    #[test]
+    fn each_worker_outcome_invokes_completion_exactly_once() {
+        for outcome in [Ok(()), Err("failed".into()), Err("任务已取消".into())] {
+            let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let captured = count.clone();
+            spawn_sync_worker(
+                move || outcome,
+                move |_| {
+                    captured.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+                spawn_and_join,
+            )
+            .unwrap();
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = count.clone();
+        assert!(spawn_sync_worker(
+            || Ok(()),
+            move |_| {
+                captured.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+            |_| Err(std::io::Error::other("injected spawn failure"))
+        )
+        .is_err());
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn unwinding_worker_panic_marks_failure_and_releases_claim() {
+        for restore in [false, true] {
+            let dir = TempWorkspace::new("cloud-save-worker-panic");
+            let state = std::sync::Arc::new(test_state(&dir));
+            let (id, started) = dispatch_for_test(
+                state.clone(),
+                restore,
+                || panic!("injected worker panic"),
+                spawn_and_join,
+            );
+            started.unwrap();
+            assert!(state.save_operations.lock().unwrap().is_empty());
+            let loaded = TaskRepository::load(&state.tasks_path).unwrap();
+            assert_eq!(loaded[&id].status, TaskStatus::Failed);
+            assert!(loaded[&id].error.as_deref().unwrap().contains("内部错误"));
+            assert!(loaded[&id].retry.is_some());
+        }
+    }
+
     /// `begin_sync` 建出的任务必须带「云端存档同步」分类。
     ///
     /// 分类不是装饰：它决定任务是否进传输中心、能否取消、是否计入角标（见
@@ -533,7 +864,8 @@ mod tests {
         let state = test_state(&dir);
 
         for task_type in ["sync_cloud_save", "restore_cloud_save"] {
-            let task_id = begin_sync(&state, task_type, "云端存档", "game-1").expect("创建同步任务");
+            let task_id =
+                begin_sync(&state, task_type, "云端存档", "game-1").expect("创建同步任务");
             let task = TaskService::get(&state, &task_id).expect("任务应当存在");
 
             assert_eq!(task.task_type, task_type);
@@ -554,12 +886,13 @@ mod tests {
     fn finish_sync_records_success_and_persists_it() {
         let dir = TempWorkspace::new("cloud-save-commands");
         let state = test_state(&dir);
-        let task_id = begin_sync(&state, "sync_cloud_save", "上传存档", "game-1")
-            .expect("创建同步任务");
+        let task_id =
+            begin_sync(&state, "sync_cloud_save", "上传存档", "game-1").expect("创建同步任务");
 
         finish_sync(
             &state,
             &task_id,
+            "",
             Ok(()),
             "【样例】游戏存档已成功同步至百度网盘",
             "【样例】游戏存档云端同步失败",
@@ -586,12 +919,13 @@ mod tests {
     fn finish_sync_records_failure_with_prefix_and_retry() {
         let dir = TempWorkspace::new("cloud-save-commands");
         let state = test_state(&dir);
-        let task_id = begin_sync(&state, "sync_cloud_save", "上传存档", "game-1")
-            .expect("创建同步任务");
+        let task_id =
+            begin_sync(&state, "sync_cloud_save", "上传存档", "game-1").expect("创建同步任务");
 
         finish_sync(
             &state,
             &task_id,
+            "",
             Err("token 已失效".to_string()),
             "【样例】游戏存档已成功同步至百度网盘",
             "【样例】游戏存档云端同步失败",
@@ -617,6 +951,7 @@ mod tests {
         finish_sync(
             &state,
             &task_id,
+            "",
             Err("任务已取消".into()),
             "done",
             "failed",

@@ -82,7 +82,7 @@ fn trim(tasks: &mut HashMap<String, AppTask>) {
         .filter(|task| !matches!(task.status, TaskStatus::Pending | TaskStatus::Running))
         .map(|task| (task.created_at.clone(), task.task_id.clone()))
         .collect::<Vec<_>>();
-    finished.sort_by(|left, right| right.0.cmp(&left.0));
+    finished.sort_by(|left, right| compare_created_at(&right.0, &left.0));
     for (_, task_id) in finished.into_iter().skip(MAX_TASKS) {
         tasks.remove(&task_id);
     }
@@ -126,6 +126,132 @@ mod tests {
     /// 不建父目录），后者在 `assert!` 失败时执行不到，于是 `%TEMP%` 下攒下残留。
     fn temp_root() -> crate::test_support::TempWorkspace {
         crate::test_support::TempWorkspace::new("task-repository")
+    }
+
+    #[test]
+    fn missing_repository_loads_as_empty_without_creating_a_file() {
+        let root = temp_root();
+        let path = root.join("tasks.json");
+        assert!(TaskRepository::load(&path).unwrap().is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn corrupt_repository_is_rejected_and_preserved() {
+        let root = temp_root();
+        let path = root.join("tasks.json");
+        let corrupt = b"{\"schemaVersion\":1,\"tasks\":[";
+        fs::write(&path, corrupt).unwrap();
+        assert!(TaskRepository::load(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn unsupported_repository_schema_is_rejected_and_preserved() {
+        let root = temp_root();
+        let path = root.join("tasks.json");
+        let unsupported = br#"{"schemaVersion":999,"tasks":[]}"#;
+        fs::write(&path, unsupported).unwrap();
+        let error = TaskRepository::load(&path).unwrap_err();
+        assert!(error.contains("999"));
+        assert_eq!(fs::read(&path).unwrap(), unsupported);
+    }
+
+    #[test]
+    fn restart_interrupts_only_unfinished_tasks_and_preserves_terminal_results() {
+        let root = temp_root();
+        let path = root.join("tasks.json");
+        let mut tasks = HashMap::new();
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Running,
+            TaskStatus::Success,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+            TaskStatus::Interrupted,
+        ] {
+            let mut current = task(status);
+            current.error = Some("previous error".into());
+            current.result = Some(serde_json::json!({"versionId": "version-1"}));
+            current.cancel_requested = true;
+            tasks.insert(current.task_id.clone(), current);
+        }
+        TaskRepository::persist(&path, &tasks).unwrap();
+        let loaded = TaskRepository::load(&path).unwrap();
+        assert_eq!(loaded.len(), tasks.len());
+        for (id, before) in &tasks {
+            let after = &loaded[id];
+            if matches!(before.status, TaskStatus::Pending | TaskStatus::Running) {
+                assert_eq!(after.status, TaskStatus::Interrupted);
+                assert!(after.error.as_deref().unwrap().contains("中断"));
+            } else {
+                assert_eq!(after.status, before.status);
+                assert_eq!(after.message, before.message);
+                assert_eq!(after.error, before.error);
+            }
+            assert_eq!(after.progress, before.progress);
+            assert_eq!(after.game_uid, before.game_uid);
+            assert_eq!(after.result, before.result);
+            assert_eq!(
+                serde_json::to_value(&after.retry).unwrap(),
+                serde_json::to_value(&before.retry).unwrap()
+            );
+            assert!(!after.cancel_requested);
+        }
+    }
+
+    #[test]
+    fn history_retention_keeps_the_latest_numeric_timestamps() {
+        let root = temp_root();
+        let path = root.join("tasks.json");
+        let mut tasks = HashMap::new();
+        for index in 1..=105 {
+            let mut current = task(TaskStatus::Success);
+            current.task_id = format!("task-{index}");
+            current.created_at = index.to_string();
+            tasks.insert(current.task_id.clone(), current);
+        }
+        TaskRepository::persist(&path, &tasks).unwrap();
+        assert_eq!(tasks.len(), 105);
+        let loaded = TaskRepository::load(&path).unwrap();
+        assert_eq!(loaded.len(), 100);
+        for index in 1..=105 {
+            assert_eq!(
+                loaded.contains_key(&format!("task-{index}")),
+                index > 5,
+                "unexpected retention for timestamp {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn persistence_preserves_all_active_tasks_beyond_the_history_limit() {
+        let root = temp_root();
+        let path = root.join("tasks.json");
+        let mut tasks = HashMap::new();
+        for index in 0..215 {
+            let status = match index {
+                0..=54 => TaskStatus::Pending,
+                55..=109 => TaskStatus::Running,
+                _ => TaskStatus::Success,
+            };
+            let mut current = task(status);
+            current.created_at = format!("{index:04}");
+            tasks.insert(current.task_id.clone(), current);
+        }
+        TaskRepository::persist(&path, &tasks).unwrap();
+        let persisted: super::TaskStore =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted.tasks.len(), 210);
+        assert_eq!(
+            persisted
+                .tasks
+                .iter()
+                .filter(|task| matches!(task.status, TaskStatus::Pending | TaskStatus::Running))
+                .count(),
+            110
+        );
+        assert_eq!(tasks.len(), 215);
     }
 
     #[test]

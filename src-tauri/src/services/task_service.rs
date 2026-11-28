@@ -8,6 +8,27 @@ use uuid::Uuid;
 pub struct TaskService;
 
 impl TaskService {
+    pub(crate) fn spawn_worker<T: Send + 'static>(
+        name: &'static str,
+        worker: impl FnOnce() -> Result<T, String> + Send + 'static,
+        finish: impl Fn(Result<T, String>) + Send + Sync + 'static,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    ) -> Result<(), String> {
+        let finish = std::sync::Arc::new(finish);
+        let worker_finish = finish.clone();
+        let job = Box::new(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(worker))
+                .unwrap_or_else(|_| Err(format!("{name}发生内部错误，详情见日志")));
+            worker_finish(result);
+        });
+        if let Err(error) = spawn(job) {
+            let error = format!("启动{name}线程失败：{error}");
+            finish(Err(error.clone()));
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// 创建一个后台任务。
     ///
     /// `category` 是**必填**的：它决定任务在前端是否可见、能否取消、是否计入角标。
@@ -74,8 +95,13 @@ impl TaskService {
             let task = tasks
                 .get_mut(task_id)
                 .ok_or_else(|| "task not found".to_string())?;
-            task.retry = Some(retry);
-            persist_locked(state, &tasks);
+            let previous_retry = task.retry.replace(retry);
+            if let Err(error) = TaskRepository::persist(&state.tasks_path, &tasks) {
+                if let Some(task) = tasks.get_mut(task_id) {
+                    task.retry = previous_retry;
+                }
+                return Err(error);
+            }
         }
         notify_changed(state, task_id, "updated");
         Ok(())
@@ -346,6 +372,275 @@ mod tests {
     /// `remove_dir_all`，`assert!` 一失败就执行不到。
     fn temp_root() -> TempWorkspace {
         TempWorkspace::new("task-service")
+    }
+
+    fn retry_payload(version: &str) -> TaskRetry {
+        TaskRetry {
+            operation: "download_game_body_package".into(),
+            game_uid: "game-1".into(),
+            game_key: Some("game-key-1".into()),
+            version_id: Some(version.into()),
+            remote_path: Some("/apps/GameSaver/game-key-1/body.zip".into()),
+            remote_fs_id: Some(42),
+        }
+    }
+
+    #[test]
+    fn creation_persists_pending_metadata_before_restart_recovery() {
+        let dir = temp_root();
+        let state = test_state(&dir);
+        let id = TaskService::create(
+            &state,
+            "package_game_body",
+            TaskCategory::BodyTransfer,
+            Some("game-1".into()),
+            "prepare package",
+        )
+        .unwrap();
+        let memory = TaskService::get(&state, &id).unwrap();
+        assert_eq!(memory.status, TaskStatus::Pending);
+        assert_eq!(memory.progress, 0);
+        assert_eq!(memory.game_uid.as_deref(), Some("game-1"));
+        assert_eq!(memory.category, Some(TaskCategory::BodyTransfer));
+        assert!(memory.error.is_none() && memory.result.is_none() && memory.retry.is_none());
+        assert!(!memory.cancel_requested);
+        assert!(memory.created_at.parse::<u128>().is_ok());
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state.tasks_path).unwrap()).unwrap();
+        assert_eq!(disk["tasks"][0]["taskId"], id);
+        assert_eq!(disk["tasks"][0]["status"], "pending");
+        let loaded = TaskRepository::load(&state.tasks_path).unwrap();
+        assert_eq!(loaded[&id].status, TaskStatus::Interrupted);
+        assert_eq!(loaded[&id].message, "应用上次未正常完成此任务");
+        assert_eq!(
+            TaskService::get(&state, &id).unwrap().status,
+            TaskStatus::Pending
+        );
+    }
+
+    #[test]
+    fn failed_creation_preserves_existing_tasks_and_emits_no_created_event() {
+        let dir = temp_root();
+        let mut state = test_state(&dir);
+        let existing = TaskService::create(
+            &state,
+            "package_game_body",
+            TaskCategory::BodyTransfer,
+            Some("game-1".into()),
+            "existing",
+        )
+        .unwrap();
+        let original_path = state.tasks_path.clone();
+        let original_bytes = std::fs::read(&original_path).unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        state.attach_event_emitter(Box::new(move |name, payload| {
+            captured.lock().unwrap().push((name.to_string(), payload));
+        }));
+        let blocker = dir.join("blocked-parent");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        state.tasks_path = blocker.join("tasks.json");
+        assert!(TaskService::create(
+            &state,
+            "package_game_body",
+            TaskCategory::BodyTransfer,
+            Some("game-2".into()),
+            "must fail"
+        )
+        .is_err());
+        assert_eq!(state.tasks.lock().unwrap().len(), 1);
+        assert!(state.tasks.lock().unwrap().contains_key(&existing));
+        assert_eq!(std::fs::read(&original_path).unwrap(), original_bytes);
+        assert!(events.lock().unwrap().is_empty());
+        state.tasks_path = original_path;
+        TaskService::create(
+            &state,
+            "package_game_body",
+            TaskCategory::BodyTransfer,
+            Some("game-2".into()),
+            "retry",
+        )
+        .unwrap();
+        assert_eq!(state.tasks.lock().unwrap().len(), 2);
+        assert_eq!(TaskRepository::load(&state.tasks_path).unwrap().len(), 2);
+        assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_task_creation_keeps_every_task_in_memory_and_on_disk() {
+        let dir = temp_root();
+        let state = test_state(&dir);
+        let start = std::sync::Barrier::new(13);
+        let ids = std::thread::scope(|scope| {
+            let workers = (0..12)
+                .map(|index| {
+                    let state = &state;
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        TaskService::create(
+                            state,
+                            "package_game_body",
+                            TaskCategory::BodyTransfer,
+                            Some(format!("game-{index}")),
+                            "prepare",
+                        )
+                        .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            start.wait();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<std::collections::HashSet<_>>()
+        });
+        assert_eq!(ids.len(), 12);
+        let memory_ids = state
+            .tasks
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let disk_ids = TaskRepository::load(&state.tasks_path)
+            .unwrap()
+            .into_keys()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(memory_ids, ids);
+        assert_eq!(disk_ids, ids);
+    }
+
+    #[test]
+    fn repeated_creation_allocates_distinct_task_ids() {
+        let dir = temp_root();
+        let state = test_state(&dir);
+        let first = TaskService::create(
+            &state,
+            "package_game_body",
+            TaskCategory::BodyTransfer,
+            Some("game-1".into()),
+            "prepare",
+        )
+        .unwrap();
+        let second = TaskService::create(
+            &state,
+            "package_game_body",
+            TaskCategory::BodyTransfer,
+            Some("game-1".into()),
+            "prepare",
+        )
+        .unwrap();
+        assert_ne!(first, second);
+        let loaded = TaskRepository::load(&state.tasks_path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains_key(&first) && loaded.contains_key(&second));
+    }
+
+    #[test]
+    fn retry_payload_survives_restart_with_all_remote_identifiers() {
+        let dir = temp_root();
+        let state = test_state(&dir);
+        let id = TaskService::create(
+            &state,
+            "download_game_body_package",
+            TaskCategory::BodyTransfer,
+            Some("game-1".into()),
+            "prepare",
+        )
+        .unwrap();
+        let expected = retry_payload("version-1");
+        TaskService::set_retry(&state, &id, expected.clone()).unwrap();
+        let loaded = TaskRepository::load(&state.tasks_path).unwrap();
+        let actual = loaded[&id].retry.as_ref().unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert_eq!(loaded[&id].status, TaskStatus::Interrupted);
+    }
+
+    #[test]
+    fn retry_persistence_failure_is_reported_without_changing_memory_or_disk() {
+        for prior_retry in [false, true] {
+            let dir = temp_root();
+            let mut state = test_state(&dir);
+            let id = TaskService::create(
+                &state,
+                "download_game_body_package",
+                TaskCategory::BodyTransfer,
+                Some("game-1".into()),
+                "prepare",
+            )
+            .unwrap();
+            if prior_retry {
+                TaskService::set_retry(&state, &id, retry_payload("old-version")).unwrap();
+            }
+            let before = serde_json::to_value(TaskService::get(&state, &id).unwrap()).unwrap();
+            let original_path = state.tasks_path.clone();
+            let original_bytes = std::fs::read(&original_path).unwrap();
+            let events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let captured = events.clone();
+            state.attach_event_emitter(Box::new(move |_, _| {
+                captured.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+            let blocker = dir.join("blocked-parent");
+            std::fs::write(&blocker, b"not a directory").unwrap();
+            state.tasks_path = blocker.join("tasks.json");
+            assert!(TaskService::set_retry(&state, &id, retry_payload("new-version")).is_err());
+            assert_eq!(
+                serde_json::to_value(TaskService::get(&state, &id).unwrap()).unwrap(),
+                before
+            );
+            assert_eq!(std::fs::read(&original_path).unwrap(), original_bytes);
+            assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 0);
+            state.tasks_path = original_path;
+            TaskService::set_retry(&state, &id, retry_payload("new-version")).unwrap();
+            let loaded = TaskRepository::load(&state.tasks_path).unwrap();
+            assert_eq!(
+                loaded[&id].retry.as_ref().unwrap().version_id.as_deref(),
+                Some("new-version")
+            );
+        }
+    }
+
+    #[test]
+    fn setting_retry_for_missing_task_preserves_the_store() {
+        let dir = temp_root();
+        let state = test_state(&dir);
+        TaskService::create(
+            &state,
+            "package_game_body",
+            TaskCategory::BodyTransfer,
+            None,
+            "prepare",
+        )
+        .unwrap();
+        let original = std::fs::read(&state.tasks_path).unwrap();
+        assert!(TaskService::set_retry(&state, "missing-id", retry_payload("version-1")).is_err());
+        assert_eq!(std::fs::read(&state.tasks_path).unwrap(), original);
+        assert_eq!(state.tasks.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn progress_updates_stay_in_memory_and_restart_uses_last_durable_checkpoint() {
+        let dir = temp_root();
+        let state = test_state(&dir);
+        let id = TaskService::create(
+            &state,
+            "download_game_body_package",
+            TaskCategory::BodyTransfer,
+            Some("game-1".into()),
+            "prepare",
+        )
+        .unwrap();
+        let before = std::fs::read(&state.tasks_path).unwrap();
+        TaskService::update(&state, &id, TaskStatus::Running, 53, "downloading", None);
+        assert_eq!(TaskService::get(&state, &id).unwrap().progress, 53);
+        assert_eq!(std::fs::read(&state.tasks_path).unwrap(), before);
+        let loaded = TaskRepository::load(&state.tasks_path).unwrap();
+        assert_eq!(loaded[&id].status, TaskStatus::Interrupted);
+        assert_eq!(loaded[&id].progress, 0);
     }
 
     #[test]
@@ -738,13 +1033,21 @@ mod tests {
             "delete_remote_body_package",
             "repair_cloud_body_manifest",
         ] {
-            for status in [TaskStatus::Success, TaskStatus::Failed, TaskStatus::Cancelled] {
+            for status in [
+                TaskStatus::Success,
+                TaskStatus::Failed,
+                TaskStatus::Cancelled,
+            ] {
                 state
                     .cloud_store_cache
                     .get_or_load("account", false, || Ok(Vec::new()))
                     .unwrap();
                 let task_id = TaskService::create(
-                    &state, operation, TaskCategory::BodyTransfer, None, "test",
+                    &state,
+                    operation,
+                    TaskCategory::BodyTransfer,
+                    None,
+                    "test",
                 )
                 .unwrap();
                 TaskService::finish(&state, &task_id, status, 100, "done", None, None);

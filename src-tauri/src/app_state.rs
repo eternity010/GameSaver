@@ -1078,6 +1078,280 @@ mod tests {
     }
 
     #[test]
+    fn game_update_and_cloud_restore_are_mutually_exclusive() {
+        let state = test_state();
+        let game_uid = "game-1";
+
+        state.claim_game_update(game_uid, false).unwrap();
+        assert!(CloudOperationClaim::claim_restore(&state, game_uid).is_err());
+        state.finish_game_update(game_uid, false);
+
+        let restore = CloudOperationClaim::claim_restore(&state, game_uid).unwrap();
+        assert!(state.claim_game_update(game_uid, false).is_err());
+        drop(restore);
+
+        state.claim_game_update(game_uid, false).unwrap();
+        state.finish_game_update(game_uid, false);
+    }
+
+    #[test]
+    fn game_update_and_cloud_upload_are_mutually_exclusive() {
+        let state = test_state();
+        let game_uid = "game-1";
+
+        state.claim_game_update(game_uid, false).unwrap();
+        assert!(CloudOperationClaim::claim(&state, game_uid).is_err());
+        state.finish_game_update(game_uid, false);
+
+        let upload = CloudOperationClaim::claim(&state, game_uid).unwrap();
+        assert!(state.claim_game_update(game_uid, false).is_err());
+        drop(upload);
+
+        state.claim_game_update(game_uid, false).unwrap();
+        state.finish_game_update(game_uid, false);
+    }
+
+    #[test]
+    fn game_removal_blocks_update_cloud_upload_and_cloud_restore() {
+        let state = test_state();
+        let game_uid = "game-1";
+
+        state.claim_game_removal(game_uid, false).unwrap();
+        assert!(state.claim_game_update(game_uid, false).is_err());
+        assert!(CloudOperationClaim::claim(&state, game_uid).is_err());
+        assert!(CloudOperationClaim::claim_restore(&state, game_uid).is_err());
+        state.finish_game_removal(game_uid, false);
+
+        state.claim_game_update(game_uid, false).unwrap();
+        state.finish_game_update(game_uid, false);
+        let upload = CloudOperationClaim::claim(&state, game_uid).unwrap();
+        drop(upload);
+        let restore = CloudOperationClaim::claim_restore(&state, game_uid).unwrap();
+        drop(restore);
+    }
+
+    #[test]
+    fn duplicate_update_cloud_upload_and_cloud_restore_are_rejected() {
+        let state = test_state();
+        let game_uid = "game-1";
+
+        state.claim_game_update(game_uid, false).unwrap();
+        assert!(state.claim_game_update(game_uid, false).is_err());
+        state.finish_game_update(game_uid, false);
+
+        let upload = CloudOperationClaim::claim(&state, game_uid).unwrap();
+        assert!(CloudOperationClaim::claim(&state, game_uid).is_err());
+        drop(upload);
+
+        let restore = CloudOperationClaim::claim_restore(&state, game_uid).unwrap();
+        assert!(CloudOperationClaim::claim_restore(&state, game_uid).is_err());
+        drop(restore);
+    }
+
+    type Admission = fn(&AppState, &str) -> Result<String, String>;
+
+    fn admission_cases() -> [(&'static str, Admission); 5] {
+        [
+            ("update", |state, uid| {
+                state.claim_game_update(uid, false)?;
+                Ok(AppState::game_operation_key(uid))
+            }),
+            ("removal", |state, uid| {
+                state.claim_game_removal(uid, false)?;
+                Ok(AppState::game_operation_key(uid))
+            }),
+            ("package", AppState::claim_body_package),
+            ("upload", |state, uid| {
+                CloudOperationClaim::claim(state, uid).map(CloudOperationClaim::disarm)
+            }),
+            ("restore", |state, uid| {
+                CloudOperationClaim::claim_restore(state, uid).map(CloudOperationClaim::disarm)
+            }),
+        ]
+    }
+
+    fn admissions_can_overlap(first: &str, second: &str) -> bool {
+        matches!(
+            (first, second),
+            ("package", "upload") | ("upload", "package")
+        )
+    }
+
+    #[test]
+    fn admission_matrix_enforces_same_game_conflicts_in_both_orders() {
+        for (first_name, first_claim) in admission_cases() {
+            for (second_name, second_claim) in admission_cases() {
+                let state = test_state();
+                let first_key = first_claim(&state, "game-1").unwrap();
+                let second = second_claim(&state, "game-1");
+                assert_eq!(
+                    second.is_ok(),
+                    admissions_can_overlap(first_name, second_name),
+                    "{first_name} -> {second_name}"
+                );
+                if let Ok(second_key) = second {
+                    state.release_operation(&second_key);
+                }
+                assert_eq!(
+                    *state.save_operations.lock().unwrap(),
+                    HashSet::from([first_key.clone()]),
+                    "second admission changed the first claim: {first_name} -> {second_name}"
+                );
+                state.release_operation(&first_key);
+                let retry_key = second_claim(&state, "game-1").unwrap();
+                state.release_operation(&retry_key);
+                assert!(state.save_operations.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn admission_matrix_allows_different_games_and_isolates_release() {
+        for (first_name, first_claim) in admission_cases() {
+            for (second_name, second_claim) in admission_cases() {
+                let state = test_state();
+                let first_key = first_claim(&state, "game-1").unwrap();
+                let second_key = second_claim(&state, "game-2")
+                    .unwrap_or_else(|error| panic!("{first_name} -> {second_name}: {error}"));
+                assert_ne!(first_key, second_key);
+                state.release_operation(&first_key);
+                state.release_operation(&first_key);
+                assert_eq!(
+                    *state.save_operations.lock().unwrap(),
+                    HashSet::from([second_key.clone()])
+                );
+                assert!(second_claim(&state, "game-2").is_err());
+                let retry_key = first_claim(&state, "game-1").unwrap();
+                state.release_operation(&retry_key);
+                state.release_operation(&second_key);
+                assert!(state.save_operations.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    fn assert_concurrent_admission_matrix(different_games: bool) {
+        for (first_name, first_claim) in admission_cases() {
+            for (second_name, second_claim) in admission_cases() {
+                for round in 0..4 {
+                    let state = test_state();
+                    let start = std::sync::Barrier::new(3);
+                    let second_uid = if different_games { "game-2" } else { "game-1" };
+                    let (first, second) = std::thread::scope(|scope| {
+                        let first_worker = scope.spawn(|| {
+                            start.wait();
+                            first_claim(&state, "game-1")
+                        });
+                        let second_worker = scope.spawn(|| {
+                            start.wait();
+                            second_claim(&state, second_uid)
+                        });
+                        start.wait();
+                        (first_worker.join().unwrap(), second_worker.join().unwrap())
+                    });
+                    let expected =
+                        if different_games || admissions_can_overlap(first_name, second_name) {
+                            2
+                        } else {
+                            1
+                        };
+                    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), expected,
+                        "concurrent {first_name} / {second_name}, different_games={different_games}, round={round}");
+                    let keys: HashSet<_> = first.into_iter().chain(second).collect();
+                    assert_eq!(keys.len(), expected);
+                    assert_eq!(*state.save_operations.lock().unwrap(), keys);
+                    for key in keys {
+                        state.release_operation(&key);
+                    }
+                    let first_key = first_claim(&state, "game-1").unwrap();
+                    state.release_operation(&first_key);
+                    let second_key = second_claim(&state, second_uid).unwrap();
+                    state.release_operation(&second_key);
+                    assert!(state.save_operations.lock().unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_same_game_admissions_keep_only_compatible_claims() {
+        assert_concurrent_admission_matrix(false);
+    }
+
+    #[test]
+    fn concurrent_different_game_admissions_do_not_block_each_other() {
+        assert_concurrent_admission_matrix(true);
+    }
+
+    fn assert_pending_transaction_isolation(removal: bool) {
+        for (name, claim) in admission_cases() {
+            let state = test_state();
+            if removal {
+                state.claim_game_removal("game-1", false).unwrap();
+                state.finish_game_removal("game-1", true);
+            } else {
+                state.claim_game_update("game-1", false).unwrap();
+                state.finish_game_update("game-1", true);
+            }
+            assert!(claim(&state, "game-1").is_err(), "pending -> {name}");
+            let other_key = claim(&state, "game-2").unwrap();
+            state.release_operation(&other_key);
+            assert!(claim(&state, "game-1").is_err());
+            if removal {
+                state.claim_game_removal("game-1", true).unwrap();
+                state.finish_game_removal("game-1", false);
+            } else {
+                state.claim_game_update("game-1", true).unwrap();
+                state.finish_game_update("game-1", false);
+            }
+            let retry_key = claim(&state, "game-1").unwrap();
+            state.release_operation(&retry_key);
+            assert!(state.save_operations.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn pending_update_blocks_its_game_without_blocking_other_games() {
+        assert_pending_transaction_isolation(false);
+    }
+
+    #[test]
+    fn pending_removal_blocks_its_game_without_blocking_other_games() {
+        assert_pending_transaction_isolation(true);
+    }
+
+    #[test]
+    fn cloud_restore_guard_releases_claim_after_command_error() {
+        fn command(state: &AppState) -> Result<(), String> {
+            let _claim = CloudOperationClaim::claim_restore(state, "game-1")?;
+            Err("manifest unavailable".into())
+        }
+        let state = test_state();
+        assert!(command(&state).is_err());
+        assert!(state.save_operations.lock().unwrap().is_empty());
+        let restore = CloudOperationClaim::claim_restore(&state, "game-1").unwrap();
+        drop(restore);
+        assert!(state.save_operations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cloud_restore_claim_survives_worker_handoff_until_worker_releases_it() {
+        let state = test_state();
+        let key = CloudOperationClaim::claim_restore(&state, "game-1")
+            .unwrap()
+            .disarm();
+        assert!(state.claim_game_update("game-1", false).is_err());
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| state.release_operation(&key))
+                .join()
+                .unwrap();
+        });
+        assert!(state.save_operations.lock().unwrap().is_empty());
+        state.claim_game_update("game-1", false).unwrap();
+        state.finish_game_update("game-1", false);
+    }
+
+    #[test]
     fn cloud_restore_checks_runtime_again_before_writing() {
         let state = test_state();
         let claim = CloudOperationClaim::claim_restore(&state, "game-1").unwrap();

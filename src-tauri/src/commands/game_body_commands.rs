@@ -205,58 +205,90 @@ pub fn package_game_body(
         }
     };
     let app_handle = app.clone();
+    let app_for_finish = app.clone();
     let task_id_for_thread = task_id.clone();
-    std::thread::spawn(move || {
-        let result =
-            package_game_body_task(&app_handle, &task_id_for_thread, &game, &protected_paths);
-        app_handle.state::<AppState>().release_operation(&package_claim);
-        match result {
-            Ok(summary) => {
-                let version_id = summary
-                    .get("versionId")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string);
-                TaskService::finish(
-                    &app_handle.state(),
-                    &task_id_for_thread,
-                    TaskStatus::Success,
-                    100,
-                    "游戏本体包创建完成",
-                    Some(summary),
-                    None,
-                );
-                if let Some(version_id) = version_id.filter(|_| auto_upload_enabled(&app_handle)) {
-                    if let Err(error) = crate::commands::baidu_commands::upload_game_body_package(
-                        app_handle.clone(),
-                        app_handle.state(),
-                        game_uid.clone(),
-                        version_id,
-                    ) {
-                        eprintln!("GameSaver 自动上传本体包失败：{error}");
-                    }
+    let task_id_for_finish = task_id.clone();
+    TaskService::spawn_worker(
+        "创建游戏本体包",
+        move || package_game_body_task(&app_handle, &task_id_for_thread, &game, &protected_paths),
+        move |result| {
+            let version_id = finish_package_task(
+                &app_for_finish.state::<AppState>(),
+                &task_id_for_finish,
+                &package_claim,
+                result,
+            );
+            if let Some(version_id) = version_id.filter(|_| auto_upload_enabled(&app_for_finish)) {
+                if let Err(error) = crate::commands::baidu_commands::upload_game_body_package(
+                    app_for_finish.clone(),
+                    app_for_finish.state(),
+                    game_uid.clone(),
+                    version_id,
+                ) {
+                    eprintln!("GameSaver 自动上传本体包失败：{error}");
                 }
             }
-            Err(error) if error == "任务已取消" => TaskService::finish(
-                &app_handle.state(),
-                &task_id_for_thread,
-                TaskStatus::Cancelled,
-                100,
-                "已取消游戏本体打包",
-                None,
-                None,
-            ),
-            Err(error) => TaskService::finish(
-                &app_handle.state(),
-                &task_id_for_thread,
-                TaskStatus::Failed,
-                100,
-                "游戏本体包创建失败",
-                None,
-                Some(error),
-            ),
-        }
-    });
+        },
+        |job| {
+            std::thread::Builder::new()
+                .name("body-package".into())
+                .spawn(job)
+                .map(|_| ())
+        },
+    )?;
     Ok(task_id)
+}
+
+fn finish_package_task(
+    state: &AppState,
+    task_id: &str,
+    claim_key: &str,
+    result: Result<serde_json::Value, String>,
+) -> Option<String> {
+    state.release_operation(claim_key);
+    match result {
+        Ok(summary) => {
+            let version_id = summary
+                .get("versionId")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string);
+            TaskService::finish(
+                state,
+                task_id,
+                TaskStatus::Success,
+                100,
+                "游戏本体包创建完成",
+                Some(summary),
+                None,
+            );
+            version_id
+        }
+        Err(error) => {
+            if error == "任务已取消" {
+                TaskService::finish(
+                    state,
+                    task_id,
+                    TaskStatus::Cancelled,
+                    100,
+                    "已取消游戏本体打包",
+                    None,
+                    None,
+                );
+            } else {
+                TaskService::finish(
+                    state,
+                    task_id,
+                    TaskStatus::Failed,
+                    100,
+                    "游戏本体包创建失败",
+                    None,
+                    Some(error),
+                );
+            }
+            None
+        }
+    }
 }
 
 #[tauri::command]
@@ -298,12 +330,8 @@ pub fn delete_game_body_package(
     let app_handle = app.clone();
     let task_id_for_thread = task_id.clone();
     std::thread::spawn(move || {
-        let result = delete_game_body_package_task(
-            &app_handle,
-            &task_id_for_thread,
-            &version,
-            &root,
-        );
+        let result =
+            delete_game_body_package_task(&app_handle, &task_id_for_thread, &version, &root);
         release_update(&app_handle.state(), &game_uid);
         match result {
             Ok(summary) => TaskService::finish(
@@ -477,7 +505,11 @@ fn local_package_for_deletion(
     game_uid: &str,
     version_id: &str,
 ) -> Result<GameBodyVersion, String> {
-    let game = store.games.iter().find(|game| game.game_uid == game_uid).ok_or("游戏不存在")?;
+    let game = store
+        .games
+        .iter()
+        .find(|game| game.game_uid == game_uid)
+        .ok_or("游戏不存在")?;
     if matches!(game.lifecycle, GameLifecycle::Removing) {
         return Err("该游戏正在删除".to_string());
     }
@@ -501,11 +533,16 @@ fn validated_local_package_path(root: &Path, version: &GameBodyVersion) -> Resul
         .filter(|name| is_safe_path_segment(name))
         .ok_or("本地 ZIP 文件名无效")?;
     if !is_safe_path_segment(&version.game_uid)
-        || !recorded.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+        || !recorded
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
     {
         return Err("本地 ZIP 缓存记录无效".to_string());
     }
-    let expected = root.join("body-packages").join(&version.game_uid).join(file_name);
+    let expected = root
+        .join("body-packages")
+        .join(&version.game_uid)
+        .join(file_name);
     if normalize_path(recorded) != normalize_path(&expected) {
         return Err("本地 ZIP 不在该游戏的缓存目录内，已停止删除".to_string());
     }
@@ -603,7 +640,14 @@ fn auto_upload_enabled(app: &AppHandle) -> bool {
 fn load_update_context(
     state: &AppState,
     game_uid: &str,
-) -> Result<(crate::domain::Game, Option<SaveProfile>, Option<SaveVersion>), String> {
+) -> Result<
+    (
+        crate::domain::Game,
+        Option<SaveProfile>,
+        Option<SaveVersion>,
+    ),
+    String,
+> {
     let store = state
         .store
         .lock()
@@ -614,10 +658,19 @@ fn load_update_context(
 fn update_context(
     store: &AppStore,
     game_uid: &str,
-) -> Result<(crate::domain::Game, Option<SaveProfile>, Option<SaveVersion>), String> {
-    let game =
-        GameLibraryService::find(store, game_uid).ok_or_else(|| "游戏不存在".to_string())?;
-    if !matches!(game.lifecycle, GameLifecycle::Active | GameLifecycle::NeedsRepair) {
+) -> Result<
+    (
+        crate::domain::Game,
+        Option<SaveProfile>,
+        Option<SaveVersion>,
+    ),
+    String,
+> {
+    let game = GameLibraryService::find(store, game_uid).ok_or_else(|| "游戏不存在".to_string())?;
+    if !matches!(
+        game.lifecycle,
+        GameLifecycle::Active | GameLifecycle::NeedsRepair
+    ) {
         return Err("游戏尚未完成设置".to_string());
     }
     let profile = store
@@ -629,7 +682,8 @@ fn update_context(
                 && profile.enabled
         })
         .cloned();
-    if profile.is_none() && !game.save_protection_skipped && GameLibraryService::is_installed(&game) {
+    if profile.is_none() && !game.save_protection_skipped && GameLibraryService::is_installed(&game)
+    {
         return Err("存档保护配置不存在".to_string());
     }
     let latest = profile.as_ref().and_then(|_| {
@@ -676,6 +730,338 @@ mod tests {
     use super::*;
     use crate::{domain::Game, test_support::TempWorkspace};
 
+    fn package_test_state(root: &TempWorkspace) -> std::sync::Arc<AppState> {
+        std::sync::Arc::new(AppState::new(
+            AppStore::default(),
+            root.to_path_buf(),
+            std::collections::HashMap::new(),
+            root.join("tasks.json"),
+        ))
+    }
+
+    fn dispatch_package_test(
+        state: std::sync::Arc<AppState>,
+        worker: impl FnOnce() -> Result<serde_json::Value, String> + Send + 'static,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    ) -> (String, Result<(), String>) {
+        let key = state.claim_body_package("game-1").unwrap();
+        let id = TaskService::create(
+            &state,
+            "package_game_body",
+            TaskCategory::BodyTransfer,
+            Some("game-1".into()),
+            "prepare",
+        )
+        .unwrap();
+        let worker_id = id.clone();
+        let result = TaskService::spawn_worker(
+            "创建游戏本体包",
+            worker,
+            move |result| {
+                finish_package_task(&state, &worker_id, &key, result);
+            },
+            spawn,
+        );
+        (id, result)
+    }
+
+    fn spawn_package_and_join(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+        std::thread::Builder::new().spawn(job)?.join().unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn package_worker_success_persists_complete_summary_and_releases_claim() {
+        let root = TempWorkspace::new("package-worker-success");
+        let state = package_test_state(&root);
+        let summary = serde_json::json!({"versionId": "v1", "packagePath": "body.zip",
+            "sha256": "hash", "fileCount": 8, "totalBytes": 1024});
+        let expected = summary.clone();
+        let (id, started) =
+            dispatch_package_test(state.clone(), move || Ok(summary), spawn_package_and_join);
+        started.unwrap();
+        let loaded = crate::repositories::TaskRepository::load(&state.tasks_path).unwrap();
+        assert_eq!(loaded[&id].status, TaskStatus::Success);
+        assert_eq!(loaded[&id].progress, 100);
+        assert_eq!(loaded[&id].result, Some(expected));
+        assert!(loaded[&id].error.is_none());
+        assert!(state.save_operations.lock().unwrap().is_empty());
+        assert!(active_body_package_task(&state, "game-1").is_none());
+        let next = state.claim_body_package("game-1").unwrap();
+        state.release_operation(&next);
+    }
+
+    fn assert_package_error(error: &str, expected: TaskStatus) {
+        let root = TempWorkspace::new("package-worker-error");
+        let state = package_test_state(&root);
+        let other_key = state.claim_cloud_operation("game-2").unwrap();
+        let worker_state = state.clone();
+        let error = error.to_string();
+        let expected_error = error.clone();
+        let (id, started) = dispatch_package_test(
+            state.clone(),
+            move || {
+                let id = active_body_package_task(&worker_state, "game-1").unwrap();
+                TaskService::update(
+                    &worker_state,
+                    &id,
+                    TaskStatus::Running,
+                    47,
+                    "compressing",
+                    None,
+                );
+                Err(error)
+            },
+            spawn_package_and_join,
+        );
+        started.unwrap();
+        let loaded = crate::repositories::TaskRepository::load(&state.tasks_path).unwrap();
+        assert_eq!(loaded[&id].status, expected);
+        assert_eq!(loaded[&id].progress, 47);
+        assert!(loaded[&id].result.is_none());
+        assert_eq!(
+            loaded[&id].error,
+            if expected == TaskStatus::Failed {
+                Some(expected_error)
+            } else {
+                None
+            }
+        );
+        assert!(active_body_package_task(&state, "game-1").is_none());
+        assert_eq!(
+            *state.save_operations.lock().unwrap(),
+            std::collections::HashSet::from([other_key.clone()])
+        );
+        state.release_operation(&other_key);
+        let next = state.claim_body_package("game-1").unwrap();
+        state.release_operation(&next);
+    }
+
+    #[test]
+    fn package_worker_error_preserves_real_progress_and_allows_retry() {
+        assert_package_error("archive write failed", TaskStatus::Failed);
+    }
+
+    #[test]
+    fn package_worker_cancellation_preserves_real_progress_without_error() {
+        assert_package_error("任务已取消", TaskStatus::Cancelled);
+    }
+
+    #[test]
+    fn package_thread_start_failure_marks_failed_without_running_compression() {
+        let root = TempWorkspace::new("package-spawn-failure");
+        let state = package_test_state(&root);
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let captured = ran.clone();
+        let (id, result) = dispatch_package_test(
+            state.clone(),
+            move || {
+                captured.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(serde_json::json!({"versionId": "v1"}))
+            },
+            |_| Err(std::io::Error::other("injected spawn failure")),
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("injected spawn failure"));
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        let loaded = crate::repositories::TaskRepository::load(&state.tasks_path).unwrap();
+        assert_eq!(loaded[&id].status, TaskStatus::Failed);
+        assert_eq!(loaded[&id].error.as_deref(), Some(error.as_str()));
+        assert!(loaded[&id].result.is_none());
+        assert!(state.save_operations.lock().unwrap().is_empty());
+        assert!(active_body_package_task(&state, "game-1").is_none());
+        let next = state.claim_body_package("game-1").unwrap();
+        state.release_operation(&next);
+    }
+
+    #[test]
+    fn package_only_success_returns_a_version_for_optional_auto_upload() {
+        for result in [
+            Ok(serde_json::json!({"versionId": "v1"})),
+            Err("archive failed".into()),
+            Err("任务已取消".into()),
+        ] {
+            let root = TempWorkspace::new("package-upload-selection");
+            let state = package_test_state(&root);
+            let key = state.claim_body_package("game-1").unwrap();
+            let id = TaskService::create(
+                &state,
+                "package_game_body",
+                TaskCategory::BodyTransfer,
+                Some("game-1".into()),
+                "prepare",
+            )
+            .unwrap();
+            let expected = if result.is_ok() {
+                Some("v1".into())
+            } else {
+                None
+            };
+            assert_eq!(finish_package_task(&state, &id, &key, result), expected);
+        }
+    }
+
+    #[test]
+    fn package_summary_without_valid_version_does_not_request_auto_upload() {
+        for summary in [
+            serde_json::json!({}),
+            serde_json::json!({"versionId": null}),
+            serde_json::json!({"versionId": "  "}),
+            serde_json::json!({"versionId": 123}),
+        ] {
+            let root = TempWorkspace::new("package-no-upload-version");
+            let state = package_test_state(&root);
+            let key = state.claim_body_package("game-1").unwrap();
+            let id = TaskService::create(
+                &state,
+                "package_game_body",
+                TaskCategory::BodyTransfer,
+                Some("game-1".into()),
+                "prepare",
+            )
+            .unwrap();
+            assert!(finish_package_task(&state, &id, &key, Ok(summary)).is_none());
+            assert!(state.save_operations.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn active_package_lookup_reuses_only_unfinished_package_tasks_for_that_game() {
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Running,
+            TaskStatus::Success,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+            TaskStatus::Interrupted,
+        ] {
+            let root = TempWorkspace::new("package-active-lookup");
+            let state = package_test_state(&root);
+            let id = TaskService::create(
+                &state,
+                "package_game_body",
+                TaskCategory::BodyTransfer,
+                Some("game-1".into()),
+                "prepare",
+            )
+            .unwrap();
+            state.tasks.lock().unwrap().get_mut(&id).unwrap().status = status.clone();
+            TaskService::create(
+                &state,
+                "upload_game_body_package",
+                TaskCategory::BodyTransfer,
+                Some("game-1".into()),
+                "upload",
+            )
+            .unwrap();
+            TaskService::create(
+                &state,
+                "package_game_body",
+                TaskCategory::BodyTransfer,
+                Some("game-2".into()),
+                "other",
+            )
+            .unwrap();
+            let expected = if matches!(status, TaskStatus::Pending | TaskStatus::Running) {
+                Some(id)
+            } else {
+                None
+            };
+            assert_eq!(active_body_package_task(&state, "game-1"), expected);
+            assert!(active_body_package_task(&state, "game-3").is_none());
+        }
+    }
+
+    #[test]
+    fn running_package_retains_claim_while_cloud_save_upload_can_overlap() {
+        let root = TempWorkspace::new("package-worker-handoff");
+        let state = package_test_state(&root);
+        let (ready_send, ready_receive) = std::sync::mpsc::channel();
+        let (resume_send, resume_receive) = std::sync::mpsc::channel();
+        let mut handle = None;
+        let (id, started) = dispatch_package_test(
+            state.clone(),
+            move || {
+                ready_send.send(()).unwrap();
+                resume_receive
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+                Ok(serde_json::json!({"versionId": "v1"}))
+            },
+            |job| {
+                handle = Some(std::thread::Builder::new().spawn(job)?);
+                Ok(())
+            },
+        );
+        started.unwrap();
+        ready_receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let duplicate_rejected = state.claim_body_package("game-1").is_err();
+        let update_rejected = state.claim_game_update("game-1", false).is_err();
+        let restore_rejected =
+            crate::app_state::CloudOperationClaim::claim_restore(&state, "game-1").is_err();
+        let cloud = state.claim_cloud_operation("game-1");
+        let active = active_body_package_task(&state, "game-1");
+        resume_send.send(()).unwrap();
+        handle.unwrap().join().unwrap();
+        assert!(duplicate_rejected && update_rejected && restore_rejected);
+        assert_eq!(active, Some(id));
+        let cloud = cloud.unwrap();
+        assert_eq!(
+            *state.save_operations.lock().unwrap(),
+            std::collections::HashSet::from([cloud.clone()])
+        );
+        state.release_operation(&cloud);
+    }
+
+    #[test]
+    fn package_releases_claim_before_finished_event_allows_follow_up_upload() {
+        for result in [
+            Ok(serde_json::json!({"versionId": "v1"})),
+            Err("archive failed".into()),
+            Err("任务已取消".into()),
+        ] {
+            let root = TempWorkspace::new("package-finish-order");
+            let state = package_test_state(&root);
+            let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = observed.clone();
+            let weak_state = std::sync::Arc::downgrade(&state);
+            state.attach_event_emitter(Box::new(move |_, payload| {
+                if payload["kind"] == "finished" {
+                    let state = weak_state.upgrade().unwrap();
+                    let next = state.claim_operation("game-1", "busy");
+                    captured.lock().unwrap().push(next.is_ok());
+                    if next.is_ok() {
+                        state.release_operation(&AppState::game_operation_key("game-1"));
+                    }
+                }
+            }));
+            let (_, started) = dispatch_package_test(state, move || result, spawn_package_and_join);
+            started.unwrap();
+            assert_eq!(*observed.lock().unwrap(), vec![true]);
+        }
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn package_unwinding_panic_marks_failure_and_releases_claim() {
+        let root = TempWorkspace::new("package-worker-panic");
+        let state = package_test_state(&root);
+        let (id, started) = dispatch_package_test(
+            state.clone(),
+            || panic!("injected compression panic"),
+            spawn_package_and_join,
+        );
+        started.unwrap();
+        let loaded = crate::repositories::TaskRepository::load(&state.tasks_path).unwrap();
+        assert_eq!(loaded[&id].status, TaskStatus::Failed);
+        assert!(loaded[&id].error.as_deref().unwrap().contains("内部错误"));
+        assert!(loaded[&id].result.is_none());
+        assert!(state.save_operations.lock().unwrap().is_empty());
+        assert!(active_body_package_task(&state, "game-1").is_none());
+    }
+
     #[test]
     fn body_repair_uses_existing_game_record_even_without_save_profile() {
         let root = TempWorkspace::new("repair-missing-game");
@@ -702,7 +1088,10 @@ mod tests {
         store.save_profiles.push(profile);
         let (_, profile, latest) = update_context(&store, &uid).unwrap();
         assert!(profile.is_some());
-        assert_eq!(latest.unwrap().version_id, store.save_versions[0].version_id);
+        assert_eq!(
+            latest.unwrap().version_id,
+            store.save_versions[0].version_id
+        );
 
         std::fs::create_dir(&game_path).unwrap();
         std::fs::write(game_path.join("game.exe"), b"fixture").unwrap();
@@ -714,9 +1103,16 @@ mod tests {
     #[test]
     fn local_zip_deletion_accepts_an_uninstalled_game_and_uses_its_recorded_cache_path() {
         let root = TempWorkspace::new("local-zip-delete");
-        let mut game = Game::new_pending("test", root.join("games/test").to_string_lossy(), "game.exe");
+        let mut game = Game::new_pending(
+            "test",
+            root.join("games/test").to_string_lossy(),
+            "game.exe",
+        );
         game.lifecycle = GameLifecycle::NeedsRepair;
-        let package = root.join("body-packages").join(&game.game_uid).join("install-transaction.zip");
+        let package = root
+            .join("body-packages")
+            .join(&game.game_uid)
+            .join("install-transaction.zip");
         let uid = game.game_uid.clone();
         let mut store = AppStore {
             games: vec![game],
@@ -738,8 +1134,15 @@ mod tests {
             ..AppStore::default()
         };
         let mut version = local_package_for_deletion(&store, &uid, "v1").unwrap();
-        assert_eq!(validated_local_package_path(&root, &version).unwrap(), package);
-        version.package_path = Some(root.join("body-packages/other/other.zip").to_string_lossy().into_owned());
+        assert_eq!(
+            validated_local_package_path(&root, &version).unwrap(),
+            package
+        );
+        version.package_path = Some(
+            root.join("body-packages/other/other.zip")
+                .to_string_lossy()
+                .into_owned(),
+        );
         assert!(validated_local_package_path(&root, &version).is_err());
         store.games[0].lifecycle = GameLifecycle::Removing;
         assert!(local_package_for_deletion(&store, &uid, "v1").is_err());
