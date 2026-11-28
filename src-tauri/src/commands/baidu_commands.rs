@@ -13,7 +13,12 @@ use crate::{
     },
 };
 use crate::services::cloud_manifest_service::CloudBodyManifest;
+use crate::services::game_body_install_service::CloudInstallTarget;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
@@ -465,26 +470,12 @@ pub fn install_cloud_game(
         .ok_or_else(|| "云端游戏缺少 gameKey，无法定位本体包".to_string())?;
     let directory = remote_body_dir(remote_game_key)?;
     validate_remote_package_path(&directory, &remote_path)?;
-    let games_root = state.games_root()?;
-    let target = {
-        let store = state
-            .store
-            .lock()
-            .map_err(|_| "读取本地游戏信息失败".to_string())?;
-        GameBodyInstallService::resolve_target(
-            &store,
-            &games_root,
-            &game_uid,
-            remote_game_key,
-            replace_existing.unwrap_or(false),
-        )?
-    };
-    let install_key = format!("install:{}", target.game_key);
-    state.claim_operation(&install_key, "该云端游戏已有安装任务正在进行")?;
-    if let Err(error) = reserve_transfer(&state, &target.game_uid) {
-        state.release_operation(&install_key);
-        return Err(error);
-    }
+    let (target, install_key) = reserve_cloud_install(
+        &state,
+        &game_uid,
+        remote_game_key,
+        replace_existing.unwrap_or(false),
+    )?;
     let task_id = match TaskService::create(
         &state,
         "install_cloud_game",
@@ -524,74 +515,107 @@ pub fn install_cloud_game(
         );
         return Err(error);
     }
-    let app_handle = app.clone();
-    let task_id_for_thread = task_id.clone();
-    std::thread::spawn(move || {
-        let result = install_cloud_game_task(
-            &app_handle,
-            &task_id_for_thread,
-            &game_uid,
-            &target,
-            &remote_path,
-            remote_fs_id,
-        );
-        let recovery_pending = app_handle
-            .state::<AppState>()
-            .games_root()
-            .map(|root| {
-                root.join(format!(".{}.cloud-install.json", target.game_uid))
-                    .exists()
-            })
-            .unwrap_or(true);
-        if recovery_pending {
-            crate::logging::warn(format!(
-                "游戏 {} 的安装事务尚未清理，已保留操作锁，请重启应用恢复",
-                target.game_uid
-            ));
-        } else {
-            release_transfer(&app_handle.state(), &target.game_uid);
-        }
-        app_handle
-            .state::<AppState>()
-            .release_operation(&install_key);
-        match result {
-            Ok(summary) => {
-                let message = if recovery_pending {
-                    "游戏已安装，清理尚未完成，请重启应用恢复后继续操作"
-                } else {
-                    "游戏本体已安装"
-                };
-                TaskService::finish(
-                    &app_handle.state(),
-                    &task_id_for_thread,
-                    TaskStatus::Success,
-                    100,
-                    message,
-                    Some(summary),
-                    None,
-                )
-            }
-            Err(error) if error == "任务已取消" => TaskService::finish(
-                &app_handle.state(),
-                &task_id_for_thread,
-                TaskStatus::Cancelled,
-                100,
-                "已取消云端游戏安装",
-                None,
-                None,
-            ),
-            Err(error) => TaskService::finish(
-                &app_handle.state(),
-                &task_id_for_thread,
-                TaskStatus::Failed,
-                100,
-                "云端游戏安装失败",
-                None,
-                Some(error),
-            ),
-        }
-    });
+    let app_for_worker = app.clone();
+    let task_id_for_worker = task_id.clone();
+    let task_id_for_finish = task_id.clone();
+    let local_uid = target.game_uid.clone();
+    TaskService::spawn_worker(
+        "安装云端游戏",
+        move || {
+            install_cloud_game_task(
+                &app_for_worker,
+                &task_id_for_worker,
+                &game_uid,
+                &target,
+                &remote_path,
+                remote_fs_id,
+            )
+        },
+        move |result| {
+            finish_cloud_install_task(
+                &app.state::<AppState>(),
+                &task_id_for_finish,
+                &local_uid,
+                &install_key,
+                result,
+            )
+        },
+        |job| {
+            std::thread::Builder::new()
+                .name("cloud-game-install".into())
+                .spawn(job)
+                .map(|_| ())
+        },
+    )?;
     Ok(task_id)
+}
+
+fn reserve_cloud_install(
+    state: &AppState,
+    game_uid: &str,
+    game_key: &str,
+    replace_existing: bool,
+) -> Result<(CloudInstallTarget, String), String> {
+    let install_key = format!("install:{game_key}");
+    state.claim_operation(&install_key, "该云端游戏已有安装任务正在进行")?;
+    let reserved = (|| {
+        let games_root = state.games_root()?;
+        let target = {
+            let store = state
+                .store
+                .lock()
+                .map_err(|_| "读取本地游戏信息失败".to_string())?;
+            GameBodyInstallService::resolve_target(
+                &store, &games_root, game_uid, game_key, replace_existing,
+            )?
+        };
+        reserve_transfer(state, &target.game_uid)?;
+        Ok((target, install_key.clone()))
+    })();
+    if reserved.is_err() {
+        state.release_operation(&install_key);
+    }
+    reserved
+}
+
+fn finish_cloud_install_task(
+    state: &AppState,
+    task_id: &str,
+    game_uid: &str,
+    install_key: &str,
+    result: Result<serde_json::Value, String>,
+) {
+    let recovery_pending = state
+        .games_root()
+        .map(|root| {
+            root.join(format!(".{game_uid}.cloud-install.json"))
+                .try_exists()
+                .unwrap_or(true)
+        })
+        .unwrap_or(true);
+    if recovery_pending {
+        crate::logging::warn(format!("游戏 {game_uid} 的安装事务尚未清理，已保留操作锁，请重启应用恢复"));
+    } else {
+        release_transfer(state, game_uid);
+    }
+    state.release_operation(install_key);
+    let (status, message, summary, error) = match result {
+        Ok(summary) => (
+            TaskStatus::Success,
+            if recovery_pending {
+                "游戏已安装，清理尚未完成，请重启应用恢复后继续操作"
+            } else {
+                "游戏本体已安装"
+            },
+            Some(summary),
+            None,
+        ),
+        Err(error) if error == "任务已取消" => {
+            (TaskStatus::Cancelled, "已取消云端游戏安装", None, None)
+        }
+        Err(error) => (TaskStatus::Failed, "云端游戏安装失败", None, Some(error)),
+    };
+    TaskService::finish(state, task_id, status, 100, message, summary, error);
 }
 
 #[tauri::command]
@@ -891,101 +915,127 @@ pub fn upload_game_body_package(
         },
     ) {
         state.release_operation(&package_claim);
+        TaskService::finish(
+            &state,
+            &task_id,
+            TaskStatus::Failed,
+            0,
+            "创建本体包上传任务失败",
+            None,
+            Some(error.clone()),
+        );
         return Err(error);
     }
-    let app_handle = app.clone();
-    let task_id_for_thread = task_id.clone();
-    std::thread::spawn(move || {
-        let result = upload_body_task(
-            &app_handle,
-            &task_id_for_thread,
-            &game,
-            &version,
-            package_path.as_deref(),
-        );
-        match result {
-            Ok(summary) => {
-                app_handle
-                    .state::<AppState>()
-                    .release_operation(&package_claim);
-                TaskService::finish(
-                    &app_handle.state(),
-                    &task_id_for_thread,
-                    TaskStatus::Success,
-                    100,
-                    "游戏本体包上传完成",
-                    Some(summary),
-                    None,
-                )
-            }
-            Err(error) if error == "任务已取消" => {
-                let _ = update_upload_record(
-                    &app_handle,
-                    &game_uid,
-                    &version.version_id,
-                    "local_only",
-                    None,
-                );
-                app_handle
-                    .state::<AppState>()
-                    .release_operation(&package_claim);
-                TaskService::finish(
-                    &app_handle.state(),
-                    &task_id_for_thread,
-                    TaskStatus::Cancelled,
-                    100,
-                    "已取消本体包上传",
-                    None,
-                    None,
-                )
-            }
-            Err(error) => {
-                let manifest_pending = error.starts_with(BODY_MANIFEST_PENDING_PREFIX);
-                let _ = update_upload_record(
-                    &app_handle,
-                    &game_uid,
-                    &version.version_id,
-                    if manifest_pending {
-                        "manifest_pending"
-                    } else {
-                        "failed"
-                    },
-                    None,
-                );
-                if manifest_pending {
-                    let _ = TaskService::set_retry(
-                        &app_handle.state(),
-                        &task_id_for_thread,
-                        TaskRetry {
-                            operation: "repair_cloud_body_manifest".to_string(),
-                            game_uid: game_uid.clone(),
-                            game_key: None,
-                            version_id: None,
-                            remote_path: None,
-                            remote_fs_id: None,
-                        },
-                    );
-                }
-                app_handle
-                    .state::<AppState>()
-                    .release_operation(&package_claim);
-                TaskService::finish(
-                    &app_handle.state(),
-                    &task_id_for_thread,
-                    TaskStatus::Failed,
-                    100,
-                    if manifest_pending {
-                        "本体包已上传，云端版本清单待修复"
-                    } else {
-                        "游戏本体包上传失败"
-                    },
-                    None,
-                    Some(error),
-                )
-            }
-        }
-    });
+    let app_for_worker = app.clone();
+    let app_for_finish = app.clone();
+    let task_id_for_worker = task_id.clone();
+    let task_id_for_finish = task_id.clone();
+    let version_id_for_finish = version.version_id.clone();
+    let started = Arc::new(AtomicBool::new(false));
+    let started_for_worker = started.clone();
+    TaskService::spawn_worker(
+        "上传游戏本体包",
+        move || {
+            started_for_worker.store(true, Ordering::Release);
+            upload_body_task(
+                &app_for_worker,
+                &task_id_for_worker,
+                &game,
+                &version,
+                package_path.as_deref(),
+            )
+        },
+        move |result| {
+            finish_upload_body_task(
+                &app_for_finish.state::<AppState>(),
+                &task_id_for_finish,
+                &package_claim,
+                &game_uid,
+                started.load(Ordering::Acquire),
+                result,
+                |status| {
+                    update_upload_record(
+                        &app_for_finish,
+                        &game_uid,
+                        &version_id_for_finish,
+                        status,
+                        None,
+                    )
+                },
+            )
+        },
+        |job| {
+            std::thread::Builder::new()
+                .name("body-package-upload".into())
+                .spawn(job)
+                .map(|_| ())
+        },
+    )?;
     Ok(task_id)
+}
+
+fn finish_upload_body_task(
+    state: &AppState,
+    task_id: &str,
+    package_claim: &str,
+    game_uid: &str,
+    started: bool,
+    result: Result<serde_json::Value, String>,
+    update_status: impl FnOnce(&str) -> Result<(), String>,
+) {
+    let (status, message, summary, error) = match result {
+        Ok(summary) => (
+            TaskStatus::Success,
+            "游戏本体包上传完成",
+            Some(summary),
+            None,
+        ),
+        Err(error) if !started => (TaskStatus::Failed, "启动本体包上传失败", None, Some(error)),
+        Err(error) if error == "任务已取消" => {
+            if let Err(record_error) = update_status("local_only") {
+                crate::logging::warn(format!("取消本体包上传后更新本地状态失败：{record_error}"));
+            }
+            (TaskStatus::Cancelled, "已取消本体包上传", None, None)
+        }
+        Err(error) => {
+            let manifest_pending = error.starts_with(BODY_MANIFEST_PENDING_PREFIX);
+            if let Err(record_error) = update_status(if manifest_pending {
+                "manifest_pending"
+            } else {
+                "failed"
+            }) {
+                crate::logging::warn(format!("本体包上传失败后更新本地状态失败：{record_error}"));
+            }
+            if manifest_pending {
+                if let Err(retry_error) = TaskService::set_retry(
+                    state,
+                    task_id,
+                    TaskRetry {
+                        operation: "repair_cloud_body_manifest".to_string(),
+                        game_uid: game_uid.to_string(),
+                        game_key: None,
+                        version_id: None,
+                        remote_path: None,
+                        remote_fs_id: None,
+                    },
+                ) {
+                    crate::logging::warn(format!("本体包上传后记录清单修复任务失败：{retry_error}"));
+                }
+            }
+            (
+                TaskStatus::Failed,
+                if manifest_pending {
+                    "本体包已上传，云端版本清单待修复"
+                } else {
+                    "游戏本体包上传失败"
+                },
+                None,
+                Some(error),
+            )
+        }
+    };
+    state.release_operation(package_claim);
+    TaskService::finish(state, task_id, status, 100, message, summary, error);
 }
 
 #[tauri::command]
@@ -1147,7 +1197,8 @@ fn upload_body_task(
         &version.version_id,
         "synced",
         Some(&remote),
-    )?;
+    )
+    .map_err(|error| format!("{BODY_MANIFEST_PENDING_PREFIX}{error}"))?;
     TaskService::update(
         &state,
         task_id,
@@ -1630,11 +1681,14 @@ fn install_cloud_game_task(
     app: &AppHandle,
     task_id: &str,
     game_uid: &str,
-    target: &crate::services::game_body_install_service::CloudInstallTarget,
+    target: &CloudInstallTarget,
     remote_path: &str,
     remote_fs_id: Option<u64>,
 ) -> Result<serde_json::Value, String> {
     let state = app.state::<AppState>();
+    if TaskService::is_cancelled(&state, task_id) {
+        return Err("任务已取消".to_string());
+    }
     let app_data_dir = app_data_dir(app)?;
     let client = load_baidu_client(app)?;
     TaskService::update(
@@ -2170,9 +2224,222 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_safe_path_segment, remote_body_dir, reserve_transfer, validate_remote_package_path,
-        CloudInstallPackageGuard, CloudInstallStagingGuard, Game,
+        finish_cloud_install_task, finish_upload_body_task, is_safe_path_segment, remote_body_dir,
+        reserve_cloud_install, reserve_transfer, validate_remote_package_path, AppState,
+        CloudInstallPackageGuard, CloudInstallStagingGuard, Game, TaskCategory, TaskRetry,
+        TaskService, TaskStatus, BODY_MANIFEST_PENDING_PREFIX,
     };
+    use crate::{repositories::TaskRepository, test_support::TempWorkspace};
+    use std::sync::Arc;
+
+    fn transfer_test_state(root: &TempWorkspace) -> Arc<AppState> {
+        Arc::new(AppState::new(
+            Default::default(),
+            root.to_path_buf(),
+            Default::default(),
+            root.join("tasks.json"),
+        ))
+    }
+
+    fn upload_test_task(root: &TempWorkspace) -> (Arc<AppState>, String, String) {
+        let state = transfer_test_state(root);
+        let claim = state.claim_body_package("test-game").unwrap();
+        let task_id = TaskService::create(
+            &state,
+            "upload_game_body_package",
+            TaskCategory::BodyTransfer,
+            Some("test-game".into()),
+            "准备上传游戏本体包",
+        )
+        .unwrap();
+        TaskService::set_retry(
+            &state,
+            &task_id,
+            TaskRetry {
+                operation: "upload_game_body_package".into(),
+                game_uid: "test-game".into(),
+                game_key: None,
+                version_id: Some("test-version".into()),
+                remote_path: None,
+                remote_fs_id: None,
+            },
+        )
+        .unwrap();
+        (state, claim, task_id)
+    }
+
+    #[test]
+    fn upload_worker_start_failure_keeps_version_state_and_releases_claim() {
+        let root = TempWorkspace::new("upload-worker-start-failure");
+        let (state, claim, task_id) = upload_test_task(&root);
+        let finish_state = state.clone();
+        let finish_id = task_id.clone();
+        let result = TaskService::spawn_worker(
+            "上传游戏本体包",
+            || panic!("worker must not run"),
+            move |result| {
+                finish_upload_body_task(
+                    &finish_state,
+                    &finish_id,
+                    &claim,
+                    "test-game",
+                    false,
+                    result,
+                    |_| panic!("version status must not change"),
+                );
+            },
+            |_| Err(std::io::Error::other("test spawn error")),
+        );
+        let error = result.unwrap_err();
+        let tasks = TaskRepository::load(&state.tasks_path).unwrap();
+        assert_eq!(tasks[&task_id].status, TaskStatus::Failed);
+        assert_eq!(tasks[&task_id].progress, 0);
+        assert_eq!(tasks[&task_id].error.as_deref(), Some(error.as_str()));
+        assert_eq!(
+            tasks[&task_id].retry.as_ref().unwrap().operation,
+            "upload_game_body_package"
+        );
+        assert!(state.claim_body_package("test-game").is_ok());
+    }
+
+    #[test]
+    fn upload_worker_cancel_and_failure_keep_progress_and_release_claim_after_record_update() {
+        for (error, version_status, task_status) in [
+            ("任务已取消", "local_only", TaskStatus::Cancelled),
+            ("上传连接中断", "failed", TaskStatus::Failed),
+        ] {
+            let root = TempWorkspace::new("upload-worker-stopped");
+            let (state, claim, task_id) = upload_test_task(&root);
+            TaskService::update(&state, &task_id, TaskStatus::Running, 44, "uploading", None);
+            let expected_error = (task_status == TaskStatus::Failed).then_some(error);
+            finish_upload_body_task(
+                &state,
+                &task_id,
+                &claim,
+                "test-game",
+                true,
+                Err(error.into()),
+                |status| {
+                    assert_eq!(status, version_status);
+                    assert!(state.claim_body_package("test-game").is_err());
+                    Ok(())
+                },
+            );
+            let tasks = TaskRepository::load(&state.tasks_path).unwrap();
+            let task = &tasks[&task_id];
+            assert_eq!(task.status, task_status);
+            assert_eq!(task.progress, 44);
+            assert_eq!(task.error.as_deref(), expected_error);
+            assert_eq!(
+                task.retry.as_ref().unwrap().operation,
+                "upload_game_body_package"
+            );
+            assert!(state.claim_body_package("test-game").is_ok());
+        }
+    }
+
+    #[test]
+    fn upload_worker_retries_manifest_repair_after_zip_publication() {
+        let root = TempWorkspace::new("upload-worker-manifest-pending");
+        let (state, claim, task_id) = upload_test_task(&root);
+        TaskService::update(&state, &task_id, TaskStatus::Running, 92, "publishing", None);
+        finish_upload_body_task(
+            &state,
+            &task_id,
+            &claim,
+            "test-game",
+            true,
+            Err(format!("{BODY_MANIFEST_PENDING_PREFIX}test network error")),
+            |status| {
+                assert_eq!(status, "manifest_pending");
+                assert!(state.claim_body_package("test-game").is_err());
+                Ok(())
+            },
+        );
+        let tasks = TaskRepository::load(&state.tasks_path).unwrap();
+        let task = &tasks[&task_id];
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.progress, 92);
+        let retry = task.retry.as_ref().unwrap();
+        assert_eq!(retry.operation, "repair_cloud_body_manifest");
+        assert_eq!(retry.game_uid, "test-game");
+        assert!(retry.version_id.is_none());
+        assert!(state.claim_body_package("test-game").is_ok());
+    }
+
+    fn cloud_install_test_task(state: &AppState) -> (String, String) {
+        let (target, key) = reserve_cloud_install(state, "test-uid", "test-game", false).unwrap();
+        let id = TaskService::create(
+            state,
+            "install_cloud_game",
+            TaskCategory::BodyTransfer,
+            Some(target.game_uid),
+            "准备安装云端游戏",
+        )
+        .unwrap();
+        (key, id)
+    }
+
+    #[test]
+    fn cloud_install_cancel_restores_admission_for_the_same_cloud_game() {
+        let root = TempWorkspace::new("cloud-install-cancel");
+        let state = transfer_test_state(&root);
+        let (key, id) = cloud_install_test_task(&state);
+        let duplicate = reserve_cloud_install(&state, "another-uid", "test-game", false);
+        assert_eq!(duplicate.err().as_deref(), Some("该云端游戏已有安装任务正在进行"));
+        TaskService::update(&state, &id, TaskStatus::Running, 47, "downloading", None);
+        TaskService::cancel(&state, &id).unwrap();
+        assert!(TaskService::is_cancelled(&state, &id));
+        finish_cloud_install_task(&state, &id, "test-uid", &key, Err("任务已取消".into()));
+        let tasks = TaskRepository::load(&state.tasks_path).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[&id].status, TaskStatus::Cancelled);
+        assert_eq!(tasks[&id].progress, 47);
+        assert!(state.save_operations.lock().unwrap().is_empty());
+        assert!(reserve_cloud_install(&state, "test-uid", "test-game", false).is_ok());
+    }
+
+    #[test]
+    fn cloud_install_worker_start_failure_releases_both_claims() {
+        let root = TempWorkspace::new("cloud-install-worker-start-failure");
+        let state = transfer_test_state(&root);
+        let (key, id) = cloud_install_test_task(&state);
+        let finish_state = state.clone();
+        let finish_id = id.clone();
+        let result = TaskService::spawn_worker(
+            "安装云端游戏",
+            || panic!("worker must not run"),
+            move |result| finish_cloud_install_task(&finish_state, &finish_id, "test-uid", &key, result),
+            |_| Err(std::io::Error::other("test spawn error")),
+        );
+        let error = result.unwrap_err();
+        let tasks = TaskRepository::load(&state.tasks_path).unwrap();
+        assert_eq!(tasks[&id].status, TaskStatus::Failed);
+        assert_eq!(tasks[&id].progress, 0);
+        assert_eq!(tasks[&id].error.as_deref(), Some(error.as_str()));
+        assert!(state.save_operations.lock().unwrap().is_empty());
+        assert!(reserve_cloud_install(&state, "test-uid", "test-game", false).is_ok());
+    }
+
+    #[test]
+    fn cloud_install_failure_keeps_local_claim_while_the_install_journal_exists() {
+        let root = TempWorkspace::new("cloud-install-journal-claim");
+        let state = transfer_test_state(&root);
+        let (key, id) = cloud_install_test_task(&state);
+        let games_root = state.games_root().unwrap();
+        std::fs::create_dir_all(&games_root).unwrap();
+        let journal = games_root.join(".test-uid.cloud-install.json");
+        std::fs::write(&journal, b"pending install").unwrap();
+        finish_cloud_install_task(&state, &id, "test-uid", &key, Err("安装提交失败".into()));
+        assert!(journal.is_file());
+        assert!(reserve_transfer(&state, "test-uid").is_err());
+        assert!(reserve_cloud_install(&state, "test-uid", "test-game", true).is_err());
+        let operations = state.save_operations.lock().unwrap();
+        assert!(operations.contains("test-uid"));
+        assert!(!operations.contains(&key));
+        let tasks = TaskRepository::load(&state.tasks_path).unwrap();
+        assert_eq!(tasks[&id].status, TaskStatus::Failed);
+    }
 
     #[test]
     fn upload_reminder_requires_store_manifest_to_contain_the_current_zip() {
